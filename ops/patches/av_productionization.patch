@@ -1,0 +1,462 @@
+*** Begin Patch
+*** Add File:.github/workflows/enforce_hardware_protected_branches.yml
++name: Enforce Real Hardware on Protected Branches
++on:
++  push:
++    branches:
++      - main
++      - release/**
++  workflow_dispatch:
++
++jobs:
++  hardware-enforce:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Ensure Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.11'
++      - name: Run hardware hard gate (strict)
++        env:
++          REQUIRE_REAL_HARDWARE: "1"
++          ACME_HIL_URL: ${{ secrets.ACME_HIL_URL }}
++          ACME_HIL_TOKEN: ${{ secrets.ACME_HIL_TOKEN }}
++          IONQ_API_KEY: ${{ secrets.IONQ_API_KEY }}
++          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
++          KUBECONFIG: ${{ secrets.KUBECONFIG }}
++        run: |
++          python ops/ci/hardware_hard_gate.py --require acme_hil,gpu,tpu,qpu,lpu,rt
++      - name: Upload diagnostics
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: hardware-gate-diagnostics
++          path: /tmp/hardware_hard_gate.json
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/robot/agent/edge_agent_production.py
++#!/usr/bin/env python3
++"""
++Hardened Edge Agent for production AV robots (scaffold)
++
++Features:
++ - TPM attestation (tpm2-tools or fallback)
++ - mTLS for OTA server (client cert configurable)
++ - Vault integration for short-lived credentials
++ - KMS signature verification helper invocation prior to activation
++ - Atomic install and safe activation/rollback hooks
++ - Basic health & watchdog integration
++
++Notes:
++ - This is a scaffold demonstrating integration points. Do not run as-is in production without security review.
++"""
++import os
++import sys
++import time
++import json
++import shutil
++import subprocess
++from pathlib import Path
++from datetime import datetime
++import requests
++
++# Configuration from env
++OTA_SERVER = os.environ.get("AEGIS_OTA_URL", "https://ota.aegis.local")
++MODEL_DIR = Path(os.environ.get("AEGIS_MODEL_DIR", "/opt/aegis/models"))
++WORK_DIR = Path(os.environ.get("AEGIS_WORK_DIR", "/var/lib/aegis"))
++EVIDENCE_DIR = Path(os.environ.get("AEGIS_EVIDENCE_DIR", "/var/lib/aegis/evidence"))
++NODE_ID = os.environ.get("AEGIS_NODE_ID", os.uname().nodename)
++CLIENT_CERT = os.environ.get("AEGIS_OTA_CLIENT_CERT")  # path to client cert
++CLIENT_KEY  = os.environ.get("AEGIS_OTA_CLIENT_KEY")   # path to client key
++CA_BUNDLE   = os.environ.get("AEGIS_OTA_CA_BUNDLE")    # path to CA bundle
++VERIFY_HELPER = Path("ops/governance/kms_verify_helper.py")
++VAULT_HELPER = Path("ops/security/vault_helper.py")
++
++MODEL_DIR.mkdir(parents=True, exist_ok=True)
++WORK_DIR.mkdir(parents=True, exist_ok=True)
++EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
++
++def log(msg, level="info"):
++    print(f"{datetime.utcnow().isoformat()}Z [{level}] {msg}", flush=True)
++
++def tpm_attest():
++    # Try tpm2-tools: fallback to nonce if not available
++    try:
++        out = subprocess.check_output(["tpm2_getrandom", "16"], text=True).strip()
++        token = {"method": "tpm_getrandom", "value": out, "ts": datetime.utcnow().isoformat()+"Z"}
++        return token
++    except Exception:
++        token = {"method": "local_nonce", "value": str(int(time.time())), "ts": datetime.utcnow().isoformat()+"Z"}
++        return token
++
++def fetch_vault_secrets():
++    # Use vault_helper if available - it writes /tmp/aegis_vault_env.sh
++    try:
++        if VAULT_HELPER.exists():
++            subprocess.check_call(["python", str(VAULT_HELPER)])
++            f = Path("/tmp/aegis_vault_env.sh")
++            if f.exists():
++                for line in f.read_text().splitlines():
++                    if line.startswith("export "):
++                        k,v = line[len("export "):].split("=",1)
++                        os.environ[k] = v.strip("'")
++                log("Loaded secrets from Vault helper")
++                return True
++    except Exception as e:
++        log(f"Vault fetch failed: {e}", level="warn")
++    return False
++
++def mtls_request(url, method="get", json_payload=None, timeout=15):
++    kwargs = {"timeout": timeout, "verify": CA_BUNDLE or True}
++    if CLIENT_CERT and CLIENT_KEY:
++        kwargs["cert"] = (CLIENT_CERT, CLIENT_KEY)
++    if json_payload:
++        r = requests.request(method, url, json=json_payload, **kwargs)
++    else:
++        r = requests.request(method, url, **kwargs)
++    r.raise_for_status()
++    return r
++
++def download_artifact(artifact_url, dest_dir):
++    log(f"Downloading artifact {artifact_url}")
++    r = mtls_request(artifact_url)
++    dest = Path(dest_dir) / Path(artifact_url).name
++    with open(dest, "wb") as fh:
++        fh.write(r.content)
++    return str(dest)
++
++def verify_with_kms(artifact_path):
++    # Delegate to KMS verify helper if present
++    if VERIFY_HELPER.exists():
++        try:
++            subprocess.check_call(["python", str(VERIFY_HELPER), "--file", artifact_path], stdout=subprocess.DEVNULL)
++            log("KMS verification succeeded")
++            return True
++        except Exception as e:
++            log(f"KMS verify failed: {e}", level="error")
++            return False
++    # fallback: require local .sig.b64
++    if Path(artifact_path + ".sig.b64").exists():
++        log("Local signature present (.sig.b64) - accepting per local policy")
++        return True
++    log("No verification method available", level="error")
++    return False
++
++def atomic_activate(artifact_path):
++    # Copy into models dir and swap symlink atomically
++    dest = MODEL_DIR / (Path(artifact_path).name + f".{int(time.time())}")
++    shutil.copy2(artifact_path, dest)
++    cur = MODEL_DIR / "current"
++    tmp_symlink = MODEL_DIR / f"current.tmp.{int(time.time())}"
++    tmp_symlink.symlink_to(dest.name)
++    tmp_symlink.replace(cur)  # atomic on POSIX
++    log(f"Activated model {dest}")
++    # create backup manifest for rollback
++    open(EVIDENCE_DIR / f"activation_{int(time.time())}.json","w").write(json.dumps({"artifact":str(dest),"ts":datetime.utcnow().isoformat()+"Z"}))
++    return True
++
++def watchdog_register():
++    # placeholder: register with a local watchdog or systemd watchdog
++    log("Registering system watchdog (placeholder)")
++
++def check_and_apply():
++    # ask OTA for latest package metadata
++    url = f"{OTA_SERVER.rstrip('/')}/packages/latest?node={NODE_ID}"
++    try:
++        r = mtls_request(url)
++    except Exception as e:
++        log(f"OTA query failed: {e}", level="warn"); return
++    if r.status_code == 204:
++        log("No package available"); return
++    pkg = r.json()
++    artifact_url = pkg.get("artifact_url")
++    if not artifact_url:
++        log("No artifact_url in package"); return
++    local = download_artifact(artifact_url, WORK_DIR)
++    if not verify_with_kms(local):
++        log("Verification failed: rejecting package", level="error"); return
++    # pre-activation checks: driver versions, RT kernel, attestation
++    # driver check: call driver_installer_manager verify
++    try:
++        subprocess.check_call(["python","ops/installers/driver_installer_manager.py"])
++    except Exception as e:
++        log(f"Driver verification failed: {e}", level="error"); return
++    att = tpm_attest()
++    log(f"Attestation token: {att}")
++    if atomic_activate(local):
++        log("Model activated; notify OTA")
++        try:
++            mtls_request(f"{OTA_SERVER.rstrip('/')}/agent/heartbeat", method="post", json_payload={"node":NODE_ID,"event":"activate","artifact":Path(local).name,"ts":datetime.utcnow().isoformat()+"Z"})
++        except Exception:
++            log("Notify OTA failed", level="warn")
++
++def run():
++    watchdog_register()
++    fetch_vault_secrets()
++    while True:
++        try:
++            check_and_apply()
++        except Exception as e:
++            log(f"Error in agent main loop: {e}", level="error")
++        time.sleep(int(os.environ.get("AEGIS_AGENT_POLL", "60")))
++
++if __name__ == "__main__":
++    run()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/hil/redundancy_hil_harness.py
++#!/usr/bin/env python3
++"""
++HIL redundancy and failure-mode test harness
++
++ - Creates HIL campaign manifests for scenarios that simulate sensor loss, compute node failure,
++   and replay corner-case sequences.
++ - Runs campaigns (via ops/hil/run_hil_campaign.py) and collects determinism + WCET evidence.
++ - Produces /tmp/hil_redundancy_report.json summarizing outcomes.
++"""
++import os
++import json
++import subprocess
++from datetime import datetime
++from pathlib import Path
++
++OUT="/tmp/hil_redundancy_report.json"
++
++SCENARIOS = [
++    {"id":"sensor_dropout_lidar","description":"Simulate LiDAR dropout for 5s at t=30s","manifest":"ops/hil/playbook/sensor_dropout_lidar.json"},
++    {"id":"compute_loss_core1","description":"Drop compute core/process to emulate partial failure","manifest":"ops/hil/playbook/compute_loss_core1.json"},
++    {"id":"corner_stopping","description":"Aggressive pedestrian crossing scenario corner-case","manifest":"ops/hil/playbook/corner_stopping.json"}
++]
++
++def run_manifest(manifest, repeats=6):
++    cmd = ["python","ops/hil/run_hil_campaign.py","--manifest",manifest,"--repeats",str(repeats)]
++    try:
++        subprocess.check_call(cmd)
++        # read campaign result
++        if Path("/tmp/hil_campaign_result.json").exists():
++            return json.load(open("/tmp/hil_campaign_result.json"))
++        return {"ok": True, "note": "no detailed summary found"}
++    except Exception as e:
++        return {"ok": False, "error": str(e)}
++
++def main():
++    results=[]
++    for s in SCENARIOS:
++        if not Path(s["manifest"]).exists():
++            results.append({"id":s["id"], "ok": False, "error":"manifest_missing"})
++            continue
++        res = run_manifest(s["manifest"], repeats=8)
++        results.append({"id":s["id"], "manifest": s["manifest"], "result": res})
++    report = {"ts": datetime.utcnow().isoformat()+"Z", "results": results}
++    open(OUT,"w").write(json.dumps(report, indent=2))
++    print("Wrote", OUT)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/hil/playbook/sensor_dropout_lidar.json
++{
++  "name": "sensor_dropout_lidar",
++  "description": "Drop lidar frames for 5 seconds at 30s into replay",
++  "replay": "replays/urban_pedestrian_crossing.replay",
++  "modifiers": [
++    {"type":"sensor_dropout", "sensor":"lidar", "start_s":30, "duration_s":5}
++  ],
++  "expected": {
++    "max_safe_decel": 2.0
++  }
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/certification/traceability_matrix.py
++#!/usr/bin/env python3
++"""
++Traceability matrix generator
++
++ - Scans requirements in ops/certification/requirements.json (list of req objects with id and description)
++ - Scans evidence index (/tmp/evidence_index.json or configured path)
++ - Produces a mapping file /tmp/traceability_matrix.json linking requirement -> evidence artifacts
++"""
++import os, json
++from pathlib import Path
++
++REQS_PATH = Path("ops/certification/requirements.json")
++EVIDENCE_INDEX = Path(os.environ.get("AEGIS_EVIDENCE_INDEX", "/tmp/evidence_index.json"))
++OUT = Path("/tmp/traceability_matrix.json")
++
++def load_requirements():
++    if REQS_PATH.exists():
++        return json.load(open(REQS_PATH))
++    return []
++
++def load_evidence():
++    if EVIDENCE_INDEX.exists():
++        return json.load(open(EVIDENCE_INDEX))
++    return []
++
++def main():
++    reqs = load_requirements()
++    evidence = load_evidence()
++    matrix = []
++    for r in reqs:
++        linked = []
++        for e in evidence:
++            tags = e.get("tags", []) or []
++            # simple heuristic: evidence references requirement ids in metadata
++            meta = e.get("meta", {})
++            if r.get("id") in json.dumps(meta) or r.get("id") in json.dumps(e):
++                linked.append(e)
++        matrix.append({"requirement": r, "evidence": linked})
++    OUT.write_text(json.dumps({"ts": datetime.utcnow().isoformat()+"Z", "matrix": matrix}, indent=2))
++    print("Wrote traceability matrix to", OUT)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/hil/scenario_generator.py
++#!/usr/bin/env python3
++"""
++Scenario generation harness
++
++ - Produces parameterized HIL replay manifests covering corner cases (e.g., occlusion, sensor noise, adversarial)
++ - Writes manifests under ops/hil/playbook/generated/
++ - Produces a coverage report /tmp/scenario_coverage.json counting families produced
++"""
++import os, json
++from pathlib import Path
++from itertools import product
++from datetime import datetime
++
++OUT_DIR = Path("ops/hil/playbook/generated")
++OUT_DIR.mkdir(parents=True, exist_ok=True)
++OUT_REPORT = Path("/tmp/scenario_coverage.json")
++
++FAMILIES = {
++    "occlusion": {"depth":[0.2, 0.5], "duration_s":[1,3]},
++    "sensor_noise": {"noise_std":[0.01,0.05,0.1]},
++    "adversary": {"ped_speed":[1.0,2.5], "angle":[-30,0,30]}
++}
++
++def gen_occlusion(params):
++    name = f"occlusion_d{params['depth']}_t{params['duration_s']}"
++    manifest = {"name": name, "replay":"replays/urban_base.replay", "modifiers":[{"type":"occlusion","depth":params["depth"],"duration_s":params["duration_s"]}]}
++    return name, manifest
++
++def gen_sensor_noise(params):
++    name = f"noise_std{params['noise_std']}"
++    manifest = {"name": name, "replay":"replays/highway.replay", "modifiers":[{"type":"sensor_noise","std":params["noise_std"]}]}
++    return name, manifest
++
++def gen_adversary(params):
++    name = f"adv_speed{params['ped_speed']}_a{params['angle']}"
++    manifest = {"name": name, "replay":"replays/crosswalk.replay", "modifiers":[{"type":"adversary_ped","speed":params["ped_speed"],"angle":params["angle"]}]}
++    return name, manifest
++
++GENERATORS = {"occlusion": gen_occlusion, "sensor_noise": gen_sensor_noise, "adversary": gen_adversary}
++
++def main():
++    produced = []
++    for family, dims in FAMILIES.items():
++        keys = list(dims.keys())
++        values = list(dims.values())
++        for combo in product(*values):
++            params = dict(zip(keys, combo))
++            name, manifest = GENERATORS[family](params)
++            path = OUT_DIR / f"{name}.json"
++            path.write_text(json.dumps(manifest, indent=2))
++            produced.append({"family":family,"name":name,"path":str(path)})
++    OUT_REPORT.write_text(json.dumps({"ts": datetime.utcnow().isoformat()+"Z","produced":produced}, indent=2))
++    print("Wrote scenario coverage to", OUT_REPORT)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/hil_redundancy_and_scenarios.yml
++name: HIL Redundancy & Scenario Campaigns
++on:
++  workflow_dispatch:
++
++jobs:
++  generate-scenarios:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Generate scenarios
++        run: python ops/hil/scenario_generator.py
++      - name: Upload generated manifests
++        uses: actions/upload-artifact@v4
++        with:
++          name: hil-manifests
++          path: ops/hil/playbook/generated
++
++  run-redundancy:
++    runs-on: ubuntu-latest
++    needs: generate-scenarios
++    steps:
++      - uses: actions/checkout@v4
++      - name: Collect hardware inventory
++        run: python ops/ci/hardware_inventory.py
++      - name: Run redundancy HIL harness
++        env:
++          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: python ops/hil/redundancy_hil_harness.py
++      - name: Upload report
++        uses: actions/upload-artifact@v4
++        with:
++          name: hil-redundancy-report
++          path: /tmp/hil_redundancy_report.json
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/runbooks/certification_audit_template.md
++# Certification & Traceability Runbook Template
++
++Purpose
++-------
+Guide to produce artifacts required by auditors and map Aegis evidence to certification requirements (ISO 26262 / UNECE R155).
++
++Steps
++1. Requirements listing
++   - Populate ops/certification/requirements.json with structured requirement objects: id, description, owner, criticality.
++2. Evidence ingestion
++   - Ensure CI uploads signed artifacts to evidence store and index (s3 + /tmp/evidence_index.json)
++3. Traceability matrix
++   - Run: python ops/certification/traceability_matrix.py
++   - Review /tmp/traceability_matrix.json and iterate until each requirement has linked evidence.
++4. Mock audit
++   - Produce audit bundle: all evidence referenced in the matrix, plus readme and SME signoffs.
++   - Run internal mock audit and document gaps.
++5. Close gaps
++   - Create GitHub issues for missing evidence, missing SME signoffs or missing HIL runs.
++
++Acceptance
++- Every requirement has at least one signed evidence artifact linked.
++- SME signoff present for safety-critical invariants.
++- HIL/WCET reports for timing requirements are present and signed.
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/billing/enable_tagging_instructions.md
++# Billing Tagging & Quota Instructions
++
++1. Tagging convention
++   - All training and evaluation jobs must include tags: {"aegis:job_id":"<uuid>", "aegis:team":"<team>"}
++2. CI wiring
++   - Update job templates to include env var AEGIS_JOB_ID and pass tag to cloud SDK calls (e.g., AWS EMR/Batch, GCP AI Platform).
++3. Billing connectors
++   - Ensure ops/billing/aws_billing_connector_enhanced.py runs daily and reconciles costs to aegis:job_id tags.
++4. Quotas & alerts
++   - Configure cloud quotas and set alerts; integrate with ops/billing/quota_enforcer.py to create issues on breach.
++
+*** End Patch
+*** End Patch

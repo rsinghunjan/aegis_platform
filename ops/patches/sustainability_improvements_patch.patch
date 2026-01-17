@@ -1,0 +1,501 @@
+*** Begin Patch
+*** Add File:ops/sustainability/energy_estimator.py
++"""
++Estimate per-pod / per-inference energy usage and convert to CO2e using a carbon intensity API.
++This is an estimator: for GPUs we read nvidia-smi utilization and TDP; for CPUs we use heuristics.
++Integrate this with inference middleware to emit per-inference kWh and CO2e metrics.
++"""
++import os, subprocess, json
++import math
++import requests
++from typing import Optional
++
++# Config
++DEFAULT_GPU_TDP_WATTS = float(os.environ.get("DEFAULT_GPU_TDP_WATTS", "300.0"))
++CARBON_API_URL = os.environ.get("CARBON_API_URL", "https://api.carbonintensity.org.uk/intensity")  # placeholder
++CARBON_API_FALLBACK = float(os.environ.get("CARBON_API_FALLBACK", "0.4"))  # kgCO2e per kWh fallback
++
++def get_gpu_utilization():
++    """Use nvidia-smi to get GPU utilization percent and power draw (watts) if available."""
++    try:
++        out = subprocess.check_output(["nvidia-smi", "--query-gpu=utilization.gpu,power.draw", "--format=csv,noheader,nounits"], stderr=subprocess.DEVNULL)
++        lines = out.decode().strip().splitlines()
++        # return first GPU entry as aggregate approximation
++        util_str, power_str = lines[0].split(",")
++        util = float(util_str.strip())
++        power = float(power_str.strip())
++        return {"util_pct": util, "power_w": power}
++    except Exception:
++        return None
++
++def estimate_energy_for_duration_seconds(duration_secs: float, pod_role: str = "inference") -> float:
++    """
++    Estimate kWh consumed by this pod during duration_secs.
++    Returns kWh.
++    """
++    # Prefer direct GPU power reading
++    g = get_gpu_utilization()
++    if g and g.get("power_w", 0.0) > 0:
++        watts = g["power_w"]
++    else:
++        # fallback: estimate by util fraction of TDP
++        util = g["util_pct"] if g else 50.0
++        watts = (util / 100.0) * DEFAULT_GPU_TDP_WATTS
++    kwh = (watts * duration_secs) / 3600.0
++    return kwh
++
++def fetch_carbon_intensity(region: Optional[str] = None) -> float:
++    """
++    Query a carbon intensity API to return kgCO2e per kWh. Fallback to configured constant.
++    """
++    try:
++        # very small wrapper to keep generic
++        r = requests.get(CARBON_API_URL, timeout=3)
++        r.raise_for_status()
++        j = r.json()
++        # adapt to common APIs: try nested keys
++        # e.g., UK API -> j['data'][0]['intensity']['actual']
++        if isinstance(j.get("data"), list):
++            intensity = j["data"][0]
++            if isinstance(intensity, dict):
++                # try 'intensity' field
++                val = intensity.get("intensity", {})
++                if isinstance(val, dict) and val.get("actual") is not None:
++                    return float(val["actual"]) / 1000.0  # gCO2/kWh -> kgCO2/kWh
++        # fallback parse
++        return CARBON_API_FALLBACK
++    except Exception:
++        return CARBON_API_FALLBACK
++
++def estimate_co2e_for_kwh(kwh: float, region: Optional[str] = None) -> float:
++    intensity = fetch_carbon_intensity(region)
++    return kwh * intensity
++
++if __name__ == "__main__":
++    # quick demo
++    kwh = estimate_energy_for_duration_seconds(1.0)  # 1 sec
++    co2 = estimate_co2e_for_kwh(kwh)
++    print(f"1s energy ~{kwh:.6f} kWh -> CO2e {co2:.6f} kg")
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/metrics/inference_middleware.py
++"""
++Middleware helper to integrate into inference service:
++ - Measure wall time per request
++ - Estimate energy (kWh) and CO2e for inference using energy_estimator
++ - Emit Prometheus metrics (via prometheus_client)
++ - Append per-inference sustainability datapoint to evidence store (optionally)
++ Usage: wrap inference handlers to call record_inference(...)
++"""
++import time
++import os
++from prometheus_client import Counter, Gauge
++from services.sustainability.energy_estimator import estimate_energy_for_duration_seconds, estimate_co2e_for_kwh
++import json
++
++INF_COUNT = Counter("aegis_inference_count_total", "Total inference count")
++INF_KWH = Counter("aegis_inference_kwh_total", "Total inferred kWh consumed")
++INF_CO2 = Counter("aegis_inference_co2_kg_total", "Total inferred CO2e (kg)")
++INF_LAT = Gauge("aegis_inference_latency_seconds", "Inference latency seconds")
++
++EVIDENCE_PATH = os.environ.get("EVIDENCE_PATH", "/tmp/inference_sustainability.jsonl")
++
++def record_inference(start_ts, end_ts, model_name, request_meta=None, store_evidence=True):
++    duration = end_ts - start_ts
++    INF_COUNT.inc()
++    INF_LAT.set(duration)
++    kwh = estimate_energy_for_duration_seconds(duration)
++    INF_KWH.inc(kwh)
++    co2 = estimate_co2e_for_kwh(kwh)
++    INF_CO2.inc(co2)
++    if store_evidence:
++        os.makedirs(os.path.dirname(EVIDENCE_PATH), exist_ok=True)
++        rec = {"ts": time.time(), "model": model_name, "duration_s": duration, "kwh": kwh, "co2_kg": co2, "meta": request_meta or {}}
++        with open(EVIDENCE_PATH, "a") as f:
++            f.write(json.dumps(rec) + "\n")
++    return {"duration_s": duration, "kwh": kwh, "co2_kg": co2}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/sustainability/s3_lifecycle_policy.json
++{
++  "Rules": [
++    {
++      "ID": "ArchiveOldCheckpoints",
++      "Prefix": "checkpoints/",
++      "Status": "Enabled",
++      "Transitions": [
++        { "Days": 7, "StorageClass": "STANDARD_IA" },
++        { "Days": 30, "StorageClass": "GLACIER" }
++      ],
++      "NoncurrentVersionTransitions": [
++        { "NoncurrentDays": 7, "StorageClass": "GLACIER" }
++      ],
++      "Expiration": { "Days": 365 }
++    },
++    {
++      "ID": "CompressAndDeleteTemp",
++      "Prefix": "tmp/",
++      "Status": "Enabled",
++      "Expiration": { "Days": 14 }
++    }
++  ]
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/sustainability/apply_s3_lifecycle.sh
++#!/usr/bin/env bash
++set -euo pipefail
++if [ $# -lt 1 ]; then
++  echo "Usage: $0 <bucket-name>"
++  exit 2
++fi
++BUCKET="$1"
++aws s3api put-bucket-lifecycle-configuration --bucket "$BUCKET" --lifecycle-configuration file://ops/sustainability/s3_lifecycle_policy.json
++echo "Applied lifecycle policy to $BUCKET"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/sustainability/compress_checkpoints.py
++"""
++Compress old checkpoints and deduplicate by checksum to reduce storage.
++Run as a cronjob after checkpoints are uploaded to S3 or local filesystem.
++"""
++import os, hashlib, shutil, gzip, argparse, glob
++
++def sha256(path):
++    h = hashlib.sha256()
++    with open(path,"rb") as f:
++        while True:
++            b = f.read(8192)
++            if not b: break
++            h.update(b)
++    return h.hexdigest()
++
++def compress_and_dedupe(path_pattern, out_dir):
++    os.makedirs(out_dir, exist_ok=True)
++    seen = {}
++    for p in glob.glob(path_pattern):
++        chk = sha256(p)
++        if chk in seen:
++            print("Duplicate found:", p, "->", seen[chk])
++            continue
++        outp = os.path.join(out_dir, os.path.basename(p) + ".gz")
++        with open(p,"rb") as fr, gzip.open(outp,"wb") as fw:
++            shutil.copyfileobj(fr, fw)
++        seen[chk] = outp
++        print("Compressed", p, "->", outp)
++
++if __name__ == "__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--pattern", default="checkpoints/*")
++    p.add_argument("--out", default="checkpoints_compressed")
++    args = p.parse_args()
++    compress_and_dedupe(args.pattern, args.out)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/terraform/spot_nodegroup.tf
++/*
++Example Terraform fragment for creating an EKS managed node group using spot instances (capacity_type = SPOT).
++Integrate into your Terraform EKS module and adjust instance types and scaling strategy.
++*/
++resource "aws_eks_node_group" "spot_workers" {
++  cluster_name    = var.cluster_name
++  node_group_name = "aegis-spot-workers"
++  node_role_arn   = aws_iam_role.eks_nodegroup.arn
++  subnet_ids      = var.private_subnet_ids
++  scaling_config {
++    desired_size = 2
++    max_size     = 10
++    min_size     = 0
++  }
++  instance_types = ["m6i.large","m6i.xlarge"]
++  capacity_type  = "SPOT"
++  ami_type = "AL2_x86_64"
++  tags = {
++    "k8s.io/cluster-autoscaler/enabled" = "true"
++  }
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/scheduling/batch_scheduler.py
++"""
++Schedule batch training jobs to low-carbon windows and/or preferred regions.
++Uses a carbon intensity API (or a fallback heuristic) to decide when to launch heavy batch jobs.
++This script can be run as a controller or invoked by CI to delay execution to low-carbon windows.
++"""
++import os, time, requests, datetime, subprocess, json
++
++CARBON_API = os.environ.get("CARBON_API_URL", "https://api.carbonintensity.org.uk/intensity")
++THRESH = float(os.environ.get("CARBON_THRESHOLD_KG_PER_KWH", "0.35"))
++CHECK_INTERVAL = int(os.environ.get("BATCH_SCHED_INTERVAL_SECS", "300"))
++KUBE_JOB_TEMPLATE = os.environ.get("KUBE_JOB_TEMPLATE", "ops/scheduling/batch_job_template.yaml")
++
++def get_current_intensity():
++    try:
++        r = requests.get(CARBON_API, timeout=5)
++        r.raise_for_status()
++        j = r.json()
++        if isinstance(j.get("data"), list):
++            val = j["data"][0].get("intensity", {}).get("actual", None)
++            if val is not None:
++                return float(val) / 1000.0
++    except Exception:
++        pass
++    # fallback: use a moderate value
++    return 0.5
++
++def schedule_job_when_low(job_name="aegis-batch-job", max_wait_secs=86400):
++    start = time.time()
++    while time.time() - start < max_wait_secs:
++        intensity = get_current_intensity()
++        print("Current carbon intensity (kgCO2/kWh):", intensity)
++        if intensity <= THRESH:
++            # launch k8s job via kubectl apply
++            cmd = ["kubectl","apply","-f", KUBE_JOB_TEMPLATE]
++            subprocess.check_call(cmd)
++            print("Launched job due to low-carbon window")
++            return True
++        print("Not low enough, sleeping", CHECK_INTERVAL, "secs")
++        time.sleep(CHECK_INTERVAL)
++    print("Timeout waiting for low-carbon window; launching job anyway")
++    subprocess.check_call(["kubectl","apply","-f", KUBE_JOB_TEMPLATE])
++    return False
++
++if __name__ == "__main__":
++    schedule_job_when_low()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/scheduling/batch_job_template.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: aegis-batch-job
++spec:
++  template:
++    metadata:
++      labels:
++        app: aegis-batch
++    spec:
++      tolerations:
++        - key: "spotInstance"
++          operator: "Exists"
++          effect: "NoSchedule"
++      nodeSelector:
++        node.kubernetes.io/instance-type: "spot"
++      restartPolicy: Never
++      containers:
++        - name: trainer
++          image: us.gcr.io/aegis/trainer:latest
++          args: ["python", "train.py", "--epochs", "10"]
++          resources:
++            limits:
++              nvidia.com/gpu: 1
++            requests:
++              cpu: "2000m"
++              memory: "16Gi"
++              nvidia.com/gpu: 1
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/triton/model_repository/ternary_model/config.pbtxt
++# update: enable dynamic batching and model control
++name: "ternary_model"
++platform: "python"
++max_batch_size: 32
++input [
++  {
++    name: "INPUT_IDS"
++    data_type: TYPE_INT32
++    dims: [ -1 ]
++  }
++]
++output [
++  {
++    name: "OUTPUT_TEXT"
++    data_type: TYPE_STRING
++    dims: [ 1 ]
++  }
++]
++instance_group [
++  {
++    count: 1
++    kind: KIND_GPU
++  }
++]
++dynamic_batching {
++  preferred_batch_size: [ 4, 8, 16 ]
++  max_queue_delay_microseconds: 1000
++}
++model_control_mode: MODEL_CONTROL_EXPLICIT
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/triton/deploy/triton_deployment_dynamic.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: triton-server
++  namespace: inference
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: triton
++  template:
++    metadata:
++      labels:
++        app: triton
++    spec:
++      nodeSelector:
++        accelerator: nvidia-gpu
++      containers:
++      - name: triton
++        image: nvcr.io/nvidia/tritonserver:23.05-py3
++        resources:
++          limits:
++            nvidia.com/gpu: 1
++          requests:
++            cpu: "2000m"
++            memory: "8Gi"
++        env:
++        - name: TRITONSERVER_MODEL_CONTROL_MODE
++          value: "explicit"
++        - name: TRITONSERVER_MODELS
++          value: "/models"
++        volumeMounts:
++        - name: model-repo
++          mountPath: /models
++        - name: shared-logs
++          mountPath: /logs
++        args: ["tritonserver","--model-repository=/models","--log-verbose=1","--strict-model-config=false"]
++      volumes:
++      - name: model-repo
++        persistentVolumeClaim:
++          claimName: triton-model-repo-pvc
++      - name: shared-logs
++        emptyDir: {}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/triton/deploy/preload_models.sh
++#!/usr/bin/env bash
++#
++# Load specified models into Triton via Triton HTTP API using model-control endpoint.
++#
++TRITON_URL=${TRITON_URL:-http://triton-server.inference:8000}
++MODEL_NAME=${1:-"ternary_model"}
++MODEL_DIR=${2:-"/models/ternary_model"}
++
++echo "Requesting Triton to load model ${MODEL_NAME}"
++curl -s -X POST "${TRITON_URL}/v2/repository/models/${MODEL_NAME}/load" -o /dev/null
++echo "Requested load; check Triton logs for status"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/sustainability/ternary_kernel_build/CMakeLists.txt
++cmake_minimum_required(VERSION 3.18)
++project(ternary_kernel)
++find_package(CUDA REQUIRED)
++add_library(ternary_gemm SHARED ternary_gemm.cu)
++set_target_properties(ternary_gemm PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/sustainability/ternary_kernel_build/README.md
++# Build native ternary kernel
++
++cd ops/sustainability/ternary_kernel_build
++mkdir -p build && cd build
++cmake ..
++make -j
++
++This compiles the CUDA ternary GEMM reference library (requires CUDA and cuBLAS).
++Integrate the compiled shared lib into your Triton backend or call from Python for benchmarking.
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/prometheus/sustainability_rules.yml
++groups:
++- name: aegis-sustainability
++  rules:
++  - record: job:inference_kwh_total:rate1m
++    expr: rate(aegis_inference_kwh_total[1m])
++  - record: job:co2e_kg_total:rate1m
++    expr: rate(aegis_inference_co2_kg_total[1m])
++  - alert: HighInferenceCO2Rate
++    expr: job:co2e_kg_total:rate1m > 0.05
++    for: 10m
++    labels:
++      severity: page
++    annotations:
++      summary: "High CO2e emission rate from inference"
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/grafana/sustainability_dashboard.json
++{
++  "dashboard": {
++    "title": "Aegis Sustainability",
++    "panels": [
++      {"type":"graph","title":"Inference kWh per minute","targets":[{"expr":"job:inference_kwh_total:rate1m"}]},
++      {"type":"graph","title":"CO2e kg per minute","targets":[{"expr":"job:co2e_kg_total:rate1m"}]},
++      {"type":"graph","title":"Inference Count","targets":[{"expr":"increase(aegis_inference_count_total[5m])"}]}
++    ]
++  }
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/sustainability/tiered_serving/traffic_split_controller.py
++"""
++Simple traffic split controller for multi-tier serving:
++ - Routes percentage of traffic between "student" (small) and "teacher" (large) deployments by patching a Kubernetes Service selector-based split via label sharding.
++ - This is a lightweight approach: create two services and an outer proxy that performs weighted routing in an ingress/gateway.
++ For a production setup use Istio/Envoy/VirtualService traffic shifting.
++"""
++import os, subprocess, json
++
++def set_split(student_pct: int):
++    # Placeholder: annotate ingress or update VirtualService in Istio to change weights
++    # For demo we print commands
++    print(f"Set student serving percentage to {student_pct}% (operator must map to Istio VirtualService in real infra)")
++    # Example Istio patch (requires istioctl and VirtualService installed):
++    # subprocess.check_call(["kubectl","patch","virtualservice","model-gateway","-n","inference","--type=json","-p", json_payload])
++
++if __name__=="__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--student", type=int, default=80)
++    args = p.parse_args()
++    set_split(args.student)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/ci/sustainability_validation.yml
++name: Sustainability Validation CI
++on:
++  workflow_dispatch:
++
++jobs:
++  validate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run sustainability lint & examples
++        run: |
++          python -m pip install --upgrade pip
++          pip install requests prometheus_client
++          python - <<'PY'
++from services.sustainability.energy_estimator import estimate_energy_for_duration_seconds, estimate_co2e_for_kwh
++print("1s energy:", estimate_energy_for_duration_seconds(1.0))
++print("CO2 for 1s:", estimate_co2e_for_kwh(estimate_energy_for_duration_seconds(1.0)))
++PY
++
+*** End Patch
+*** End Patch

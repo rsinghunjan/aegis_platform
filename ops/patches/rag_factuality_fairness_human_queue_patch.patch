@@ -1,0 +1,596 @@
+*** Begin Patch
+*** Add File:services/factuality/nli_verifier.py
++"""
++NLI-based factuality verifier wrapper.
++Uses a pretrained NLI model (e.g., roberta-large-mnli / facebook/bart-large-mnli) to score
++entailment between a claim (model output) and candidate evidence passages.
++
++API:
++  verify_claim(claim:str, evidence: List[{"id":..., "text":...}]) -> {
++    "best_evidence_id": id or None,
++    "score": float (0..1 entailment prob),
++    "verdict": "support"/"contradict"/"neutral"/"insufficient",
++    "evidence_scores": [ {id, score} ... ]
++  }
++
++Calibration:
++ - You should compute verifier thresholds on domain-labeled claim↔evidence datasets.
++ - The calibrate tool (ops/safety/calibrate_thresholds.py) can be adapted to tune this verifier.
++"""
++from typing import List, Dict, Any
++import os
++import numpy as np
++from transformers import pipeline
++
++# Model choice can be configured via env var
++NLI_MODEL = os.environ.get("NLI_MODEL", "facebook/bart-large-mnli")
++# mapping: pipeline label -> normalized score
++LABEL_MAP = {"ENTAILMENT": "support", "CONTRADICTION": "contradict", "NEUTRAL": "neutral"}
++
++class NliVerifier:
++    def __init__(self, model_name: str = NLI_MODEL):
++        self.clf = pipeline("zero-shot-classification", model=model_name) if "zero-shot" in model_name else pipeline("text-classification", model=model_name, return_all_scores=True)
++        # fallback mode detection
++        self.use_zs = False
++
++    def _score_pair(self, claim: str, evidence_text: str) -> float:
++        """
++        Return an entailment score (0..1) estimating support for claim given evidence.
++        Using M-NLI-style models; adapt mapping as needed for your model outputs.
++        """
++        try:
++            # Some classification pipelines return label/score. Use wrapper for M-NLI style.
++            res = self.clf(f"{evidence_text}", f"{claim}")
++            # res could be list of dicts or list of labels depending on pipeline
++            # Standard HF entailment models produce label+score in text-classification with return_all_scores
++            if isinstance(res, list) and isinstance(res[0], dict) and "label" in res[0]:
++                # return max entailment-like label score mapping if possible
++                # attempt to find ENTAILMENT label
++                for entry in res:
++                    lbl = entry.get("label", "").upper()
++                    scr = entry.get("score", 0.0)
++                    if "ENTAIL" in lbl:
++                        return float(scr)
++                # fallback to highest score
++                return float(max(e.get("score", 0.0) for e in res))
++            # fallback: if using zero-shot, estimate via hypothesis template
++            if isinstance(res, dict) and "labels" in res and "scores" in res:
++                # not strictly entailment but produce an approximate confidence
++                labels = res["labels"]
++                scores = res["scores"]
++                # if 'entailment' label exists map it, else return max
++                for l,s in zip(labels, scores):
++                    if "entail" in l.lower():
++                        return float(s)
++                return float(max(scores))
++        except Exception:
++            pass
++        return 0.0
++
++    def verify_claim(self, claim: str, evidence: List[Dict[str, Any]], min_support: float = 0.35) -> Dict[str, Any]:
++        """
++        Score claim against provided evidence passages and return best evidence + score and verdict.
++        min_support should be calibrated on your domain.
++        """
++        evidence_scores = []
++        for e in evidence:
++            txt = e.get("text", "")
++            score = self._score_pair(claim, txt)
++            evidence_scores.append({"id": e.get("id"), "score": float(score), "text_snippet": txt[:400]})
++        if not evidence_scores:
++            return {"best_evidence_id": None, "score": 0.0, "verdict": "insufficient", "evidence_scores": []}
++        evidence_scores.sort(key=lambda x: x["score"], reverse=True)
++        best = evidence_scores[0]
++        verdict = "support" if best["score"] >= min_support else "insufficient"
++        return {"best_evidence_id": best["id"], "score": best["score"], "verdict": verdict, "evidence_scores": evidence_scores}
++
++# helper instance (shared)
++_VERIFIER = None
++
++def get_verifier():
++    global _VERIFIER
++    if _VERIFIER is None:
++        _VERIFIER = NliVerifier()
++    return _VERIFIER
++
++if __name__ == "__main__":
++    v = get_verifier()
++    sample_claim = "The Eiffel Tower is in Berlin."
++    evid = [{"id":"doc1", "text":"The Eiffel Tower is a wrought-iron lattice tower in Paris."},
++            {"id":"doc2","text":"Berlin is the capital of Germany."}]
++    print(v.verify_claim(sample_claim, evid))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/retriever/milvus_retriever.py
++"""
++Milvus-backed retriever abstraction with FAISS fallback.
++ - stores documents with ids and textual content
++ - supports upsert_documents(docs) and query(text, top_k)
++ - computes simple retrieval metrics (recall@k) given labelled qrels
++"""
++import os
++import time
++from typing import List, Dict
++import numpy as np
++
++try:
++    from pymilvus import connections, FieldSchema, CollectionSchema, DataType, Collection, utility
++    MILVUS_AVAILABLE = True
++except Exception:
++    MILVUS_AVAILABLE = False
++
++from sentence_transformers import SentenceTransformer
++EMBED_MODEL = SentenceTransformer(os.environ.get("RETRIEVAL_EMBED_MODEL","all-MiniLM-L6-v2"))
++
++class Retriever:
++    def __init__(self, collection_name: str = "aegis_corpus"):
++        self.collection_name = collection_name
++        self.emb_model = EMBED_MODEL
++        if MILVUS_AVAILABLE and os.environ.get("MILVUS_URI"):
++            host = os.environ.get("MILVUS_URI").split(":")[0]
++            port = int(os.environ.get("MILVUS_URI").split(":")[1])
++            connections.connect("default", host=host, port=port)
++            if not utility.has_collection(collection_name):
++                # create table
++                id_field = FieldSchema(name="doc_id", dtype=DataType.VARCHAR, is_primary=True, max_length=256)
++                text_field = FieldSchema(name="text", dtype=DataType.VARCHAR, is_primary=False, max_length=65535)
++                emb_field = FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=EMBED_MODEL.get_sentence_embedding_dimension())
++                schema = CollectionSchema([id_field, text_field, emb_field], description="Aegis doc collection")
++                self.collection = Collection(collection_name, schema)
++            else:
++                self.collection = Collection(collection_name)
++            self.use_milvus = True
++        else:
++            self.use_milvus = False
++            # FAISS fallback: in-memory lists
++            self.docs = []
++            self.doc_ids = []
++            self.embs = None
++
++    def upsert_documents(self, docs: List[Dict]):
++        """
++        docs: list of {"id": str, "text": str}
++        """
++        texts = [d["text"] for d in docs]
++        ids = [d["id"] for d in docs]
++        embs = self.emb_model.encode(texts, convert_to_numpy=True)
++        if self.use_milvus:
++            # Milvus expects list of columns
++            self.collection.insert([ids, texts, embs.tolist()])
++            self.collection.flush()
++        else:
++            self.doc_ids.extend(ids)
++            self.docs.extend(texts)
++            if self.embs is None:
++                self.embs = embs
++            else:
++                self.embs = np.vstack([self.embs, embs])
++
++    def query(self, text: str, top_k: int = 5) -> List[Dict]:
++        q_emb = self.emb_model.encode([text], convert_to_numpy=True)
++        if self.use_milvus:
++            res = self.collection.search(q_emb.tolist(), "embedding", {"metric_type":"IP"}, limit=top_k, output_fields=["doc_id","text"])
++            out = []
++            for hits in res:
++                for h in hits:
++                    out.append({"id": h.entity.get("doc_id"), "text": h.entity.get("text"), "score": float(h.score)})
++            return out
++        else:
++            if self.embs is None or len(self.docs)==0:
++                return []
++            import numpy as np
++            scores = (self.embs @ q_emb[0]).tolist()
++            idxs = list(np.argsort(scores)[::-1][:top_k])
++            out = [{"id": self.doc_ids[i], "text": self.docs[i], "score": float(scores[i])} for i in idxs]
++            return out
++
++    def recall_at_k(self, queries: List[Dict], k=5) -> float:
++        """
++        queries: list of {q: text, relevant_ids: [id...]}
++        Returns average recall@k
++        """
++        total = 0
++        hit = 0
++        for q in queries:
++            r = self.query(q["q"], top_k=k)
++            retrieved_ids = set(item["id"] for item in r)
++            rel = set(q.get("relevant_ids", []))
++            if len(rel)==0: continue
++            total += 1
++            if len(retrieved_ids & rel) > 0:
++                hit += 1
++        return float(hit)/max(1,total)
++
++if __name__ == "__main__":
++    r = Retriever()
++    docs = [{"id":"d1","text":"Paris is the capital of France."},{"id":"d2","text":"Berlin is the capital of Germany."}]
++    r.upsert_documents(docs)
++    print(r.query("Where is the Eiffel Tower?", top_k=2))
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/rag/middleware.py
++"""
++RAG middleware that integrates retriever + generator + verifier + provenance linking.
++ - retrieve top-k passages
++ - prepare a context prompt for generator including attributed passages
++ - call generator (HF model) to produce an answer
++ - verify answer with NLI verifier against retrieved passages
++ - produce provenance mapping tokens -> evidence id (approximate)
++
++This module is intended to be used by your inference service to produce evidence-backed outputs.
++"""
++from typing import List, Dict, Any
++import os, re
++from transformers import AutoModelForCausalLM, AutoTokenizer
++from services.factuality.nli_verifier import get_verifier
++from ops.retriever.milvus_retriever import Retriever
++import numpy as np
++
++RETRIEVER_COLLECTION = os.environ.get("RETRIEVER_COLLECTION","aegis_corpus")
++GEN_MODEL = os.environ.get("RAG_GEN_MODEL","gpt2")
++TOP_K = int(os.environ.get("RAG_TOP_K","5"))
++
++retriever = Retriever(RETRIEVER_COLLECTION)
++verifier = get_verifier()
++
++tokenizer = AutoTokenizer.from_pretrained(GEN_MODEL)
++gen_model = AutoModelForCausalLM.from_pretrained(GEN_MODEL)
++
++def build_context(passages: List[Dict], max_passages=5) -> str:
++    ctx = []
++    for i,p in enumerate(passages[:max_passages]):
++        ctx.append(f"[{p['id']}] {p['text']}")
++    return "\n\n".join(ctx)
++
++def generate_with_rag(prompt: str, top_k: int = TOP_K, gen_kwargs=None) -> Dict[str, Any]:
++    # Retrieve
++    passages = retriever.query(prompt, top_k=top_k)
++    context = build_context(passages)
++    # Build final prompt: context + instruction
++    full_prompt = f"Context:\n{context}\n\nQuestion: {prompt}\nAnswer concisely and cite evidence ids in square brackets."
++    inputs = tokenizer(full_prompt, return_tensors="pt", truncation=True)
++    out_ids = gen_model.generate(**inputs, max_length=256, **(gen_kwargs or {}))
++    out_text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
++    # Basic heuristic: extract citations like [docid]
++    cited = re.findall(r"\[([^\]]+)\]", out_text)
++    # Verify the whole answer (or sentence-wise)
++    v = verifier.verify_claim(out_text, passages)
++    # provenance mapping (approx): for each sentence map to best evidence id by similarity
++    sentences = re.split(r'(?<=[\.\?\!])\s+', out_text)
++    provenance = []
++    for s in sentences:
++        best_id = None
++        best_score = 0.0
++        for p in passages:
++            # coarse similarity by cosine of embeddings (uses retriever embeddings model)
++            emb_s = retriever.emb_model.encode([s], convert_to_numpy=True)[0]
++            emb_p = retriever.emb_model.encode([p["text"]], convert_to_numpy=True)[0]
++            sim = float(np.dot(emb_s, emb_p) / (np.linalg.norm(emb_s)*np.linalg.norm(emb_p)+1e-10))
++            if sim > best_score:
++                best_score = sim; best_id = p["id"]
++        provenance.append({"sentence": s, "best_evidence_id": best_id, "similarity": best_score})
++    return {"answer": out_text, "verifier": v, "provenance": provenance, "retrieved": passages}
++
++if __name__ == "__main__":
++    res = generate_with_rag("Where is the Eiffel Tower?")
++    print(res)
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/uncertainty/uncertainty.py
++"""
++Simple uncertainty scoring utilities:
++ - generation_entropy: token-level softmax entropy
++ - ensemble_variance: variance across multiple sampled generations
++ - verifier_confidence: uses NLI verifier score
++
++These signals can be combined into a conservative abstain decision.
++"""
++import math
++import numpy as np
++from typing import List
++
++def softmax(xs):
++    ex = np.exp(xs - np.max(xs))
++    return ex / ex.sum()
++
++def token_entropy(logits: List[float]) -> float:
++    p = softmax(np.array(logits))
++    return -float(np.sum(p * np.log(np.clip(p,1e-12,1.0))))
++
++def generation_entropy_from_logits(logits_matrix: List[List[float]]) -> float:
++    # average token entropies
++    ent = [token_entropy(l) for l in logits_matrix]
++    return float(np.mean(ent)) if ent else 0.0
++
++def ensemble_variance(generated_texts: List[str]) -> float:
++    # approximate via embedding variance
++    from sentence_transformers import SentenceTransformer
++    model = SentenceTransformer("all-MiniLM-L6-v2")
++    embs = model.encode(generated_texts, convert_to_numpy=True)
++    return float(np.mean(np.var(embs, axis=0)))
++
++def combined_uncertainty(entropy_score: float, ensemble_var: float, verifier_score: float) -> float:
++    # normalized combination (weights can be tuned)
++    return 0.5*entropy_score + 0.3*ensemble_var + 0.2*(1.0 - verifier_score)
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/explainability/provenance.py
++"""
++Generate provenance records linking generation tokens/sentences to evidence passages.
++This is an approximate, explainability scaffold: for token-level alignment you should
++apply attention-based attribution or token overlap methods.
++"""
++from typing import List, Dict, Any
++from sentence_transformers import SentenceTransformer
++import numpy as np
++
++EMB_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
++
++def map_sentences_to_evidence(sentences:List[str], passages:List[Dict[str,Any]]) -> List[Dict]:
++    out = []
++    p_embs = EMB_MODEL.encode([p["text"] for p in passages], convert_to_numpy=True)
++    for s in sentences:
++        s_emb = EMB_MODEL.encode([s], convert_to_numpy=True)[0]
++        sims = (p_embs @ s_emb) / (np.linalg.norm(p_embs, axis=1)*np.linalg.norm(s_emb)+1e-10)
++        best_idx = int(np.argmax(sims))
++        out.append({"sentence": s, "best_evidence_id": passages[best_idx]["id"], "similarity": float(sims[best_idx])})
++    return out
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/bias/fairness_suite/eval_fairness.py
++"""
++Fairness evaluation suite:
++ - runs demographic/counterfactual prompt set against candidate model
++ - computes simple disparity metrics (average toxicity by group, parity difference)
++ - outputs JSON report for dashboarding
++"""
++import json, os
++from typing import List, Dict
++from services.safety.ensemble.app import tox_pipeline, detect_pii
++from transformers import AutoTokenizer, AutoModelForCausalLM
++import numpy as np
++
++def load_prompts(file_path: str) -> List[Dict]:
++    # expected JSONL lines: {"group":"female","prompt":"Tell me about leadership..."}
++    lines = [json.loads(l) for l in open(file_path)]
++    return lines
++
++def run_model(prompts: List[Dict], model_name: str) -> List[Dict]:
++    tokenizer = AutoTokenizer.from_pretrained(model_name)
++    model = AutoModelForCausalLM.from_pretrained(model_name)
++    out = []
++    for p in prompts:
++        inputs = tokenizer(p["prompt"], return_tensors="pt", truncation=True)
++        gen = model.generate(**inputs, max_length=64)
++        text = tokenizer.decode(gen[0], skip_special_tokens=True)
++        out.append({"group": p.get("group"), "prompt":p["prompt"], "response": text})
++    return out
++
++def compute_toxicity(responses: List[Dict]) -> Dict:
++    group_scores = {}
++    for r in responses:
++        res = tox_pipeline(r["response"], truncation=True)
++        score = float(res[0].get("score", 0.0))
++        g = r.get("group","unknown")
++        group_scores.setdefault(g, []).append(score)
++    report = {}
++    for g,s in group_scores.items():
++        report[g] = {"count": len(s), "mean_toxicity": float(np.mean(s)), "std": float(np.std(s))}
++    # parity: max difference between groups
++    groups = list(report.keys())
++    parity = 0.0
++    if len(groups) >= 2:
++        vals = [report[g]["mean_toxicity"] for g in groups]
++        parity = float(max(vals) - min(vals))
++    report["parity_diff"] = parity
++    return report
++
++def run_fairness_suite(prompts_file: str, model_name: str, out_file: str):
++    prompts = load_prompts(prompts_file)
++    responses = run_model(prompts, model_name)
++    report = compute_toxicity(responses)
++    json.dump(report, open(out_file,"w"), indent=2)
++    print("Wrote fairness report to", out_file)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/safety/auto_calibration_service.py
++"""
++Auto-calibration service:
++ - periodically pulls labeled safety/rater events from rater backend DB (requires DATABASE_URL)
++ - runs calibration to compute thresholds.json and deploys to safety service configmap
++ - keeps a versioned history of thresholds in an S3 bucket or GH release (configurable)
++"""
++import os, time, json, subprocess
++import psycopg2
++
++DB = os.environ.get("DATABASE_URL")
++SAFETY_CALIB_OUT = os.environ.get("SAFETY_CALIB_OUT", "/tmp/thresholds.json")
++S3_HISTORY_BUCKET = os.environ.get("SAFETY_THRESH_BUCKET", "")
++POLL_INTERVAL = int(os.environ.get("CALIB_INTERVAL_SECS", "3600"))
++
++def fetch_labeled_examples(limit=1000):
++    if not DB:
++        print("DATABASE_URL not set")
++        return []
++    conn = psycopg2.connect(DB)
++    cur = conn.cursor()
++    cur.execute("SELECT text, toxicity_label, pii_label FROM rater_labels WHERE created_at > now() - interval '7 days' LIMIT %s", (limit,))
++    rows = cur.fetchall()
++    cur.close(); conn.close()
++    out = []
++    for row in rows:
++        out.append({"text": row[0], "toxicity_label": int(row[1]), "pii_label": int(row[2])})
++    return out
++
++def write_jsonl(items, path):
++    with open(path,"w") as f:
++        for it in items:
++            f.write(json.dumps(it)+"\n")
++
++def run_calibration_cycle():
++    examples = fetch_labeled_examples()
++    if not examples:
++        print("No new labels found")
++        return
++    tmp = "/tmp/calib.jsonl"
++    write_jsonl(examples, tmp)
++    subprocess.check_call(["python","ops/safety/calibrate_thresholds.py","--in", tmp, "--out", SAFETY_CALIB_OUT])
++    # deploy to k8s
++    subprocess.check_call(["./ops/safety/apply_thresholds_and_deploy.sh", SAFETY_CALIB_OUT])
++    # archive
++    if S3_HISTORY_BUCKET:
++        subprocess.check_call(["aws","s3","cp", SAFETY_CALIB_OUT, f"s3://{S3_HISTORY_BUCKET}/thresholds_{int(time.time())}.json"])
++
++def main_loop():
++    while True:
++        try:
++            run_calibration_cycle()
++        except Exception as e:
++            print("calibration error", e)
++        time.sleep(POLL_INTERVAL)
++
++if __name__ == "__main__":
++    main_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/human_queue/queue_service.py
++"""
++Human review queue service.
++ - receives flagged items (text, model_output, provenance, severity)
++ - stores queue in Postgres (requires DATABASE_URL)
++ - exposes endpoints for rater UI to list tasks, claim tasks, submit decisions
++ - emits events to re-evaluate items (webhook) or call CI gating on resolution
++"""
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++import os, psycopg2, json, time
++from typing import Optional
++
++DB = os.environ.get("DATABASE_URL")
++app = FastAPI()
++
++class FlagItem(BaseModel):
++    task_id: Optional[str]
++    text: str
++    output: str
++    provenance: dict
++    severity: str = "medium"
++    reported_by: Optional[str]
++
++def get_conn():
++    if not DB:
++        raise RuntimeError("DATABASE_URL not configured")
++    return psycopg2.connect(DB)
++
++@app.post("/enqueue")
++def enqueue(item: FlagItem):
++    conn = get_conn(); cur = conn.cursor()
++    cur.execute("INSERT INTO human_queue (text, output, provenance, severity, reported_by, status, created_at) VALUES (%s,%s,%s,%s,%s,%s, now()) RETURNING id",
++                (item.text, item.output, json.dumps(item.provenance), item.severity, item.reported_by, "open"))
++    id = cur.fetchone()[0]
++    conn.commit(); cur.close(); conn.close()
++    return {"task_id": str(id)}
++
++@app.get("/tasks")
++def list_tasks(limit: int = 50):
++    conn = get_conn(); cur = conn.cursor()
++    cur.execute("SELECT id, text, output, provenance, severity, status, claimed_by FROM human_queue WHERE status IN ('open','claimed') ORDER BY created_at DESC LIMIT %s",(limit,))
++    rows = cur.fetchall(); cur.close(); conn.close()
++    out=[]
++    for r in rows:
++        out.append({"id": r[0], "text": r[1], "output": r[2], "provenance": r[3], "severity": r[4], "status": r[5], "claimed_by": r[6]})
++    return out
++
++@app.post("/claim/{task_id}")
++def claim(task_id: int, claimer: str):
++    conn = get_conn(); cur = conn.cursor()
++    cur.execute("UPDATE human_queue SET status='claimed', claimed_by=%s, claimed_at=now() WHERE id=%s AND status='open' RETURNING id", (claimer, task_id))
++    res = cur.fetchone()
++    conn.commit(); cur.close(); conn.close()
++    if not res:
++        raise HTTPException(status_code=404, detail="task not available")
++    return {"claimed": True, "task_id": task_id}
++
++@app.post("/resolve/{task_id}")
++def resolve(task_id: int, verdict: str, reviewer: str, notes: Optional[str]=None):
++    conn = get_conn(); cur = conn.cursor()
++    cur.execute("UPDATE human_queue SET status='resolved', verdict=%s, reviewed_by=%s, review_notes=%s, resolved_at=now() WHERE id=%s RETURNING id", (verdict, reviewer, notes, task_id))
++    res = cur.fetchone()
++    conn.commit(); cur.close(); conn.close()
++    if not res:
++        raise HTTPException(status_code=404, detail="task not found")
++    # Optionally trigger re-eval or call webhooks here
++    return {"resolved": True}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/ci/factuality_rag_ci.yml
++name: Factuality & RAG CI smoke tests
++on:
++  workflow_dispatch:
++
++jobs:
++  factuality:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Install deps
++        run: |
++          python -m pip install --upgrade pip
++          pip install transformers sentence-transformers pymilvus faiss-cpu requests
++      - name: Run NLI verifier smoke test
++        run: |
++          python - <<'PY'
++from services.factuality.nli_verifier import get_verifier
++v = get_verifier()
++evid = [{"id":"doc1","text":"Paris is the capital of France."}]
++print(v.verify_claim("The Eiffel Tower is in Paris.", evid))
++PY
++      - name: Run retriever smoke (FAISS fallback)
++        run: |
++          python - <<'PY'
++from ops.retriever.milvus_retriever import Retriever
++r = Retriever()
++r.upsert_documents([{"id":"d1","text":"Paris is the capital of France."},{"id":"d2","text":"Berlin is capital of Germany."}])
++print(r.query("Where is the Eiffel Tower?", top_k=2))
++print("Recall@1 (toy):", r.recall_at_k([{"q":"Where is the Eiffel Tower?","relevant_ids":["d1"]}], k=1))
++PY
++      - name: RAG middleware smoke
++        run: |
++          python - <<'PY'
++from services.rag.middleware import generate_with_rag
++print(generate_with_rag("Where is the Eiffel Tower?", top_k=2))
++PY
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/docs/RAG_AND_FACTUALITY_README.md
++## RAG, Verifier, Uncertainty, Provenance & Human Queue
++
++This patch added:
++- NLI verifier using an off-the-shelf M-NLI model: services/factuality/nli_verifier.py
++- Retriever backed by Milvus with FAISS fallback: ops/retriever/milvus_retriever.py
++- RAG middleware to generate evidence-backed answers: services/rag/middleware.py
++- Uncertainty utilities to combine entropy, ensemble variance and verifier confidence: services/uncertainty/uncertainty.py
++- Provenance mapping helper: services/explainability/provenance.py
++- Fairness evaluation suite: ops/bias/fairness_suite/eval_fairness.py
++- Auto-calibration service to re-run threshold calibration from rater labels: ops/safety/auto_calibration_service.py
++- Human review queue service (FastAPI + Postgres): services/human_queue/queue_service.py
++- CI smoke tests for factuality & RAG: ops/ci/factuality_rag_ci.yml
++
++Recommended next steps:
++1. Provision Milvus (or vector DB) and set MILVUS_URI in environment to enable persistent retrieval.
++2. Create rater_labels table and ensure rater backend writes label rows for auto-calibration.
++3. Tune NLI_MODEL and calibrate min_support threshold on a labeled domain dataset.
++4. Wire RAG middleware into your inference service, use human_queue.enqueue for "review" verdicts.
++5. Run ops/ci/factuality_rag_ci.yml in CI and inspect outputs.
++
+*** End Patch
+*** End Patch

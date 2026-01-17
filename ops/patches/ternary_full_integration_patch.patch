@@ -1,0 +1,472 @@
+*** Begin Patch
+*** Add File:ops/quant/awq_gptq_integration.py
++#!/usr/bin/env python3
++"""
++AWQ / GPTQ integration helpers.
++These functions attempt to call AWQ or GPTQ converters if those tools are installed
++in the environment. They are non-blocking: if the tools are not present the functions
++return None and the caller can fall back to other methods (ternary QAT / fallback).
++
++Note: operators should install AWQ/GPTQ toolchains in CI runners where requested.
++"""
++import os
++import subprocess
++import logging
++
++log = logging.getLogger("awq_gptq")
++
++def run_awq_convert(model_name, out_dir):
++    """
++    Attempt to run AWQ conversion tool. Return path to converted model or raise if fails.
++    """
++    out = os.path.abspath(out_dir)
++    cmd = ["python", "-m", "awq.convert", "--model", model_name, "--out", out]
++    log.info("Running AWQ: %s", " ".join(cmd))
++    try:
++        subprocess.check_call(cmd)
++        return out
++    except FileNotFoundError:
++        log.warning("AWQ conversion tool not found in PATH")
++        return None
++    except subprocess.CalledProcessError as e:
++        log.exception("AWQ conversion failed")
++        raise
++
++def run_gptq_convert(model_name, out_dir):
++    """
++    Attempt to run GPTQ conversion tool. Return path to converted model or None.
++    """
++    out = os.path.abspath(out_dir)
++    cmd = ["python", "-m", "gptq.convert", "--model", model_name, "--out", out]
++    log.info("Running GPTQ: %s", " ".join(cmd))
++    try:
++        subprocess.check_call(cmd)
++        return out
++    except FileNotFoundError:
++        log.warning("GPTQ conversion tool not found in PATH")
++        return None
++    except subprocess.CalledProcessError:
++        log.exception("GPTQ conversion failed")
++        raise
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--model", default="distilgpt2")
++    p.add_argument("--out", default="./out/awq_model")
++    args = p.parse_args()
++    print("Trying AWQ...")
++    print(run_awq_convert(args.model, args.out))
++    print("Trying GPTQ...")
++    print(run_gptq_convert(args.model, args.out))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/training/quantization/utils_v2.py
++"""
++Improved ternary quantizer utilities with per-channel scales and STE.
++This implements a per-out-channel ternarization for Linear layers which helps
++maintain accuracy. This is still a PoC: production QAT should use more robust
++per-layer/per-channel strategies, clipping schedules, and learning-rate tuning.
++"""
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++import numpy as np
++
++def ternarize_per_channel(weight, threshold_factor):
++    """
++    weight: Tensor of shape (out_features, in_features)
++    threshold_factor: scalar (float) or Tensor of shape (out_features,)
++    Returns:
++      ternary: same shape as weight, values in {-1,0,1}
++      scales: Tensor of shape (out_features,) per-output-channel scale
++    """
++    # compute per-out-channel scale = mean(abs(w), dim=1)
++    w = weight
++    scales = w.abs().mean(dim=1)  # (out_features,)
++    scales = torch.where(scales == 0, torch.ones_like(scales), scales)
++    t = threshold_factor * scales  # (out_features,)
++    # broadcast threshold for comparison
++    pos = (w > t.unsqueeze(1)).to(w.dtype)
++    neg = (w < -t.unsqueeze(1)).to(w.dtype)
++    tern = pos - neg
++    return tern, scales
++
++class TernaryLinearV2(nn.Module):
++    """
++    Linear replacement that applies per-channel ternary quantization during forward.
++    Stores last ternary and scales for checkpointing.
++    """
++    def __init__(self, linear: nn.Linear, threshold_init=0.05, learnable_threshold=False):
++        super().__init__()
++        # reuse original parameters to keep optimizer state when swapping
++        self.weight = linear.weight
++        self.bias = linear.bias if linear.bias is not None else None
++        # threshold can be a scalar or learnable per-channel parameter
++        if learnable_threshold:
++            self.threshold = nn.Parameter(torch.full((self.weight.size(0),), float(threshold_init)))
++        else:
++            self.register_buffer("threshold", torch.full((1,), float(threshold_init)))
++        self.learnable = learnable_threshold
++        self.last_tern = None
++        self.last_scales = None
++
++    def forward(self, x):
++        if self.learnable:
++            thr = torch.clamp(self.threshold, min=1e-6)
++        else:
++            thr = self.threshold.squeeze(0)
++        tern, scales = ternarize_per_channel(self.weight, thr)
++        # STE reconstruction: scale * tern + (w - w.detach())
++        recon = scales.unsqueeze(1) * tern + (self.weight - self.weight.detach())
++        self.last_tern = tern.detach().cpu().numpy()
++        self.last_scales = scales.detach().cpu().numpy()
++        return F.linear(x, recon, bias=self.bias)
++
++    def get_quant_metadata(self):
++        return {"ternary": self.last_tern.tolist() if self.last_tern is not None else None,
++                "scales": self.last_scales.tolist() if self.last_scales is not None else None,
++                "learnable_threshold": self.learnable}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/training/quantization/ternary_qat_v2.py
++"""
++Improved ternary QAT trainer:
++ - Replaces Linear modules with TernaryLinearV2
++ - Saves per-channel quant metadata into a prov file
++ - Includes a small eval loop using a tiny validation set to compute a proxy perplexity
++
++Usage:
++  python ops/training/quantization/ternary_qat_v2.py --out ./out/ternary_v2
++"""
++import argparse, json, os
++import torch
++from transformers import AutoModelForCausalLM, AutoTokenizer
++from torch.utils.data import DataLoader, Dataset
++from tqdm import tqdm
++from ops.training.quantization.utils_v2 import TernaryLinearV2
++
++class SmallEvalDataset(Dataset):
++    def __init__(self, tokenizer, samples=64, seq_len=64):
++        self.tokenizer = tokenizer
++        self.samples = samples
++        self.seq_len = seq_len
++    def __len__(self): return self.samples
++    def __getitem__(self, idx):
++        import random
++        # For PoC use random text via tokenizer's pad token (replace with real eval data)
++        ids = torch.randint(0, self.tokenizer.vocab_size, (self.seq_len,), dtype=torch.long)
++        return ids
++
++def replace_linears_with_v2(module, learnable_threshold=False):
++    replaced = 0
++    for name, child in list(module.named_children()):
++        if isinstance(child, torch.nn.Linear):
++            setattr(module, name, TernaryLinearV2(child, threshold_init=0.05, learnable_threshold=learnable_threshold))
++            replaced += 1
++        else:
++            replaced += replace_linears_with_v2(child, learnable_threshold)
++    return replaced
++
++def eval_perplexity(model, tokenizer, device):
++    model.eval()
++    ds = SmallEvalDataset(tokenizer)
++    dl = DataLoader(ds, batch_size=4)
++    total_loss = 0.0
++    n = 0
++    with torch.no_grad():
++        for batch in dl:
++            batch = batch.to(device)
++            out = model(input_ids=batch, labels=batch)
++            total_loss += float(out.loss.item()) * batch.size(0)
++            n += batch.size(0)
++    ppl = torch.exp(torch.tensor(total_loss / n)).item()
++    return ppl
++
++def save_checkpoint_with_prov(model, out_dir, prov_meta):
++    os.makedirs(out_dir, exist_ok=True)
++    sd = model.state_dict()
++    torch.save(sd, os.path.join(out_dir, "ternary_v2_model.pt"))
++    quant_meta = {}
++    for n, m in model.named_modules():
++        if hasattr(m, "get_quant_metadata"):
++            quant_meta[n] = m.get_quant_metadata()
++    prov = {"quant_type": "ternary_v2", "quant_metadata": quant_meta}
++    prov.update(prov_meta or {})
++    open(os.path.join(out_dir, "ternary_v2_model.prov.json"), "w").write(json.dumps(prov, indent=2))
++    print("Saved model and provenance to", out_dir)
++
++def train(args):
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    tokenizer = AutoTokenizer.from_pretrained("distilgpt2")
++    model = AutoModelForCausalLM.from_pretrained("distilgpt2").to(device)
++    nrep = replace_linears_with_v2(model, learnable_threshold=args.learnable_threshold)
++    print(f"Replaced {nrep} Linear layers with TernaryLinearV2")
++    # minimal toy training loop
++    ds = SmallEvalDataset(tokenizer, samples=128, seq_len=32)
++    dl = DataLoader(ds, batch_size=8)
++    optim = torch.optim.AdamW(model.parameters(), lr=5e-5)
++    model.train()
++    for epoch in range(args.epochs):
++        for batch in tqdm(dl, desc="train"):
++            batch = batch.to(device)
++            out = model(input_ids=batch, labels=batch)
++            loss = out.loss
++            loss.backward()
++            optim.step()
++            optim.zero_grad()
++    ppl = eval_perplexity(model, tokenizer, device)
++    prov_meta = {"base_model":"distilgpt2","qat_epochs":args.epochs,"ppl":ppl, "commit":"<git-sha>"}
++    save_checkpoint_with_prov(model, args.out_dir, prov_meta)
++    print("Eval perplexity (proxy):", ppl)
++
++if __name__=="__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--out-dir", default="./out/ternary_v2")
++    p.add_argument("--epochs", type=int, default=1)
++    p.add_argument("--learnable-threshold", dest="learnable_threshold", action="store_true")
++    args = p.parse_args()
++    train(args)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/serving/ternary_fallback_v2.py
++"""
++Updated ternary fallback loader that understands per-channel scales produced by TernaryLinearV2.
++It reconstructs float weights from stored ternary arrays and per-channel scales.
++"""
++import os, json, torch
++from transformers import AutoModelForCausalLM, AutoTokenizer
++
++def load_ternary_v2_model(model_name="distilgpt2", checkpoint_dir="./out/ternary_v2"):
++    tokenizer = AutoTokenizer.from_pretrained(model_name)
++    model = AutoModelForCausalLM.from_pretrained(model_name)
++    state_path = os.path.join(checkpoint_dir, "ternary_v2_model.pt")
++    prov_path = os.path.join(checkpoint_dir, "ternary_v2_model.prov.json")
++    if not os.path.exists(state_path):
++        raise FileNotFoundError("ternary_v2 checkpoint not found")
++    sd = torch.load(state_path, map_location="cpu")
++    prov = json.load(open(prov_path)) if os.path.exists(prov_path) else {}
++    quant_meta = prov.get("quant_metadata", {})
++    # Reconstruct weights where quant metadata exists
++    for mod_name, meta in quant_meta.items():
++        tern = meta.get("ternary")
++        scales = meta.get("scales")
++        if tern is None or scales is None:
++            continue
++        # find state dict keys that correspond to this module
++        for k in list(sd.keys()):
++            if k.startswith(mod_name + ".weight"):
++                # reconstruct: scales is list length out_features
++                import numpy as np
++                tern_arr = np.array(tern)
++                scales_arr = np.array(scales).reshape(-1,1)
++                recon = (scales_arr * tern_arr).astype("float32")
++                sd[k] = torch.from_numpy(recon)
++    model.load_state_dict(sd, strict=False)
++    return model, tokenizer
++
++def generate(prompt="Hi", checkpoint_dir="./out/ternary_v2"):
++    model, tokenizer = load_ternary_v2_model(checkpoint_dir=checkpoint_dir)
++    model.eval()
++    inputs = tokenizer(prompt, return_tensors="pt")
++    with torch.no_grad():
++        out = model.generate(**inputs, max_length=32)
++    return tokenizer.decode(out[0], skip_special_tokens=True)
++
++if __name__ == "__main__":
++    print(generate("Quick test of ternary_v2", checkpoint_dir="./out/ternary_v2"))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/quant/metrics/perplexity_eval.py
++#!/usr/bin/env python3
++"""
++Compute a proxy perplexity on a small validation set.
++Used by CI to compare baseline model vs quantized variants.
++"""
++import argparse, json
++import torch
++from transformers import AutoModelForCausalLM, AutoTokenizer
++from torch.utils.data import DataLoader, Dataset
++
++class EvalDataset(Dataset):
++    def __init__(self, tokenizer, texts, seq_len=64):
++        self.tokenizer = tokenizer
++        self.texts = texts
++        self.seq_len = seq_len
++    def __len__(self): return len(self.texts)
++    def __getitem__(self, idx):
++        toks = self.tokenizer(self.texts[idx], truncation=True, max_length=self.seq_len, padding='max_length', return_tensors="pt")
++        return toks["input_ids"].squeeze(0)
++
++def compute_perplexity(model_name_or_obj, texts, device="cpu"):
++    if isinstance(model_name_or_obj, str):
++        tokenizer = AutoTokenizer.from_pretrained(model_name_or_obj)
++        model = AutoModelForCausalLM.from_pretrained(model_name_or_obj).to(device)
++    else:
++        model = model_name_or_obj
++        tokenizer = AutoTokenizer.from_pretrained("distilgpt2")
++        model = model.to(device)
++    ds = EvalDataset(tokenizer, texts, seq_len=64)
++    dl = DataLoader(ds, batch_size=4)
++    total_loss = 0.0
++    n = 0
++    model.eval()
++    with torch.no_grad():
++        for batch in dl:
++            batch = batch.to(device)
++            out = model(input_ids=batch, labels=batch)
++            total_loss += float(out.loss.item()) * batch.size(0)
++            n += batch.size(0)
++    import math
++    ppl = math.exp(total_loss / n)
++    return ppl
++
++if __name__ == "__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--model", default="distilgpt2")
++    p.add_argument("--texts", default="Hello world|The quick brown fox")
++    args = p.parse_args()
++    texts = args.texts.split("|")
++    print("Perplexity:", compute_perplexity(args.model, texts))
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/quant_compare.yml
++name: Quant Comparison (AWQ / GPTQ / Ternary QAT)
++on:
++  workflow_dispatch:
++
++jobs:
++  quant-compare:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: "3.11"
++      - name: Install deps (optional heavy libs skipped)
++        run: |
++          python -m pip install --upgrade pip
++          pip install torch transformers sentence-transformers tqdm
++      - name: Run AWQ/GPTQ conversion (if available)
++        run: |
++          python -c "from ops.quant.awq_gptq_integration import run_awq_convert, run_gptq_convert; print('AWQ ->', run_awq_convert('distilgpt2','./out/awq')); print('GPTQ ->', run_gptq_convert('distilgpt2','./out/gptq'))"
++      - name: Run ternary QAT PoC v2
++        run: |
++          python ops/training/quantization/ternary_qat_v2.py --out-dir ./out/ternary_v2 --epochs 1
++      - name: Evaluate baseline & quantized perplexities (proxy)
++        run: |
++          python - <<'PY'
++from ops.quant.metrics.perplexity_eval import compute_perplexity
++texts = ["The quick brown fox jumps over the lazy dog", "In a galaxy far far away"]
++print("Baseline PPL:", compute_perplexity("distilgpt2", texts))
++print("Ternary_v2 PPL:", compute_perplexity("./out/ternary_v2/ternary_v2_model.pt", texts))
++PY
++      - name: Upload artifacts
++        uses: actions/upload-artifact@v4
++        with:
++          name: quant-artifacts
++          path: |
++            out/ternary_v2
++            out/awq
++            out/gptq
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/onnx/custom_op/CMakeLists.txt
++cmake_minimum_required(VERSION 3.13)
++project(ternary_op)
++
++find_package(ONNXRuntime REQUIRED)
++
++add_library(ternary_op SHARED ternary_op.cc)
++target_include_directories(ternary_op PRIVATE ${ONNXRUNTIME_INCLUDE_DIRS})
++target_link_libraries(ternary_op PRIVATE ${ONNXRUNTIME_LIBRARIES})
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/onnx/custom_op/ternary_op.cc
++// Minimal ONNXRuntime custom op skeleton for ternary decompress op.
++// Production: implement efficient kernel in C++ and register it with ONNXRuntime.
++#include <onnxruntime_cxx_api.h>
++#include <vector>
++#include <iostream>
++
++struct TernaryDecompressOp : Ort::CustomOpBase<TernaryDecompressOp, Ort::KernelBase> {
++  void* CreateKernel(const OrtApi& api, const OrtKernelInfo* info) const { return new Ort::KernelBase(api, info); }
++  const char* GetName() const { return "TernaryDecompress"; }
++  size_t GetInputTypeCount() const { return 2; } // ternary int8 tensor + scale tensor
++  ONNXTensorElementDataType GetInputType(size_t) const { return ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8; }
++  size_t GetOutputTypeCount() const { return 1; }
++  ONNXTensorElementDataType GetOutputType(size_t) const { return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT; }
++};
++
++extern "C" {
++  ORT_API_STATUS(OrtRegisterCustomOps)(OrtSessionOptions* options, const OrtApiBase*) {
++    // Registration stub: production must call Ort::CustomOpDomain and RegisterCustomOpDomain
++    std::cout << "TernaryDecompress custom op library loaded (stub)." << std::endl;
++    return nullptr;
++  }
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/triton/ternary_backend/Dockerfile
++FROM ubuntu:22.04
++RUN apt-get update && apt-get install -y build-essential git cmake python3 python3-pip
++WORKDIR /workspace
++# Placeholder: copy source in CI or build locally to create a Triton backend package
++COPY ./ /workspace
++CMD ["bash", "-lc", "echo 'Build Triton ternary backend: compile C++ kernels and package as backend.'; sleep 3600"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/triton/ternary_backend/ternary_backend.cc
++// Triton backend C++ skeleton for ternary kernels.
++// Implementing a real Triton backend requires conforming to the Triton Backend API.
++// This file is a placeholder that documents the intended entry points.
++/*
++ - init: library init, parse backend config
++ - create: create model instance
++ - execute: perform inference on provided inputs (ternary decode + GEMM)
++ - finalize: cleanup
++
++ Production implementation should follow Triton backend API examples:
++ https://github.com/triton-inference-server/backend
++*/
++#include <stdio.h>
++int main() {
++  printf("Triton ternary backend skeleton (placeholder)\n");
++  return 0;
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:README_quant_integration.md
++# Quantization Integration: AWQ / GPTQ / Ternary QAT
++
++This patch adds:
++- AWQ/GPTQ integration helpers: ops/quant/awq_gptq_integration.py
++- Improved ternary QAT with per-channel scales and STE: ops/training/quantization/*_v2.py and utils_v2.py
++- Improved fallback loader that reconstructs per-channel scaled ternary weights: ops/serving/ternary_fallback_v2.py
++- Perplexity evaluator: ops/quant/metrics/perplexity_eval.py
++- CI workflow: .github/workflows/quant_compare.yml to run conversions and QAT PoC and upload artifacts
++- ONNX/Triton custom op and backend skeletons for native ternary kernel development (placeholders)
++
++Usage notes:
++- The AWQ/GPTQ helpers call external toolchains; install AWQ/GPTQ on CI runners you plan to use.
++- Ternary QAT PoC uses distilgpt2 for speed; replace with your target model and tune training parameters, schedules and calibration datasets.
++- The Triton / ONNX custom op files are skeletons to guide implementation. You will need C++ kernel engineering to get production performance.
++
++Next steps:
++- Integrate AWQ/GPTQ toolchains into your CI images or runners.
++- Run the quant_compare workflow in CI and inspect artifacts.
++- If you want, I can generate a PR that groups these patches into a branch and a detailed PR description.
++
+*** End Patch
+*** End Patch

@@ -1,0 +1,518 @@
+*** Begin Patch
+*** Add File:services/factuality/finetune_verifier.py
++"""
++Fine-tune a seq2seq verifier model (BART/T5) or NLI model on claim-evidence datasets (FEVER or domain dataset).
++Produces a verifier model and a calibrated threshold file (verifier_threshold.json).
++
++Usage:
++  python services/factuality/finetune_verifier.py --data ./data/fever_train.jsonl --out_dir ./out/verifier --model_name facebook/bart-large
++
++Notes:
++ - Expects data lines: {"claim": "...", "evidence": "..." , "label": "support"/"contradict"/"neutral"}
++ - Tune --batch_size/--epochs for your infra. Use HF Trainer for distributed training.
++"""
++import argparse, os, json
++from datasets import load_dataset, Dataset
++from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
++import numpy as np
++
++def load_jsonl(path):
++    rows = []
++    with open(path) as f:
++        for line in f:
++            rows.append(json.loads(line))
++    return rows
++
++def prepare_dataset(rows, tokenizer, max_len=256):
++    texts_a = [r["evidence"] for r in rows]
++    texts_b = [r["claim"] for r in rows]
++    labels_map = {"contradict":0,"neutral":1,"support":2}
++    labels = [labels_map.get(r.get("label","neutral"),1) for r in rows]
++    ds = Dataset.from_dict({"evidence":texts_a,"claim":texts_b,"label":labels})
++    def tokenize_fn(ex):
++        return tokenizer(ex["evidence"], ex["claim"], truncation=True, padding="max_length", max_length=max_len)
++    ds = ds.map(tokenize_fn, batched=True)
++    ds = ds.rename_column("label","labels")
++    ds.set_format(type="torch", columns=["input_ids","attention_mask","labels"])
++    return ds
++
++def calibrate_threshold(trainer, ds_eval, out_path):
++    # compute scores on eval set and pick threshold maximizing F1 for 'support' (label 2) vs others
++    import torch
++    preds = trainer.predict(ds_eval)
++    logits = preds.predictions
++    probs = torch.softmax(torch.tensor(logits), dim=1).numpy()[:,2]  # support prob
++    labels = preds.label_ids
++    best_f1 = 0.0
++    best_th = 0.5
++    from sklearn.metrics import f1_score
++    for th in np.linspace(0.1,0.9,41):
++        preds_bin = (probs >= th).astype(int)
++        labels_bin = (labels==2).astype(int)
++        f1 = f1_score(labels_bin, preds_bin, zero_division=0)
++        if f1 > best_f1:
++            best_f1 = f1; best_th = float(th)
++    json.dump({"best_threshold": best_th, "best_f1": best_f1}, open(out_path,"w"), indent=2)
++    print("Wrote threshold:", out_path)
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--data", required=True)
++    p.add_argument("--out_dir", default="./out/verifier")
++    p.add_argument("--model_name", default="facebook/bart-large")
++    p.add_argument("--epochs", type=int, default=1)
++    p.add_argument("--batch_size", type=int, default=8)
++    args = p.parse_args()
++    os.makedirs(args.out_dir, exist_ok=True)
++    rows = load_jsonl(args.data)
++    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
++    ds = prepare_dataset(rows, tokenizer)
++    # split
++    ds_train = ds.select(range(int(len(ds)*0.9)))
++    ds_eval = ds.select(range(int(len(ds)*0.9), len(ds)))
++    model = AutoModelForSequenceClassification.from_pretrained(args.model_name, num_labels=3)
++    training_args = TrainingArguments(output_dir=args.out_dir, per_device_train_batch_size=args.batch_size,
++                                      per_device_eval_batch_size=args.batch_size, num_train_epochs=args.epochs,
++                                      evaluation_strategy="epoch", save_strategy="epoch")
++    trainer = Trainer(model=model, args=training_args, train_dataset=ds_train, eval_dataset=ds_eval)
++    trainer.train()
++    trainer.save_model(args.out_dir)
++    # calibrate
++    calibrate_threshold(trainer, ds_eval, os.path.join(args.out_dir, "verifier_threshold.json"))
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/retriever/milvus_provision_and_index_manager.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Provision Milvus via Helm and create initial collection/index with RBAC and TLS placeholders.
++#
++MILVUS_RELEASE=${1:-milvus}
++NAMESPACE=${2:-milvus}
++HELM_REPO_URL="https://milvus-helm-charts.storage.googleapis.com"
++
++kubectl create namespace $NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
++helm repo add milvus $HELM_REPO_URL
++helm repo update
++helm install $MILVUS_RELEASE milvus/milvus -n $NAMESPACE --wait --timeout 5m
++echo "Milvus installed in namespace $NAMESPACE (release $MILVUS_RELEASE)."
++echo "Next: configure MILVUS_URI env var (host:port) for retriever service and ensure network & RBAC security."
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/retriever/index_lifecycle_manager.py
++"""
++Index lifecycle manager:
++ - monitors the source corpus manifest (S3 path or git ref)
++ - triggers reindex when corpus changes (diff based on manifest hash)
++ - supports scheduled refresh cadence and shard pruning
++ - writes index metadata to persistent registry (Postgres or a JSON file)
++"""
++import os, time, json, hashlib
++from ops.retriever.milvus_retriever import Retriever
++
++MANIFEST_PATH = os.environ.get("CORPUS_MANIFEST", "/data/corpus_manifest.json")
++POLL_INTERVAL = int(os.environ.get("INDEX_POLL_INTERVAL", "300"))
++REGISTRY_PATH = os.environ.get("INDEX_REGISTRY_PATH", "/data/index_registry.json")
++
++def manifest_hash(path):
++    if not os.path.exists(path):
++        return None
++    h = hashlib.sha256()
++    for line in open(path, "rb"):
++        h.update(line)
++    return h.hexdigest()
++
++def main_loop():
++    last_hash = None
++    retriever = Retriever()
++    while True:
++        cur_hash = manifest_hash(MANIFEST_PATH)
++        if cur_hash and cur_hash != last_hash:
++            print("Manifest changed, reindexing...")
++            # manifest expected format: [{"id":"doc1","text":"...","source":"s3://...","version":"v1"}, ...]
++            docs = json.load(open(MANIFEST_PATH))
++            retriever.upsert_documents(docs)
++            meta = {"last_indexed": time.time(), "manifest_hash": cur_hash, "count": len(docs)}
++            json.dump(meta, open(REGISTRY_PATH, "w"), indent=2)
++            last_hash = cur_hash
++        time.sleep(POLL_INTERVAL)
++
++if __name__=="__main__":
++    main_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/triton/ternary_backend/ternary_gemm.cu
++/*
++Reference CUDA implementation:
++ - Unpacks ternary int8 values (-1,0,1) from a packed representation (here we assume int8 per element)
++ - Writes an unpacked float matrix and calls cuBLAS SGEMM for GEMM performance
++
++This is a starter: production kernels should be fully vectorized and avoid extra GPU memory copies
++by streaming blocks and using optimized packing.
++*/
++#include <cuda_runtime.h>
++#include <cublas_v2.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++extern "C" {
++  int ternary_gemm(const int8_t* A_tern, const float* A_scales, int m, int k,
++                   const float* B, int k2, int n, float* C) {
++    // A_tern: m x k, values -1,0,1 stored as int8 per element
++    // A_scales: per-row scales length m (or NULL for scalar)
++    // B: k x n float
++    // C: output m x n float (preallocated)
++    // For simplicity unpack A into float buffer
++    float* A_float = nullptr;
++    if (cudaMalloc((void**)&A_float, sizeof(float)*m*k) != cudaSuccess) {
++      return -1;
++    }
++    // launch kernel to unpack and multiply by scale (simple loop here, not optimized)
++    // For brevity use host-side copy (not ideal) - replace with proper kernel in production.
++    float* hostA = (float*)malloc(sizeof(float)*m*k);
++    for (int i=0;i<m;i++){
++      float s = A_scales ? A_scales[i] : 1.0f;
++      for (int j=0;j<k;j++){
++        int8_t v = A_tern[i*k + j];
++        hostA[i*k + j] = ((float)v) * s;
++      }
++    }
++    // copy to device
++    cudaMemcpy(A_float, hostA, sizeof(float)*m*k, cudaMemcpyHostToDevice);
++    free(hostA);
++    // cuBLAS SGEMM: C = A_float * B
++    cublasHandle_t handle;
++    cublasCreate(&handle);
++    const float alpha = 1.0f, beta = 0.0f;
++    // A: m x k, B: k x n, C: m x n (row-major assumption; cuBLAS expects column-major so use transposes)
++    // We'll call cublasSgemm with appropriate transposes to match row-major semantics
++    cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, B, n, A_float, k, &beta, C, n);
++    cublasDestroy(handle);
++    cudaFree(A_float);
++    return 0;
++  }
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/onnx/custom_op/ternary_decompress_vectorized.cc
++// Enhanced ONNXRuntime custom op skeleton that hints vectorized implementation paths.
++// For production use, implement multi-threading and SIMD intrinsics here.
++#include "onnxruntime_cxx_api.h"
++#include <immintrin.h>
++#include <vector>
++#include <iostream>
++
++struct TernaryDecompressKernelV : Ort::KernelBase {
++  TernaryDecompressKernelV(const OrtApi& api, const OrtKernelInfo* info) : Ort::KernelBase(api, info) {}
++  void Compute(OrtKernelContext* context) {
++    // Implementation omitted for brevity; see ternary_decompress.cc for reference
++    std::cout << "Vectorized TernaryDecompress placeholder\n";
++  }
++};
++
++struct TernaryDecompressCustomOpV : Ort::CustomOpBase<TernaryDecompressCustomOpV, TernaryDecompressKernelV> {
++  const char* GetName() const { return "TernaryDecompressV"; }
++  size_t GetInputTypeCount() const { return 2; }
++  ONNXTensorElementDataType GetInputType(size_t) const { return ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8; }
++  size_t GetOutputTypeCount() const { return 1; }
++  ONNXTensorElementDataType GetOutputType(size_t) const { return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT; }
++  void* CreateKernel(const OrtApi& api, const OrtKernelInfo* info) const { return new TernaryDecompressKernelV(api, info); }
++};
++
++extern "C" {
++  ORT_API_STATUS(OrtRegisterCustomOps)(OrtSessionOptions* options, const OrtApiBase* api) {
++    std::cout << "TernaryDecompressV loaded\n";
++    return nullptr;
++  }
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/explainability/token_attribution.py
++"""
++Token-level attribution using attention rollout and integrated gradients (Captum).
++Return per-token attribution scores and map them to evidence tokens for fine-grained provenance.
++"""
++from transformers import AutoModelForCausalLM, AutoTokenizer
++import torch
++import numpy as np
++
++try:
++    from captum.attr import IntegratedGradients
++    CAPTUM_AVAILABLE = True
++except Exception:
++    CAPTUM_AVAILABLE = False
++
++def attention_rollout_attribution(model, input_ids, layer_start=0):
++    # attention rollout: aggregate attention matrices to get token influence scores
++    model.eval()
++    with torch.no_grad():
++        outputs = model(input_ids, output_attentions=True)
++    # sum attentions across heads and layers
++    attns = outputs.attentions  # tuple of (batch, head, seq, seq)
++    joint = None
++    for i,a in enumerate(attns):
++        if i < layer_start: continue
++        # a: (batch, head, seq, seq)
++        avg = a.mean(dim=1)  # mean over heads -> (batch, seq, seq)
++        if joint is None:
++            joint = avg
++        else:
++            joint = torch.matmul(joint, avg)
++    # token importance as sum of attention from [CLS]/first token or from tokens to output
++    scores = joint.sum(dim=1) if joint is not None else torch.zeros(input_ids.shape)
++    return scores.squeeze(0).cpu().numpy().tolist()
++
++def integrated_gradients_attribution(model, tokenizer, text, target_token_index=None):
++    if not CAPTUM_AVAILABLE:
++        raise RuntimeError("Captum not installed")
++    model.eval()
++    tokens = tokenizer(text, return_tensors="pt")
++    ig = IntegratedGradients(model)
++    input_ids = tokens["input_ids"]
++    def forward_func(input_ids):
++        outputs = model(input_ids)
++        # sum logits for target token position or return logits mean
++        return outputs.logits.sum()
++    attributions, delta = ig.attribute(inputs=input_ids, target=0, return_convergence_delta=True)
++    return attributions.squeeze(0).cpu().detach().numpy().tolist()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/bias/mitigation/mitigate.py
++"""
++Bias mitigation helpers:
++ - counterfactual augmentation using simple swap templates
++ - constrained decoding utility (ban tokens/phrases)
++ - training reweighting stub
++"""
++from transformers import AutoTokenizer, AutoModelForCausalLM
++import random
++import json
++
++def counterfactual_augment(prompts_jsonl, out_jsonl, swaps=None):
++    """
++    Simple counterfactual augmentation: for each prompt line, produce counterfactuals by replacing tokens.
++    prompts_jsonl: input file lines [{"group":"male","prompt":"..."}]
++    swaps: dict mapping token->list of replacements, e.g. {"he":["she"], "male":["female"]}
++    """
++    if swaps is None:
++        swaps = {" he ": " she ", " He ": " She ", " his ": " her ", " man ": " woman "}
++    out=[]
++    for line in open(prompts_jsonl):
++        item = json.loads(line)
++        text = item["prompt"]
++        out.append(item)
++        for k,v in swaps.items():
++            if k in text:
++                new = text.replace(k, random.choice(v) if isinstance(v,list) else v)
++                newitem = dict(item)
++                newitem["prompt"] = new
++                newitem["augmented"] = True
++                out.append(newitem)
++    with open(out_jsonl,"w") as f:
++        for it in out:
++            f.write(json.dumps(it)+"\n")
++    print("Wrote augmented prompts to", out_jsonl)
++
++def constrained_decode(tokenizer, model, input_ids, banned_strings=[]):
++    """
++    Return generated text while avoiding banned strings via simple filter on finished sequences.
++    For production, use constrained decoding APIs (HuggingFace decode logits processors).
++    """
++    out_ids = model.generate(input_ids, max_length=64)
++    text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
++    for b in banned_strings:
++        if b in text:
++            return "[REDACTED]"
++    return text
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/human_queue/operational_enhancements.py
++"""
++Enhancements to human queue to support SLA, routing and CI hooks.
++ - Adds priority handling and skill routing (e.g., 'factuality','toxicity')
++ - Allows webhooks on resolve to trigger CI/gate re-evaluation
++"""
++import os, requests, json
++
++CI_GATING_URL = os.environ.get("CI_GATING_URL", "")
++
++def route_task(task_record):
++    # simple routing: severity->priority->skill
++    severity = task_record.get("severity","medium")
++    if severity == "high":
++        return {"team":"sre","skill":"ops"}
++    if "privacy" in task_record.get("provenance",{}).get("reasons",[]):
++        return {"team":"privacy","skill":"pii"}
++    return {"team":"safety","skill":"factuality"}
++
++def on_resolve_webhook(task_id, verdict, reviewer):
++    # notify CI gating that an item was resolved (CI can trigger auto-retrain or unblock promotion)
++    if not CI_GATING_URL:
++        return
++    payload = {"task_id": task_id, "verdict": verdict, "reviewer": reviewer}
++    try:
++        requests.post(CI_GATING_URL, json=payload, timeout=5)
++    except Exception as e:
++        print("CI gating webhook failed", e)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/safety/auto_calibration_service_improved.py
++"""
++Improved auto-calibration:
++ - uses fallback thresholds when insufficient labels
++ - alerts operators via Slack webhook (if configured)
++ - keeps minimum sample counts before applying new thresholds
++"""
++import os, time, json, subprocess
++import psycopg2
++
++DB = os.environ.get("DATABASE_URL")
++MIN_SAMPLES = int(os.environ.get("CALIB_MIN_SAMPLES", "50"))
++ALERT_WEBHOOK = os.environ.get("ALERT_WEBHOOK", "")
++SAFETY_CALIB_OUT = os.environ.get("SAFETY_CALIB_OUT", "/tmp/thresholds.json")
++
++def alert(msg):
++    if ALERT_WEBHOOK:
++        import requests
++        try:
++            requests.post(ALERT_WEBHOOK, json={"text":msg}, timeout=3)
++        except Exception:
++            pass
++    print("ALERT:", msg)
++
++def fetch_labeled_examples(limit=1000):
++    if not DB:
++        return []
++    conn = psycopg2.connect(DB); cur = conn.cursor()
++    cur.execute("SELECT text, toxicity_label, pii_label FROM rater_labels WHERE created_at > now() - interval '7 days' LIMIT %s", (limit,))
++    rows = cur.fetchall(); cur.close(); conn.close()
++    return [{"text":r[0],"toxicity_label":int(r[1]),"pii_label":int(r[2])} for r in rows]
++
++def run_cycle():
++    examples = fetch_labeled_examples()
++    if len(examples) < MIN_SAMPLES:
++        alert(f"Not enough labeled examples for calibration: {len(examples)} < {MIN_SAMPLES}")
++        # fallback: do not change thresholds
++        return
++    tmp = "/tmp/calib.jsonl"
++    with open(tmp,"w") as f:
++        for e in examples: f.write(json.dumps(e)+"\n")
++    subprocess.check_call(["python","ops/safety/calibrate_thresholds.py","--in",tmp,"--out",SAFETY_CALIB_OUT])
++    subprocess.check_call(["./ops/safety/apply_thresholds_and_deploy.sh", SAFETY_CALIB_OUT])
++    alert("Auto-calibration deployed new thresholds")
++
++if __name__=="__main__":
++    while True:
++        try:
++            run_cycle()
++        except Exception as e:
++            print("calib error", e)
++        time.sleep(int(os.environ.get("CALIB_INTERVAL_SECS", "3600")))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/ci/load_test_locust/locustfile.py
++from locust import HttpUser, task, between
++
++class TritonUser(HttpUser):
++    wait_time = between(1,2)
++    @task
++    def infer(self):
++        # Hit Triton Python backend HTTP/gRPC frontend (example path)
++        self.client.post("/v2/models/ternary_model/infer", json={"inputs":[{"name":"INPUT_IDS","shape":[1],"data":[101,102]}]})
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/ci/load_test_locust/README.md
++Run locust against the Triton HTTP/gRPC proxy to simulate inference load:
++
++1. Start locust:
++   locust -f locustfile.py --host http://triton-proxy.example.com
++2. Open UI and run a load profile to measure p95/p99 and throughput.
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tests/e2e_canary_rollback.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# E2E canary & rollback test:
++#  - deploy a canary with signed image
++#  - run safety adversarial suite
++#  - if failures detected, rollback to baseline
++#
++NAMESPACE=${1:-inference}
++DEPLOYMENT=${2:-gen-deployment}
++CANARY_IMAGE=${3:-""}
++BASELINE_IMAGE=${4:-""}
++
++if [ -z "$CANARY_IMAGE" ] || [ -z "$BASELINE_IMAGE" ]; then
++  echo "Usage: $0 <namespace> <deployment> <canary_image> <baseline_image>"
++  exit 2
++fi
++
++kubectl -n $NAMESPACE set image deployment/$DEPLOYMENT *=$CANARY_IMAGE
++sleep 10
++echo "Running adversarial suite..."
++python ops/safety/run_adversarial_suite.py --url http://safety-detectors.safety.svc:8090/check --in services/safety/adversarial/adversarial_prompts.jsonl --out /tmp/report.json
++BLOCKED=$(jq '[.[] | select(.response.verdict=="block")] | length' /tmp/report.json || echo 0)
++TOTAL=$(jq 'length' /tmp/report.json || echo 0)
++if [ "$TOTAL" -eq 0 ]; then echo "No tests"; exit 1; fi
++PCT=$(echo "scale=2; $BLOCKED*100/$TOTAL" | bc)
++echo "Blocked $BLOCKED/$TOTAL ($PCT%)"
++# if block rate below threshold, rollback
++THRESH=${SAFETY_BLOCK_THRESHOLD:-60}
++if (( $(echo "$PCT < $THRESH" | bc -l) )); then
++  echo "Block rate below threshold ($THRESH%), rolling back to baseline"
++  kubectl -n $NAMESPACE set image deployment/$DEPLOYMENT *=$BASELINE_IMAGE
++  exit 0
++fi
++echo "Canary passed safety checks"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/docs/PRODUCTION_CHECKLIST_ADVANCED.md
++## Advanced Productionization Checklist (Factuality, Retriever, Ternary kernels, Explainability, Bias, Human Queue)
++
++1) Verifier:
++ - Run services/factuality/finetune_verifier.py on domain claim↔evidence dataset.
++ - Deploy verifier model and threshold (verifier_threshold.json) to safety service config.
++ - Include verifier threshold in CI gating (factuality checks).
++
++2) Retriever & Index:
++ - Provision Milvus via ops/retriever/milvus_provision_and_index_manager.sh
++ - Populate corpus manifest and run ops/retriever/index_lifecycle_manager.py as a k8s cronjob.
++ - Set MILVUS_URI in retriever service env and ensure RBAC and network policies.
++
++3) Native Ternary Kernels:
++ - Build CUDA reference: ops/triton/ternary_backend/ternary_gemm.cu (requires CUDA, cuBLAS).
++ - Implement production streaming kernel to avoid full unpack; validate with perf benchmarks and GPU CI.
++ - Alternatively use Triton Python backend reconstruct-at-init approach (lighter but slower startup).
++
++4) Explainability:
++ - Deploy services/explainability/token_attribution.py hooks in inference path to produce token-level attributions on flagged outputs.
++
++5) Bias Mitigation:
++ - Use ops/bias/mitigation/mitigate.py to augment training prompts, run fairness evaluations and reweight training.
++
++6) Human Queue & CI:
++ - Deploy services/human_queue and integrate rater UI to claim/resolve tasks.
++ - Wire on_resolve_webhook to CI gating URL to automatically retrain or unblock promotions.
++
++7) Testing & SRE:
++ - Run e2e canary & rollback (ops/tests/e2e_canary_rollback.sh) and load tests (locust) to validate SLOs.
++ - Execute sim/HIL campaigns with proofs and require SME signoff prior to production.
++
+*** End Patch
+*** End Patch

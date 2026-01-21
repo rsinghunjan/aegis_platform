@@ -1,0 +1,404 @@
+*** Begin Patch
+*** Add File:services/agent/idp/keycloak_sync.py
++#!/usr/bin/env python3
++"""
++Keycloak / OIDC group -> role sync for agent RBAC.
++ - Fetches group membership from Keycloak (or generic OIDC with group endpoint)
++ - Builds a USER_ROLE_MAP (user -> [roles]) JSON and writes to a Kubernetes ConfigMap 'agent-rbac' in the agent namespace.
++ - Fallback to writing to local file when not running in-cluster.
++"""
++import os, json, requests
++from kubernetes import client, config
++
++KEYCLOAK_URL = os.environ.get("KEYCLOAK_URL")  # e.g., https://keycloak.example.com
++REALM = os.environ.get("KEYCLOAK_REALM", "master")
++ADMIN_TOKEN = os.environ.get("KEYCLOAK_ADMIN_TOKEN", "")
++AGENT_NS = os.environ.get("AGENT_NAMESPACE", "default")
++CONFIGMAP_NAME = os.environ.get("AGENT_RBAC_CONFIGMAP", "agent-rbac")
++
++def fetch_users_and_groups():
++    # This is a small Keycloak-specific implementation. For other IdPs adapt endpoints.
++    if not KEYCLOAK_URL or not ADMIN_TOKEN:
++        raise RuntimeError("KEYCLOAK_URL and KEYCLOAK_ADMIN_TOKEN must be set")
++    headers = {"Authorization": f"Bearer {ADMIN_TOKEN}", "Accept": "application/json"}
++    # list users
++    users = requests.get(f"{KEYCLOAK_URL}/admin/realms/{REALM}/users", headers=headers, timeout=30).json()
++    user_map = {}
++    for u in users:
++        username = u.get("username")
++        # get groups for user
++        groups = requests.get(f"{KEYCLOAK_URL}/admin/realms/{REALM}/users/{u['id']}/groups", headers=headers, timeout=30).json()
++        user_map[username] = [g.get("name") for g in groups]
++    return user_map
++
++def map_groups_to_roles(user_groups_map, group_to_role_map):
++    # group_to_role_map: dict group->role
++    out = {}
++    for user, groups in user_groups_map.items():
++        roles = set()
++        for g in groups:
++            if g in group_to_role_map:
++                roles.add(group_to_role_map[g])
++        if not roles:
++            roles.add("rater")
++        out[user] = list(roles)
++    return out
++
++def write_configmap(data):
++    try:
++        config.load_incluster_config()
++    except Exception:
++        config.load_kube_config()
++    v1 = client.CoreV1Api()
++    cm = client.V1ConfigMap(metadata=client.V1ObjectMeta(name=CONFIGMAP_NAME), data={"USER_ROLE_MAP": json.dumps(data)})
++    try:
++        v1.create_namespaced_config_map(namespace=AGENT_NS, body=cm)
++        print("Created ConfigMap", CONFIGMAP_NAME)
++    except client.exceptions.ApiException as e:
++        if e.status == 409:
++            v1.patch_namespaced_config_map(name=CONFIGMAP_NAME, namespace=AGENT_NS, body=cm)
++            print("Patched ConfigMap", CONFIGMAP_NAME)
++        else:
++            raise
++
++def main():
++    # Optional: supply mapping via env GROUP_TO_ROLE_JSON
++    g2r = {}
++    if os.environ.get("GROUP_TO_ROLE_JSON"):
++        g2r = json.loads(os.environ.get("GROUP_TO_ROLE_JSON"))
++    else:
++        # sensible defaults
++        g2r = {"sre":"sre", "ml-leads":"ml-lead", "admins":"admin"}
++    users = fetch_users_and_groups()
++    mapped = map_groups_to_roles(users, g2r)
++    write_configmap(mapped)
++    print("Wrote USER_ROLE_MAP entries:", len(mapped))
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/cronjobs/idp_sync_cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: agent-idp-sync
++  namespace: default
++spec:
++  schedule: "*/30 * * * *"
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          restartPolicy: OnFailure
++          containers:
++            - name: idp-sync
++              image: us.gcr.io/aegis/agent-idp-sync:latest
++              env:
++                - name: KEYCLOAK_URL
++                  value: "https://keycloak.example.com"
++                - name: KEYCLOAK_ADMIN_TOKEN
++                  valueFrom:
++                    secretKeyRef:
++                      name: keycloak-admin
++                      key: token
++                - name: GROUP_TO_ROLE_JSON
++                  value: '{"sre":"sre","ml-leads":"ml-lead","admins":"admin"}'
++              volumeMounts: []
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/rbac_manager.py
++#!/usr/bin/env python3
++"""
++RBAC manager for agent tool calls.
++ - Reads user->roles mapping from in-cluster ConfigMap 'agent-rbac' if available, otherwise falls back to env USER_ROLE_MAP.
++ - ROLE_TOOL_MAP continues to define which roles can call which tools.
++"""
++import os, json
++from typing import List
++try:
++    from kubernetes import client, config
++    K8S_AVAILABLE = True
++except Exception:
++    K8S_AVAILABLE = False
++
++DEFAULT_ROLE_MAP = {
++    "sre": ["k8s.set_image", "k8s.scale_deployment", "k8s.create_configmap"],
++    "ml-lead": ["policy.update_serving_policy","k8s.set_image"],
++    "rater": [],
++    "admin": ["*"]
++}
++
++ROLE_MAP = json.loads(os.environ.get("ROLE_TOOL_MAP", json.dumps(DEFAULT_ROLE_MAP)))
++
++def load_user_role_map_from_configmap(namespace="default", name="agent-rbac"):
++    if not K8S_AVAILABLE:
++        return {}
++    try:
++        config.load_incluster_config()
++    except Exception:
++        try:
++            config.load_kube_config()
++        except Exception:
++            return {}
++    v1 = client.CoreV1Api()
++    try:
++        cm = v1.read_namespaced_config_map(name=name, namespace=namespace)
++        data = cm.data.get("USER_ROLE_MAP","{}")
++        return json.loads(data)
++    except Exception:
++        return {}
++
++# cached user map
++_USER_ROLE_MAP = {}
++
++def refresh_user_map(namespace="default", name="agent-rbac"):
++    global _USER_ROLE_MAP
++    cm = load_user_role_map_from_configmap(namespace,name)
++    if cm:
++        _USER_ROLE_MAP = cm
++    else:
++        try:
++            _USER_ROLE_MAP = json.loads(os.environ.get("USER_ROLE_MAP","{}"))
++        except Exception:
++            _USER_ROLE_MAP = {}
++    return _USER_ROLE_MAP
++
++def user_roles(user: str) -> List[str]:
++    if not _USER_ROLE_MAP:
++        refresh_user_map()
++    if user in _USER_ROLE_MAP:
++        return _USER_ROLE_MAP[user]
++    if user == "ci":
++        return ["sre"]
++    if user.startswith("ml-"):
++        return ["ml-lead"]
++    return ["rater"]
++
++def is_allowed(user: str, tool_name: str) -> bool:
++    roles = user_roles(user)
++    for r in roles:
++        allowed = ROLE_MAP.get(r, [])
++        if "*" in allowed:
++            return True
++        if tool_name in allowed:
++            return True
++    return False
++
++if __name__=="__main__":
++    print("RBAC manager loaded; current map keys:", list(refresh_user_map().keys())[:5])
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/tool_adapters/policy_adapter.py
++#!/usr/bin/env python3
++"""
++Policy adapter wrapper: apply serving policy changes via ConfigMap and return previous state.
++Supports dry_run and produces an auditable result.
++"""
++import subprocess, json, time
++from services.agent.backup_store import store_backup
++
++def update_serving_policy(namespace: str, name: str, data: dict, dry_run=False):
++    """
++    name: configmap name (e.g., serving-policy-tenantA)
++    data: dictionary of policy entries
++    """
++    # capture current CM for backup
++    prev = None
++    try:
++        prev_raw = subprocess.check_output(["kubectl","-n",namespace,"get","configmap",name,"-o","json"], stderr=subprocess.DEVNULL)
++        prev = json.loads(prev_raw.decode("utf-8"))
++    except Exception:
++        prev = None
++    if dry_run:
++        return {"status":"dry_run","would_apply": data, "previous_present": bool(prev)}
++    # apply new CM via kubectl apply - create temp file
++    import tempfile, os
++    cm = {"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":namespace},"data":{k:str(v) for k,v in data.items()}}
++    t = tempfile.NamedTemporaryFile(delete=False, mode="w")
++    json.dump(cm, t); t.close()
++    subprocess.check_call(["kubectl","apply","-f", t.name])
++    # store backup of previous if exists
++    if prev:
++        bk = store_backup(f"policy_{name}_{int(time.time())}", prev)
++    else:
++        bk = None
++    return {"status":"applied","backup_uri": bk}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/tool_adapters/storage_adapter.py
++#!/usr/bin/env python3
++"""
++Storage adapter wrappers for safe object operations (S3).
++ - Provides safe_delete_object which moves object to a tombstone/backup prefix instead of immediate delete.
++ - Requires S3 bucket configured in env STORAGE_BUCKET
++"""
++import os, boto3, time
++from urllib.parse import urlparse
++
++STORAGE_BUCKET = os.environ.get("MM_STORE_BUCKET", "")
++S3_REGION = os.environ.get("AWS_REGION", "us-west-2")
++
++def s3_client():
++    return boto3.client("s3", region_name=S3_REGION)
++
++def safe_delete_object(s3_uri):
++    """
++    Move object s3://bucket/key -> s3://bucket/.tombstone/key_TIMESTAMP
++    """
++    parsed = urlparse(s3_uri)
++    bucket = parsed.netloc
++    key = parsed.path.lstrip("/")
++    client = s3_client()
++    tomb = f".tombstone/{key}.{int(time.time())}"
++    client.copy_object(Bucket=bucket, CopySource={"Bucket":bucket,"Key":key}, Key=tomb)
++    client.delete_object(Bucket=bucket, Key=key)
++    return {"status":"moved_to_tombstone","tombstone_uri": f"s3://{bucket}/{tomb}"}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/generative/request_shadow_proxy.py
++#!/usr/bin/env python3
++"""
++HTTP proxy that forwards requests to the production generation endpoint and asynchronously mirrors (shadows)
++the request to a candidate endpoint. Useful as middleware in front of production service for long-shadow collection.
++ - Configure PROD_URL and CANDIDATE_URL
++ - Writes shadow records to local SHADOW_OUT or EVIDENCE_BUCKET using audit_logger.s3_put
++"""
++from fastapi import FastAPI, Request, Response
++import os, asyncio, aiohttp, time, json
++from services.agent.audit_logger import s3_put
++
++PROD_URL = os.environ.get("PROD_URL")
++CANDIDATE_URL = os.environ.get("CANDIDATE_URL")
++SHADOW_OUT = os.environ.get("SHADOW_OUT", "/data/shadow_generations.jsonl")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++
++app = FastAPI(title="Aegis Shadow Proxy")
++
++async def forward(session, url, payload):
++    async with session.post(url, json=payload, timeout=30) as resp:
++        text = await resp.text()
++        try:
++            return json.loads(text)
++        except Exception:
++            return {"raw": text, "status": resp.status}
++
++@app.post("/generate")
++async def generate(req: Request):
++    payload = await req.json()
++    async with aiohttp.ClientSession() as session:
++        # forward to prod synchronously
++        prod_resp = await forward(session, PROD_URL, payload)
++        # schedule shadow to candidate asynchronously
++        async def do_shadow():
++            try:
++                cand_resp = await forward(session, CANDIDATE_URL, payload)
++            except Exception as e:
++                cand_resp = {"error": str(e)}
++            rec = {"ts": time.time(), "request": payload, "prod": {"resp": prod_resp}, "candidate": {"resp": cand_resp}}
++            # write to local file
++            try:
++                with open(SHADOW_OUT, "a") as f:
++                    f.write(json.dumps(rec) + "\n")
++            except Exception:
++                pass
++            # upload to evidence bucket if configured
++            if EVIDENCE_BUCKET:
++                try:
++                    s3_put(f"gen_shadow/{int(time.time())}.json", rec)
++                except Exception:
++                    pass
++        asyncio.create_task(do_shadow())
++        # return production response to caller
++        return Response(content=json.dumps(prod_resp), media_type="application/json")
++
++if __name__=="__main__":
++    import uvicorn
++    uvicorn.run("services.generative.request_shadow_proxy:app", host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/deployments/shadow-proxy-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: shadow-proxy
++  namespace: inference
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: shadow-proxy
++  template:
++    metadata:
++      labels:
++        app: shadow-proxy
++    spec:
++      containers:
++      - name: shadow-proxy
++        image: us.gcr.io/aegis/shadow-proxy:latest
++        env:
++        - name: PROD_URL
++          value: "http://verifier.safety.svc:8080/generate"
++        - name: CANDIDATE_URL
++          value: "http://verifier-canary.safety.svc:8080/generate"
++        - name: SHADOW_OUT
++          value: "/data/shadow_generations.jsonl"
++        volumeMounts:
++        - name: data
++          mountPath: /data
++      volumes:
++      - name: data
++        emptyDir: {}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/dryrun_runner.py
++#!/usr/bin/env python3
++"""
++LLM planner dry-run runner
++ - Reads a trace file or sample intents, runs the enhanced LLM planner in dry-run mode,
++   validates output via plan verifier and schema, simulates via business simulator, and archives results.
++ - Designed to run as a periodic job producing evidence for planner reliability and hallucination rates.
++"""
++import os, json, time
++from services.agent.llm_planner_enhanced import plan_for_intent
++from services.agent.llm_plan_validator import validate_plan
++from services.agent.plan_verifier import plan_verdict
++from services.agent.simulator.business_simulator_v2 import simulate_plan
++from services.agent.audit_logger import s3_put
++
++INTENTS_FILE = os.environ.get("AGENT_INTENTS_FILE", "ops/agent/sample_intents.jsonl")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET","")
++
++def load_intents(path):
++    out=[]
++    for l in open(path):
++        if not l.strip(): continue
++        out.append(json.loads(l))
++    return out
++
++def main():
++    intents = load_intents(INTENTS_FILE)
++    results=[]
++    for it in intents:
++        intent = it.get("intent")
++        plan = plan_for_intent(intent, {})
++        ok, info = validate_plan(plan)
++        verdict = plan_verdict(plan)
++        sim = simulate_plan(plan.get("plan",[]), None, runs=20)
++        rec = {"ts": time.time(), "intent": intent, "plan": plan, "schema_ok": ok, "schema_info": info, "verdict": verdict, "simulation": sim}
++        results.append(rec)
++    out = {"ts": time.time(), "results": results}
++    if EVIDENCE_BUCKET:
++        s3_put(f"agent_dryrun/{int(time.time())}.json", out)
++    else:
++        path = f"/tmp/agent_dryrun_{int(time.time())}.json"
++        with open(path,"w") as f:
+
+

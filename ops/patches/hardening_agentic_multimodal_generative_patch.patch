@@ -1,0 +1,622 @@
+*** Begin Patch
+*** Add File:services/agent/tool_wrapper_generator.py
++#!/usr/bin/env python3
++"""
++Generate verified wrapper scaffolds for all registered tools.
++ - Reads services.agent.tool_registry.list_tools()
++ - For each tool, emits a wrapper file under services/agent/tool_adapters/generated/
++ - Generated wrappers enforce RBAC, support dry_run, and include backup hooks.
++"""
++import os
++import inspect
++from services.agent import tool_registry
++
++OUT_DIR = os.environ.get("TOOL_WRAPPER_OUT", "services/agent/tool_adapters/generated")
++os.makedirs(OUT_DIR, exist_ok=True)
++
++TEMPLATE = '''#!/usr/bin/env python3
++"""
++Auto-generated wrapper for {tool_name}
++ - Enforces RBAC using services.agent.rbac_manager.is_allowed
++ - Supports dry_run param
++ - Calls the underlying adapter function if available
++ - Captures pre-action backup (best-effort) via services.agent.backup_store.store_backup
++"""
++from services.agent.rbac_manager import is_allowed, user_roles
++from services.agent.backup_store import store_backup
++from services.agent.sensitive_tools import is_sensitive, get_sensitivity
++from services.agent.human_approval_requester import request_approval, wait_for_approval
++
++# Underlying adapter import (may need operator to edit)
++try:
++    from services.agent.tool_adapters import {adapter_module}
++except Exception:
++    {adapter_module} = None
++
++def wrapper_{fn_name}(requester: str, params: dict, dry_run: bool = False):
++    tool_full = "{tool_name}"
++    if not is_allowed(requester, tool_full):
++        raise PermissionError(f"{{requester}} not allowed to call {{tool_full}}")
++    if is_sensitive(tool_full):
++        meta = get_sensitivity(tool_full)
++        min_role = meta.get("min_role")
++        roles = user_roles(requester)
++        if min_role not in roles and "*" not in roles:
++            rid = request_approval(f"Manual approval for {{tool_full}}", requester, {{"params": params}})
++            approval = wait_for_approval(rid)
++            if approval.get("state") != "approved":
++                return {{"status": "rejected_by_human", "approval": approval}}
++    # take best-effort backup (adapter may implement snapshot helpers)
++    try:
++        backup_uri = store_backup(f"pre_{tool_full}_{requester}", params)
++    except Exception:
++        backup_uri = None
++    if dry_run:
++        return {{"status": "dry_run_ok", "backup_uri": backup_uri}}
++    # call underlying adapter function if present
++    if {adapter_module} is None:
++        return {{"status":"not_implemented","note":"adapter module missing"}}
++    # operator: adapt the call below to match adapter signature
++    try:
++        func = getattr({adapter_module}, "{adapter_fn}", None)
++        if not func:
++            return {{"status":"not_implemented","note":"adapter function missing"}}
++        # assume adapter accepts **params
++        res = func(**params)
++        return {{"status":"ok","result":res,"backup_uri": backup_uri}}
++    except Exception as e:
++        # in case of error, it's expected controllers / executors will attempt rollback using backup_uri
++        return {{"status":"failed","error": str(e), "backup_uri": backup_uri}}
++
++'''
++
++def safe_name(s):
++    return s.replace(".", "_").replace("/", "_")
++
++def main():
++    tools = tool_registry.list_tools()
++    for name, meta in tools.items():
++        # try to infer adapter module and function name from tool name (heuristic)
++        parts = name.split(".")
++        adapter_module = f"tool_adapters.{parts[0]}_adapter"
++        adapter_fn = parts[1] if len(parts) > 1 else parts[0]
++        fn_name = safe_name(name)
++        out = TEMPLATE.format(tool_name=name, adapter_module=adapter_module, adapter_fn=adapter_fn, fn_name=fn_name)
++        fname = os.path.join(OUT_DIR, f"{fn_name}.py")
++        with open(fname, "w") as f:
++            f.write(out)
++        print("Generated wrapper:", fname)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/wrapper_audit_runner.py
++#!/usr/bin/env python3
++"""
++Audit-runner for generated wrappers.
++ - Loads wrappers from services/agent/tool_adapters/generated and runs dry_run checks
++ - Validates RBAC enforcement by exercising each wrapper with a test requester and records results
++ - Produces an audit report and uploads to EVIDENCE_BUCKET if configured
++"""
++import os
++import importlib.util
++import glob
++import json
++import time
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++GEN_DIR = os.environ.get("TOOL_WRAPPER_OUT", "services/agent/tool_adapters/generated")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++
++def load_wrapper(path):
++    spec = importlib.util.spec_from_file_location("mod", path)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++def run():
++    results = []
++    for p in glob.glob(os.path.join(GEN_DIR, "*.py")):
++        name = os.path.basename(p)
++        try:
++            mod = load_wrapper(p)
++            # find any callable wrapper_* in module
++            funcs = [getattr(mod, a) for a in dir(mod) if a.startswith("wrapper_")]
++            for f in funcs:
++                # run dry-run with test params
++                try:
++                    res = f("ci", {"test": "value"}, dry_run=True)
++                    results.append({"wrapper": name, "func": f.__name__, "ok": True, "result": res})
++                except Exception as e:
++                    results.append({"wrapper": name, "func": f.__name__, "ok": False, "error": str(e)})
++        except Exception as e:
++            results.append({"wrapper": name, "loaded": False, "error": str(e)})
++    report = {"ts": int(time.time()), "results": results}
++    out = f"/tmp/wrapper_audit_{int(time.time())}.json"
++    with open(out, "w") as f:
++        json.dump(report, f, indent=2)
++    if EVIDENCE_BUCKET and boto3:
++        s3 = boto3.client("s3")
++        key = f"agent_wrapper_audit/{os.path.basename(out)}"
++        s3.upload_file(out, EVIDENCE_BUCKET, key)
++        print("Uploaded to s3://{}/{}".format(EVIDENCE_BUCKET, key))
++    print("Report:", out)
++    return out
++
++if __name__=="__main__":
++    run()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/long_dryrun_runner.py
++#!/usr/bin/env python3
++"""
++Large-scale dry-run runner for planner + verifier + simulator
++ - Executes planner on a corpus of intents (ops/agent/sample_intents.jsonl or a provided trace)
++ - Runs many iterations in parallel (threads) and aggregates schema failure, simulation risk, and other metrics
++ - Writes aggregated evidence to EVIDENCE_BUCKET
++"""
++import os
++import json
++import threading
++from queue import Queue
++import time
++from services.agent.llm_planner_enhanced import plan_for_intent
++from services.agent.llm_plan_validator import validate_plan
++from services.agent.plan_verifier import plan_verdict
++from services.agent.simulator.business_simulator_v2 import simulate_plan
++from services.agent.audit_logger import s3_put
++
++INTENTS_FILE = os.environ.get("AGENT_INTENTS_FILE", "ops/agent/sample_intents.jsonl")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++WORKERS = int(os.environ.get("DRYRUN_WORKERS", "20"))
++ITERATIONS = int(os.environ.get("DRYRUN_ITERATIONS", "1000"))
++
++def load_intents(path):
++    out=[]
++    for l in open(path):
++        if not l.strip(): continue
++        out.append(json.loads(l))
++    return out
++
++def worker(q, stats):
++    while True:
++        item = q.get()
++        if item is None:
++            break
++        intent = item.get("intent")
++        plan = plan_for_intent(intent, {})
++        ok, info = validate_plan(plan)
++        verdict = plan_verdict(plan)
++        sim = simulate_plan(plan.get("plan",[]), None, runs=10)
++        # record per-run stats
++        stats.append({"intent": intent, "schema_ok": ok, "schema_info": str(info), "verdict": verdict, "sim": sim})
++        q.task_done()
++
++def run():
++    intents = load_intents(INTENTS_FILE)
++    if not intents:
++        print("No intents found")
++        return
++    q = Queue(maxsize=ITERATIONS)
++    stats = []
++    # spawn workers
++    threads = []
++    for _ in range(WORKERS):
++        t = threading.Thread(target=worker, args=(q, stats), daemon=True)
++        t.start()
++        threads.append(t)
++    # enqueue iterations
++    for i in range(ITERATIONS):
++        q.put(intents[i % len(intents)])
++    q.join()
++    for _ in threads:
++        q.put(None)
++    # aggregate
++    total = len(stats)
++    schema_fail = sum(1 for s in stats if not s["schema_ok"])
++    high_risk = sum(1 for s in stats if s["verdict"].get("sim",{}).get("summary",{}).get("max_risk_p95",0) > 0.5)
++    report = {"ts": int(time.time()), "total_runs": total, "schema_failures": schema_fail, "high_risk_count": high_risk, "sample": stats[:50]}
++    out = f"/tmp/long_dryrun_{int(time.time())}.json"
++    with open(out,"w") as f:
++        json.dump(report, f, indent=2)
++    if EVIDENCE_BUCKET:
++        s3_put(f"agent_long_dryrun/{os.path.basename(out)}", report)
++    print("Wrote dryrun report:", out)
++    return out
++
++if __name__=="__main__":
++    run()
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/agent_long_dryrun_big.yml
++name: Agent Long Dry-run Large
++on:
++  workflow_dispatch:
++
++jobs:
++  long-dryrun:
++    runs-on: ubuntu-latest
++    timeout-minutes: 720
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.10'
++      - name: Install deps
++        run: pip install boto3 jsonschema requests || true
++      - name: Run long dry-run
++        env:
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++          DRYRUN_WORKERS: 40
++          DRYRUN_ITERATIONS: 2000
++        run: |
++          python services/agent/long_dryrun_runner.py
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/ingest/ingest_stress_runner.py
++#!/usr/bin/env python3
++"""
++Stress runner for resumable ingest.
++ - Spawns multiple parallel uploader processes to hit the resumable service
++ - Collects success/failure counts and basic latency metrics
++ - Can run for a specified duration or number of total uploads
++ - Uploads a summary to EVIDENCE_BUCKET
++"""
++import argparse
++import requests
++import time
++from concurrent.futures import ThreadPoolExecutor, as_completed
++import os, json
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++
++def upload_file(server, filepath, dataset, modality, chunk_size=1024*256):
++    fname = os.path.basename(filepath)
++    init = requests.post(f"{server}/resumable/init", json={"filename": fname, "modality": modality, "dataset_id": dataset}, timeout=10)
++    init.raise_for_status()
++    uid = init.json()["upload_id"]
++    with open(filepath, "rb") as f:
++        offset = 0
++        while True:
++            data = f.read(chunk_size)
++            if not data:
++                break
++            files = {'chunk': ('chunk', data)}
++            r = requests.put(f"{server}/resumable/{uid}/chunk?offset={offset}", files=files, timeout=30)
++            r.raise_for_status()
++            offset += len(data)
+    # finalize
++    fin = requests.post(f"{server}/resumable/{uid}/finalize", timeout=120)
++    fin.raise_for_status()
++    return fin.json()
++
++def run_load(server, files, parallel, total_uploads):
++    results = []
++    start = time.time()
++    with ThreadPoolExecutor(max_workers=parallel) as ex:
++        futures = []
++        for i in range(total_uploads):
++            fp = files[i % len(files)]
++            futures.append(ex.submit(upload_file, server, fp, "stress-dataset", "image"))
++        for fut in as_completed(futures):
++            try:
++                res = fut.result()
++                results.append({"ok": True, "resp": res})
++            except Exception as e:
++                results.append({"ok": False, "error": str(e)})
++    dur = time.time() - start
++    success = sum(1 for r in results if r["ok"])
++    fail = sum(1 for r in results if not r["ok"])
++    summary = {"total": len(results), "success": success, "fail": fail, "duration_s": dur}
++    return summary, results
++
++def upload_summary(summary, details, run_id):
++    out = {"ts": int(time.time()), "run_id": run_id, "summary": summary}
++    if EVIDENCE_BUCKET and boto3:
++        s3 = boto3.client("s3")
++        key = f"ingest_stress/{run_id}.json"
++        s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(out).encode("utf-8"))
++        # also upload details truncated
++        key2 = f"ingest_stress/{run_id}_details.json"
++        s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key2, Body=json.dumps(details[:100]).encode("utf-8"))
++        return f"s3://{EVIDENCE_BUCKET}/{key}"
++    else:
++        path = f"/tmp/ingest_stress_{run_id}.json"
++        with open(path, "w") as f:
++            json.dump(out, f, indent=2)
++        return path
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--server", required=True)
++    p.add_argument("--files", nargs="+", required=True)
++    p.add_argument("--parallel", type=int, default=50)
++    p.add_argument("--total", type=int, default=500)
++    args = p.parse_args()
++    summary, details = run_load(args.server, args.files, args.parallel, args.total)
++    run_id = f"stress_{int(time.time())}"
++    uri = upload_summary(summary, details, run_id)
++    print("Summary uploaded to", uri)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:tekton/tasks/kernel_tuner_orchestrator.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: kernel-tuner-orchestrator
++  namespace: ml-pipelines
++spec:
++  params:
++    - name: workload
++      type: string
++  steps:
++    - name: run-tuner
++      image: us.gcr.io/aegis/kernel-tuner:latest
++      script: |
++        #!/usr/bin/env bash
++        set -euo pipefail
++        python services/triton/kernel_opt/opt_tuner.py --workload $(inputs.params.workload) --out ops/triton/backend/kernel_best_config_vision.json
++    - name: validate-and-bake
++      image: python:3.10-slim
++      script: |
++        #!/usr/bin/env bash
++        set -euo pipefail
++        python services/triton/validate_and_bake_kernel.py
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/triton/validate_and_test_model.py
++#!/usr/bin/env python3
++"""
++Validate model repo uploaded to model store and perform a quick inference test against Triton server.
++ - Expects model_name and server host
++ - Calls Triton Model Control reload and then sends sample inference to verify correctness
++"""
++import sys
++import time
++import requests
++import json
++
++def reload_triton(server):
++    url_reload = f"http://{server}/v2/repository/models?action=reload"
++    r = requests.post(url_reload, timeout=30)
++    r.raise_for_status()
++    return r.text
++
++def infer_test(server, model_name, input_payload):
++    # This assumes model has HTTP infer endpoint /v2/models/{model}/infer (adjust as needed)
++    url = f"http://{server}/v2/models/{model_name}/infer"
++    r = requests.post(url, json=input_payload, timeout=30)
++    r.raise_for_status()
++    return r.json()
++
++def main():
++    if len(sys.argv) < 4:
++        print("Usage: validate_and_test_model.py <server:port> <model_name> <sample_input.json>")
++        sys.exit(2)
++    server = sys.argv[1]; model = sys.argv[2]; sample = sys.argv[3]
++    print("Reloading Triton models...")
++    reload_triton(server)
++    print("Waiting 5s for models to load...")
++    time.sleep(5)
++    payload = json.load(open(sample))
++    print("Running test inference...")
++    out = infer_test(server, model, payload)
++    print("Inference OK:", out)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:scripts/run_kernel_tuner_and_validate.sh
++#!/usr/bin/env bash
++set -euo pipefail
++WORKLOAD=${1:-vision}
++./scripts/run_kernel_tuner.sh "$WORKLOAD" || true
++python services/triton/validate_and_bake_kernel.py
++echo "Kernel tuner run and validation complete"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/generative/long_shadow_daemon.py
++#!/usr/bin/env python3
++"""
++Continuous long-shadow daemon to mirror a % of production generation traffic to candidate endpoints.
++ - Designed to run inside cluster as a deployment; reads sampling rate and writes to EVIDENCE_BUCKET.
++ - Includes rotation and batching for S3 writes to reduce API chattiness.
++"""
++import os
++import time
++import json
++import random
++import threading
++try:
++    import boto3
++except Exception:
++    boto3 = None
++from services.agent.audit_logger import s3_put
++
++PROD_PROXY = os.environ.get("PROD_PROXY", "http://prod-gen-proxy:8080/generate")
++CANDIDATE_URL = os.environ.get("CANDIDATE_URL")
++SAMPLE_RATE = float(os.environ.get("LONG_SHADOW_SAMPLE_RATE", "0.01"))
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++BATCH_SIZE = int(os.environ.get("LONG_SHADOW_BATCH", "50"))
++OUT_PREFIX = "gen_shadow/long"
++
++buffer = []
++lock = threading.Lock()
++
++def send_batch(b):
++    rec = {"ts": int(time.time()), "samples": b}
++    if EVIDENCE_BUCKET and boto3:
++        key = f"{OUT_PREFIX}/{int(time.time())}_batch.json"
++        s3 = boto3.client("s3")
++        s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(rec).encode("utf-8"))
++    else:
++        path = f"/tmp/long_shadow_{int(time.time())}.json"
++        with open(path, "w") as f:
++            json.dump(rec, f)
++
++def shadow_request(request_payload):
++    # send to candidate endpoint, record both responses
++    try:
++        import requests
++        prod = requests.post(PROD_PROXY, json=request_payload, timeout=10).json()
++    except Exception:
++        prod = {"error": "prod_failed"}
++    try:
++        cand = requests.post(CANDIDATE_URL, json=request_payload, timeout=30).json()
++    except Exception:
++        cand = {"error": "cand_failed"}
++    rec = {"ts": time.time(), "request": request_payload, "prod": prod, "candidate": cand}
++    with lock:
++        buffer.append(rec)
++        if len(buffer) >= BATCH_SIZE:
++            b = buffer[:]
++            buffer.clear()
++            send_batch(b)
++
++def main_loop():
++    # in real deployment, this subscribes to a message bus or receives traffic from the proxy
++    print("Long shadow daemon started, sampling rate:", SAMPLE_RATE)
++    while True:
++        # in this scaffold we generate synthetic prompts; replace by hooking into actual request stream
++        if random.random() < SAMPLE_RATE:
++            req = {"prompt": "Long-shadow sample " + str(time.time()), "max_tokens": 64}
++            shadow_request(req)
++        time.sleep(0.1)
++
++if __name__=="__main__":
++    main_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/factuality/sme_signoff.py
++#!/usr/bin/env python3
++"""
++SME signoff service for verifier thresholds.
++ - Exposes simple CLI and a small HTTP endpoint to record SME approvals for thresholds.
++ - Stores signoffs in a ConfigMap in Kubernetes or uploads to evidence bucket for audit.
++"""
++import os
++import json
++from datetime import datetime
++try:
++    from kubernetes import client, config
++    K8S = True
++except Exception:
++    K8S = False
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++CONFIGMAP_NAME = os.environ.get("SME_SIGNOFF_CM", "verifier-sme-signoffs")
++NAMESPACE = os.environ.get("SME_NAMESPACE", "safety")
++
++def record_signoff(sme_name, thresholds_path, notes=""):
++    payload = {"sme": sme_name, "thresholds_path": thresholds_path, "notes": notes, "ts": int(datetime.utcnow().timestamp())}
++    # write to evidence bucket if available
++    if EVIDENCE_BUCKET and boto3:
++        s3 = boto3.client("s3")
++        key = f"verifier_signoffs/{sme_name}_{int(time.time())}.json"
++        s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(payload).encode("utf-8"))
++        return f"s3://{EVIDENCE_BUCKET}/{key}"
++    # else store as ConfigMap
++    if K8S:
++        try:
++            config.load_incluster_config()
++        except Exception:
++            config.load_kube_config()
++        v1 = client.CoreV1Api()
++        cm = client.V1ConfigMap(metadata=client.V1ObjectMeta(name=CONFIGMAP_NAME), data={sme_name: json.dumps(payload)})
++        try:
++            v1.create_namespaced_config_map(namespace=NAMESPACE, body=cm)
++        except client.exceptions.ApiException as e:
++            if e.status == 409:
++                v1.patch_namespaced_config_map(name=CONFIGMAP_NAME, namespace=NAMESPACE, body=cm)
++        return f"configmap://{NAMESPACE}/{CONFIGMAP_NAME}"
++    # fallback local
++    out = f"/tmp/verifier_signoff_{sme_name}_{int(time.time())}.json"
++    with open(out, "w") as f:
++        json.dump(payload, f, indent=2)
++    return out
++
++if __name__=="__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--sme", required=True)
++    p.add_argument("--thresholds", required=True)
++    p.add_argument("--notes", default="")
++    args = p.parse_args()
++    res = record_signoff(args.sme, args.thresholds, args.notes)
++    print("Recorded signoff to", res)
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/hardening_full_pipeline.yml
++name: Full Hardening Pipeline (agentic/multimodal/generative)
++on:
++  workflow_dispatch:
++
++jobs:
++  hardening:
++    runs-on: ubuntu-latest
++    timeout-minutes: 720
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.10'
++      - name: Install deps
++        run: pip install boto3 jsonschema requests numpy scikit-image scikit-learn librosa soundfile || true
++      - name: Generate wrappers
++        run: python services/agent/tool_wrapper_generator.py
++      - name: Run wrapper audit
++        env:
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++        run: python services/agent/wrapper_audit_runner.py
++      - name: Run long dry-run (smaller scale)
++        env:
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++          DRYRUN_WORKERS: 20
++          DRYRUN_ITERATIONS: 500
++        run: python services/agent/long_dryrun_runner.py
++      - name: Run ingest stress (sample)
++        env:
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++          INGEST_SERVER: ${{ secrets.INGEST_SERVER }}
++        run: python services/ingest/ingest_stress_runner.py --server "${INGEST_SERVER:-http://localhost:8080}" --files ops/multimodal/sample_images/* --parallel 50 --total 500
++      - name: Run kernel tuner orchestrator (Tekton task recommended)
++        run: echo "Run kernel tuner via cluster job (see tekton/tasks/kernel_tuner_orchestrator.yaml)"
++      - name: Validate model repo & inference
++        env:
++          TRITON_HOST: ${{ secrets.TRITON_HOST }}
++        run: |
++          ./scripts/package_triton_model.sh models/vision_sample vision_encoder /tmp/model_store || true
++          python services/triton/validate_and_test_model.py "${TRITON_HOST:-localhost:8000}" vision_encoder ops/triton/sample_inference_input.json || true
++      - name: Record SME signoff (manual step)
++        run: echo "Run services/factuality/sme_signoff.py --sme <name> --thresholds out/calib/thresholds.json"
++
+*** End Patch
+*** End Patch

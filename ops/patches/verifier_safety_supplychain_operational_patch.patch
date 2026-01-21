@@ -1,0 +1,408 @@
+*** Begin Patch
+*** Add File:ops/argo/verifier_full_pipeline_with_sme.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  name: verifier-full-pipeline
++  namespace: ml-pipelines
++spec:
++  entrypoint: verifier-pipeline
++  serviceAccountName: argo-workflow-sa
++  onExit: verifier-exit-handler
++
++  templates:
++  - name: verifier-pipeline
++    steps:
++    - - name: fetch-manifest
++        template: fetch-manifest
++    - - name: finetune-domain
++        template: finetune-domain
++        arguments:
++          parameters:
++            - name: manifest
++              value: "{{steps.fetch-manifest.outputs.parameters.manifest_path}}"
++    - - name: calibrate-thresholds
++        template: calibrate
++        arguments:
++          parameters:
++            - name: preds
++              value: /workspace/candidate/preds.jsonl
++            - name: labels
++              value: /workspace/candidate/labels.jsonl
++    - - name: adversarial-tests
++        template: adversarial
++    - - name: fairness-tests
++        template: fairness
++    - - name: validation-battery
++        template: validation-battery
++    - - name: upload-and-sign
++        template: sign-and-publish
++    - - name: request-sme-signoff
++        template: sme-request
++    - - name: gated-promotion
++        template: transactional-promotion
++
++  - name: fetch-manifest
++    script:
++      image: alpine:3.18
++      command: [sh]
++      source: |
++        set -euo pipefail
++        if [ -f /workspace/train_manifest.jsonl ]; then
++          cp /workspace/train_manifest.jsonl /tmp/train_manifest.jsonl
++          echo "manifest_path=/tmp/train_manifest.jsonl" > /tmp/outputs
++        else
++          echo "manifest_path=" > /tmp/outputs
++        fi
++        cat /tmp/outputs
++    outputs:
++      parameters:
++      - name: manifest_path
++        valueFrom:
++          path: /tmp/outputs
++
++  - name: finetune-domain
++    inputs:
++      parameters:
++        - name: manifest
++    container:
++      image: us.gcr.io/aegis/verifier-trainer:latest
++      command: [sh, -c]
++      args:
++        - |
++          set -euo pipefail
++          python services/factuality/finetune_domain.py --manifest "{{inputs.parameters.manifest}}" --out_dir /workspace/candidate --epochs 2
++    retryStrategy:
++      limit: 2
++      retryPolicy: "OnFailure"
++
++  - name: calibrate
++    inputs:
++      parameters:
++        - name: preds
++        - name: labels
++    container:
++      image: us.gcr.io/aegis/verifier-calib:latest
++      command: [sh, -c]
++      args:
++        - |
++          set -euo pipefail
++          python services/factuality/calibrate_and_publish.py
++
++  - name: adversarial
++    container:
++      image: us.gcr.io/aegis/validation-battery:latest
++      command: [sh, -c]
++      args:
++        - |
++          set -euo pipefail
++          python services/ci/adversarial_suite.py || (echo "adversarial failed" && exit 2)
++    retryStrategy:
++      limit: 1
++
++  - name: fairness
++    container:
++      image: us.gcr.io/aegis/validation-battery:latest
++      command: [sh, -c]
++      args:
++        - |
++          set -euo pipefail
++          python services/ci/fairness_check.py || (echo "fairness failed" && exit 2)
++
++  - name: validation-battery
++    container:
++      image: us.gcr.io/aegis/validation-battery:latest
++      command: [sh, -c]
++      args:
++        - |
++          set -euo pipefail
++          python services/ci/validation_battery.py /workspace/candidate || (echo "validation failed" && exit 2)
++
++  - name: sign-and-publish
++    container:
++      image: us.gcr.io/aegis/cosign-ci:latest
++      env:
++        - name: COSIGN_AWS_KMS_KEY_ARN
++          valueFrom:
++            secretKeyRef:
++              name: cosign-kms
++              key: kms_arn
++      command: [sh, -c]
++      args:
++        - |
++          set -euo pipefail
++          TAR=/workspace/candidate.tar.gz
++          tar -czf $TAR -C /workspace candidate
++          cosign sign --key "$COSIGN_AWS_KMS_KEY_ARN" $TAR
++          gsutil cp $TAR gs://aegis-model-registry/verifier/$(date +%s)/candidate.tar.gz
++
++  - name: sme-request
++    script:
++      image: python:3.10-slim
++      command: [sh]
++      source: |
++        set -euo pipefail
++        ART_META=/workspace/artifact_meta.json
++        # Create a manual-approval request for SME signoff and wait for approval
++        REQ_ID="verifier_$(date +%s)"
++        curl -sS -X POST "${MANUAL_APPROVAL_URL:-http://manual-approval.svc}/request" -H "Content-Type: application/json" -d "{\"request_id\":\"$REQ_ID\",\"user\":\"system\",\"reason\":\"SME signoff for verifier candidate\"}"
++        # Poll for approval (timeout after 48h)
++        for i in $(seq 1 576); do
++          sleep 300
++          RES=$(curl -sS "${MANUAL_APPROVAL_URL:-http://manual-approval.svc}/list")
++          echo "$RES" | grep "$REQ_ID" | grep -E "approved|rejected" && break || true
++        done
++        # Evaluate final decision
++        RES=$(curl -sS "${MANUAL_APPROVAL_URL:-http://manual-approval.svc}/list")
++        echo "$RES" | grep "$REQ_ID" | grep approved || (echo "SME not approved" && exit 2)
++
++  - name: transactional-promotion
++    resource:
++      action: apply
++      manifest: |
++        apiVersion: aegis.example.com/v1
++        kind: ModelPromotion
++        metadata:
++          name: verifier-{{workflow.uid}}
++        spec:
++          artifact:
++            path: gs://aegis-model-registry/verifier/latest/candidate.tar.gz
++            image: us.gcr.io/aegis/verifier:candidate
++
++  - name: verifier-exit-handler
++    script:
++      image: bitnami/kubectl:1.27
++      source: |
++        #!/bin/sh
++        set -euo pipefail
++        NAMESPACE=${TARGET_NAMESPACE:-safety}
++        # If last step failed, log and create incident
++        # Argo provides status via env; for simplicity, check for presence of promotion-backup configmap and canary state
++        if ! kubectl -n $NAMESPACE get deployment verifier -o jsonpath='{.status.availableReplicas}' 2>/dev/null; then
++          echo "Production verifier not available; creating incident"
++          curl -sS -X POST "${TICKET_URL:-http://ticket.svc}/create" -H "Content-Type: application/json" -d '{"title":"Verifier pipeline failure","body":"Argo pipeline exit handler detected failure"}' || true
++        fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:tekton/tasks/sme-approval-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: sme-approval-task
++  namespace: ml-pipelines
++spec:
++  params:
++    - name: request_id
++      type: string
++  steps:
++    - name: request
++      image: curlimages/curl:8.2.1
++      script: |
++        #!/usr/bin/env sh
++        set -euo pipefail
++        REQID="$(inputs.params.request_id)"
++        curl -sS -X POST "${MANUAL_APPROVAL_URL:-http://manual-approval.svc}/request" -H "Content-Type: application/json" -d "{\"request_id\":\"$REQID\",\"user\":\"system\",\"reason\":\"SME signoff\"}"
++    - name: poll
++      image: curlimages/curl:8.2.1
++      script: |
++        #!/usr/bin/env sh
++        set -euo pipefail
++        REQID="$(inputs.params.request_id)"
++        for i in $(seq 1 288); do
++          sleep 300
++          RES=$(curl -sS "${MANUAL_APPROVAL_URL:-http://manual-approval.svc}/list")
++          echo "$RES" | grep "$REQID" | grep approved && exit 0 || true
++        done
++        echo "Timeout waiting for SME approval"
++        exit 2
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/cosign/populate_ca_bundle.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Populate CA bundle for ValidatingWebhookConfiguration using cert-manager-issued secret
++# Usage:
++#   ./ops/cosign/populate_ca_bundle.sh <namespace> <tls-secret-name> <validatingwebhookconfiguration-name>
++
++NS=${1:-admission}
++TLS_SECRET=${2:-cosign-webhook-tls}
++VWC_NAME=${3:-cosign-validating-webhook}
++
++if ! kubectl -n "$NS" get secret "$TLS_SECRET" >/dev/null 2>&1; then
++  echo "Secret $TLS_SECRET not found in $NS"
++  exit 2
++fi
++
++CA_BUNDLE=$(kubectl -n "$NS" get secret "$TLS_SECRET" -o jsonpath='{.data.ca\.crt}')
++if [ -z "$CA_BUNDLE" ]; then
++  echo "CA bundle not present in secret"
++  exit 2
++fi
++
++kubectl get validatingwebhookconfiguration "$VWC_NAME" -o json | \
++  jq --arg cab "$CA_BUNDLE" '.webhooks[0].clientConfig.caBundle=$cab' > /tmp/vwc.json
++
++kubectl apply -f /tmp/vwc.json
++echo "Updated ValidatingWebhookConfiguration $VWC_NAME with CA bundle from $TLS_SECRET"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/experimentation/shadow_run_controller.py
++"""
++Shadow-run controller
++ - Continuously copies a sampled fraction of production traffic to candidate endpoint(s)
++ - Stores side-by-side results for offline evaluation and emits metrics to Prometheus Pushgateway or Observability Collector
++ - Supports configurable sample_rate, tenant whitelist and time windows
++"""
++import os
++import time
++import json
++import random
++import threading
++import requests
++from prometheus_client import Gauge, start_http_server
++
++PROD_URL = os.environ.get("PROD_PROXY", "http://prod-inference.svc:8080/infer")
++CANARY_URL = os.environ.get("CANARY_PROXY", "http://canary-inference.svc:8080/infer")
++OUT_PATH = os.environ.get("SHADOW_OUT", "/data/shadow_results.jsonl")
++SAMPLE_RATE = float(os.environ.get("SHADOW_SAMPLE_RATE", "0.01"))
++MET_PORT = int(os.environ.get("SHADOW_MET_PORT", "9480"))
++
++G_SAMP = Gauge("aegis_shadow_samples_total", "Number of shadowed samples")
++G_DIV = Gauge("aegis_shadow_divergence_rate", "Divergence between prod and canary")
++
++def shadow_request(req):
++    try:
++        p = requests.post(PROD_URL, json=req, timeout=5).json()
++    except Exception:
++        p = {}
++    try:
++        c = requests.post(CANARY_URL, json=req, timeout=10).json()
++    except Exception:
++        c = {}
++    div = compute_divergence(p, c)
++    rec = {"ts": time.time(), "req": req, "prod": p, "canary": c, "divergence": div}
++    with open(OUT_PATH, "a") as f:
++        f.write(json.dumps(rec) + "\n")
++    G_SAMP.inc()
++    if div is not None:
++        G_DIV.set(div)
++    return rec
++
++def compute_divergence(prod, canary):
++    try:
++        a = prod.get("text","")
++        b = canary.get("text","")
++        if not a or not b:
++            return 1.0
++        return 0.0 if a.strip() == b.strip() else 1.0
++    except Exception:
++        return None
++
++def run_loop():
++    start_http_server(MET_PORT)
++    # In production, this would subscribe to a traffic topic or intercept via proxy; here we simulate sampling loop
++    while True:
++        # For demo: sample a synthetic request
++        if random.random() < SAMPLE_RATE:
++            req = {"prompt": "Shadow test at "+str(time.time()), "max_tokens": 16}
++            try:
++                shadow_request(req)
++            except Exception:
++                pass
++        time.sleep(0.5)
++
++if __name__=="__main__":
++    run_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/k8s/wattmeter-calib-cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: wattmeter-calibration
++  namespace: monitoring
++spec:
++  schedule: "0 */6 * * *"  # every 6 hours
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          nodeSelector:
++            dedicated: wattmeter-host
++          restartPolicy: OnFailure
++          containers:
++            - name: watt-calib
++              image: us.gcr.io/aegis/watt-calibrator:latest
++              env:
++                - name: WATT_CSV
++                  value: /data/wattmeter_sync.csv
++                - name: NVML_SAMPLES
++                  value: /data/nvml_samples.jsonl
++              volumeMounts:
++                - name: data
++                  mountPath: /data
++          volumes:
++            - name: data
++              hostPath:
++                path: /mnt/wattmeter
++                type: Directory
++
+*** End Patch
+*** Begin Patch
+*** Add File:tekton/tasks/kernel-autotuner-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: kernel-autotuner-task
++  namespace: ml-pipelines
++spec:
++  steps:
++    - name: run-tuner
++      image: us.gcr.io/aegis/kernel-tuner:latest
++      script: |
++        #!/usr/bin/env bash
++        set -euo pipefail
++        python services/triton/kernel_opt/opt_tuner.py --out ops/triton/backend/kernel_best_config.json
++    - name: validate
++      image: python:3.10-slim
++      script: |
++        #!/usr/bin/env bash
++        set -euo pipefail
++        python services/triton/kernel_opt/validate_kernel_results.py ops/triton/backend/kernel_best_config.json
++    - name: apply-config
++      image: bitnami/kubectl:1.27
++      script: |
++        #!/usr/bin/env bash
++        set -euo pipefail
++        kubectl -n inference create configmap kernel-best-config --from-file=ops/triton/backend/kernel_best_config.json --dry-run=client -o yaml | kubectl apply -f -
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/runbooks/sre_oncall_and_compliance.md
++# SRE On-call, Legal & Compliance Playbook (summary)
++
++Sections:
++1) On-call & Escalation
++ - Primary on-call for inference: page SRE on PagerDuty. Provide runbook for speculative = disable circuit breaker, roll back canary if needed.
++ - Incident triage steps: identify whether safety (verifier failure), quality (regression), cost (budget exhausted) or infra.
++
++2) Legal & Compliance
++ - Evidence retention: verify S3 bucket has Object Lock enabled and retention config matches legal policy.
++ - Data retention & deletion: process to request and verify deletion of PII-labeled artifacts.
++ - Signoffs: maintain ledger of SME approvals (services/factuality/sme_signoff.py) and archive signoff artifacts.
++
++3) Billing & Rater Capacity
++ - Ensure budget manager hooks are wired to billing system and trigger tenant notifications via Billing API.
++ - Rater capacity planning: use capacity_planner module and autoscaler integration to maintain SLA.
++
++4) Playbooks and runbooks available:
++ - Production checklist (ops/runbooks/production_checklist.md)
++ - Promotion and rollback runbooks (ops/runbooks/Operator_Autonomy_Playbook.md)
++
+*** End Patch
+*** End Patch

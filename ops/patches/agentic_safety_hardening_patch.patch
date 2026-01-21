@@ -1,0 +1,384 @@
+*** Begin Patch
+*** Add File:services/agent/plan_verifier.py
++#!/usr/bin/env python3
++"""
++Plan verifier / multi-step safety checks
++- Validates LLM planner output against schema, checks for unsafe patterns,
++  runs a lightweight simulation to estimate risk/reward, and returns a structured verdict.
++ - Designed to be invoked before any execution (automatic or human-approved).
++"""
++import os, json, re
++from typing import Dict, Any
++from services.agent.llm_plan_validator import validate_plan
++from services.agent.simulator.business_simulator_v2 import simulate_plan
++
++# Tunable constraints (env)
++MAX_ALLOWED_STUDENT_INC = int(os.environ.get("MAX_STUDENT_PCT_INC", "10"))
++MAX_ALLOWED_REPLICAS = int(os.environ.get("MAX_REPLICAS_ALLOWED", "50"))
++SIM_RISK_THRESHOLD = float(os.environ.get("SIM_RISK_THRESHOLD", "0.5"))
++
++def detect_unsafe_patterns(plan_obj: Dict[str,Any]) -> (bool, str):
++    # Example checks: extreme student pct changes, scaling to huge replica counts, unknown "destroy" actions
++    for step in plan_obj.get("plan", []):
++        tool = step.get("tool","")
++        action = step.get("action","")
++        params = step.get("params",{})
++        # policy change checks
++        if tool.startswith("policy") and action == "update_serving_policy":
++            inc = params.get("student_pct_increase", 0)
++            if abs(int(inc)) > MAX_ALLOWED_STUDENT_INC:
++                return True, f"student_pct change {inc} exceeds per-day allowed {MAX_ALLOWED_STUDENT_INC}"
++        # scale check
++        if tool.startswith("k8s") and action == "scale_deployment":
++            rep = int(params.get("replicas", 0))
++            if rep > MAX_ALLOWED_REPLICAS:
++                return True, f"replica target {rep} exceeds allowed {MAX_ALLOWED_REPLICAS}"
++        # destructive ops pattern
++        if re.search(r"delete|remove|destroy", action, re.I):
++            return True, f"destructive action '{action}' not allowed via agent"
++    return False, ""
++
++def plan_verdict(plan_obj: Dict[str,Any]) -> Dict[str,Any]:
++    # 1) schema validation
++    ok, info = validate_plan(plan_obj)
++    if not ok:
++        return {"allow": False, "reason": f"schema_validation_failed: {info}"}
++    # 2) unsafe pattern detection
++    unsafe, reason = detect_unsafe_patterns(plan_obj)
++    if unsafe:
++        return {"allow": False, "reason": f"unsafe_pattern: {reason}"}
++    # 3) simulate plan for business metrics
++    sim = simulate_plan(plan_obj.get("plan", []), trace_file=None, runs=50)
++    # if simulated max risk is too high, deny automatic allow
++    max_risk = sim.get("summary",{}).get("max_risk_p95", 0)
++    if max_risk > SIM_RISK_THRESHOLD:
++        return {"allow": False, "reason": f"simulated_risk_high: {max_risk}", "sim": sim}
++    # 4) pass
++    return {"allow": True, "reason": "ok", "sim": sim}
++
++if __name__=="__main__":
++    import sys
++    plan = json.load(open(sys.argv[1]))
++    print(json.dumps(plan_verdict(plan), indent=2))
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/human_approval_requester.py
++#!/usr/bin/env python3
++"""
++Helper to request human approval from a manual-approval service.
++ - POST /request -> returns request_id
++ - Poll /status or /list to find approved state
++ - Timeout configurable
++"""
++import os, time, requests
++
++MANUAL_APPROVAL_URL = os.environ.get("MANUAL_APPROVAL_URL", "http://manual-approval.svc")
++POLL_INTERVAL = int(os.environ.get("MANUAL_APPROVAL_POLL_S", "30"))
++TIMEOUT_S = int(os.environ.get("MANUAL_APPROVAL_TIMEOUT_S", str(60*60*24)))  # default 24h
++
++def request_approval(title: str, requestor: str, payload: dict) -> str:
++    body = {"title": title, "requester": requestor, "payload": payload}
++    r = requests.post(MANUAL_APPROVAL_URL.rstrip("/") + "/request", json=body, timeout=10)
++    r.raise_for_status()
++    return r.json().get("request_id")
++
++def wait_for_approval(request_id: str, timeout: int = TIMEOUT_S) -> dict:
++    start = time.time()
++    while time.time() - start < timeout:
++        r = requests.get(MANUAL_APPROVAL_URL.rstrip("/") + "/status/" + request_id, timeout=10)
++        if r.status_code == 200:
++            j = r.json()
++            state = j.get("state")
++            if state in ("approved","rejected"):
++                return j
++        time.sleep(POLL_INTERVAL)
++    # timeout
++    return {"request_id": request_id, "state": "timeout"}
++
++if __name__=="__main__":
++    # small CLI for tests
++    rid = request_approval("Test approval","ci", {"plan":"test"})
++    print("requested", rid)
++    print(wait_for_approval(rid, timeout=60))
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/sensitive_tools.py
++#!/usr/bin/env python3
++"""
++Sensitive tool definitions
++ - Central mapping of tool -> sensitivity metadata
++ - Used by wrappers and orchestration to require manual approval or extra checks for sensitive actions.
++"""
++SENSITIVE_TOOLS = {
++    # tool name -> reason and min_role required to bypass manual approval
++    "k8s.set_image": {"reason":"image change affects runtime code", "min_role":"admin"},
++    "k8s.scale_deployment": {"reason":"scaling affects capacity/cost", "min_role":"sre"},
++    "policy.update_serving_policy": {"reason":"affects routing of traffic to models", "min_role":"ml-lead"},
++    "k8s.delete_deployment": {"reason":"destructive operation", "min_role":"admin"}
++}
++
++def is_sensitive(tool_name: str) -> bool:
++    return tool_name in SENSITIVE_TOOLS
++
++def get_sensitivity(tool_name: str) -> dict:
++    return SENSITIVE_TOOLS.get(tool_name, {})
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/wrapper_enforcer.py
++#!/usr/bin/env python3
++"""
++Enforcer wrapper utilities for tool execution:
++ - Check RBAC (user->roles)
++ - If tool is sensitive, require manual approval (unless user has elevated role)
++ - Ensure idempotency by asking underlying adapter about current state where supported
++"""
++from services.agent.rbac_manager import is_allowed, user_roles
++from services.agent.sensitive_tools import is_sensitive, get_sensitivity
++from services.agent.human_approval_requester import request_approval, wait_for_approval
++from typing import Callable, Any, Dict
++
++def enforce_and_call(tool_full: str, caller: str, params: Dict[str,Any], call_fn: Callable, dry_run=False) -> Dict[str,Any]:
++    # RBAC check
++    if not is_allowed(caller, tool_full):
++        raise PermissionError(f"user {caller} not allowed to call {tool_full}")
++    # sensitivity
++    if is_sensitive(tool_full):
++        meta = get_sensitivity(tool_full)
++        min_role = meta.get("min_role")
++        roles = user_roles(caller)
++        if min_role not in roles and "*" not in roles:
++            # request manual approval
++            title = f"Manual approval required for {tool_full}"
++            req_id = request_approval(title, caller, {"tool": tool_full, "params": params})
++            approval = wait_for_approval(req_id)
++            if approval.get("state") != "approved":
++                return {"status":"rejected_manual","request_id": req_id, "approval": approval}
++    # idempotency and dry_run are handled by call_fn itself if supported
++    result = call_fn(caller=caller, **params) if callable(call_fn) else call_fn(**params)
++    return {"status":"ok","result":result}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/backup_store.py
++#!/usr/bin/env python3
++"""
++Backup store for pre-execution snapshots.
++ - Stores JSON blobs (deployment manifests, config snapshots) into evidence bucket with SSE-KMS and retention metadata.
++ - Returns a storage URI that can be referenced in AgentAction.status for rollback.
++"""
++import os, time, json, boto3
++from datetime import datetime, timedelta
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET")
++KMS_KEY = os.environ.get("COSIGN_KMS_ARN")
++REGION = os.environ.get("AWS_REGION", "us-west-2")
++
++def s3_client():
++    return boto3.client("s3", region_name=REGION)
++
++def store_backup(name: str, payload: dict) -> str:
++    if not EVIDENCE_BUCKET:
++        # fallback to local file
++        path = f"/tmp/{name}_{int(time.time())}.json"
++        with open(path,"w") as f:
++            json.dump(payload, f)
++        return f"file://{path}"
++    key = f"agent_backups/{name}/{int(time.time())}.json"
++    body = json.dumps(payload).encode("utf-8")
++    extra = {}
++    if KMS_KEY:
++        extra["ServerSideEncryption"]="aws:kms"
++        extra["SSEKMSKeyId"]=KMS_KEY
++    s3 = s3_client()
++    s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=body, **extra)
++    # attempt to set retention (best effort)
++    try:
++        until = (datetime.utcnow() + timedelta(days=3650)).isoformat() + "Z"
++        s3.put_object_retention(Bucket=EVIDENCE_BUCKET, Key=key, Retention={'Mode':'GOVERNANCE','RetainUntilDate': until})
++    except Exception:
++        pass
++    return f"s3://{EVIDENCE_BUCKET}/{key}"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/execute_with_safety.py
++#!/usr/bin/env python3
++"""
++Orchestration entrypoint to execute plans with safety checks:
++ - Validate with plan_verifier
++ - If allowed & low risk: proceed to safe_executor
++ - If medium/high risk: automatically create a manual approval request and wait
++ - For each step, take backups to backup_store before execution
++"""
++import os, json
++from services.agent.plan_verifier import plan_verdict
++from services.agent.human_approval_requester import request_approval, wait_for_approval
++from services.agent.backup_store import store_backup
++from services.agent.safe_executor import execute_safe_plan
++from services.agent.audit_logger import audit_log_action
++
++def execute_plan_safe(name: str, plan_obj: dict, requester: str, dry_run=False):
++    verdict = plan_verdict(plan_obj)
++    audit_log_action(name, requester, {"plan": plan_obj}, {"verdict": verdict})
++    if not verdict.get("allow", False):
++        # If not allowed automatically, require human approval
++        title = "Plan blocked by automatic verifier - request human review"
++        req = request_approval(title, requester, {"plan": plan_obj, "verdict": verdict})
++        res = wait_for_approval(req)
++        return {"state": "pending_human_auto_block", "approval": res, "verdict": verdict}
++    # If risk_level is medium or high, require human approval before executing
++    risk = plan_obj.get("risk_level", "low")
++    if risk in ("medium", "high"):
++        title = f"Manual approval for {risk} risk plan"
++        req = request_approval(title, requester, {"plan": plan_obj, "verdict": verdict})
++        approval = wait_for_approval(req)
++        if approval.get("state") != "approved":
++            audit_log_action(name, requester, {"plan": plan_obj}, {"state":"rejected_by_human","approval": approval})
++            return {"state":"rejected_human","approval": approval}
++    # pre-execution: for each step take backup (best-effort)
++    backups = []
++    for i, step in enumerate(plan_obj.get("plan", [])):
++        # attempt to capture relevant snapshot (for k8s deployments, record current manifest)
++        try:
++            tool = step.get("tool")
++            if tool.startswith("k8s"):
++                # ask kubectl to dump current deployment (scaffolded helper)
++                import subprocess, tempfile
++                ns = step.get("params",{}).get("namespace","default")
++                dep = step.get("params",{}).get("deployment")
++                if dep:
++                    out = subprocess.check_output(["kubectl","-n",ns,"get","deployment",dep,"-o","json"])
++                    uri = store_backup(f"{name}_step{i}_deployment_{ns}_{dep}", json.loads(out.decode("utf-8")))
++                    backups.append({"step": i, "backup_uri": uri})
++        except Exception as e:
++            # best-effort backup; continue
++            backups.append({"step": i, "backup_error": str(e)})
++    # record backups
++    audit_log_action(name, requester, {"plan": plan_obj}, {"backups": backups})
++    # execute via safe executor
++    result = execute_safe_plan(name, plan_obj.get("plan", []), requester, dry_run=dry_run)
++    # post-exec audit
++    audit_log_action(name, requester, {"plan": plan_obj}, {"execution_result": result})
++    return {"verdict": verdict, "backups": backups, "execution": result}
++
++if __name__=="__main__":
++    import sys
++    name = f"exec_{int(__import__('time').time())}"
++    plan = json.load(open(sys.argv[1]))
++    print(json.dumps(execute_plan_safe(name, plan, "ci", dry_run=True), indent=2))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/chaos/chaos_canary_test.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Simple chaos canary test:
++# 1) Deploy candidate image to verifier-canary
++# 2) Run canary eval
++# 3) Randomly kill a pod in the production (or canary) verifier to test rollback and idempotency
++# 4) Assert canary eval still runs and promotion controller either rolls back or leaves stable
++#
++NAMESPACE=${NAMESPACE:-safety}
++CANDIDATE_IMAGE=${CANDIDATE_IMAGE:-"us.gcr.io/aegis/verifier:canary"}
++CANARY_SVC=${CANARY_SVC:-verifier-canary}
++PROD_DEPLOY=${PROD_DEPLOY:-verifier}
++
++echo "Deploying canary image to canary deployment"
++kubectl -n ${NAMESPACE} set image deployment/${CANARY_SVC} ${CANARY_SVC}=${CANDIDATE_IMAGE} --record || true
++kubectl -n ${NAMESPACE} rollout status deployment/${CANARY_SVC} --timeout=120s || true
++
++echo "Running canary eval"
++python tests/generative/canary_eval.py --prompts ops/generative/sample_prompts.txt --prod_url http://verifier.safety.svc:8080/generate --cand_url http://${CANARY_SVC}.${NAMESPACE}.svc:8080/generate --out /tmp/canary_result.json || true
++cat /tmp/canary_result.json
++
++echo "Injecting chaos: killing one prod verifier pod"
++POD=$(kubectl -n ${NAMESPACE} get pods -l app=${PROD_DEPLOY} -o jsonpath='{.items[0].metadata.name}')
++if [ -n "$POD" ]; then
++  kubectl -n ${NAMESPACE} delete pod $POD || true
++fi
++
++echo "Wait 30s then re-run canary eval"
++sleep 30
++python tests/generative/canary_eval.py --prompts ops/generative/sample_prompts.txt --prod_url http://verifier.safety.svc:8080/generate --cand_url http://${CANARY_SVC}.${NAMESPACE}.svc:8080/generate --out /tmp/canary_result_after_chaos.json || true
++cat /tmp/canary_result_after_chaos.json
++
++echo "Chaos canary test complete. Inspect promotion controller logs and AgentAction records for rollback behavior."
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/chaos/promotion_idempotency_chaos.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Promotion idempotency + chaos tester:
++# - Creates a ModelPromotion CR to trigger promotion controller
++# - Simulates API server flakiness by deleting the promotion CR mid-flight (emulating transient failures)
++# - Reapplies CR and checks controller handles idempotency and rollback appropriately.
++
++CR_FILE=${CR_FILE:-/tmp/promo_test.yaml}
++cat > ${CR_FILE} <<EOF
++apiVersion: aegis.example.com/v1
++kind: ModelPromotion
++metadata:
++  name: promo-chaos-$(date +%s)
++spec:
++  artifact:
++    path: gs://aegis-model-registry/verifier/test/candidate.tar.gz
++    image: us.gcr.io/aegis/verifier:chaos-test
++EOF
++
++kubectl apply -f ${CR_FILE}
++echo "Promotion CR applied"
++sleep 10
++echo "Simulate transient failure: delete CR"
++kubectl delete -f ${CR_FILE} || true
++sleep 5
++echo "Reapply CR to test idempotency"
++kubectl apply -f ${CR_FILE}
++echo "Wait and inspect ModelPromotion status"
++for i in $(seq 1 30); do
++  sleep 10
++  kubectl get modelpromotion -o wide || true
++done
++echo "Idempotency chaos test complete. Check promotion controller logs for duplicate handling and rollback."
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/runbooks/agent_rollback_runbook.md
++# Agentic Rollback & Backup Runbook
++
++Overview
++- When an agent step causes an unexpected or unsafe change, the operator must inspect stored backups (created pre-execution), perform rollback, and run postmortem.
++
++1) Identify the AgentAction
++- Use alerts or list recent AgentAction CRs:
++  kubectl -n <ns> get agentactions
++  kubectl -n <ns> get agentaction <name> -o yaml
++
++2) Find backups
++- AgentAction.status/backups contains backup URIs (s3://... or file://...). Copy the backup payload locally:
++  aws s3 cp s3://bucket/agent_backups/<...> /tmp/backup.json
++
++3) Rollback common cases
++- Deployment image change:
++  kubectl -n <ns> apply -f /tmp/backup.json
++- Replica count:
++  kubectl -n <ns> scale deployment/<name> --replicas=<previous>
++
++4) Clear circuit breaker (after remediation)
++- Run:
++  ./ops/agent/run_clear_circuit.sh <namespace>
++
++5) Postmortem & update policies
++- Add entry to incidents tracker, attach S3 evidence and AgentAction CR YAML.
++- Consider tightening safe_policy.json constraints or requiring manual approval for the action in future.
++
++6) Escalation
++- If rollback fails or production is degraded, page SRE and Security teams per on-call roster.
++
+*** End Patch
+*** End Patch

@@ -1,0 +1,575 @@
+*** Begin Patch
+*** Add File:ops/argo/transactional_promotion_workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  name: transactional-model-promotion
++  namespace: ml-pipelines
++spec:
++  entrypoint: promote
++  onExit: promote-exit-handler
++  serviceAccountName: argo-workflow-sa
++
++  templates:
++  - name: promote
++    steps:
++    - - name: fetch-artifact-meta
++        template: fetch-artifact-meta
++    - - name: verify-signature
++        template: verify-signature
++        arguments:
++          parameters:
++            - name: artifact-path
++              value: "{{steps.fetch-artifact-meta.outputs.parameters.artifact_path}}"
++    - - name: backup-prod
++        template: backup-prod
++    - - name: deploy-canary
++        template: deploy-canary
++        arguments:
++          parameters:
++            - name: image
++              value: "{{steps.fetch-artifact-meta.outputs.parameters.artifact_image}}"
++    - - name: canary-eval
++        template: canary-eval
++    - - name: promote-to-prod
++        template: promote-to-prod
++
++  - name: fetch-artifact-meta
++    script:
++      image: bitnami/kubectl:1.27
++      command: [sh]
++      source: |
++        #!/bin/sh
++        set -euo pipefail
++        # Read artifact meta from mounted PVC or S3 (operator provides)
++        ART_META=${ARTIFACT_META_PATH:-/workspace/artifact_meta.json}
++        if [ ! -f "$ART_META" ]; then
++          echo "artifact_meta not found" >&2
++          exit 1
++        fi
++        ART_PATH=$(jq -r .artifact_path "$ART_META")
++        # artifact image (optional)
++        IMG=$(jq -r .image // empty "$ART_META" || true)
++        echo "artifact_path=$ART_PATH" > /tmp/outputs
++        echo "artifact_image=$IMG" >> /tmp/outputs
++        cat /tmp/outputs
++    outputs:
++      parameters:
++      - name: artifact_path
++        valueFrom:
++          path: /tmp/outputs
++      - name: artifact_image
++        valueFrom:
++          path: /tmp/outputs
++
++  - name: verify-signature
++    inputs:
++      parameters:
++      - name: artifact-path
++    script:
++      image: us.gcr.io/aegis/cosign-ci:latest
++      command: [sh]
++      source: |
++        set -euo pipefail
++        ART=${ARTIFACT_PATH}
++        echo "Verifying artifact signature for $ART"
++        cosign verify --key "${COSIGN_VERIFIER_KEY:-/secrets/cosign_pub.pem}" "$ART"
++
++  - name: backup-prod
++    script:
++      image: bitnami/kubectl:1.27
++      source: |
++        #!/bin/sh
++        set -euo pipefail
++        NAMESPACE=${TARGET_NAMESPACE:-safety}
++        DEPLOY=${TARGET_DEPLOYMENT:-verifier}
++        # record current image
++        IMAGE=$(kubectl -n $NAMESPACE get deployment $DEPLOY -o jsonpath='{.spec.template.spec.containers[0].image}')
++        echo "current_image=$IMAGE" > /tmp/backup
++        # store backup as configmap (idempotent)
++        kubectl -n $NAMESPACE create configmap promotion-backup --from-literal=current_image="$IMAGE" --dry-run=client -o yaml | kubectl apply -f -
++        cat /tmp/backup
++    outputs:
++      artifacts:
++      - name: backup
++        path: /tmp/backup
++
++  - name: deploy-canary
++    inputs:
++      parameters:
++        - name: image
++    script:
++      image: bitnami/kubectl:1.27
++      source: |
++        #!/bin/sh
++        set -euo pipefail
++        IMG=${IMAGE}
++        NAMESPACE=${TARGET_NAMESPACE:-safety}
++        cat <<YAML | kubectl -n ${NAMESPACE} apply -f -
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: verifier-canary
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: verifier-canary
++  template:
++    metadata:
++      labels:
++        app: verifier-canary
++    spec:
++      containers:
++      - name: verifier
++        image: ${IMG}
++YAML
++        kubectl -n ${NAMESPACE} rollout status deployment/verifier-canary --timeout=120s
++
++  - name: canary-eval
++    script:
++      image: us.gcr.io/aegis/canary-eval:latest
++      command: [sh]
++      source: |
++        #!/bin/sh
++        set -euo pipefail
++        python services/ci/run_canary_checks.py --canary-url http://verifier-canary.safety.svc:8080/verify --baseline-url http://verifier.safety.svc:8080/verify --samples ops/factuality/verification_samples.jsonl --out /tmp/canary_result.json
++        cat /tmp/canary_result.json
++    outputs:
++      artifacts:
++      - name: canary-result
++        path: /tmp/canary_result.json
++
++  - name: promote-to-prod
++    script:
++      image: bitnami/kubectl:1.27
++      source: |
++        #!/bin/sh
++        set -euo pipefail
++        NAMESPACE=${TARGET_NAMESPACE:-safety}
++        # apply production deployment (idempotent)
++        kubectl -n $NAMESPACE patch deployment verifier --type=json -p='[{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"'"${ARTIFACT_IMAGE:-unknown}"'"}]'
++        kubectl -n $NAMESPACE rollout status deployment/verifier --timeout=120s
++
++  - name: promote-exit-handler
++    script:
++      image: bitnami/kubectl:1.27
++      source: |
++        #!/bin/sh
++        set -euo pipefail
++        # If workflow failed, rollback to backed-up image
++        STATUS_FILE=/tmp/argo/outputs/exit_status || true
++        # Argo provides workflow status envs; simplification: check for verifier-canary health
++        NAMESPACE=${TARGET_NAMESPACE:-safety}
++        # If verifier-canary is not healthy, restore
++        if ! kubectl -n $NAMESPACE get deployment verifier-canary >/dev/null 2>&1; then
++          echo "No canary found, nothing to do"
++          exit 0
++        fi
++        # Evaluate canary result via presence of canary_result.json in workspace
++        if [ -f /tmp/canary_result.json ]; then
++          PASS=$(jq -r .pass /tmp/canary_result.json || echo false)
++        else
++          PASS=false
++        fi
++        if [ "$PASS" != "true" ]; then
++          echo "Canary failed - rolling back production deployment using promotion-backup configmap"
++          OLD_IMAGE=$(kubectl -n $NAMESPACE get configmap promotion-backup -o jsonpath='{.data.current_image}')
++          if [ -n "$OLD_IMAGE" ]; then
++            kubectl -n $NAMESPACE set image deployment/verifier verifier="$OLD_IMAGE" || true
++            kubectl -n $NAMESPACE rollout status deployment/verifier --timeout=120s || true
++          fi
++        else
++          echo "Canary passed - cleaning up backup"
++          kubectl -n $NAMESPACE delete configmap promotion-backup || true
++        fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/promotion/transaction_controller.py
++#!/usr/bin/env python3
++"""
++Promotion controller (improved transactional semantics)
++ - Watches ModelPromotion CR (ops/argo/promotion_transaction_crd.yaml must be installed)
++ - Downloads artifact (supports gs:// or local), verifies cosign signature (KMS), then:
++   * backs up current deployment image
++   * applies canary deployment and runs smoke checks
++   * if smoke checks pass, patches production deployment; else restores backup
++ - Updates CR status for audit and idempotency.
++"""
++import os
++import time
++import json
++import subprocess
++from urllib.parse import urlparse
++from kubernetes import client, config, watch
++
++NAMESPACE = os.environ.get("NAMESPACE", "safety")
++COSIGN_KEY = os.environ.get("COSIGN_VERIFIER_KEY", "/secrets/cosign_pub.pem")
++SMOKE_TEST_CMD = os.environ.get("SMOKE_TEST_CMD", "python services/ci/smoke_tests.py")
++
++def download_artifact(uri, out):
++    if uri.startswith("gs://"):
++        subprocess.check_call(["gsutil", "cp", uri, out])
++    elif uri.startswith("s3://"):
++        subprocess.check_call(["aws","s3","cp",uri,out])
++    else:
++        # assume local path
++        subprocess.check_call(["cp", uri, out])
++
++def verify(artifact):
++    try:
++        subprocess.check_call(["cosign","verify","--key",COSIGN_KEY,artifact])
++        return True
++    except Exception:
++        return False
++
++def get_current_image(deploy="verifier"):
++    p = subprocess.check_output(["kubectl","-n",NAMESPACE,"get","deployment",deploy,"-o","json"])
++    j = json.loads(p)
++    return j["spec"]["template"]["spec"]["containers"][0]["image"]
++
++def set_image(deploy, image):
++    subprocess.check_call(["kubectl","-n",NAMESPACE,"set","image","deployment/"+deploy, f"{deploy}="+image, "--record"])
++    subprocess.check_call(["kubectl","-n",NAMESPACE,"rollout","status","deployment/"+deploy,"--timeout=120s"])
++
++def main():
++    try:
++        config.load_incluster_config()
++    except Exception:
++        config.load_kube_config()
++    api = client.CustomObjectsApi()
++    w = watch.Watch()
++    for ev in w.stream(api.list_namespaced_custom_object, group="aegis.example.com", version="v1", namespace=NAMESPACE, plural="modelpromotions", timeout_seconds=0):
++        obj = ev["object"]
++        typ = ev["type"]
++        name = obj["metadata"]["name"]
++        spec = obj.get("spec", {})
++        if typ != "ADDED":
++            continue
++        if obj.get("status", {}).get("state") == "promoted":
++            continue
++        artifact = spec.get("artifact", {})
++        art_uri = artifact.get("path")
++        if not art_uri:
++            api.patch_namespaced_custom_object_status(group="aegis.example.com", version="v1", namespace=NAMESPACE, plural="modelpromotions", name=name, body={"status":{"state":"error","error":"no_artifact"}})
++            continue
++        tmp = "/tmp/artifact.tar.gz"
++        try:
++            download_artifact(art_uri, tmp)
++            # verify signature
++            if not verify(tmp):
++                api.patch_namespaced_custom_object_status(group="aegis.example.com", version="v1", namespace=NAMESPACE, plural="modelpromotions", name=name, body={"status":{"state":"verification_failed"}})
++                continue
++            # backup current prod image
++            old_image = get_current_image("verifier")
++            # create backup configmap
++            subprocess.check_call(["kubectl","-n",NAMESPACE,"create","configmap","promotion-backup","--from-literal=current_image="+old_image,"--dry-run=client","-o","yaml"], stdout=subprocess.PIPE)
++            subprocess.check_call(["kubectl","-n",NAMESPACE,"apply","-f","-"], input=subprocess.check_output(["kubectl","-n",NAMESPACE,"create","configmap","promotion-backup","--from-literal=current_image="+old_image,"--dry-run=client","-o","yaml"]))
++            # extract image name from artifact meta if present
++            # (operator should embed image into artifact metadata or use container registry)
++            image = artifact.get("image")
++            if not image:
++                raise RuntimeError("artifact missing image metadata")
++            # deploy canary
++            set_image("verifier-canary", image)
++            # run smoke tests
++            rc = subprocess.call(SMOKE_TEST_CMD, shell=True)
++            if rc != 0:
++                # rollback canary -> restore prod image
++                set_image("verifier", old_image)
++                api.patch_namespaced_custom_object_status(group="aegis.example.com", version="v1", namespace=NAMESPACE, plural="modelpromotions", name=name, body={"status":{"state":"canary_failed"}})
++                continue
++            # promote to prod
++            set_image("verifier", image)
++            api.patch_namespaced_custom_object_status(group="aegis.example.com", version="v1", namespace=NAMESPACE, plural="modelpromotions", name=name, body={"status":{"state":"promoted","promotedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ")}})
++        except Exception as e:
++            # restore backup if possible
++            try:
++                set_image("verifier", old_image)
++            except Exception:
++                pass
++            api.patch_namespaced_custom_object_status(group="aegis.example.com", version="v1", namespace=NAMESPACE, plural="modelpromotions", name=name, body={"status":{"state":"error","error": str(e)}})
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:tests/promotion/test_transactional_promotion_harness.sh
++#!/usr/bin/env bash
++#
++# Test harness to validate transactional promotion flow
++#
++set -euo pipefail
++NAMESPACE=${NAMESPACE:-safety}
++# Create a dummy artifact meta in PVC or local path
++ART_META_PATH=${ART_META_PATH:-/tmp/artifact_meta.json}
++cat > $ART_META_PATH <<'JSON'
++{
++  "artifact_path": "/tmp/dummy_artifact.tar.gz",
++  "image": "us.gcr.io/aegis/verifier:test-harness"
++}
++JSON
++
++# create a ModelPromotion CR to trigger controller
++cat <<CR > /tmp/mpromo.yaml
++apiVersion: aegis.example.com/v1
++kind: ModelPromotion
++metadata:
++  name: promo-test-$(date +%s)
++spec:
++  artifact:
++    path: file:///tmp/dummy_artifact.tar.gz
++    image: us.gcr.io/aegis/verifier:test-harness
++CR
++
++kubectl -n $NAMESPACE apply -f /tmp/mpromo.yaml
++echo "Created ModelPromotion. Watch status:"
++kubectl -n $NAMESPACE get modelpromotion -w
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/factuality/verifier_gate.py
++#!/usr/bin/env python3
++"""
++Validation gate used by CI and Argo/Tekton workflows:
++ - Runs validation battery and computes pass/fail using thresholds from calibration ConfigMap
++ - Emits JSON {pass: true|false, metrics: {...}} for workflow consumption
++"""
++import os, json, subprocess, sys
++from kubernetes import client, config
++
++CALIB_CM = os.environ.get("VERIFIER_CALIB_CM", "verifier-calib")
++CALIB_NS = os.environ.get("CALIB_NS", "safety")
++
++def load_threshold():
++    try:
++        config.load_incluster_config()
++    except Exception:
++        config.load_kube_config()
++    v1 = client.CoreV1Api()
++    try:
++        cm = v1.read_namespaced_config_map(CALIB_CM, CALIB_NS)
++        thresholds = json.loads(cm.data.get("thresholds.json","{}"))
++        return thresholds
++    except Exception:
++        return {"threshold": 0.5}
++
++def run_validation(candidate_dir):
++    # run existing validation battery; assume it writes metrics to candidate_dir/validation_metrics.json
++    cmd = ["python","services/ci/validation_battery.py", candidate_dir]
++    try:
++        subprocess.check_call(cmd, timeout=30*60)
++    except subprocess.CalledProcessError:
++        return {"pass": False, "reason": "validation_failed"}
++    metrics_path = os.path.join(candidate_dir, "validation_metrics.json")
++    metrics = {}
++    if os.path.exists(metrics_path):
++        metrics = json.load(open(metrics_path))
++    else:
++        # fallback metric
++        metrics = {"verifier_f1": 0.0}
++    return {"pass": True, "metrics": metrics}
++
++def main():
++    candidate_dir = sys.argv[1]
++    thresholds = load_threshold()
++    res = run_validation(candidate_dir)
++    metrics = res.get("metrics",{})
++    f1 = metrics.get("verifier_f1", 0.0)
++    pass_gate = f1 >= float(thresholds.get("f1_threshold", thresholds.get("f1", 0.5)))
++    out = {"pass": bool(pass_gate), "f1": f1, "thresholds": thresholds}
++    print(json.dumps(out))
++    if not pass_gate:
++        sys.exit(2)
++
++if __name__=="__main__":
++    main(sys.argv[1])
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/gated_promotion_ci.yml
++name: Gated Promotion CI
++on:
++  workflow_dispatch:
++
++jobs:
++  train_and_validate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with: {python-version: '3.10'}
++      - name: Install deps
++        run: pip install -r requirements-ci.txt
++      - name: Finetune verifier (artifact)
++        run: |
++          python services/factuality/finetune_domain.py --manifest ops/factuality/sample_manifest.jsonl --out_dir out/candidate --model_name facebook/bart-large --epochs 1
++      - name: Run validation gate
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG }}
++        run: |
++          python services/factuality/verifier_gate.py out/candidate || (echo "Gate failed" && exit 1)
++      - name: Package artifact and sign
++        run: |
++          tar -czf out/candidate.tar.gz -C out candidate
++          cosign sign --key "${{ secrets.COSIGN_AWS_KMS_KEY_ARN }}" out/candidate.tar.gz
++      - name: Upload artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: candidate_artifact
++          path: out/candidate.tar.gz
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/cosign-admission/OPERATOR_GUIDE.md
++Cosign Admission Controller — Operator Guide (Hardened Deployment)
++----------------------------------------------------------------
++
++Overview
++- This guide shows steps to provision KMS/HSM keys, configure TLS for the webhook (recommended: cert-manager), deploy the cosign admission Helm chart (helm/cosign-admission), and enforce signature verification in production namespaces.
++
++1) Provision a KMS key (example AWS)
++ - Create key:
++   aws kms create-key --description "cosign key for Aegis" --origin AWS_KMS
++ - Create an alias and grant permissions to the CI service principal to sign:
++   aws kms create-alias --alias-name alias/cosign-aegis --target-key-id <KEY_ID>
++ - Record the key ARN and store in Kubernetes secret:
++   kubectl -n security create secret generic cosign-kms --from-literal=kms_arn=arn:aws:kms:... --dry-run=client -o yaml | kubectl apply -f -
++
++2) Provision TLS for webhook (cert-manager recommended)
++ - Install cert-manager in cluster.
++ - Create Issuer (e.g., ClusterIssuer) for your CA or use ACME if external domain is available.
++ - In Helm values set tls.secretName to the TLS secret that cert-manager will create.
++ - Use the helm chart to deploy; cert-manager will issue certs and populate the secret.
++
++3) Configure CA bundle in ValidatingWebhookConfiguration
++ - After certificate is issued, extract CA bundle and patch the ValidatingWebhookConfiguration caBundle field.
++ - Example:
++   kubectl get secret cosign-webhook-tls -n admission -o jsonpath='{.data.ca\.crt}' | base64 --decode > ca.crt
++   kubectl patch validatingwebhookconfiguration cosign-validating-webhook --type='json' -p='[{"op":"replace","path":"/webhooks/0/clientConfig/caBundle","value":"'"$(base64 -w0 ca.crt)"'"}]'
++
++4) Test signing end-to-end
++ - Sign an example artifact in CI using cosign with KMS key:
++   cosign sign --key $COSIGN_AWS_KMS_KEY_ARN artifact.tar.gz
++ - Try to deploy an image signed with that key into the production namespace; the webhook should allow it. Unsigned images must be rejected.
++
++Notes & Security
++- Use least-privilege IAM roles for signing and verification.
++- Rotate KMS keys periodically; update Helm secret and redeploy webhook accordingly.
++- For HSM: use cloud-specific HSM-backed KMS endpoints that cosign supports.
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/grafana/wattmeter_dashboard.json
++{
++  "title": "Wattmeter Calibration & Accuracy",
++  "panels": [
++    {
++      "title": "NVML Estimated Power vs Wattmeter (recent)",
++      "type": "timeseries",
++      "targets": [
++        {"expr":"nvml_power_watts","refId":"A"},
++        {"expr":"wattmeter_power_watts","refId":"B"}
++      ]
++    },
++    {
++      "title": "Calibration Scale (telemetry calibration scale)",
++      "type": "timeseries",
++      "targets": [
++        {"expr":"aegis_telemetry_scale","refId":"A"}
++      ]
++    },
++    {
++      "title": "Calibration Error (abs diff)",
++      "type": "timeseries",
++      "targets": [
++        {"expr":"abs(nvml_power_watts - wattmeter_power_watts)","refId":"A"}
++      ]
++    }
++  ]
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/prometheus/alerts_watt_calibration.yml
++groups:
++- name: watt-calibration
++  rules:
++  - alert: WattmeterCalibrationDrift
++    expr: abs(nvml_power_watts - wattmeter_power_watts) > 50
++    for: 10m
++    labels:
++      severity: warning
++    annotations:
++      summary: "Large discrepancy between NVML estimate and wattmeter (>50W)"
++      description: "Check calibration script and wattmeter sync files"
++
++  - alert: WattmeterMissing
++    expr: absent(wattmeter_power_watts)
++    for: 15m
++    labels:
++      severity: page
++    annotations:
++      summary: "Wattmeter feed missing"
++      description: "No wattmeter metrics seen; check ingestion pipeline"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/rl/policy/safe_policy.json
++{
++  "policy_id": "rl_safe_default_v1",
++  "description": "Safe-to-apply policy constraints for RL-suggested serving changes",
++  "constraints": {
++    "max_student_pct_change_per_day": 10,
++    "max_student_pct_total": 60,
++    "disallow_changes_on_high_risk_channels": true,
++    "require_manual_approval_for_significant_quality_drop":  true,
++    "quality_floor": 0.85,
++    "safety_budget_per_day": 0.01
++  },
++  "approval": {
++    "manual_approval_required": true,
++    "required_roles": ["ml-lead","sre","safety"]
++  },
++  "staged_rollout": {
++    "stage_1": {"pct": 1, "duration_hours": 24},
++    "stage_2": {"pct": 5, "duration_hours": 48},
++    "stage_3": {"pct": 20, "duration_hours": 72}
++  }
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/rl/staged_migration_plan.md
++# Staged Plan to Move RL Sandbox toward Controlled Automation
++
++Overview
++- RL agent suggests policies in sandbox. This plan describes a staged, risk-controlled path to operator-supervised application, then limited automation.
++
++Stages:
++1) Sandbox & offline evaluation (0-4 weeks)
++ - RL generates candidates; run offline_eval.py on historical traces.
++ - Only candidates with estimated reward > threshold and safety risk = 0 are kept.
++
++2) Human review & manual apply (4-8 weeks)
++ - Human approves top candidates via manual-approval service.
++ - Operator uses safe_apply_operator to apply policy; monitor for 7 days.
++
++3) Canary automation (8-16 weeks)
++ - After 90 days of stable behavior and low safety incidents, allow controller to perform limited automated application for stage_1 percentages (see safe_policy).
++ - Each automated change requires cross-check: acceptance_rate and verifier precision must be within safety margins.
++
++4) Gradual automation (16+ weeks)
++ - Increase automated application windows if metrics remain stable and SMEs sign off.
++ - Maintain human override and audit logs; require periodic re-evaluation.
++
++Controls & Safeguards
++- Manual approval remains required for high-risk channels.
++- All candidate actions are logged in metadata store and evidence saved with Object Lock.
++- Circuit breaker disables RL actions if acceptance_rate < threshold or verifier regressions occur.
++
+*** End Patch
+*** End Patch

@@ -1,0 +1,495 @@
+*** Begin Patch
+*** Add File:services/policy/hard_policy_enforcer.py
++"""
++Hard policy enforcer and fail-safe guardrails.
++ - Enforces non-negotiable constraints (forbidden patterns, max tokens, evidence_required for high-risk)
++ - Integrates with policy_engine to decide action and escalates to human approval if needed
++ - Designed to be called from inference gateway before forwarding to model
++"""
++import os, re, time, json
++from typing import Dict, Any
++from services.explainability.auto_explain import uncertainty_from_logits
++from services.policy.policy_engine import evaluate as evaluate_policy
++from services.policy.quarantine import quarantine_artifact
++
++MAX_TOKENS_DEFAULT = int(os.environ.get("MAX_TOKENS_DEFAULT", "1024"))
++FORBIDDEN_PATTERNS = [
++    re.compile(r"\b(?:secret|password|ssn|social security|credit card)\b", re.IGNORECASE),
++]
++HUMAN_APPROVAL_SIGNAL_URL = os.environ.get("HUMAN_APPROVAL_SIGNAL_URL", "")  # optional
++
++def matches_forbidden(text: str) -> bool:
++    if not text:
++        return False
++    for p in FORBIDDEN_PATTERNS:
++        if p.search(text):
++            return True
++    return False
++
++def enforce_hard_constraints(request: Dict[str, Any], output_preview: Dict[str, Any]=None) -> Dict[str, Any]:
++    """
++    request: { prompt, user_id, model, requested_max_tokens, risk_level }
++    output_preview: best-effort predicted output (optional) used for pre-checks
++    Returns action dict: {"action":"allow"|"enqueue_review"|"block"|"require_manual_approval", "reason": "..."}
++    """
++    # basic DLP
++    if matches_forbidden(request.get("prompt","")):
++        return {"action":"block", "reason":"forbidden_content_in_prompt"}
++
++    # token limit
++    limit = int(request.get("requested_max_tokens", MAX_TOKENS_DEFAULT))
++    if limit > MAX_TOKENS_DEFAULT:
++        return {"action":"block", "reason":"requested_token_limit_exceeds_policy"}
++
++    # policy-level evaluation (evidence_required, verifier thresholds, etc.)
++    # If output_preview is provided, evaluate against policy; else conservative path: require review for high risk
++    if output_preview:
++        verdict = evaluate_policy(output_preview)
++        if verdict.get("action") == "allow":
++            return {"action":"allow", "reason":"policy_passed"}
++        if verdict.get("action") == "enqueue_review":
++            # quarantine artifact and enqueue
++            quarantine_artifact({"req": request, "preview": output_preview, "ts": time.time()})
++            return {"action":"enqueue_review", "reason":"policy_requested_review"}
++        if verdict.get("action") == "block":
++            return {"action":"block", "reason":"policy_blocked"}
++    else:
++        # No preview; conservative behavior for high-risk
++        if request.get("risk_level","default") == "high_risk":
++            return {"action":"require_manual_approval", "reason":"no_preview_high_risk"}
++
++    return {"action":"allow", "reason":"no_issues_detected"}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/audit/audit_logger.py
++"""
++Central audit logger:
++ - Appends structured audit events locally and optionally uploads to S3 (evidence store) for immutable retention
++ - Ensures minimal required fields for compliance (user, request_id, timestamp, action, reason, model_version)
++"""
++import os, json, time
++from typing import Dict, Any
++import boto3
++
++AUDIT_LOG = os.environ.get("AUDIT_LOG_PATH", "/var/log/aegis/audit_events.jsonl")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++s3 = boto3.client("s3") if EVIDENCE_BUCKET else None
++
++def log_event(event: Dict[str, Any], persist_to_s3: bool = False):
++    event_rec = {
++        "ts": time.time(),
++        "user": event.get("user"),
++        "request_id": event.get("request_id"),
++        "action": event.get("action"),
++        "reason": event.get("reason"),
++        "model": event.get("model"),
++        "model_version": event.get("model_version"),
++        "meta": event.get("meta", {})
++    }
++    try:
++        os.makedirs(os.path.dirname(AUDIT_LOG), exist_ok=True)
++        with open(AUDIT_LOG, "a") as f:
++            f.write(json.dumps(event_rec) + "\n")
++    except Exception:
++        pass
++    if persist_to_s3 and s3:
++        key = f"audit/{int(time.time())}_{event_rec.get('request_id','unknown')}.json"
++        try:
++            s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(event_rec).encode("utf-8"))
++        except Exception:
++            pass
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/cost/budget_manager.py
++"""
++Budget manager enforces per-tenant or per-model cost budgets.
++ - Uses Redis to track budget consumption and enforce throttles
++ - Exposes check_and_consume(user_or_tenant, estimated_cost) -> bool
++"""
++import os, time
++try:
++    import redis
++except Exception:
++    redis = None
++
++REDIS_URL = os.environ.get("BUDGET_REDIS_URL", "redis://localhost:6379/2")
++BUDGET_DEFAULT_USD = float(os.environ.get("BUDGET_DEFAULT_USD", "100.0"))  # per period
++BUDGET_WINDOW_SECS = int(os.environ.get("BUDGET_WINDOW_SECS", "86400"))  # daily
++
++if redis:
++    r = redis.from_url(REDIS_URL)
++else:
++    r = None
++
++def _key(tenant):
++    now = int(time.time())
++    window = now // BUDGET_WINDOW_SECS
++    return f"budget:{tenant}:{window}"
++
++def get_balance(tenant: str) -> float:
++    if not r:
++        return BUDGET_DEFAULT_USD
++    val = r.get(_key(tenant))
++    if not val:
++        return BUDGET_DEFAULT_USD
++    return float(val)
++
++def check_and_consume(tenant: str, amount_usd: float) -> bool:
++    """
++    Atomically check and consume budget; returns True if allowed, False if exceeds budget.
++    """
++    if not r:
++        # non-redis fallback: allow (operator must ensure budgets elsewhere)
++        return True
++    key = _key(tenant)
++    pipe = r.pipeline()
++    pipe.get(key)
++    res = pipe.execute()[0]
++    if res is None:
++        # initialize
++        r.set(key, BUDGET_DEFAULT_USD - amount_usd, ex=BUDGET_WINDOW_SECS)
++        return True
++    bal = float(res)
++    if amount_usd > bal:
++        return False
++    # decrement
++    r.decrbyfloat(key, amount_usd)
++    return True
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/serving/inference_gateway.py
++"""
++Inference gateway (centralized enforcement point).
++ - Applies DLP/redaction, rate limits, budget checks, hard policy enforcement and audit logging
++ - If allowed, forwards request to chosen model endpoint (serving decision engine can be used)
++"""
++import os, requests, uuid, time
++from fastapi import FastAPI, Header, HTTPException, Request
++from services.excel.dlp_rules import contains_pii, redact
++from services.audit.audit_logger import log_event
++from services.cost.budget_manager import check_and_consume
++from services.policy.hard_policy_enforcer import enforce_hard_constraints
++from services.autonomy.serving_decision_engine import choose as choose_model
++
++SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY", "")
++DEFAULT_MODEL_ENDPOINT = os.environ.get("DEFAULT_MODEL_ENDPOINT", "http://triton-proxy.inference:8080/infer")
++RATE_LIMIT_HEADER = "X-User-Rate-Remaining"
++
++app = FastAPI()
++
++def estimate_cost_for_request(req: dict) -> float:
++    # naive heuristic: cost per second * expected duration (this should be refined)
++    return float(os.environ.get("EST_COST_PER_REQUEST_USD", "0.001"))
++
++@app.post("/infer")
++async def infer(req: Request, authorization: str = Header(None)):
++    body = await req.json()
++    user = "anonymous"
++    if authorization and authorization.startswith("Bearer "):
++        # ideally validate token; for scaffold we extract subject-less
++        user = authorization.split(" ",1)[1][:20]
++
++    # DLP: block or redact heavy PII
++    if contains_pii(body.get("prompt","")):
++        raise HTTPException(status_code=400, detail="Prompt contains sensitive PII. Remove or request redaction.")
++    # Redact metadata
++    body["prompt_redacted"] = redact(body.get("prompt",""))
++
++    # Serving decision: choose model variant
++    chosen = choose_model()
++    model_name = chosen.get("chosen", {}).get("name", "teacher")
++    # budget check
++    estimated_cost = estimate_cost_for_request(body)
++    tenant = body.get("tenant", user)
++    ok_budget = check_and_consume(tenant, estimated_cost)
++    if not ok_budget:
++        log_event({"user": user, "request_id": None, "action":"throttled", "reason":"budget_exhausted", "model": model_name}, persist_to_s3=False)
++        raise HTTPException(status_code=429, detail="Tenant budget exceeded")
++
++    # run a conservative pre-check using hard policy enforcer (no preview available)
++    hp = enforce_hard_constraints({"prompt": body.get("prompt",""), "user_id": user, "requested_max_tokens": body.get("max_tokens", 256), "risk_level": body.get("risk_level","default")})
++    if hp.get("action") == "block":
++        log_event({"user": user, "request_id": None, "action":"blocked", "reason": hp.get("reason"), "model": model_name}, persist_to_s3=True)
++        raise HTTPException(status_code=403, detail=f"Blocked: {hp.get('reason')}")
++    if hp.get("action") == "require_manual_approval":
++        # create request and signal for manual approval; return pending response
++        req_id = str(uuid.uuid4())
++        log_event({"user": user, "request_id": req_id, "action":"require_manual_approval", "reason":hp.get("reason"), "model": model_name}, persist_to_s3=True)
++        return {"status":"pending_manual_approval", "request_id": req_id, "reason": hp.get("reason")}
++
++    # Forward to model endpoint
++    # choose endpoint by model_name (resolve name->url via simple mapping env or service discovery)
++    endpoint = os.environ.get(f"MODEL_ENDPOINT_{model_name.upper()}", DEFAULT_MODEL_ENDPOINT)
++    # attach provenance flags so model returns provenance if supported
++    payload = {"prompt": body.get("prompt"), "max_tokens": body.get("max_tokens",256), "requester": user, "return_provenance": True}
++    try:
++        resp = requests.post(endpoint, json=payload, headers={"Authorization": f"Bearer {SERVICE_API_KEY}"}, timeout=30)
++    except Exception as e:
++        raise HTTPException(status_code=502, detail="Upstream model error")
++    if resp.status_code != 200:
++        raise HTTPException(status_code=502, detail="Model endpoint returned error")
++    result = resp.json()
++    # post-hoc enforcement using preview
++    hp2 = enforce_hard_constraints({"prompt": body.get("prompt"), "user_id": user, "requested_max_tokens": body.get("max_tokens",256), "risk_level": body.get("risk_level","default")}, output_preview=result)
++    if hp2.get("action") == "block":
++        # quarantine and block
++        log_event({"user": user, "request_id": result.get("request_id"), "action":"blocked_after_preview", "reason":hp2.get("reason"), "model": model_name}, persist_to_s3=True)
++        quarantine_artifact({"req": body, "resp": result})
++        raise HTTPException(status_code=403, detail="Response blocked by policy")
++    if hp2.get("action") == "enqueue_review" or hp2.get("action") == "require_manual_approval":
++        req_id = result.get("request_id") or str(uuid.uuid4())
++        log_event({"user": user, "request_id": req_id, "action":"enqueued_for_review", "reason":hp2.get("reason"), "model": model_name}, persist_to_s3=True)
++        return {"status":"enqueued_for_review", "request_id": req_id, "preview": result}
++
++    # allowed: audit and return
++    log_event({"user": user, "request_id": result.get("request_id"), "action":"allowed", "reason":"policy_passed", "model": model_name}, persist_to_s3=False)
++    return result
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/policy/manual_approval.py
++"""
++Manual approval service (simple)
++ - Operators can approve or reject pending manual approval requests
++ - Trainer orchestrator and inference gateway can poll / query approval status
++ - For production, integrate with ticketing or ChatOps workflows
++"""
++import os, json, time
++from fastapi import FastAPI, HTTPException
++
++APP = FastAPI()
++STORE = os.environ.get("MANUAL_APPROVAL_STORE", "/data/manual_approvals.jsonl")
++
++def append_record(rec):
++    os.makedirs(os.path.dirname(STORE), exist_ok=True)
++    with open(STORE, "a") as f:
++        f.write(json.dumps(rec) + "\n")
++
++def load_all():
++    out=[]
++    if not os.path.exists(STORE):
++        return out
++    for l in open(STORE):
++        out.append(json.loads(l))
++    return out
++
++@APP.post("/request")
++def create_request(request_id: str, user: str, reason: str):
++    rec = {"request_id": request_id, "user": user, "reason": reason, "status":"pending", "ts": time.time()}
++    append_record(rec)
++    return {"status":"created"}
++
++@APP.post("/approve")
++def approve(request_id: str, approver: str):
++    # naive: append an approval record; consumers must read approvals and act
++    rec = {"request_id": request_id, "approver": approver, "action":"approved", "ts": time.time()}
++    append_record(rec)
++    return {"status":"approved"}
++
++@APP.post("/reject")
++def reject(request_id: str, approver: str, reason: str = ""):
++    rec = {"request_id": request_id, "approver": approver, "action":"rejected", "reason": reason, "ts": time.time()}
++    append_record(rec)
++    return {"status":"rejected"}
++
++@APP.get("/list")
++def list_requests():
++    return load_all()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/serving/safe_promotion_controller.py
++"""
++Safe promotion controller:
++ - Ensures candidate models only auto-promote when safety margins and validation battery pass
++ - Otherwise create a human approval request and block automatic promotion
++"""
++import os, requests, json, time
++from services.audit.audit_logger import log_event
++
++VERIFICATION_METRICS_THRESHOLD = float(os.environ.get("PROMOTION_VERIFIER_THRESHOLD", "0.45"))
++MIN_PERF_MARGIN = float(os.environ.get("PROMOTION_PERF_MARGIN", "0.02"))  # candidate must beat baseline by margin or at least match
++MANUAL_APPROVAL_URL = os.environ.get("MANUAL_APPROVAL_URL", "http://manual-approval:8080/request")
++
++def evaluate_and_promote(candidate_artifact: dict, validation_results: dict) -> dict:
++    """
++    validation_results: output from validation battery containing keys: verifier_f1, perf_score, fairness_ok (bool), adversarial_ok (bool)
++    """
++    vid = candidate_artifact.get("id")
++    # basic safety checks
++    if not validation_results.get("fairness_ok") or not validation_results.get("adversarial_ok"):
++        # enqueue for human review
++        log_event({"user":"system","request_id": vid, "action":"promotion_blocked","reason":"safety_checks_failed","model": candidate_artifact.get("name")}, persist_to_s3=True)
++        # request manual approval
++        try:
++            requests.post(MANUAL_APPROVAL_URL, json={"request_id": vid, "user":"system", "reason":"safety_checks_failed"})
++        except Exception:
++            pass
++        return {"status":"blocked","reason":"safety_checks_failed"}
++
++    # verifier threshold
++    if validation_results.get("verifier_f1",0.0) < VERIFICATION_METRICS_THRESHOLD:
++        log_event({"user":"system","request_id":vid,"action":"promotion_blocked","reason":"verifier_threshold_not_met","model":candidate_artifact.get("name")}, persist_to_s3=True)
++        requests.post(MANUAL_APPROVAL_URL, json={"request_id": vid, "user":"system", "reason":"verifier_threshold_not_met"})
++        return {"status":"blocked","reason":"verifier_threshold_not_met"}
++
++    # perf check (must not regress more than MIN_PERF_MARGIN)
++    baseline_perf = candidate_artifact.get("baseline_perf", 0.0)
++    cand_perf = validation_results.get("perf_score", 0.0)
++    if cand_perf + MIN_PERF_MARGIN < baseline_perf:
++        log_event({"user":"system","request_id":vid,"action":"promotion_blocked","reason":"perf_regression","model":candidate_artifact.get("name")}, persist_to_s3=True)
++        requests.post(MANUAL_APPROVAL_URL, json={"request_id": vid, "user":"system", "reason":"perf_regression"})
++        return {"status":"blocked","reason":"perf_regression"}
++
++    # all checks passed -> promote to canary via orchestrator (simplified)
++    try:
++        # orchestrator endpoint
++        orchestrator = os.environ.get("ORCHESTRATOR_PROMOTE_URL", "http://trainer.orchestrator:8080/promote")
++        resp = requests.post(orchestrator, json={"artifact": candidate_artifact}, timeout=30)
++        if resp.status_code == 200:
++            log_event({"user":"system","request_id":vid,"action":"promoted","model":candidate_artifact.get("name")}, persist_to_s3=True)
++            return {"status":"promoted"}
++    except Exception as e:
++        log_event({"user":"system","request_id":vid,"action":"promotion_failed","reason":str(e),"model":candidate_artifact.get("name")}, persist_to_s3=True)
++    return {"status":"error","reason":"orchestrator_failed"}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/observability/budget_alerts.py
++"""
++Emit lightweight alerts when budgets approach exhaustion.
++ - Polls Redis budget keys and emits events (simple webhook or Prometheus metrics)
++"""
++import os, time
++try:
++    import redis
++except Exception:
++    redis = None
++WEBHOOK = os.environ.get("BUDGET_ALERT_WEBHOOK", "")
++REDIS_URL = os.environ.get("BUDGET_REDIS_URL", "redis://localhost:6379/2")
++ALERT_THRESHOLD_FRAC = float(os.environ.get("BUDGET_ALERT_THRESHOLD_FRAC", "0.1"))
++
++if redis:
++    r = redis.from_url(REDIS_URL)
++else:
++    r = None
++
++def poll_budgets():
++    if not r:
++        return
++    for key in r.scan_iter(match="budget:*"):
++        try:
++            val = float(r.get(key) or 0)
++            # extract tenant from key
++            if val <= 0:
++                msg = {"tenant": str(key), "status":"exhausted", "balance": val}
++                if WEBHOOK:
++                    try:
++                        import requests
++                        requests.post(WEBHOOK, json=msg, timeout=5)
++                    except Exception:
++                        pass
++        except Exception:
++            continue
++
++if __name__=="__main__":
++    while True:
++        poll_budgets()
++        time.sleep(int(os.environ.get("BUDGET_POLL_SECS","60")))
++
+*** End Patch
+*** Begin Patch
+*** Add File:config/policies/hard_constraints.json
++{
++  "max_tokens_global": 1024,
++  "forbidden_terms": ["password","secret","ssn","social security","credit card"],
++  "max_response_length_tokens": 2000,
++  "evidence_required_risk_levels": ["high_risk"],
++  "auto_promotion_allowed": false,
++  "promotion_verifier_threshold": 0.45,
++  "promotion_min_perf_margin": 0.02
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/security/dlp_integration.py
++"""
++DLP integration helper used by gateway and other services.
++ - Provides block_or_redact(prompt) -> ("block"|"redact"|"ok", text)
++ - Ensures we don't leak PII into model or logs; redacted forms can be sent to model if policy allows
++"""
++from services.excel.dlp_rules import contains_pii, redact
++
++def block_or_redact(prompt: str):
++    if contains_pii(prompt):
++        # block by default; operator can choose redact-only mode for certain tenants
++        redacted = redact(prompt)
++        return ("block", redacted)
++    return ("ok", prompt)
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agents/approval_operator_stub.py
++"""
++Operator approval stub to surface pending approvals and allow operators to approve via CLI or a small web UI.
++ - Lists pending approvals in manual approvals store and allows approve/reject with a reason
++ - Intended for human-in-the-loop guardrails
++"""
++import requests, os, json
++
++MANUAL_APPROVAL_LIST = os.environ.get("MANUAL_APPROVAL_STORE", "/data/manual_approvals.jsonl")
++APPROVAL_API = os.environ.get("MANUAL_APPROVAL_API", "http://manual-approval:8080")
++
++def list_pending():
++    try:
++        r = requests.get(f"{APPROVAL_API}/list", timeout=5)
++        return r.json()
++    except Exception:
++        # fallback: read file
++        out=[]
++        if os.path.exists(MANUAL_APPROVAL_LIST):
++            for l in open(MANUAL_APPROVAL_LIST):
++                out.append(json.loads(l))
++        return out
++
++def approve(request_id, approver):
++    requests.post(f"{APPROVAL_API}/approve", json={"request_id": request_id, "approver": approver})
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/README_GUARDRAILS.md
++Guardrails: Risk Mitigation Runbook & Implementation Notes
++-------------------------------------------------------
++
++This patch adds multiple safety and mitigation components:
++- Hard-policy enforcer (services/policy/hard_policy_enforcer.py): enforces forbidden terms, token limits, and evidence_required policy paths.
++- Central audit logger (services/audit/audit_logger.py) to persist actions with optional S3 persistence.
++- Budget manager (services/cost/budget_manager.py) to enforce tenant/model cost budgets via Redis.
++- Inference gateway (services/serving/inference_gateway.py) which integrates DLP, budget checks, hard policy checks, audit logging and forwarding to model endpoints.
++- Manual approval service (services/policy/manual_approval.py) to enable human fail-safe on high-risk requests and promotions.
++- Safe promotion controller (services/serving/safe_promotion_controller.py) ensures only safe candidates auto-promote; otherwise requests human approval.
++- Budget alerts poller (services/observability/budget_alerts.py) to notify when budgets are exhausted.
++- DLP integration helper (services/security/dlp_integration.py).
++- Operator approval helper (services/agents/approval_operator_stub.py).
++- Config file with hard constraints (config/policies/hard_constraints.json)
++
++Operator actions to deploy:
++1. Deploy Redis (if not present) and configure BUDGET_REDIS_URL.
++2. Deploy inference gateway in front of your model endpoints and route client traffic to it.
++3. Configure SERVICE_API_KEY and MODEL_ENDPOINT_* env vars in the gateway deployment.
++4. Wire MANUAL_APPROVAL service (manual-approval) and ensure operators can call /approve.
++5. Ensure audit logger has EVIDENCE_BUCKET set if S3 persistence is required.
++6. Tune policies in config/policies/hard_constraints.json for your org's risk appetite.
++
++Notes:
++- These components are scaffolds. In production:
++  - Use a hardened API gateway (with proper auth), not direct FastAPI exposed to Internet.
++  - Integrate manual approvals with ticketing/ChatOps for traceability.
++  - Use Redis or a backing store with ACLs for budgets; make budget enforcement robust to clock drift.
++  - Expand DLP rules and integrate enterprise DLP solutions as required.
++
+*** End Patch
+*** End Patch

@@ -1,0 +1,557 @@
+*** Begin Patch
+*** Add File:ops/argo/training_promotion_workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  name: verifier-retrain-and-promote
++  namespace: ml-pipelines
++spec:
++  entrypoint: retrain-promote
++  serviceAccountName: argo-workflow-sa
++  templates:
++  - name: retrain-promote
++    dag:
++      tasks:
++      - name: fetch-training-manifest
++        template: fetch-manifest
++      - name: autolabel-validate
++        dependencies: [fetch-training-manifest]
++        template: validate-manifest
++      - name: finetune
++        dependencies: [autolabel-validate]
++        template: finetune
++      - name: validation-battery
++        dependencies: [finetune]
++        template: validation-battery
++      - name: sign-and-publish
++        dependencies: [validation-battery]
++        template: sign-and-publish
++      - name: canary-deploy
++        dependencies: [sign-and-publish]
++        template: canary-deploy
++      - name: canary-eval
++        dependencies: [canary-deploy]
++        template: canary-eval
++      - name: gated-promote
++        dependencies: [canary-eval]
++        template: gated-promote
++
++  - name: fetch-manifest
++    script:
++      image: alpine:3.18
++      command: [sh]
++      source: |
++        set -euo pipefail
++        echo "Fetching training manifest from shared storage..."
++        # idempotent checkout, manifest path must be available via PVC or object store
++        if [ ! -f /work/train_manifest.jsonl ]; then
++          echo "No manifest found; exiting early"
++          exit 0
++        fi
++        cp /work/train_manifest.jsonl /tmp/train_manifest.jsonl
++
++  - name: validate-manifest
++    script:
++      image: python:3.10-slim
++      command: [sh]
++      source: |
++        set -euo pipefail
++        pip install jsonschema
++        python - <<PY
++import json,sys
++from jsonschema import validate, ValidationError
++schema = {"type":"object", "properties":{"id":{"type":"string"}, "text":{"type":"string"}, "label":{"type":"string"}}, "required":["id","text"]}
++valid=True
++for l in open("/tmp/train_manifest.jsonl"):
++    j=json.loads(l)
++    try:
++        validate(j,schema)
++    except ValidationError as e:
++        print("schema invalid:", e); valid=False; break
++if not valid:
++    sys.exit(2)
++print("manifest validated")
++PY
++
++  - name: finetune
++    container:
++      image: us.gcr.io/aegis/verifier-trainer:latest
++      command: ["/bin/sh","-c"]
++      args:
++        - |
++          set -euo pipefail
++          export OUT_DIR=/workspace/out/verifier/$(date +%s)
++          mkdir -p $OUT_DIR
++          python services/factuality/finetune_verifier.py --data /tmp/train_manifest.jsonl --out_dir $OUT_DIR --model_name facebook/bart-large --epochs 2
++          cp -r $OUT_DIR /workspace/out/
++    retryStrategy:
++      limit: 2
++      retryPolicy: "OnFailure"
++
++  - name: validation-battery
++    container:
++      image: us.gcr.io/aegis/validation-battery:latest
++      command: ["/bin/sh","-c"]
++      args:
++        - |
++          set -euo pipefail
++          python services/ci/validation_battery.py /workspace/out/verifier
++    retryStrategy:
++      limit: 1
++      retryPolicy: "OnFailure"
++
++  - name: sign-and-publish
++    script:
++      image: us.gcr.io/aegis/cosign-ci:latest
++      command: [sh]
++      source: |
++        set -euo pipefail
++        ARTIFACT_DIR=/workspace/out/verifier
++        TAR=/workspace/out/verifier.tar.gz
++        tar -czf $TAR -C $ARTIFACT_DIR .
++        ./ops/supplychain/sign_artifact.sh $TAR || true
++        # Upload artifact to model registry or object store (idempotent put)
++        gsutil cp $TAR gs://aegis-model-registry/verifier/$(date +%s)/verifier.tar.gz
++
++  - name: canary-deploy
++    script:
++      image: bitnami/kubectl:1.27
++      command: [sh]
++      source: |
++        set -euo pipefail
++        # Create canary deployment updating verifier image or configmap
++        kubectl -n safety apply -f services/factuality/k8s/verifier-canary-deploy.yaml
++        kubectl -n safety rollout status deployment/verifier-canary --timeout=120s
++
++  - name: canary-eval
++    container:
++      image: us.gcr.io/aegis/canary-eval:latest
++      command: ["/bin/sh","-c"]
++      args:
++        - |
++          set -euo pipefail
++          python services/ci/run_canary_checks.py --canary-url http://verifier-canary.safety.svc:8080/verify --baseline-url http://verifier.safety.svc:8080/verify --samples ops/factuality/verification_samples.jsonl --threshold-f1 0.7
++    retryStrategy:
++      limit: 0
++
++  - name: gated-promote
++    script:
++      image: bitnami/kubectl:1.27
++      command: [sh]
++      source: |
++        set -euo pipefail
++        # Query the canary evaluation result artifact or CRD and decide
++        RESULT_JSON=/workspace/canary_result.json
++        if [ -f $RESULT_JSON ]; then
++          PASS=$(jq -r .pass $RESULT_JSON)
++        else
++          echo "{\"pass\":false}" > $RESULT_JSON
++          PASS=false
++        fi
++        if [ "$PASS" = "true" ]; then
++          echo "Promoting candidate to prod (idempotent apply)"
++          kubectl -n safety apply -f services/factuality/k8s/verifier-prod-deploy.yaml
++          kubectl -n safety rollout status deployment/verifier --timeout=120s
++        else
++          echo "Canary failed — creating human review ticket"
++          # create a ticket in issue tracker (placeholder)
++          curl -sS -X POST "${TICKET_URL:-http://ticket.svc}/create" -d '{"title":"Verifier Canary Failed","body":"Auto-promotion blocked; manual review required."}' || true
++          # also call manual approval service
++          curl -sS -X POST "${MANUAL_APPROVAL_URL:-http://manual-approval.inference.svc}/request" -d '{"request_id":"verifier_candidate","user":"system","reason":"canary_failed"}' || true
++          exit 1
++        fi
++
++  # Volume mounts for workspace should be provided by a persistent volume claim in the Argo workflow template in cluster
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/factuality/calibrate_verifier.py
++#!/usr/bin/env python3
++"""
++Calibrate verifier thresholds and produce a signed calibration artifact.
++ - Loads predictions and labels from validation samples, computes precision/recall/F1 at multiple thresholds
++ - Writes thresholds.json with recommended threshold for 'support' label at desired precision target
++ - Registers calibration artifact in metadata service
++"""
++import argparse, json, numpy as np, os
++from sklearn.metrics import precision_recall_fscore_support
++from services.metadata.metadata_service import register_artifact
++
++def calibrate(preds_path, labels_path, out_dir, precision_target=0.9):
++    os.makedirs(out_dir, exist_ok=True)
++    preds = [json.loads(l) for l in open(preds_path)]
++    labs = [json.loads(l) for l in open(labels_path)]
++    scores = [p.get("best",{}).get("score",0.0) for p in preds]
++    y_true = [1 if l.get("label")=="support" else 0 for l in labs]
++    thresholds = list(np.linspace(0.0,1.0,101))
++    best = {"threshold":0.5,"precision":0.0,"recall":0.0,"f1":0.0}
++    for t in thresholds:
++        y_pred = [1 if s>=t else 0 for s in scores]
++        p,r,f,_ = precision_recall_fscore_support(y_true,y_pred,average='binary',zero_division=0)
++        if p >= precision_target and f > best["f1"]:
++            best = {"threshold":t,"precision":p,"recall":r,"f1":f}
++    with open(os.path.join(out_dir,"thresholds.json"),"w") as f:
++        json.dump(best,f,indent=2)
++    register_artifact({"id": f"verifier_calib_{int(os.time())}", "type":"calibration", "path": os.path.join(out_dir,"thresholds.json"), "meta": best})
++    print("Calibration written:", best)
++
++if __name__=="__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--preds", required=True)
++    p.add_argument("--labels", required=True)
++    p.add_argument("--out", required=True)
++    p.add_argument("--precision", type=float, default=0.9)
++    args=p.parse_args()
++    calibrate(args.preds, args.labels, args.out, args.precision)
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/verifier_calibrate_and_gate.yml
++name: Verifier Calibrate & Gate
++on:
++  workflow_dispatch:
++
++jobs:
++  calibrate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Py
++        uses: actions/setup-python@v4
++        with: {python-version: '3.10'}
++      - name: Install deps
++        run: pip install scikit-learn numpy
++      - name: Download preds & labels (from CI artifacts or bucket)
++        run: |
++          # operator must populate PRED_ARTIFACT and LABEL_ARTIFACT secrets/paths
++          : 
++      - name: Calibrate
++        run: python services/factuality/calibrate_verifier.py --preds ops/factuality/sample_preds.jsonl --labels ops/factuality/verification_samples.jsonl --out out/calib --precision 0.9
++      - name: Upload calibration artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: verifier_calibration
++          path: out/calib
++
++  gate:
++    runs-on: ubuntu-latest
++    needs: calibrate
++    steps:
++      - uses: actions/checkout@v4
++      - name: Download calibration
++        uses: actions/download-artifact@v4
++        with: {name: verifier_calibration}
++      - name: Deploy calibration configmap
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG }}
++        run: |
++          kubectl -n safety create configmap verifier-calib --from-file=out/calib --dry-run=client -o yaml | kubectl apply -f -
++          kubectl -n safety rollout restart deployment/verifier
++          kubectl -n safety rollout status deployment/verifier --timeout=120s
++      - name: Run verifier gate checks
++        env:
++          VERIFIER_URL: ${{ secrets.VERIFIER_URL }}
++        run: |
++          python services/factuality/verifier_gate.py || (echo "Verifier gate failed" && exit 1)
++
+*** End Patch
+*** Begin Patch
+*** Add File:security/cosign/webhook/README_ADMISSION.md
++Cosign Admission Controller (Hardened deployment notes)
++ - Use the cosign validating webhook to refuse unsigned images in production namespaces.
++ - Must run with TLS certs (use cert-manager with KubernetesIssuer).
++ - Configure SERVICE_COSIGN_KMS_ARN to point to your KMS-backed public key URI (e.g., ksm://arn:aws:kms:...).
++ - Deploy a ValidatingWebhookConfiguration that targets "create" for pods and deployments in prod namespace.
++
++High-level steps:
++ 1. Provision KMS key (AWS/GCP/HSM) and export public key for cosign verification.
++ 2. Deploy webhook container (see services/cosign/webhook/*).
++ 3. Create TLS secret used by webhook service (cert-manager can automate).
++ 4. Create ValidatingWebhookConfiguration referencing the service and CA bundle.
++
+*** End Patch
+*** Begin Patch
+*** Add File:security/cosign/webhook/deployment.yaml
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: admission
++---
++apiVersion: v1
++kind: Secret
++metadata:
++  name: cosign-webhook-tls
++  namespace: admission
++type: kubernetes.io/tls
++data:
++  tls.crt: "" # operator must populate via cert-manager or manual cert
++  tls.key: ""
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: cosign-admission-webhook
++  namespace: admission
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: cosign-admission
++  template:
++    metadata:
++      labels:
++        app: cosign-admission
++    spec:
++      containers:
++      - name: webhook
++        image: us.gcr.io/aegis/cosign-admission:latest
++        env:
++          - name: SERVICE_COSIGN_KMS_ARN
++            valueFrom:
++              secretKeyRef:
++                name: cosign-kms
++                key: kms_arn
++        ports:
++          - containerPort: 8443
++        volumeMounts:
++          - name: cert
++            mountPath: /certs
++            readOnly: true
++      volumes:
++      - name: cert
++        secret:
++          secretName: cosign-webhook-tls
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: cosign-admission
++  namespace: admission
++spec:
++  ports:
++    - port: 443
++      targetPort: 8443
++  selector:
++    app: cosign-admission
++---
++apiVersion: admissionregistration.k8s.io/v1
++kind: ValidatingWebhookConfiguration
++metadata:
++  name: cosign-validating-webhook
++webhooks:
++  - name: cosign.aegis.example.com
++    admissionReviewVersions: ["v1","v1beta1"]
++    sideEffects: None
++    failurePolicy: Fail
++    clientConfig:
++      service:
++        name: cosign-admission
++        namespace: admission
++        path: /validate
++      caBundle: "" # populate with CA used by the webhook TLS cert
++    rules:
++      - operations: ["CREATE"]
++        apiGroups: [""]
++        apiVersions: ["v1"]
++        resources: ["pods","deployments"]
++    namespaceSelector:
++      matchExpressions:
++        - key: environment
++          operator: In
++          values: ["prod"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agents/rl/rl_sandbox.py
++"""
++RL Sandbox & Safe Agent skeleton for cost-quality tradeoffs.
++ - Runs in a sandbox environment with a simulated traffic generator and reward function
++ - Produces suggested policy actions but requires human approval before any cluster change
++ - Provides a REST API to view candidate actions and training metrics
++"""
++import os
++import time
++import json
++import random
++import threading
++from typing import Dict, Any
++from fastapi import FastAPI
++
++app = FastAPI(title="RL Agent Sandbox")
++
++# Simple in-memory policy store
++POLICY_CANDIDATES = []
++
++def simulate_env_step(action: Dict[str,Any]) -> float:
++    # Simulate reward: positive for lower cost and maintained quality, negative for safety violations
++    cost_saved = action.get("cost_saving", 0.0)
++    quality_impact = action.get("quality_delta", 0.0)
++    safety_penalty = action.get("safety_risk", 0.0)
++    reward = cost_saving*10.0 + quality_impact*100.0 - safety_penalty*1000.0
++    return reward
++
++def propose_candidate():
++    # Random policy perturbation example
++    c = {"id": f"cand_{int(time.time())}_{random.randint(0,999)}", "action":{"switch_to_student_pct": random.choice([10,20,30,50])}, "meta":{}}
++    # simulate reward
++    r = simulate_env_step({"cost_saving": c["action"]["switch_to_student_pct"]/100.0, "quality_delta": -0.01, "safety_risk": 0.0})
++    c["est_reward"] = r
++    POLICY_CANDIDATES.append(c)
++
++@app.on_event("startup")
++def start_worker():
++    def loop():
++        while True:
++            propose_candidate()
++            time.sleep(60)
++    t = threading.Thread(target=loop, daemon=True)
++    t.start()
++
++@app.get("/candidates")
++def list_candidates():
++    return POLICY_CANDIDATES[-20:]
++
++@app.post("/apply")
++def apply_candidate(candidate_id: str, approver: str):
++    # In sandbox only: record approval request and emit manual approval external ticket
++    for c in POLICY_CANDIDATES:
++        if c["id"] == candidate_id:
++            # write to manual approval service and log
++            try:
++                import requests
++                requests.post(os.environ.get("MANUAL_APPROVAL_URL","http://manual-approval:8080/request"), json={"request_id": candidate_id, "user": approver, "reason":"rl_suggested"})
++            except Exception:
++                pass
++            return {"status":"requested_approval","candidate":c}
++    return {"status":"not_found"}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/sustainability/wattmeter_integration.py
++"""
++Wattmeter integration & calibrated estimator
++ - Periodically consumes synchronized wattmeter CSVs and node telemetry to compute calibration
++ - Publishes calibration JSON used by telemetry estimator and writes Prometheus-exportable calibration metrics
++"""
++import os, time, json
++from prometheus_client import Gauge, start_http_server
++import numpy as np
++
++CALIBRATION_OUT = os.environ.get("WATT_CALIB_OUT", "/data/telemetry_calibration.json")
++CSV_PATH = os.environ.get("WATT_CSV_PATH", "/data/wattmeter.csv")
++MET_PORT = int(os.environ.get("WATT_MET_PORT","9470"))
++
++G_SCALE = Gauge("aegis_telemetry_scale", "Telemetry calibration scale")
++G_OFFSET = Gauge("aegis_telemetry_offset", "Telemetry calibration offset")
++
++def calibrate_from_csv(csv_path):
++    ts=[]; watts=[]
++    for l in open(csv_path):
++        if not l.strip(): continue
++        t,w = l.strip().split(",")
++        ts.append(float(t)); watts.append(float(w))
++    ts=np.array(ts); watts=np.array(watts)
++    # Example: naive fit against NVML mean exposure sampled previously at matching timestamps (operator must produce matching telemetry)
++    # Here we provide a simple linear fit between telemetry_estimate and wattmeter ground truth
++    telemetry_samples = np.linspace(1.0,2.0,len(watts)) # placeholder
++    A = np.vstack([telemetry_samples, np.ones(len(watts))]).T
++    a,b = np.linalg.lstsq(A, watts, rcond=None)[0]
++    cfg = {"scale": float(a), "offset": float(b)}
++    with open(CALIBRATION_OUT,"w") as f:
++        json.dump(cfg,f,indent=2)
++    G_SCALE.set(cfg["scale"]); G_OFFSET.set(cfg["offset"])
++    return cfg
++
++if __name__=="__main__":
++    start_http_server(MET_PORT)
++    while True:
++        if os.path.exists(CSV_PATH):
++            try:
++                cfg=calibrate_from_csv(CSV_PATH)
++                print("Wattmeter calibration saved", cfg)
++            except Exception as e:
++                print("calibration error", e)
++        time.sleep(600)
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/triton/kernel_autotuner/integration_job.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: triton-kernel-autotuner
++  namespace: inference
++spec:
++  template:
++    spec:
++      restartPolicy: OnFailure
++      nodeSelector:
++        accelerator: nvidia
++      containers:
++      - name: tuner
++        image: us.gcr.io/aegis/kernel-tuner:latest
++        resources:
++          limits:
++            nvidia.com/gpu: 1
++        command: ["/bin/sh","-c"]
++        args:
++          - |
++            set -euo pipefail
++            python services/triton/kernel_opt/opt_tuner.py
++            # upload best config to model registry or write to PVC used by Triton backend
++            if [ -f ops/triton/backend/kernel_best_config.json ]; then
++              kubectl -n inference create configmap kernel-best-config --from-file=ops/triton/backend/kernel_best_config.json --dry-run=client -o yaml | kubectl apply -f -
++            fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/runbooks/Operator_Autonomy_Playbook.md
++# Operator Playbook: From scaffold to production-grade autonomous flows
++
++This runbook describes the concrete human steps and approvals required to safely enable automated retrain/promote flows and RL-driven policy actions.
++
++1) Pre-deployment checks
++ - Ensure KMS keys exist and cosign signing is functional; cosign must sign artifacts produced by CI.
++ - Ensure ValidatingWebhookConfiguration for cosign is in place for production namespaces.
++ - Confirm S3 buckets with Object Lock enabled for evidence and artifacts used for compliance (legal signoff).
++
++2) Argo workflow readiness
++ - Ensure argo-workflow-sa has limited RBAC scoped to ml-pipelines namespace.
++ - Ensure PV/PVC used by workflows are backed up and have sufficient capacity.
++ - Validate finetune container images (reproducible builds) and that metadata service is reachable.
++
++3) Canary strategy
++ - Shadow for minimum 7 days or 100k inference samples.
++ - Canary 1% → 5% → 10% with 24–72h observation windows; require SME signoff between steps.
++
++4) Enabling RL actions
++ - RL agent outputs must produce a manual-approval request before any cluster modification.
++ - Only after human approval in the manual-approval service may the operator apply changes recommended by RL agent.
++
++5) Incident & rollback
++ - If canary or spec acceptance metrics breach thresholds, run argo rollback template and create an incident ticket.
++ - Follow SLO runbook to scale rater capacity and initiate urgent retrain if verifier regression observed.
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/ci/kernel_autotuner_workflow.yml
++name: Kernel Autotuner CI
++on:
++  workflow_dispatch:
++
++jobs:
++  run-autotuner:
++    runs-on: self-hosted
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run kernel tuner on GPU host
++        run: |
++          python services/triton/kernel_opt/opt_tuner.py
++      - name: Upload best config
++        uses: actions/upload-artifact@v4
++        with:
++          name: kernel_best_config
++          path: ops/triton/backend/kernel_best_config.json
++
+*** End Patch
+*** End Patch

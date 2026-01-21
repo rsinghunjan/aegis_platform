@@ -1,0 +1,612 @@
+*** Begin Patch
+*** Add File:services/observability/telemetry.py
++"""
++Per-inference telemetry helper.
++ - Records latency, tokens, GPU power, memory, kWh, CO2e, verifier score, provenance links.
++ - Writes events to a local/remote event store and exposes Prometheus metrics.
++ - Intended to be called from inference middleware around each request.
++"""
++import time, os, json
++from prometheus_client import Counter, Gauge
++from services.sustainability.gpu_telemetry import get_gpu_stats
++from services.sustainability.energy_estimator import estimate_energy_for_duration_seconds, estimate_co2e_for_kwh
++
++METRIC_INFER_COUNT = Counter("aegis_inference_count_total", "Total inferences")
++METRIC_INFER_LATENCY = Gauge("aegis_inference_latency_seconds", "Inference latency seconds")
++METRIC_INFER_KWH = Counter("aegis_inference_kwh_total", "Total kWh for inference")
++METRIC_INFER_CO2 = Counter("aegis_inference_co2_kg_total", "Total CO2e for inference kg")
++METRIC_TOKEN_COUNT = Counter("aegis_inference_tokens_total", "Total tokens generated")
++METRIC_VERIFIER_SCORE = Gauge("aegis_verifier_score", "Verifier support score (last)")
++
++EVENT_LOG_PATH = os.environ.get("OBS_EVENT_LOG", "/var/log/aegis/inference_events.jsonl")
++
++def record_inference(req_id: str, model: str, start_ts: float, end_ts: float, tokens:int, verifier_score:float, provenance:list):
++    dur = end_ts - start_ts
++    METRIC_INFER_COUNT.inc()
++    METRIC_INFER_LATENCY.set(dur)
++    METRIC_TOKEN_COUNT.inc(tokens)
++    METRIC_VERIFIER_SCORE.set(verifier_score or 0.0)
++    kwh = estimate_energy_for_duration_seconds(dur)
++    co2 = estimate_co2e_for_kwh(kwh)
++    METRIC_INFER_KWH.inc(kwh)
++    METRIC_INFER_CO2.inc(co2)
++    # attach GPU snapshot if available
++    gpu = None
++    try:
++        gs = get_gpu_stats()
++        gpu = gs[0] if gs else None
++    except Exception:
++        gpu = None
++    ev = {
++        "ts": time.time(),
++        "req_id": req_id,
++        "model": model,
++        "latency_s": dur,
++        "tokens": tokens,
++        "verifier_score": verifier_score,
++        "provenance": provenance,
++        "kwh": kwh,
++        "co2_kg": co2,
++        "gpu": gpu
++    }
++    try:
++        os.makedirs(os.path.dirname(EVENT_LOG_PATH), exist_ok=True)
++        with open(EVENT_LOG_PATH, "a") as f:
++            f.write(json.dumps(ev) + "\n")
++    except Exception:
++        pass
++    return ev
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/observability/metadata_store.py
++"""
++Centralized metadata store for models, datasets, experiments and artifacts.
++ - Lightweight SQLite-backed store for scaffolding. Replace with Postgres in prod.
++ - Tracks model versions, dataset versions, training runs, metric snapshots, and provenance links.
++"""
++import os, sqlite3, json, time
++DB_PATH = os.environ.get("METADATA_DB", "/data/metadata.db")
++
++def init_db():
++    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
++    conn = sqlite3.connect(DB_PATH)
++    cur = conn.cursor()
++    cur.execute("""CREATE TABLE IF NOT EXISTS models (
++        id TEXT PRIMARY KEY, name TEXT, version TEXT, created_at REAL, metadata TEXT
++    )""")
++    cur.execute("""CREATE TABLE IF NOT EXISTS datasets (
++        id TEXT PRIMARY KEY, name TEXT, version TEXT, created_at REAL, metadata TEXT
++    )""")
++    cur.execute("""CREATE TABLE IF NOT EXISTS experiments (
++        id TEXT PRIMARY KEY, model_id TEXT, dataset_id TEXT, params TEXT, metrics TEXT, created_at REAL
++    )""")
++    cur.execute("""CREATE TABLE IF NOT EXISTS artifacts (
++        id TEXT PRIMARY KEY, type TEXT, path TEXT, metadata TEXT, created_at REAL
++    )""")
++    conn.commit(); conn.close()
++
++def register_model(id, name, version, metadata):
++    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
++    cur.execute("INSERT OR REPLACE INTO models (id,name,version,created_at,metadata) VALUES (?,?,?,?,?)",
++                (id,name,version,time.time(),json.dumps(metadata)))
++    conn.commit(); conn.close()
++
++def register_experiment(id, model_id, dataset_id, params, metrics):
++    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
++    cur.execute("INSERT OR REPLACE INTO experiments (id,model_id,dataset_id,params,metrics,created_at) VALUES (?,?,?,?,?,?)",
++                (id,model_id,dataset_id,json.dumps(params),json.dumps(metrics),time.time()))
++    conn.commit(); conn.close()
++
++def query_models():
++    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
++    cur.execute("SELECT id,name,version,metadata,created_at FROM models")
++    rows = cur.fetchall(); conn.close()
++    return [{"id":r[0],"name":r[1],"version":r[2],"meta":json.loads(r[3]) if r[3] else {}, "created_at": r[4]} for r in rows]
++
++if __name__=="__main__":
++    init_db()
++    register_model("m1","verifier","v0.1",{"notes":"initial"})
++    print(query_models())
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/drift/label_drift.py
++"""
++Label distribution drift detector.
++ - Computes distribution over labels (from rater outputs / ground truth) and compares to baseline using JS divergence.
++ - Emits Prometheus metrics and triggers webhook on significant drift.
++"""
++import os, json, time
++import numpy as np
++from prometheus_client import Gauge, start_http_server
++from scipy.stats import entropy
++
++BASELINE_PATH = os.environ.get("LABEL_BASELINE", "/data/label_baseline.json")
++SAMPLES_PATH = os.environ.get("LABEL_SAMPLES", "/data/label_samples.jsonl")
++DRIFT_THRESHOLD = float(os.environ.get("LABEL_DRIFT_THRESHOLD", "0.2"))
++METRIC_LABEL_JS = Gauge("aegis_label_js_divergence", "Jensen-Shannon divergence of label distributions")
++WEBHOOK = os.environ.get("LABEL_DRIFT_WEBHOOK", "")
++
++def load_baseline():
++    if os.path.exists(BASELINE_PATH):
++        return json.load(open(BASELINE_PATH))
++    return {}
++
++def load_samples():
++    counts = {}
++    if os.path.exists(SAMPLES_PATH):
++        for l in open(SAMPLES_PATH):
++            try:
++                j = json.loads(l)
++                lab = j.get("label","unknown")
++                counts[lab]=counts.get(lab,0)+1
++            except Exception:
++                continue
++    return counts
++
++def js_divergence(p, q):
++    # p and q are dicts label->count
++    labels = set(p.keys()) | set(q.keys())
++    P = np.array([p.get(l,0) for l in labels], dtype=float)
++    Q = np.array([q.get(l,0) for l in labels], dtype=float)
++    if P.sum()==0 or Q.sum()==0: return 0.0
++    P/=P.sum(); Q/=Q.sum()
++    M = 0.5*(P+Q)
++    return 0.5*(entropy(P,M)+entropy(Q,M))
++
++def main_loop():
++    start_http_server(int(os.environ.get("LABEL_DRIFT_METRICS_PORT", "9430")))
++    baseline = load_baseline()
++    while True:
++        samples = load_samples()
++        score = js_divergence(baseline, samples)
++        METRIC_LABEL_JS.set(score)
++        if score >= DRIFT_THRESHOLD and WEBHOOK:
++            try:
++                import requests
++                requests.post(WEBHOOK, json={"type":"label_drift","score":score}, timeout=5)
++            except Exception:
++                pass
++        time.sleep(int(os.environ.get("LABEL_DRIFT_POLL", "300")))
++
++if __name__=="__main__":
++    main_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/autonomy/label_pipeline.py
++"""
++Label ingestion pipeline:
++ - Polls human_queue for resolved labels, validates schema, deduplicates and writes to training manifest and metadata store
++ - Emits ground-truth funnel metrics (#labels/day, rater latency, agreement rates)
++"""
++import os, time, json
++import requests
++from prometheus_client import start_http_server, Counter, Gauge
++from services.observability.metadata_store import register_experiment
++
++HUMAN_QUEUE_API = os.environ.get("HUMAN_QUEUE_API", "http://human-queue.safety.svc:80/tasks")
++TRAIN_MANIFEST = os.environ.get("TRAIN_MANIFEST_PATH", "/data/train_manifest.jsonl")
++SAMPLES_POLL = int(os.environ.get("LABEL_PIPE_POLL", "60"))
++
++MET_LABELS_DAY = Counter("aegis_labels_total", "Total labels ingested")
++MET_RATER_LATENCY = Gauge("aegis_rater_latency_seconds", "Rater latency seconds (avg)")
++MET_AGREEMENT = Gauge("aegis_rater_agreement_rate", "Rater agreement rate")
++
++def fetch_resolved():
++    try:
++        r = requests.get(HUMAN_QUEUE_API, timeout=10)
++        r.raise_for_status()
++        return r.json()
++    except Exception:
++        return []
++
++def validate_record(r):
++    # minimal schema validation
++    return "text" in r and ("label" in r or "verdict" in r)
++
++def dedupe_and_append(records):
++    seen = set()
++    os.makedirs(os.path.dirname(TRAIN_MANIFEST), exist_ok=True)
++    with open(TRAIN_MANIFEST, "a") as f:
++        for r in records:
++            key = r.get("text")[:200] + "|" + str(r.get("label") or r.get("verdict"))
++            if key in seen: continue
++            seen.add(key)
++            f.write(json.dumps({"id": r.get("id"), "text": r.get("text"), "label": r.get("label") or r.get("verdict")}) + "\n")
++            MET_LABELS_DAY.inc()
++
++def compute_basic_stats(records):
++    # compute average latency and simple agreement estimate
++    latencies = [r.get("latency",0) for r in records if r.get("latency",0)]
++    if latencies:
++        MET_RATER_LATENCY.set(sum(latencies)/len(latencies))
++    # naive agreement: fraction where label==consensus (stub)
++    MET_AGREEMENT.set(0.9)
++
++def main_loop():
++    start_http_server(int(os.environ.get("LABEL_PIPE_METRICS_PORT", "9432")))
++    while True:
++        recs = fetch_resolved()
++        new = [r for r in recs if validate_record(r)]
++        if new:
++            dedupe_and_append(new)
++            compute_basic_stats(new)
++            # register experiment entry
++            register_experiment(str(time.time()), "verifier", "dataset", {"source":"human_queue"}, {"n_labels":len(new)})
++        time.sleep(SAMPLES_POLL)
++
++if __name__=="__main__":
++    main_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/data/augment.py
++"""
++Auto-augmentation and synthetic labeling helpers.
++ - Simple paraphrase generator stub (for production replace with backtranslation or LLM-based augmentation with verification)
++ - Assigns a synthetic confidence score and writes augmented records to augmentation manifest
++"""
++import os, json, random
++
++AUG_OUT = os.environ.get("AUG_OUT", "/data/augmented.jsonl")
++
++def paraphrase(text):
++    # placeholder naive transformation
++    return text + " (paraphrase)"
++
++def augment_and_score(record):
++    aug = paraphrase(record["text"])
++    conf = random.uniform(0.6, 0.9)
++    return {"id": record.get("id") + "_aug", "text": aug, "label": record["label"], "confidence": conf}
++
++def run_from_manifest(manifest_path):
++    if not os.path.exists(manifest_path): return
++    with open(manifest_path) as f, open(AUG_OUT, "a") as out:
++        for l in f:
++            r = json.loads(l)
++            if r.get("label"):
++                a = augment_and_score(r)
++                out.write(json.dumps(a) + "\n")
++
++if __name__=="__main__":
++    import sys
++    run_from_manifest(sys.argv[1] if len(sys.argv)>1 else "/data/train_manifest.jsonl")
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/data/validators.py
++"""
++Data quality validators and schema checks.
++ - Basic JSON schema validation and heuristics for text length, null fields, and source provenance.
++ - Write failing records to a quarantine location for human review.
++"""
++import os, json
++from jsonschema import validate, ValidationError
++
++SCHEMA = {
++    "type":"object",
++    "properties":{
++        "id":{"type":"string"},
++        "text":{"type":"string"},
++        "label":{"type":["string","null"]}
++    },
++    "required":["id","text"]
++}
++
++QUARANTINE_DIR = os.environ.get("DATA_QUARANTINE", "/data/quarantine")
++
++def check_record(rec):
++    try:
++        validate(rec, SCHEMA)
++    except ValidationError as e:
++        os.makedirs(QUARANTINE_DIR, exist_ok=True)
++        with open(os.path.join(QUARANTINE_DIR, f"{rec.get('id')}.json"), "w") as f:
++            f.write(json.dumps({"record": rec, "error": str(e)}))
++        return False
++    if len(rec.get("text","")) < 3:
++        return False
++    return True
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/ci/validation_battery.py
++"""
++Validation battery orchestrator:
++ - Runs unit tests, adversarial suite, fairness checks, verifier/recall/regression tests and perf benchmarks on a candidate model.
++ - Returns a composite pass/fail result consumed by the Trainer Orchestrator for promotion gating.
++"""
++import os, json, subprocess, time
++
++def run_cmd(cmd, timeout=300):
++    try:
++        subprocess.check_call(cmd, timeout=timeout)
++        return True, ""
++    except subprocess.CalledProcessError as e:
++        return False, str(e)
++    except Exception as e:
++        return False, str(e)
++
++def run_battery(candidate_dir):
++    results = {}
++    # unit tests
++    results["unit_tests"], results["unit_msg"] = run_cmd(["pytest","-q","tests/unit"])
++    # adversarial safety (placeholder)
++    results["adversarial"], results["adv_msg"] = run_cmd(["python","ops/tests/run_adversarial_suite.py", candidate_dir])
++    # fairness tests (placeholder)
++    results["fairness"], results["fair_msg"] = run_cmd(["python","ops/tests/fairness_check.py", candidate_dir])
++    # verifier/regression tests
++    results["verifier"], results["ver_msg"] = run_cmd(["python","services/factuality/verifier_gate.py"])
++    # perf benchmark (placeholder)
++    results["perf"], results["perf_msg"] = run_cmd(["python","ops/tests/bench_model.py", candidate_dir])
++    # composite decision
++    passed = all(results.get(k,False) for k in ["unit_tests","adversarial","fairness","verifier","perf"])
++    return passed, results
++
++if __name__=="__main__":
++    import sys
++    c = sys.argv[1] if len(sys.argv)>1 else "out/verifier"
++    print(run_battery(c))
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/ci/canary_runner.py
++"""
++Canary runner:
++ - Deploys candidate model to a canary deployment (k8s) and routes a small percentage of traffic (via VirtualService or proxy)
++ - Runs shadow/compare tests for a configured window and collects divergence/safety metrics
++ - Signals promotion or rollback via webhook
++"""
++import os, subprocess, time, requests
++
++CANARY_DEPLOYMENT = os.environ.get("CANARY_DEPLOYMENT", "inference-canary")
++NAMESPACE = os.environ.get("KUBE_NAMESPACE", "inference")
++COMPARE_SCRIPT = os.environ.get("CANARY_COMPARE_SCRIPT", "ops/tests/compare_canary.py")
++PROMOTE_HOOK = os.environ.get("PROMOTE_HOOK", "")
++ROLLBACK_HOOK = os.environ.get("ROLLBACK_HOOK", "")
++
++def deploy_canary(image):
++    # simple kubectl set image pattern
++    subprocess.check_call(["kubectl","-n",NAMESPACE,"set","image","deployment/"+CANARY_DEPLOYMENT,"model="+image])
++
++def run_compare(window_s=300):
++    # run compare script which should return pass/fail
++    try:
++        subprocess.check_call(["python", COMPARE_SCRIPT, "--window", str(window_s)])
++        return True
++    except Exception:
++        return False
++
++def main(image):
++    deploy_canary(image)
++    ok = run_compare(300)
++    if ok and PROMOTE_HOOK:
++        requests.post(PROMOTE_HOOK, json={"image": image})
++    if not ok and ROLLBACK_HOOK:
++        requests.post(ROLLBACK_HOOK, json={"image": image})
++
++if __name__=="__main__":
++    import sys
++    main(sys.argv[1])
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/human_ops/capacity_planner.py
++"""
++Simple capacity planner for raters:
++ - Computes required rater capacity based on backlog, target throughput, and expected SLA
++ - Emits recommended scaling action which can be fed to autoscaler or ops
++"""
++import os, math, requests, json
++
++HUMAN_QUEUE_API = os.environ.get("HUMAN_QUEUE_API", "http://human-queue.safety.svc:80/tasks")
++TARGET_PER_RATER_PER_HOUR = int(os.environ.get("TARGET_PER_RATER_PER_HOUR", "40"))
++
++def get_backlog():
++    try:
++        r = requests.get(HUMAN_QUEUE_API, timeout=10)
++        if r.status_code==200:
++            tasks = r.json()
++            pending = [t for t in tasks if t.get("status") in ("open","claimed")]
++            return len(pending)
++    except Exception:
++        pass
++    return 0
++
++def recommend_replicas():
++    backlog = get_backlog()
++    # assume 1 hour SLA window
++    needed = math.ceil(backlog / TARGET_PER_RATER_PER_HOUR)
++    return max(1, needed)
++
++if __name__=="__main__":
++    print("Recommended replicas:", recommend_replicas())
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/serving/model_residency.py
++"""
++Model residency manager:
++ - Ensures high-value models are resident in Triton / model server
++ - Provides a simple API to preload models and evict low-priority models
++ - Writes residency state to metadata store
++"""
++import os, requests, time
++from services.observability.metadata_store import register_model
++
++TRITON_CONTROL_URL = os.environ.get("TRITON_CONTROL", "http://triton-server.inference:8000/v2/repository/models")
++
++def preload_model(name):
++    url = f"{TRITON_CONTROL_URL}/{name}/load"
++    try:
++        requests.post(url, timeout=10)
++        register_model(f"{name}:{int(time.time())}", name, "residency", {"residency":"loaded"})
++        return True
++    except Exception:
++        return False
++
++def unload_model(name):
++    url = f"{TRITON_CONTROL_URL}/{name}/unload"
++    try:
++        requests.post(url, timeout=10)
++        return True
++    except Exception:
++        return False
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/policy/quarantine.py
++"""
++Quarantine & forensics:
++ - When policy engine decides to quarantine a response, capture full artifact, store in Object Lock S3 path and create an incident.
++ - Optionally enqueue to human_queue for forensic labeling.
++"""
++import os, json, time
++import boto3, requests
++
++S3_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++HUMAN_QUEUE_URL = os.environ.get("HUMAN_QUEUE_URL", "http://human-queue.safety.svc:80/enqueue")
++s3 = boto3.client("s3") if S3_BUCKET else None
++
++def quarantine_artifact(artifact: dict):
++    ts = int(time.time())
++    key = f"quarantine/{ts}_{artifact.get('req_id','unknown')}.json"
++    body = json.dumps(artifact)
++    if s3:
++        s3.put_object(Bucket=S3_BUCKET, Key=key, Body=body.encode("utf-8"))
++    # create incident (git issue or ticket) - for demo we POST to alert queue
++    try:
++        requests.post(os.environ.get("ALERT_QUEUE","http://alert-queue.svc/alerts"), json={"type":"quarantine","s3_key": key, "artifact": artifact}, timeout=5)
++    except Exception:
++        pass
++    # optionally enqueue to human queue
++    try:
++        requests.post(HUMAN_QUEUE_URL, json={"text": artifact.get("prompt",""), "output": artifact.get("answer",""), "severity":"high", "metadata":{"quarantine_key": key}}, timeout=5)
++    except Exception:
++        pass
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/supplychain/sign_artifact.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Sign an artifact (file or tar) using cosign and KMS key configured in COSIGN_AWS_KMS_KEY_ARN
++# Usage: ./sign_artifact.sh <path-to-artifact>
++ART=${1:-}
++if [ -z "$ART" ]; then echo "Usage: $0 <artifact>"; exit 2; fi
++if [ -z "${COSIGN_AWS_KMS_KEY_ARN:-}" ]; then echo "Set COSIGN_AWS_KMS_KEY_ARN env"; exit 2; fi
++cosign sign --key "${COSIGN_AWS_KMS_KEY_ARN}" "$ART"
++echo "Signed $ART"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/experimentation/shadow_runner.py
++"""
++Shadow traffic runner:
++ - For a time window, sends a copy of production requests to candidate model and compares outputs offline
++ - Collects divergence metrics for canary validation
++"""
++import os, requests, time, json
++
++PROD_PROXY = os.environ.get("PROD_PROXY", "http://prod-inference.svc:8080/infer")
++CANARY_PROXY = os.environ.get("CANARY_PROXY", "http://canary-inference.svc:8080/infer")
++OUT_PATH = os.environ.get("SHADOW_OUT", "/data/shadow_results.jsonl")
++
++def shadow_request(req):
++    # send to prod and canary in parallel (non-blocking to response)
++    try:
++        p = requests.post(PROD_PROXY, json=req, timeout=5).json()
++    except Exception:
++        p = {}
++    try:
++        c = requests.post(CANARY_PROXY, json=req, timeout=10).json()
++    except Exception:
++        c = {}
++    rec = {"ts": time.time(), "req": req, "prod": p, "canary": c}
++    with open(OUT_PATH, "a") as f:
++        f.write(json.dumps(rec) + "\n")
++    return rec
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/experimentation/bandit_controller.py
++"""
++Simple multi-armed bandit controller (epsilon-greedy) to route traffic among models and learn rewards.
++ - Uses a reward function (e.g., verifier score or user feedback) to adjust weights.
++ - Stores weights in metadata store or in-memory (scaffold).
++"""
++import random, time, json
++
++ARMS = {"student": {"count":0, "score":0.0}, "teacher":{"count":0,"score":0.0}, "quant":{"count":0,"score":0.0}}
++EPSILON = float(__import__("os").environ.get("BANDIT_EPSILON","0.1"))
++
++def choose_arm():
++    if random.random() < EPSILON:
++        return random.choice(list(ARMS.keys()))
++    # choose best average score
++    best = max(ARMS.items(), key=lambda kv: (kv[1]["score"] / (kv[1]["count"]+1e-6)))
++    return best[0]
++
++def update(arm, reward):
++    a = ARMS[arm]
++    a["count"] += 1
++    a["score"] += reward
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agents/rl_agent_stub.py
++"""
++RL Agent stub for safe cost-quality optimization.
++ - Placeholder: collects state (cost, quality) and returns a suggested policy action.
++ - Implement RL algorithms in a sandboxed, human-reviewed pipeline before automated deployment.
++"""
++def suggest_action(state):
++    # state contains metrics: {"cost_usd_per_min":.., "quality_score":..}
++    if state.get("cost_usd_per_min",0) > 1.0 and state.get("quality_score",0) > 0.9:
++        return {"action":"switch_to_student_partial","pct":80}
++    if state.get("quality_score",0) < 0.8:
++        return {"action":"route_more_to_teacher","pct":20}
++    return {"action":"noop"}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/cost/profiler.py
++"""
++Per-model cost profiler:
++ - Tracks runtime cost per inference using instance type and resource billing heuristics
++ - Integrates with telemetry to compute cost per 1k inferences and emits lightweight reports
++"""
++import os, json, time
++
++PROFILE_OUT = os.environ.get("COST_PROFILE_OUT", "/data/cost_profiles.json")
++
++def compute_cost_for_model(model_name, avg_seconds, instance_cost_per_hour):
++    cost_per_inference = (avg_seconds / 3600.0) * instance_cost_per_hour
++    return cost_per_inference
++
++def write_profile(profile):
++    with open(PROFILE_OUT, "w") as f:
++        f.write(json.dumps(profile, indent=2))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/runbooks/SLO_runbook.md
++# SLO / SRE Runbook (template)
++
++SLOs:
++- API latency p95 <= 2s
++- Verifier precision >= 0.8 on holdout weekly sample
++- Human queue claim SLA <= 5m (95%)
++- Sustainability: CO2e per 1k inferences below target (organisational)
++
++Runbook:
++1. Alert triggers (Prometheus): follow paging runbook and check dashboards.
++2. Investigate: check telemetry event logs (/var/log/aegis/inference_events.jsonl), model residency, GPU metrics.
++3. If drift detected: escalate to orchestrator agent; run reindex -> retrain pipeline.
++4. If verifier regression: increase rater capacity, run active label acquisition, create retrain job.
++5. For suspected data leakage: quarantine artifacts, notify security, rotate keys if needed.
++
+*** End Patch
+*** End Patch

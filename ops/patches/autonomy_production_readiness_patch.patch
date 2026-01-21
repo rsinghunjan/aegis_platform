@@ -1,0 +1,393 @@
+*** Begin Patch
+*** Add File:terraform/kms_rotation/README.md
++Provisioning & rotating KMS keys (operator notes)
++-----------------------------------------------
++
++This directory contains helper guidance for provisioning and rotating AWS KMS keys used for cosign signing.
++
++Steps (operator):
++1. Provision a new KMS key (recommended via terraform in ../kms_and_s3 or your org IaC process).
++2. If creating a replacement key for rotation, capture the new KMS ARN.
++3. Update Kubernetes secret containing the cosign KMS ARN:
++     kubectl -n security create secret generic cosign-kms --from-literal=kms_arn=<NEW_ARN> --dry-run=client -o yaml | kubectl apply -f -
++4. Update CI secret (GitHub Actions) with the new KMS key ARN:
++     gh secret set COSIGN_AWS_KMS_KEY_ARN --body "<NEW_ARN>" --repo <org/repo>
++5. Optionally re-sign latest artifacts (or let CI re-sign on next build).
++
++Notes:
++- Do not delete the old KMS key immediately — keep until old signatures expire or until you re-sign historical artifacts.
++- For HSM-backed keys, consult cloud provider docs (AWS CloudHSM vs AWS KMS with custom key store).
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/kms/rotate_cosign_kms.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Rotate or create a new KMS key for cosign and wire into k8s & GitHub Actions.
++#
++# Usage:
++#   ./ops/kms/rotate_cosign_kms.sh --create   # create new key (aws cli required)
++#   ./ops/kms/rotate_cosign_kms.sh --set <kms_arn>  # set existing ARN in k8s & GH secrets
++#
++usage(){ echo "usage: $0 [--create] | [--set <kms_arn>]"; exit 2; }
++
++MODE=""
++KMS_ARN=""
++if [ "${1:-}" == "--create" ]; then
++  MODE="create"
++elif [ "${1:-}" == "--set" ]; then
++  MODE="set"
++  KMS_ARN="${2:-}"; if [ -z "$KMS_ARN" ]; then usage; fi
++else
++  usage
++fi
++
++if [ "$MODE" = "create" ]; then
++  echo "Creating a new AWS KMS key (requires aws CLI configured)..."
++  KEY_ID=$(aws kms create-key --description "Cosign key for Aegis (rotated $(date -u +%Y%m%dT%H%M%SZ))" --query KeyMetadata.KeyId --output text)
++  KMS_ARN=$(aws kms describe-key --key-id "$KEY_ID" --query KeyMetadata.Arn --output text)
++  echo "Created key: $KMS_ARN"
++fi
++
++echo "Storing KMS ARN into Kubernetes secret (namespace 'security')..."
++kubectl create namespace security --dry-run=client -o yaml | kubectl apply -f -
++kubectl -n security create secret generic cosign-kms --from-literal=kms_arn="$KMS_ARN" --dry-run=client -o yaml | kubectl apply -f -
++echo "K8s secret security/cosign-kms updated."
++
++if command -v gh >/dev/null 2>&1; then
++  echo "Attempting to update GitHub Actions secret COSIGN_AWS_KMS_KEY_ARN (requires gh auth)"
++  REPO=${GITHUB_REPO:-}
++  if [ -n "$REPO" ]; then
++    gh secret set COSIGN_AWS_KMS_KEY_ARN --body "$KMS_ARN" --repo "$REPO" || echo "Failed to set GH secret via gh CLI; set it manually."
++  else
++    echo "GITHUB_REPO not set; skip updating GH secret. Export GITHUB_REPO=<org/repo> to enable."
++  fi
++else
++  echo "gh CLI not installed; please set COSIGN_AWS_KMS_KEY_ARN in CI manually."
++fi
++
++echo "Rotation complete. Verify by running CI sign/verify workflows."
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/certmanager/deploy_cert_manager_and_cert.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Install cert-manager (if missing), create a Certificate for cosign-admission and populate CA bundle.
++#
++# Usage:
++#   ./ops/certmanager/deploy_cert_manager_and_cert.sh <namespace=admission> <secret_name=cosign-webhook-tls>
++#
++NAMESPACE=${1:-admission}
++SECRET=${2:-cosign-webhook-tls}
++
++echo "Ensure cert-manager is installed..."
++kubectl get deployment -n cert-manager cert-manager >/dev/null 2>&1 || kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
++
++echo "Deploy cosign Helm chart if not present (operator should manage helm values)..."
++helm upgrade --install cosign-admission helm/cosign-admission -n "$NAMESPACE" --create-namespace --wait || true
++
++echo "Create Certificate resource for cosign webhook (if chart didn't create it)."
++cat <<EOF | kubectl -n "$NAMESPACE" apply -f -
++apiVersion: cert-manager.io/v1
++kind: Certificate
++metadata:
++  name: cosign-admission-cert
++spec:
++  secretName: ${SECRET}
++  dnsNames:
++  - cosign-admission.${NAMESPACE}.svc
++  issuerRef:
++    name: letsencrypt-prod
++    kind: ClusterIssuer
++EOF
++
++echo "Waiting for certificate secret..."
++for i in $(seq 1 30); do
++  if kubectl -n "$NAMESPACE" get secret "$SECRET" >/dev/null 2>&1; then
++    echo "Secret $SECRET exists"
++    break
++  fi
++  echo "Waiting for certificate issuance... ($i/30)"
++  sleep 10
++done
++
++echo "Populate ValidatingWebhookConfiguration CA bundle..."
++./ops/cosign/populate_ca_bundle.sh "$NAMESPACE" "$SECRET" cosign-validating-webhook || true
++
++echo "Cert-manager & Certificate provisioning complete."
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/factuality/run_verifier_pipeline.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Local helper to run verifier finetune -> calibrate -> adversarial/fairness -> archive + SME signoff
++#
++# Usage:
++#   ./services/factuality/run_verifier_pipeline.sh --dataset-id <dataset_id> --manifest <manifest_path> --out out/candidate
++#
++MANIFEST=""
++DATASET_ID=""
++OUT_DIR=${OUT_DIR:-out/candidate}
++EVIDENCE_BUCKET=${EVIDENCE_BUCKET:-}
++
++usage() { echo "Usage: $0 --dataset-id <id> --manifest <path> [--out <out_dir>]"; exit 2; }
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --dataset-id) DATASET_ID="$2"; shift 2;;
++    --manifest) MANIFEST="$2"; shift 2;;
++    --out) OUT_DIR="$2"; shift 2;;
++    *) usage;;
++  esac
++done
++
++if [ -z "$DATASET_ID" ] || [ -z "$MANIFEST" ]; then usage; fi
++
++echo "Check SME dataset approval..."
++STATE=$(curl -sS "${SME_REGISTRY_URL:-http://sme-registry.svc}/datasets/state?dataset_id=${DATASET_ID}" | jq -r .state || echo "unknown")
++if [ "$STATE" != "approved" ]; then
++  echo "Dataset $DATASET_ID is not SME-approved (state=$STATE). Aborting."
++  exit 1
++fi
++
++mkdir -p "$OUT_DIR"
++echo "Running finetune on manifest $MANIFEST -> $OUT_DIR"
++python services/factuality/finetune_domain.py --manifest "$MANIFEST" --out_dir "$OUT_DIR" --seed 42
++
++echo "Calibrating thresholds..."
++python services/factuality/calibrate_and_publish.py --preds "$OUT_DIR/preds.jsonl" --labels "$OUT_DIR/labels.jsonl" || true
++
++echo "Running adversarial tests..."
++python services/ci/adversarial_suite.py || (echo "Adversarial tests failed" && exit 1)
++
++echo "Running fairness checks..."
++python services/ci/fairness_check.py || (echo "Fairness checks failed" && exit 1)
++
++echo "Requesting SME signoff..."
++REQ_ID="verifier_local_$(date -u +%Y%m%dT%H%M%SZ)"
++curl -sS -X POST "${MANUAL_APPROVAL_URL:-http://manual-approval.svc}/request" -H "Content-Type: application/json" -d "{\"request_id\":\"$REQ_ID\",\"user\":\"local-run\",\"reason\":\"SME signoff for verifier candidate\"}"
++echo "Waiting for approval (polling up to 48h)..."
++for i in $(seq 1 576); do
++  sleep 300
++  RES=$(curl -sS "${MANUAL_APPROVAL_URL:-http://manual-approval.svc}/list")
++  echo "$RES" | grep "$REQ_ID" | grep approved && { echo "Approved"; break; }
++done
++RES=$(curl -sS "${MANUAL_APPROVAL_URL:-http://manual-approval.svc}/list")
++echo "$RES" | grep "$REQ_ID" | grep approved || (echo "No SME approval observed; failing" && exit 1)
++
++echo "Archiving artifacts to evidence bucket (if configured)..."
++if [ -n "$EVIDENCE_BUCKET" ]; then
++  aws s3 cp "$OUT_DIR/candidate.tar.gz" "s3://${EVIDENCE_BUCKET}/verifier_local/$(date -u +%Y%m%dT%H%M%SZ)_candidate.tar.gz"
++  aws s3 cp "$OUT_DIR/thresholds.json" "s3://${EVIDENCE_BUCKET}/verifier_local/$(date -u +%Y%m%dT%H%M%SZ)_thresholds.json"
++fi
++
++echo "Verifier pipeline complete and SME-approved."
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/argo/run_extended_canary_and_chaos.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Submit the extended-canary workflow, optionally inject chaos, and validate rollback/idempotency.
++#
++NAMESPACE=${ARGO_NAMESPACE:-ml-pipelines}
++WF_TEMPLATE=${1:-argo/extended_canary_and_rollback_workflow.yaml}
++ENABLE_CHAOS=${ENABLE_CHAOS:-true}
++
++echo "Submitting Argo extended canary workflow (enable_chaos=$ENABLE_CHAOS)..."
++argo submit -n "$NAMESPACE" -p enable_chaos="$ENABLE_CHAOS" "$WF_TEMPLATE"
++echo "Waiting for workflow to complete (watch logs)..."
++argo watch -n "$NAMESPACE" --name $(argo list -n "$NAMESPACE" -o name | head -n1)
++
++echo "Now running promotion idempotency test (create ModelPromotion CR twice)"
++CR=/tmp/promo_test.yaml
++cat > "$CR" <<EOF
++apiVersion: aegis.example.com/v1
++kind: ModelPromotion
++metadata:
++  name: promo-test-$(date +%s)
++spec:
++  artifact:
++    path: gs://aegis-model-registry/verifier/test/candidate.tar.gz
++    image: us.gcr.io/aegis/verifier:test-harness
++EOF
++
++echo "Apply CR first time..."
++kubectl apply -f "$CR"
++echo "Apply CR second time (idempotency)..."
++kubectl apply -f "$CR"
++
++echo "Check status fields"
++kubectl get modelpromotion -o yaml | sed -n '1,200p'
++
++echo "Extended canary and chaos test submitted. Inspect Argo UI and controller logs for rollback confirmation."
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/sustainability/validate_watt_calibration.py
++#!/usr/bin/env python3
++"""
++Validate wattmeter calibration accuracy and publish a small metric report.
++ - Loads telemetry_calibration.json and sample NVML/wattmeter recent data
++ - Computes mean absolute error and prints result and exits non‑zero if error above threshold
++"""
++import json, sys, os
++import numpy as np
++from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
++
++CALIB_JSON = os.environ.get("WATT_CALIB_OUT", "/data/telemetry_calibration.json")
++NVML_SAMPLE = os.environ.get("NVML_SAMPLE_PATH", "/data/nvml_samples.jsonl")
++WATT_SAMPLE = os.environ.get("WATT_SAMPLE_PATH", "/data/wattmeter_sync.csv")
++THRESH = float(os.environ.get("WATT_CALIB_THRESHOLD_W", "10.0"))
++PUSHGW = os.environ.get("PUSHGATEWAY","")
++
++def load_nvml(path):
++    out=[]
++    if os.path.exists(path):
++        for l in open(path):
++            try:
++                out.append(json.loads(l))
++            except:
++                continue
++    return [x.get("power_w",0.0) for x in out]
++
++def load_watt_csv(path):
++    out=[]
++    if os.path.exists(path):
++        for l in open(path):
++            if not l.strip(): continue
++            t,v = l.strip().split(",")
++            out.append(float(v))
++    return out
++
++def main():
++    if not os.path.exists(CALIB_JSON):
++        print("Calibration JSON not found:", CALIB_JSON); sys.exit(2)
++    calib = json.load(open(CALIB_JSON))
++    nvml = load_nvml(NVML_SAMPLE)
++    watt = load_watt_csv(WATT_SAMPLE)
++    if len(nvml)==0 or len(watt)==0:
++        print("Missing samples for validation"); sys.exit(2)
++    # Apply linear calibration if present
++    scale = float(calib.get("scale",1.0))
++    offset = float(calib.get("offset",0.0))
++    est = [v*scale + offset for v in nvml[:len(watt)]]
++    errors = [abs(e - w) for e,w in zip(est, watt[:len(est)])]
++    mae = float(np.mean(errors))
++    print("MAE (W):", mae, "threshold:", THRESH)
++    if PUSHGW:
++        reg = CollectorRegistry()
++        g = Gauge("aegis_watt_calib_mae_w", "Watt calibration MAE (W)", registry=reg)
++        g.set(mae)
++        push_to_gateway(PUSHGW, job='watt_calib_validation', registry=reg)
++    if mae > THRESH:
++        print("Calibration MAE above threshold, consider re-calibration")
++        sys.exit(3)
++    print("Calibration validation OK")
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:jobs/kernel_autotuner/run_fleet_autotuner_ci.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# CI helper to run fleet autotuner on a target node pool (requires kubectl & kube access)
++#
++NAMESPACE=${NAMESPACE:-inference}
++CORES=${CORES:-1}
++
++echo "Triggering fleet autotuner job in namespace $NAMESPACE"
++kubectl -n "$NAMESPACE" apply -f jobs/kernel_autotuner/fleet_job.yaml
++echo "Waiting for fleet autotuner job completion (polling)..."
++for i in $(seq 1 60); do
++  STATUS=$(kubectl -n "$NAMESPACE" get job fleet-kernel-autotuner -o jsonpath='{.status.succeeded}' 2>/dev/null || echo "")
++  if [ "$STATUS" = "1" ]; then
++    echo "Fleet autotuner job succeeded"
++    break
++  fi
++  sleep 30
++done
++
++echo "Collecting kernel_best_config.json from a known PVC or via configmap (operator must expose results)"
++# attempt to fetch configmap if created
++kubectl -n "$NAMESPACE" get configmap kernel-best-config -o yaml || echo "kernel-best-config not found yet; operator must gather outputs"
++
++echo "Run validate script locally if config found"
++kubectl -n "$NAMESPACE" get configmap kernel-best-config -o jsonpath='{.data.kernel_best_config\.json}' > /tmp/kernel_best_config.json || true
++if [ -f /tmp/kernel_best_config.json ]; then
++  python services/triton/kernel_opt/validate_kernel_results.py /tmp/kernel_best_config.json || (echo "Validation failed" && exit 1)
++  echo "Validation passed; apply to Triton backend ConfigMap"
++  kubectl -n "$NAMESPACE" create configmap kernel-best-config --from-file=/tmp/kernel_best_config.json --dry-run=client -o yaml | kubectl apply -f -
++else
++  echo "No kernel_best_config.json to validate/apply"
++fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/organizational/sre_oncall_roster_template.yaml
++# Example SRE on-call roster (YAML template)
++oncall:
++  primary:
++    - name: "alice"
++      pagerduty: "alice_pd"
++      email: "alice@example.com"
++  secondary:
++    - name: "bob"
++      pagerduty: "bob_pd"
++      email: "bob@example.com"
++  rotation:
++    period_days: 7
++  contacts:
++    security_team: "security@example.com"
++    legal_team: "legal@example.com"
++    ml_lead: "ml-lead@example.com"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/runbooks/production_enablement_checklist.md
++# Production Enablement Checklist (detailed)
++
++Before enabling automated promotions or broad RL automation:
++
++Security & Supply Chain:
++- [ ] KMS key provisioned and cosign-kms secret created in k8s (namespace: security)
++- [ ] CI secret COSIGN_AWS_KMS_KEY_ARN set in GitHub Actions
++- [ ] cert-manager installed and cosign admission TLS cert issued & CA bundle populated
++- [ ] ValidatingWebhookConfiguration active in prod namespaces (environment=prod) and tested
++
++Verifier & Safety:
++- [ ] SME datasets registered & state=approved in SME Dataset Registry
++- [ ] Verifier finetune + calibration run successfully with thresholds published to ConfigMap
++- [ ] Adversarial & fairness suites pass; artefacts archived
++- [ ] SME signoffs captured and archived in evidence bucket
++
++Operational Validation:
++- [ ] Long shadow cronworkflow running and evidence uploading
++- [ ] Extended canary windows (24-72h) executed for sample artifacts
++- [ ] Chaos tests performed and rollback behavior validated
++- [ ] Promotion controller idempotency tested (apply CR twice) and logs archived
++
++Observability & Sustainability:
++- [ ] Wattmeter calibration job executed on representative hosts and validation MAE within threshold
++- [ ] Carbon intensity integration validated (carbon_validate.py) and used by scheduler
++- [ ] Kernel autotuner executed on representative GPU nodes and best config applied to Triton
++
++Org & Compliance:
++- [ ] SRE on-call roster published and trained on runbooks
++- [ ] Legal signoff on S3 Object Lock retention period (archive evidence)
++- [ ] Billing integration tested (tenant budgets & throttle)
++- [ ] Rater capacity & SLA defined and resourced
++
++Go / No-go:
++- [ ] All items above completed and evidence archived -> enable limited auto-promotion for low-risk flows
++
+*** End Patch
+*** End Patch

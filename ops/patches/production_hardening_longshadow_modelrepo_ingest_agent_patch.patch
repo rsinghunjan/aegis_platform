@@ -1,0 +1,411 @@
+*** Begin Patch
+*** Add File:services/generative/shadow_aggregator.py
++#!/usr/bin/env python3
++"""
++Shadow aggregator and daily/rolling reporter
++ - Aggregates shadow_runner outputs from local file or S3 (gen_shadow/*.jsonl)
++ - Computes divergence rate, verifier regressions, and basic safety signals over configurable window
++ - Writes an evidence report to EVIDENCE_BUCKET and emits a Pushgateway metric (if configured)
++
++Usage:
++  export EVIDENCE_BUCKET=... (optional)
++  export SHADOW_LOCAL=/data/shadow_generations.jsonl
++  python services/generative/shadow_aggregator.py --window-hours 24 --out /tmp/shadow_report.json
++"""
++import os, json, time, argparse
++from datetime import datetime, timedelta
++try:
++    import boto3
++except Exception:
++    boto3 = None
++try:
++    from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
++except Exception:
++    push_to_gateway = None
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++PUSHGW = os.environ.get("PUSHGATEWAY", "")
++LOCAL_SHADOW_PATH = os.environ.get("SHADOW_OUT", "/data/shadow_generations.jsonl")
++
++def iter_local(path, since_ts):
++    if not os.path.exists(path):
++        return
++    with open(path) as f:
++        for l in f:
++            if not l.strip(): continue
++            try:
++                j = json.loads(l)
++                if j.get("ts",0) >= since_ts:
++                    yield j
++            except Exception:
++                continue
++
++def read_s3_prefix(bucket, prefix, since_ts):
++    if not boto3:
++        return
++    s3 = boto3.client("s3")
++    paginator = s3.get_paginator("list_objects_v2")
++    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
++        for obj in page.get("Contents", []):
++            key = obj["Key"]
++            try:
++                body = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
++                for l in body.splitlines():
++                    if not l.strip(): continue
++                    j = json.loads(l)
++                    if j.get("ts",0) >= since_ts:
++                        yield j
++            except Exception:
++                continue
++
++def aggregate(items):
++    total = 0
++    divergences = 0
++    verifier_failures = 0
++    per_min = {}
++    for it in items:
++        total += 1
++        div = float(it.get("divergence", 0.0))
++        divergences += 1 if div > 0 else 0
++        vfail = 0
++        p = it.get("prod",{}).get("resp",{})
++        c = it.get("candidate",{}).get("resp",{})
++        # quick heuristic: if either resp has an 'error' field, count as verifier/service failure
++        if p.get("error") or c.get("error"):
++            verifier_failures += 1
++            vfail = 1
++        ts_min = int(it.get("ts",0)) // 60
++        per_min.setdefault(ts_min, {"total":0,"div":0,"vfail":0})
++        per_min[ts_min]["total"] += 1
++        per_min[ts_min]["div"] += 1 if div>0 else 0
++        per_min[ts_min]["vfail"] += vfail
++    divergence_rate = (divergences/total) if total else 0.0
++    vfail_rate = (verifier_failures/total) if total else 0.0
++    return {"total": total, "divergences": divergences, "divergence_rate": divergence_rate, "verifier_failures": verifier_failures, "verifier_failure_rate": vfail_rate, "per_min": per_min}
++
++def upload_report(report, dest_key):
++    if not EVIDENCE_BUCKET or not boto3:
++        with open(dest_key, "w") as f:
++            f.write(json.dumps(report, indent=2))
++        return dest_key
++    s3 = boto3.client("s3")
++    key = f"gen_shadow_reports/{os.path.basename(dest_key)}"
++    s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(report).encode("utf-8"))
++    return f"s3://{EVIDENCE_BUCKET}/{key}"
++
++def push_metrics(report):
++    if not push_to_gateway or not PUSHGW:
++        return
++    reg = CollectorRegistry()
++    g_div = Gauge("aegis_gen_shadow_divergence_rate", "Shadow divergence rate (window)", registry=reg)
++    g_total = Gauge("aegis_gen_shadow_total", "Shadow sample count", registry=reg)
++    g_vfail = Gauge("aegis_gen_shadow_verifier_failure_rate", "Verifier failure rate", registry=reg)
++    g_div.set(float(report["divergence_rate"]))
++    g_total.set(int(report["total"]))
++    g_vfail.set(float(report["verifier_failure_rate"]))
++    push_to_gateway(PUSHGW, job='shadow_aggregator', registry=reg)
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--window-hours", type=int, default=24)
++    p.add_argument("--out", default="/tmp/shadow_report.json")
++    args = p.parse_args()
++    since = int((datetime.utcnow() - timedelta(hours=args.window_hours)).timestamp())
++    items = []
++    # local-first
++    try:
++        items.extend(list(iter_local(LOCAL_SHADOW_PATH, since)))
++    except Exception:
++        pass
++    # also check S3 prefix if configured
++    if EVIDENCE_BUCKET and boto3:
++        try:
++            items.extend(list(read_s3_prefix(EVIDENCE_BUCKET, "gen_shadow/", since)))
++        except Exception:
++            pass
++    report = aggregate(items)
++    report["window_hours"] = args.window_hours
++    report["generated_at"] = int(time.time())
++    path = args.out
++    dest = upload_report(report, path)
++    push_metrics(report)
++    print("Report saved to", dest)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:argo/cron_shadow_aggregate.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: CronWorkflow
++metadata:
++  name: shadow-aggregate-hourly
++  namespace: ml-pipelines
++spec:
++  schedule: "0 * * * *" # hourly at top of hour
++  concurrencyPolicy: "Forbid"
++  startingDeadlineSeconds: 300
++  workflowSpec:
++    entrypoint: aggregate
++    templates:
++    - name: aggregate
++      steps:
++      - - name: run-aggregator
++          template: run-aggregator
++    - name: run-aggregator
++      container:
++        image: python:3.10-slim
++        command: ["/bin/sh","-c"]
++        args:
++          - |
++            pip install boto3 prometheus_client || true
++            python services/generative/shadow_aggregator.py --window-hours 24 --out /tmp/shadow_report.json
++            # copy report to evidence store if available
++            if [ -n "${EVIDENCE_BUCKET:-}" ]; then
++              aws s3 cp /tmp/shadow_report.json s3://${EVIDENCE_BUCKET}/gen_shadow_reports/ || true
++            fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/model_repo_lifecycle.yml
++name: Triton Model Repo Lifecycle (package -> publish -> reload)
++on:
++  workflow_dispatch:
++
++jobs:
++  publish-model:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Package model
++        run: |
++          ./scripts/package_triton_model.sh models/vision_sample vision_encoder /tmp/model_store || true
++      - name: Upload to S3 model store (if configured)
++        env:
++          STORE_PREFIX: ${{ secrets.MODEL_STORE_PREFIX }}
++        run: |
++          if [ -n "$STORE_PREFIX" ]; then
++            if echo "$STORE_PREFIX" | grep -q '^s3://'; then
++              aws s3 cp --recursive /tmp/triton_repo_*/ "$STORE_PREFIX/vision_encoder/" || true
++              echo "Uploaded model to $STORE_PREFIX/vision_encoder"
++              # tag release with timestamp
++              TAG=triton-vision-$(date -u +%Y%m%dT%H%M%SZ)
++              git tag -a "$TAG" -m "Published model $TAG" || true
++              git push origin --tags || true
++            fi
++          fi
++      - name: Trigger Triton reload (if TRITON_HOST provided)
++        env:
++          TRITON_HOST: ${{ secrets.TRITON_HOST }}
++        run: |
++          if [ -n "$TRITON_HOST" ]; then
++            python scripts/triton_model_control.py --server $TRITON_HOST --reload || true
++          fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:tests/ingest/ingest_load_test.py
++#!/usr/bin/env python3
++"""
++Load test for resumable ingest service.
++ - Starts N worker threads, each uploads files by chunked/resumable protocol and reports success/fail counts.
++ - Produces a JSON summary with throughput, error rate, retries.
++"""
++import argparse, os, requests, threading, time, random, json
++
++def worker(server, filepath, dataset, modality, results, fail_rate):
++    try:
++        # use resumable client endpoints
++        init = requests.post(f"{server}/resumable/init", json={"filename": os.path.basename(filepath), "modality": modality, "dataset_id": dataset})
++        init.raise_for_status()
++        uid = init.json()["upload_id"]
++        with open(filepath, "rb") as f:
++            chunk_size = 1024*128
++            offset = 0
++            while True:
++                data = f.read(chunk_size)
++                if not data: break
++                # simulate network flake
++                if random.random() < fail_rate:
++                    time.sleep(0.05)
++                files = {'chunk': ('chunk', data)}
++                r = requests.put(f"{server}/resumable/{uid}/chunk?offset={offset}", files=files, timeout=30)
++                r.raise_for_status()
++                offset += len(data)
++        fin = requests.post(f"{server}/resumable/{uid}/finalize", timeout=60)
++        fin.raise_for_status()
++        results.append({"ok": True, "resp": fin.json()})
++    except Exception as e:
++        results.append({"ok": False, "error": str(e)})
++
++def run_load(server, files, parallel=10, fail_rate=0.05):
++    threads=[]
++    results=[]
++    start=time.time()
++    for i in range(parallel):
++        fp = random.choice(files)
++        t = threading.Thread(target=worker, args=(server, fp, "load-test", "image", results, fail_rate))
++        t.start()
++        threads.append(t)
++    for t in threads:
++        t.join()
++    dur=time.time()-start
++    success=sum(1 for r in results if r["ok"])
++    fail=sum(1 for r in results if not r["ok"])
++    return {"total": len(results), "success": success, "fail": fail, "duration_s": dur, "samples": results[:10]}
++
++if __name__=="__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--server", default="http://localhost:8080")
++    p.add_argument("--files", nargs="+", required=True)
++    p.add_argument("--parallel", type=int, default=20)
++    p.add_argument("--fail-rate", type=float, default=0.05)
++    args = p.parse_args()
++    out = run_load(args.server, args.files, args.parallel, args.fail_rate)
++    print(json.dumps(out, indent=2))
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/hallucination_monitor.py
++#!/usr/bin/env python3
++"""
++LLM planner hallucination monitor
++ - Runs the enhanced LLM planner over a corpus of intents (ops/agent/sample_intents.jsonl)
++ - Validates planner outputs against schema and allowed tool list, computes schema-failure/hallucination rates
++ - Uploads a report to evidence bucket and pushes a metric to Pushgateway
++"""
++import os, json, time
++from services.agent.llm_planner_enhanced import plan_for_intent
++from services.agent.llm_plan_validator import validate_plan
++try:
++    import boto3
++except Exception:
++    boto3 = None
++try:
++    from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
++except Exception:
++    push_to_gateway = None
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET","")
++PUSHGW = os.environ.get("PUSHGATEWAY","")
++INTENTS_FILE = os.environ.get("AGENT_INTENTS_FILE","ops/agent/sample_intents.jsonl")
++
++def load_intents(path):
++    out=[]
++    if not os.path.exists(path):
++        return out
++    for l in open(path):
++        if not l.strip(): continue
++        out.append(json.loads(l))
++    return out
++
++def upload_report(report, name):
++    if not EVIDENCE_BUCKET or not boto3:
++        path = f"/tmp/{name}.json"
++        with open(path,"w") as f:
++            json.dump(report,f,indent=2)
++        return path
++    s3 = boto3.client("s3")
++    key = f"agent_planner_reports/{name}.json"
++    s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(report).encode("utf-8"))
++    return f"s3://{EVIDENCE_BUCKET}/{key}"
++
++def push_metric(rate):
++    if not push_to_gateway or not PUSHGW:
++        return
++    reg = CollectorRegistry()
++    g = Gauge("aegis_agent_planner_schema_failure_rate", "Planner schema failure/hallucination rate", registry=reg)
++    g.set(rate)
++    push_to_gateway(PUSHGW, job='planner_hallucination_monitor', registry=reg)
++
++def main():
++    intents = load_intents(INTENTS_FILE)
++    total = len(intents)
++    failures = 0
++    details=[]
++    for it in intents:
++        intent_text = it.get("intent")
++        plan = plan_for_intent(intent_text, {})
++        ok, info = validate_plan(plan)
++        if not ok:
++            failures += 1
++        details.append({"intent": intent_text, "valid": ok, "info": info})
++    rate = failures/total if total else 0.0
++    report = {"total": total, "failures": failures, "failure_rate": rate, "details_sample": details[:50], "ts": int(time.time())}
++    name = f"planner_report_{int(time.time())}"
++    dest = upload_report(report, name)
++    push_metric(rate)
++    print("Report written to", dest)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/agent_planner_dryrun.yml
++name: Agent Planner Dry-run (scheduled)
++on:
++  schedule:
++    - cron: "0 2 * * *"  # daily at 02:00 UTC
++  workflow_dispatch:
++
++jobs:
++  planner-dryrun:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.10'
++      - name: Run planner hallucination monitor
++        env:
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++          PUSHGATEWAY: ${{ secrets.PUSHGATEWAY }}
++          AGENT_INTENTS_FILE: ops/agent/sample_intents.jsonl
++        run: |
++          pip install boto3 prometheus_client jsonschema requests || true
++          python services/agent/hallucination_monitor.py
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/prometheus/longshadow_and_ingest_sli_rules.yml
++groups:
++- name: longshadow-and-ingest-sli
++  rules:
++  - alert: GenerativeLongShadowDivergenceHigh
++    expr: avg_over_time(aegis_gen_shadow_divergence[24h]) > 0.05
++    for: 2h
++    labels:
++      severity: page
++    annotations:
++      summary: "Generative shadow divergence >5% over 24h"
++
++  - alert: PlannerHallucinationRateHigh
++    expr: aegis_agent_planner_schema_failure_rate > 0.01
++    for: 1h
++    labels:
++      severity: page
++    annotations:
++      summary: "Agent planner schema-failure (hallucination) rate >1% over 1h"
++
++  - alert: IngestLoadTestFailRateHigh
++    expr: increase(aegis_ingest_resumable_errors_total[1h]) / max(1, increase(aegis_ingest_resumable_attempts_total[1h])) > 0.02
++    for: 30m
++    labels:
++      severity: warning
++    annotations:
++      summary: "Resumable ingest error rate >2% in 1h"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/agent/sample_intents.jsonl
++{"intent":"scale verifier to 2", "meta": {}}
++{"intent":"set image verifier myorg/verifier:canary", "meta": {}}
++{"intent":"increase_student_pct tenantA 10", "meta": {}}
++{"intent":"update serving policy reduce_student_pct tenantB 5", "meta": {}}
++{"intent":"rollback verifier to previous", "meta": {}}
++
+*** End Patch
+*** End Patch

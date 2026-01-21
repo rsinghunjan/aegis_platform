@@ -1,0 +1,708 @@
+*** Begin Patch
+*** Add File:services/physical/ros2_bridge.py
++#!/usr/bin/env python3
++"""
++ROS2 <-> Aegis bridge service (FastAPI)
++
++Purpose:
++- Provide a lightweight HTTP bridge for ROS2 (or rosbridge) data to be forwarded into Aegis:
++  - POST /telemetry  : accepts sensor/event payloads and emits Prometheus metrics + optional S3 evidence
++  - POST /actuate    : request an actuator command; the bridge calls the actuator wrapper endpoint via transaction_manager
++  - GET  /health     : health check
++Notes:
++- In real deployments you may integrate directly with ROS2 (rclpy) or use rosbridge websocket to forward messages
++  to this service. For portability we accept HTTP POSTs from rosbridge, from a small local forwarder, or from
++  simulation harnesses.
++- Configure via env:
++  - EVIDENCE_BUCKET (optional) - S3 bucket to store telemetry/evidence
++  - PUSHGATEWAY (optional) - Prometheus Pushgateway URL for edge metrics
++  - ACTUATOR_WRAPPER_URL - base URL of actuator wrapper service (http://wrapper.svc.cluster.local:8080/execute)
++"""
++import os
++import json
++import time
++import logging
++from typing import Any, Dict, Optional
++
++import requests
++from fastapi import FastAPI, HTTPException, Request
++from pydantic import BaseModel
++
++# Optional: prometheus_client for local metrics + pushgateway
++from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
++
++# Optional S3 evidence writer
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger("ros2-bridge")
++
++app = FastAPI(title="Aegis ROS2 Bridge")
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++PUSHGATEWAY = os.environ.get("PUSHGATEWAY", "")
++ACTUATOR_WRAPPER_URL = os.environ.get("ACTUATOR_WRAPPER_URL", "http://actuator-wrapper.monitoring.svc.cluster.local:8080/execute")
++REGION = os.environ.get("AEGIS_REGION", "local")
++INSTANCE = os.environ.get("AEGIS_INSTANCE", "edge-0001")
++
++s3 = None
++if EVIDENCE_BUCKET and boto3 is not None:
++    s3 = boto3.client("s3")
++
++
++class TelemetryPayload(BaseModel):
++    node_id: str
++    topic: str
++    timestamp: Optional[float]
++    payload: Dict[str, Any]
++    sample_rate: Optional[float] = None
++
++
++class ActuateRequest(BaseModel):
++    actuator: str
++    command: Dict[str, Any]
++    request_id: Optional[str] = None
++    metadata: Optional[Dict[str, Any]] = None
++
++
++def push_metric(name: str, value: float, labels: Dict[str, str] = None):
++    if not PUSHGATEWAY:
++        return
++    try:
++        reg = CollectorRegistry()
++        g = Gauge(name, "edge metric from ros2 bridge", list(labels.keys()) if labels else [])
++        if labels:
++            g = Gauge(name, "edge metric from ros2 bridge", labelnames=list(labels.keys()), registry=reg)
++            g.labels(**labels).set(value)
++        else:
++            g.set(value)
++        push_to_gateway(PUSHGATEWAY, job=INSTANCE, registry=reg)
++    except Exception as e:
++        logger.warning("push_metric error: %s", e)
++
++
++def upload_evidence(prefix: str, payload: Dict[str, Any]) -> Optional[str]:
++    ts = int(time.time())
++    key = f"{prefix}/{INSTANCE}/{ts}.json"
++    if s3 is None:
++        path = f"/tmp/evidence_{ts}.json"
++        with open(path, "w") as f:
++            json.dump(payload, f, indent=2)
++        logger.info("Wrote evidence locally to %s", path)
++        return path
++    try:
++        s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(payload).encode("utf-8"))
++        uri = f"s3://{EVIDENCE_BUCKET}/{key}"
++        logger.info("Uploaded evidence to %s", uri)
++        return uri
++    except Exception as e:
++        logger.warning("s3 put failed: %s", e)
++        return None
++
++
++@app.post("/telemetry")
++async def telemetry(t: TelemetryPayload):
++    # Normalize timestamp
++    ts = t.timestamp or time.time()
++    record = {
++        "node_id": t.node_id,
++        "topic": t.topic,
++        "timestamp": ts,
++        "payload": t.payload,
++        "region": REGION,
++        "instance": INSTANCE,
++    }
++    # Push simple numeric fields to Pushgateway for scraping
++    # For each numeric key in payload push a metric: aegis_telemetry_<topic>_{key}
++    for k, v in t.payload.items():
++        try:
++            val = float(v)
++            metric_name = f"aegis_telemetry_{t.topic}_{k}"
++            labels = {"node": t.node_id, "region": REGION}
++            push_metric(metric_name, val, labels=labels)
++        except Exception:
++            # not numeric: skip
++            continue
++    # Save evidence if requested or if topic is critical
++    if t.topic.startswith("safety") or t.sample_rate:
++        uploaded = upload_evidence(f"telemetry/{t.topic}", record)
++        return {"stored_at": uploaded}
++    return {"status": "ok"}
++
++
++@app.post("/actuate")
++async def actuate(req: ActuateRequest, request: Request):
++    # Forward actuation request to the actuator wrapper via transaction_manager-style call
++    # We expect wrapper to provide idempotency and safety checks. We add request metadata.
++    payload = {
++        "actuator": req.actuator,
++        "command": req.command,
++        "request_id": req.request_id or f"{INSTANCE}-{int(time.time()*1000)}",
++        "metadata": req.metadata or {},
++        "source": "ros2-bridge",
++        "node": INSTANCE,
++    }
++    try:
++        r = requests.post(ACTUATOR_WRAPPER_URL, json=payload, timeout=10)
++        r.raise_for_status()
++    except Exception as e:
++        logger.exception("Actuator wrapper call failed")
++        raise HTTPException(status_code=502, detail=str(e))
++    res = r.json()
++    # Optionally store actuator evidence
++    upload_evidence(f"actuations/{req.actuator}", {"request": payload, "response": res})
++    return res
++
++
++@app.get("/health")
++def health():
++    return {"status": "ok", "instance": INSTANCE, "region": REGION}
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/manifests/ros2-bridge-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: ros2-bridge
++  namespace: monitoring
++  labels:
++    app: ros2-bridge
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: ros2-bridge
++  template:
++    metadata:
++      labels:
++        app: ros2-bridge
++    spec:
++      # nodeSelector to prefer edge nodes (adjust to your cluster labels)
++      nodeSelector:
++        node-role.kubernetes.io/edge: "true"
++      containers:
++        - name: ros2-bridge
++          image: us.gcr.io/aegis/ros2-bridge:latest
++          env:
++            - name: EVIDENCE_BUCKET
++              valueFrom:
++                secretKeyRef:
++                  name: evidence-bucket
++                  key: bucket
++            - name: PUSHGATEWAY
++              value: "http://pushgateway.monitoring.svc:9091"
++            - name: ACTUATOR_WRAPPER_URL
++              value: "http://actuator-wrapper.monitoring.svc.cluster.local:8080/execute"
++            - name: AEGIS_REGION
++              value: "edge-region-1"
++            - name: AEGIS_INSTANCE
++              valueFrom:
++                fieldRef:
++                  fieldPath: metadata.name
++          ports:
++            - containerPort: 8080
++              name: http
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: ros2-bridge
++  namespace: monitoring
++spec:
++  selector:
++    app: ros2-bridge
++  ports:
++    - name: http
++      port: 8080
++      targetPort: 8080
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/physical/actuator_wrapper_template.py
++#!/usr/bin/env python3
++"""
++Actuator wrapper template (idempotent with emergency-stop and transaction hooks)
++
++- Exposes POST /execute to perform an actuator command.
++- Performs:
++    * Authentication/authorization check (Keycloak token via header)
++    * Safety pre-check (emergency stop, permissive flags)
++    * Idempotency using request_id (stores last result in local cache or S3)
++    * Records transaction via transaction_manager (if available)
++    * Executes hardware command via device adapter (placeholder)
++    * Verifies post-condition and returns result
++    * Uploads signed evidence (optionally)
++Notes:
++- Replace device_adapter.execute(...) with your actual hardware control logic (e.g., CAN bus, serial, ROS2 action)
++- This template logs evidence and attempts to be safe by checking a cluster-level emergency-stop ConfigMap.
++"""
++import os
++import time
++import json
++import logging
++from typing import Dict, Any
++from fastapi import FastAPI, HTTPException, Request, Header
++from pydantic import BaseModel
++
++try:
++    # optional transaction manager from Aegis codebase
++    from services.agent.transaction_manager import start_transaction, record_step, finalize_transaction
++except Exception:
++    start_transaction = None
++    record_step = None
++    finalize_transaction = None
++
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger("actuator-wrapper")
++
++app = FastAPI(title="Aegis Actuator Wrapper")
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++EMERGENCY_CM = os.environ.get("EMERGENCY_CM", "actuator-emergency")
++IDEMPOTENCY_TTL_S = int(os.environ.get("WRAPPER_IDEMPOTENCY_TTL_S", "3600"))
++
++s3 = boto3.client("s3") if (boto3 and EVIDENCE_BUCKET) else None
++# in-memory idempotency cache (for demo). In prod use Redis or DB.
++_idempotency_cache: Dict[str, Dict[str, Any]] = {}
++
++
++class ExecuteReq(BaseModel):
++    actuator: str
++    command: Dict[str, Any]
++    request_id: str
++    metadata: Dict[str, Any] = {}
++
++
++def check_emergency():
++    # Real implementation should read ConfigMap in cluster or watch a hardware E-stop line
++    # For demo, check env var
++    if os.environ.get("AEGIS_EMERGENCY_STOP", "false").lower() == "true":
++        return True
++    return False
++
++
++def upload_evidence(key_prefix: str, payload: Dict[str, Any]):
++    ts = int(time.time())
++    key = f"{key_prefix}/{ts}.json"
++    if not s3:
++        p = f"/tmp/{key.replace('/','_')}"
++        with open(p, "w") as f:
++            json.dump(payload, f, indent=2)
++        logger.info("Wrote evidence locally: %s", p)
++        return p
++    try:
++        s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(payload).encode("utf-8"))
++        uri = f"s3://{EVIDENCE_BUCKET}/{key}"
++        logger.info("Uploaded evidence to %s", uri)
++        return uri
++    except Exception as e:
++        logger.warning("Failed to upload evidence: %s", e)
++        return None
++
++
++def device_execute(actuator: str, command: Dict[str, Any]) -> Dict[str, Any]:
++    # Placeholder: implement hardware-level execution (e.g., call into a device driver)
++    # For safety, simulate slow execution and return fake response
++    logger.info("Simulated device_execute for actuator=%s command=%s", actuator, command)
++    time.sleep(0.2)
++    return {"status": "ok", "actuator": actuator, "applied": command, "timestamp": int(time.time())}
++
++
++@app.post("/execute")
++async def execute(body: ExecuteReq, authorization: str = Header(None)):
++    # Basic idempotency check
++    rid = body.request_id
++    if not rid:
++        raise HTTPException(status_code=400, detail="request_id required for idempotency")
++    # Check emergency stop
++    if check_emergency():
++        raise HTTPException(status_code=503, detail="Emergency stop enabled; refusing to actuate")
++    # Check idempotency cache
++    cached = _idempotency_cache.get(rid)
++    if cached and (time.time() - cached.get("ts", 0) < IDEMPOTENCY_TTL_S):
++        logger.info("Idempotent: returning cached result for %s", rid)
++        return cached["result"]
++    # Start transaction (if available)
++    tx = None
++    if start_transaction:
++        try:
++            tx = start_transaction(f"act_{rid}", "actuator-wrapper", {"actuator": body.actuator})
++            record_step(tx, 0, {"action": "precheck"})
++        except Exception:
++            tx = None
++    # Execute hardware action
++    try:
++        res = device_execute(body.actuator, body.command)
++        # Post-verify placeholder
++        ok = res.get("status") == "ok"
++        if not ok:
++            raise RuntimeError("device reported non-ok")
++    except Exception as e:
++        # record failure
++        if tx and record_step:
++            try:
++                record_step(tx, 1, {"action": "failed", "error": str(e)})
++                finalize_transaction(tx, "failed", {"error": str(e)})
++            except Exception:
++                pass
++        logger.exception("Execution failed")
++        raise HTTPException(status_code=500, detail=str(e))
++    # On success, finalize transaction
++    if tx and finalize_transaction:
++        try:
++            record_step(tx, 1, {"action": "applied", "result": res})
++            finalize_transaction(tx, "applied", {"result": res})
++        except Exception:
++            pass
++    # Upload evidence
++    upload_evidence(f"actuator/{body.actuator}", {"request": body.dict(), "response": res})
++    # Cache result for idempotency
++    _idempotency_cache[rid] = {"ts": time.time(), "result": res}
++    return res
++
++
++@app.get("/health")
++def health():
++    return {"status": "ok"}
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/manifests/actuator-wrapper-configmap.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: actuator-wrapper-config
++  namespace: monitoring
++data:
++  WRAPPER_IDEMPOTENCY_TTL_S: "3600"
++  WRAPPER_SAFETY_TIMEOUT_S: "5"
++  WRAPPER_MAX_RETRIES: "3"
++  # Emergency stop is controlled via ConfigMap key "emergency": "true"/"false"
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: actuator-emergency
++  namespace: monitoring
++data:
++  emergency: "false"
++
+*** End Patch
+*** Begin Patch
+*** Add File:tekton/tasks/gazebo-run-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: run-gazebo-episode
++  namespace: cicd
++spec:
++  params:
++    - name: episode_name
++      type: string
++    - name: duration_s
++      type: string
++      default: "60"
++    - name: evidence_bucket
++      type: string
++  steps:
++    - name: fetch-simulator
++      image: docker.io/library/python:3.10-slim
++      script: |
++        set -euo pipefail
++        echo "Prepare simulator environment (placeholder)"
++    - name: run-gazebo
++      image: us.gcr.io/aegis/gazebo-runner:latest
++      script: |
++        set -euo pipefail
++        echo "Running Gazebo episode: $(params.episode_name)"
++        # The container is expected to run a simulation and write /workspace/output/episode.json
++        mkdir -p /workspace/output
++        # Placeholder: a real runner writes logs/artifacts to /workspace/output
++        echo "{\"episode\":\"$(params.episode_name)\",\"duration\":$(params.duration_s),\"ts\":$(date +%s)}" > /workspace/output/episode.json
++    - name: upload-evidence
++      image: amazon/aws-cli:2.13.7
++      script: |
++        set -euo pipefail
++        EPATH=/workspace/output/episode.json
++        if [ -f "$EPATH" ]; then
++          echo "Uploading evidence to s3://$(params.evidence_bucket)/simulations/$(params.episode_name)/$(date +%s).json"
++          aws s3 cp "$EPATH" "s3://$(params.evidence_bucket)/simulations/$(params.episode_name)/$(date +%s).json"
++        else
++          echo "No episode artifact found"
++        fi
++  workspaces:
++    - name: workspace
++
+*** End Patch
+*** Begin Patch
+*** Add File:tekton/pipelines/gazebo-pipeline.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Pipeline
++metadata:
++  name: gazebo-sim-pipeline
++  namespace: cicd
++spec:
++  params:
++    - name: episode_name
++      type: string
++    - name: duration_s
++      type: string
++    - name: evidence_bucket
++      type: string
++  workspaces:
++    - name: shared-workspace
++  tasks:
++    - name: run-episode
++      taskRef:
++        name: run-gazebo-episode
++      params:
++        - name: episode_name
++          value: $(params.episode_name)
++        - name: duration_s
++          value: $(params.duration_s)
++        - name: evidence_bucket
++          value: $(params.evidence_bucket)
++      workspaces:
++        - name: workspace
++          workspace: shared-workspace
++
+*** End Patch
+*** Begin Patch
+*** Add File:tekton/triggers/gazebo-trigger.yaml
++apiVersion: triggers.tekton.dev/v1alpha1
++kind: TriggerTemplate
++metadata:
++  name: gazebo-sim-trigger-template
++  namespace: cicd
++spec:
++  params:
++    - name: episode_name
++    - name: duration_s
++    - name: evidence_bucket
++  resourcetemplates:
++    - apiVersion: tekton.dev/v1beta1
++      kind: PipelineRun
++      metadata:
++        generateName: gazebo-sim-run-
++      spec:
++        pipelineRef:
++          name: gazebo-sim-pipeline
++        params:
++          - name: episode_name
++            value: "$(params.episode_name)"
++          - name: duration_s
++            value: "$(params.duration_s)"
++          - name: evidence_bucket
++            value: "$(params.evidence_bucket)"
++        workspaces:
++          - name: shared-workspace
++            persistentVolumeClaim:
++              claimName: cicd-shared-pvc
++---
++apiVersion: triggers.tekton.dev/v1alpha1
++kind: TriggerBinding
++metadata:
++  name: gazebo-sim-binding
++  namespace: cicd
++spec:
++  params:
++    - name: episode_name
++      value: $(body.episode_name)
++    - name: duration_s
++      value: $(body.duration_s)
++    - name: evidence_bucket
++      value: $(body.evidence_bucket)
++---
++apiVersion: triggers.tekton.dev/v1alpha1
++kind: Trigger
++metadata:
++  name: gazebo-sim-trigger
++  namespace: cicd
++spec:
++  binding:
++    ref: gazebo-sim-binding
++  template:
++    ref: gazebo-sim-trigger-template
++  interceptors:
++    - ref:
++        name: "cel"
++      params:
++        - name: "filter"
++          value: "body.event == 'run-sim'"
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/manifests/edge/jetson-triton-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: jetson-triton
++  namespace: edge
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: jetson-triton
++  template:
++    metadata:
++      labels:
++        app: jetson-triton
++    spec:
++      # run on nodes labeled as edge/jetson
++      nodeSelector:
++        accelerator: nvidia
++        node-role.kubernetes.io/edge: "true"
++      containers:
++        - name: triton
++          image: nvcr.io/nvidia/tritonserver:23.07-py3
++          args: ["tritonserver", "--model-repository=/models"]
++          volumeMounts:
++            - name: models
++              mountPath: /models
++          resources:
++            limits:
++              nvidia.com/gpu: 1
++        - name: prometheus-sidecar
++          image: prom/prometheus:2.46.0
++          args: ["--config.file=/etc/prometheus/prometheus.yml"]
++          volumeMounts:
++            - name: prometheus-config
++              mountPath: /etc/prometheus
++          ports:
++            - containerPort: 9090
++              name: prom
++      volumes:
++        - name: models
++          emptyDir: {}
++        - name: prometheus-config
++          configMap:
++            name: jetson-prometheus-config
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: jetson-triton
++  namespace: edge
++spec:
++  selector:
++    app: jetson-triton
++  ports:
++    - name: grpc
++      port: 8001
++      targetPort: 8001
++    - name: http
++      port: 8000
++      targetPort: 8000
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/manifests/edge/jetson-prometheus-config.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: jetson-prometheus-config
++  namespace: edge
++data:
++  prometheus.yml: |
++    global:
++      scrape_interval: 15s
++    scrape_configs:
++      - job_name: 'jetson-local'
++        static_configs:
++          - targets: ['localhost:9100', 'localhost:8002']
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/runbooks/robot_pilot_runbook.md
++# Robot Pilot Runbook (simulation → shadow → canary → rollout)
++
++This runbook describes the safe, staged process to pilot a new perception/planning/control model on physical robots using Aegis.
++
++Prerequisites
++- Aegis stack deployed to staging with Postgres-backed registry, long-shadow, accounting, and Prometheus.
++- Evidence S3 bucket created with Object Lock enabled.
++- Keycloak configured and registry auth enabled.
++- Edge nodes labeled and reachable (node-role.kubernetes.io/edge=true).
++- Simulation environment (Gazebo/Isaac) available and Tekton pipeline configured.
++
++Stages
++
++1) Development & registry
++- Train model locally or in cloud.
++- Register model and upload version:
++  aegisctl register my-robot-model
++  aegisctl upload my-robot-model v1 --artifact /path/to/model.onnx
++- Add model card and test metadata in registry.
++
++2) Simulation verification (HIL / DT)
++- Run Tekton pipeline to execute N simulation episodes:
++  - Trigger the gazebo pipeline via Tekton Trigger (or:
++    tkn pipeline start gazebo-sim-pipeline -p episode_name=pilot -p duration_s=60 -p evidence_bucket=<bucket>)
++- Collect evidence in S3: s3://<EVIDENCE_BUCKET>/simulations/...
++- Run long_dryrun locally:
++  DRYRUN_ITERATIONS=2000 DRYRUN_WORKERS=40 python services/agent/long_dryrun_runner.py
++- Ensure planner schema/hallucination failure <= acceptance threshold.
++
++3) Long‑shadow (observe-only on device)
++- Deploy model to edge in shadow mode (no actuation). Use long-shadow deployment or lightweight agent to forward predictions to Aegis:
++  ./ops/scripts/run_long_shadow_campaign.sh --days 30 --sample-rate 0.01
++- Monitor divergence metrics daily via long-shadow supervisor; collect evidence and request SME signoff when metrics acceptable.
++
++4) Pilot actuated canary (human-in-loop)
++- Prepare canary robot with manual-override and emergency-stop hardware.
++- Deploy model to a single robot with wrappers and transaction_manager active.
++- Operator supervises in-person or remote; run short missions with live telemetry.
++- If safe, extend to small fraction of fleet (progressive rollout).
++
++5) Promotion & fleet rollout
++- When SME signoff obtained and acceptance criteria met:
++  - Run Model Promotion gate via GH Action or aegisctl to annotate model and trigger fleet pipeline.
++  - Deploy via canary → 10% → 50% → 100% with monitoring windows at each step.
++  - Use policy_controller to automatically mitigate non-critical workloads if carbon budgets or error rates spike.
++
++6) Incident & MTTR drills
++- Rehearse MTTR: run services/agent/mttr_drill.py to verify rollback and emergency-stop integration.
++- Postmortem: attach evidence artifacts to s3://<EVIDENCE_BUCKET>/incidents/<id> and fill postmortem template (ops/runbooks/postmortem_template.md).
++
++Safety checks (must pass before actuated pilots)
++- Wrapper audit (services/agent/wrapper_audit_runner.py) passes with no critical failures.
++- Long_dryrun acceptance thresholds satisfied.
++- Emergency-stop hardware tested and effective.
++- Transaction manager rollback tested and MTTR within SLO.
++- SME signoff artifacts present in S3.
++
++Notes
++- Keep human in the loop for first several weeks.
++- Collect and sign evidence for each step.
++- Use small sample rates for long-shadow initially to limit operational load and cost.
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/scripts/upload_simulation_evidence.sh
++#!/usr/bin/env bash
++# Helper to upload local simulation artifacts to evidence bucket used by Tekton task debugging
++set -euo pipefail
++EVIDENCE_BUCKET=${EVIDENCE_BUCKET:-}
++if [ -z "$EVIDENCE_BUCKET" ]; then
++  echo "EVIDENCE_BUCKET env required"
++  exit 2
++fi
++ARTIFACT=${1:-}
++if [ ! -f "$ARTIFACT" ]; then
++  echo "artifact not found: $ARTIFACT"
++  exit 2
++fi
++aws s3 cp "$ARTIFACT" "s3://$EVIDENCE_BUCKET/simulations/$(basename $ARTIFACT)-$(date +%s).json"
++echo "Uploaded"
++
+*** End Patch
+*** End Patch

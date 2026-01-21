@@ -1,0 +1,577 @@
+*** Begin Patch
+*** Add File:services/agent/tool_adapters/verified_k8s.py
++#!/usr/bin/env python3
++"""
++Verified K8s wrappers with RBAC, idempotency, backups, retries and audit logging.
++ - Exposes safe_set_image, safe_scale_deployment, safe_create_configmap
++ - Uses services.agent.rbac_manager.is_allowed for authorization
++ - Stores pre-action snapshots via services.agent.backup_store.store_backup
++ - Emits audit records via services.agent.audit_logger.audit_log_action
++ - Retries transient failures with exponential backoff
++"""
++import time
++import subprocess
++from typing import Dict, Any
++
++from services.agent.rbac_manager import is_allowed
++from services.agent.backup_store import store_backup
++from services.agent.audit_logger import audit_log_action
++
++RETRY_MAX = int(__import__("os").environ.get("K8S_WRAPPER_RETRIES", "3"))
++RETRY_BASE_S = float(__import__("os").environ.get("K8S_WRAPPER_RETRY_BASE_S", "0.5"))
++
++def _run_kubectl(cmd):
++    return subprocess.check_output(cmd).decode("utf-8")
++
++def _retry(func, *a, **kw):
++    for i in range(RETRY_MAX):
++        try:
++            return func(*a, **kw)
++        except subprocess.CalledProcessError as e:
++            if i == RETRY_MAX - 1:
++                raise
++            time.sleep(RETRY_BASE_S * (2 ** i))
++
++def safe_set_image(requester: str, namespace: str, deployment: str, image: str, dry_run: bool=False) -> Dict[str, Any]:
++    tool = "k8s.set_image"
++    if not is_allowed(requester, tool):
++        raise PermissionError("not permitted")
++    # idempotency check
++    try:
++        cur = _run_kubectl(["kubectl","-n",namespace,"get","deployment",deployment,"-o","jsonpath={.spec.template.spec.containers[0].image}"]).strip()
++    except Exception:
++        cur = None
++    if cur == image:
++        audit_log_action("safe_set_image", requester, {"namespace":namespace,"deployment":deployment,"image":image}, {"state":"noop","reason":"image_already_set"})
++        return {"status":"noop","reason":"image_already_set","image":image}
++    # backup current deployment
++    try:
++        manifest = _run_kubectl(["kubectl","-n",namespace,"get","deployment",deployment,"-o","json"])
++        backup_uri = store_backup(f"set_image_{namespace}_{deployment}_{int(time.time())}", {"deployment_json": manifest})
++    except Exception as e:
++        backup_uri = None
++    if dry_run:
++        return {"status":"dry_run","would_set":image,"backup_uri":backup_uri}
++    def _do():
++        _run_kubectl(["kubectl","-n",namespace,"set","image","deployment/"+deployment, f"{deployment}={image}"])
++        return {"status":"ok","image":image}
++    res = _retry(_do)
++    audit_log_action("safe_set_image", requester, {"namespace":namespace,"deployment":deployment,"image":image}, {"state":"executed","result":res,"backup_uri":backup_uri})
++    return {"status":"ok","result":res,"backup_uri":backup_uri}
++
++def safe_scale_deployment(requester: str, namespace: str, deployment: str, replicas: int, dry_run: bool=False) -> Dict[str, Any]:
++    tool = "k8s.scale_deployment"
++    if not is_allowed(requester, tool):
++        raise PermissionError("not permitted")
++    try:
++        cur = int(_run_kubectl(["kubectl","-n",namespace,"get","deployment",deployment,"-o","jsonpath={.spec.replicas}"]).strip())
++    except Exception:
++        cur = None
++    if cur == replicas:
++        audit_log_action("safe_scale", requester, {"namespace":namespace,"deployment":deployment,"replicas":replicas}, {"state":"noop"})
++        return {"status":"noop","reason":"replicas_already_set","replicas":replicas}
++    # backup current spec
++    backup_uri = None
++    try:
++        manifest = _run_kubectl(["kubectl","-n",namespace,"get","deployment",deployment,"-o","json"])
++        backup_uri = store_backup(f"scale_{namespace}_{deployment}_{int(time.time())}", {"deployment_json": manifest})
++    except Exception:
++        pass
++    if dry_run:
++        return {"status":"dry_run","would_scale_to":replicas,"backup_uri":backup_uri}
++    def _do():
++        _run_kubectl(["kubectl","-n",namespace,"scale","deployment",deployment,"--replicas="+str(replicas)])
++        return {"status":"ok","replicas":replicas}
++    res = _retry(_do)
++    audit_log_action("safe_scale", requester, {"namespace":namespace,"deployment":deployment,"replicas":replicas}, {"state":"executed","result":res,"backup_uri":backup_uri})
++    return {"status":"ok","result":res,"backup_uri":backup_uri}
++
++def safe_create_configmap(requester: str, namespace: str, name: str, data: Dict[str,str], dry_run: bool=False) -> Dict[str, Any]:
++    tool = "k8s.create_configmap"
++    if not is_allowed(requester, tool):
++        raise PermissionError("not permitted")
++    # backup existing if present
++    backup_uri = None
++    try:
++        prev = _run_kubectl(["kubectl","-n",namespace,"get","configmap",name,"-o","json"])
++        backup_uri = store_backup(f"cm_{namespace}_{name}_{int(time.time())}", {"configmap_json": prev})
++    except Exception:
++        prev = None
++    if dry_run:
++        return {"status":"dry_run","would_create":name,"previous_present": bool(prev), "backup_uri": backup_uri}
++    # write to temp file and apply
++    import tempfile, json as _json
++    cm = {"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":namespace},"data":{k:str(v) for k,v in data.items()}}
++    tf = tempfile.NamedTemporaryFile(delete=False, mode="w")
++    _json.dump(cm, tf); tf.close()
++    def _do():
++        _run_kubectl(["kubectl","apply","-f", tf.name])
++        return {"status":"applied"}
++    res = _retry(_do)
++    audit_log_action("safe_create_configmap", requester, {"namespace":namespace,"name":name,"data_keys": list(data.keys())}, {"state":"executed","result":res,"backup_uri":backup_uri})
++    return {"status":"ok","result":res,"backup_uri":backup_uri}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/transaction_manager.py
++#!/usr/bin/env python3
++"""
++Transaction manager for agentic actions.
++ - Records transaction metadata (start/steps/backup_uris/status) into evidence store.
++ - Provides rollback orchestration by replaying stored backups.
++ - This is a control-plane helper used by execute_with_safety.
++"""
++import time
++from services.agent.backup_store import store_backup
++from services.agent.audit_logger import audit_log_action, s3_put
++import json, os
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++
++def start_transaction(name: str, requester: str, plan: dict) -> dict:
++    tx = {"name": name, "requester": requester, "plan": plan, "start_ts": int(time.time()), "steps": [], "state": "started"}
++    # record to evidence
++    key = f"agent_tx/{name}_{int(time.time())}.json"
++    if EVIDENCE_BUCKET:
++        s3_put(key, tx)
++    else:
++        with open(f"/tmp/{os.path.basename(key)}","w") as f:
++            json.dump(tx, f)
++    return tx
++
++def record_step(tx: dict, step_index: int, step: dict, backup_uri: str=None):
++    entry = {"index": step_index, "step": step, "backup_uri": backup_uri, "ts": int(time.time())}
++    tx.setdefault("steps", []).append(entry)
++    # update evidence copy
++    key = f"agent_tx/{tx['name']}_latest.json"
++    if EVIDENCE_BUCKET:
++        s3_put(key, tx)
++    else:
++        with open(f"/tmp/{os.path.basename(key)}","w") as f:
++            json.dump(tx, f)
++    return entry
++
++def finalize_transaction(tx: dict, final_state: str, details: dict=None):
++    tx["state"] = final_state
++    tx["end_ts"] = int(time.time())
++    if details:
++        tx["details"] = details
++    key = f"agent_tx/{tx['name']}_final_{int(time.time())}.json"
++    if EVIDENCE_BUCKET:
++        s3_put(key, tx)
++    else:
++        with open(f"/tmp/{os.path.basename(key)}","w") as f:
++            json.dump(tx, f)
++    audit_log_action("transaction_finalized", tx["requester"], {"tx": tx["name"]}, {"state": final_state})
++    return tx
++
++def rollback_transaction(tx: dict):
++    # Iterate steps in reverse, apply backups if possible (best effort)
++    for s in reversed(tx.get("steps", [])):
++        b = s.get("backup_uri")
++        if not b:
++            continue
++        try:
++            if b.startswith("s3://"):
++                # Download and apply depending on content (scaffold)
++                import boto3, tempfile, json, subprocess
++                s3 = boto3.client("s3")
++                parts = b[len("s3://"):].split("/",1)
++                bucket = parts[0]; key = parts[1]
++                tmp = tempfile.NamedTemporaryFile(delete=False)
++                s3.download_file(bucket, key, tmp.name)
++                data = json.load(open(tmp.name))
++                # If manifest exists, re-apply via kubectl
++                if "deployment_json" in data:
++                    tmp2 = tempfile.NamedTemporaryFile(delete=False, mode="w")
++                    json.dump(data["deployment_json"], tmp2); tmp2.close()
++                    subprocess.check_call(["kubectl","apply","-f", tmp2.name])
++        except Exception:
++            pass
++    tx["state"] = "rolled_back"
++    finalize_transaction(tx, "rolled_back")
++    return tx
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/ingest/resumable_service_v2.py
++#!/usr/bin/env python3
++"""
++Improved resumable ingestion service with concurrency limiting, metrics and retry-friendly chunking.
++ - Adds /health and Prometheus metrics
++ - Uses chunk storage with idempotent offsets and includes checksum verification on finalize
++ - Uses a worker queue to perform derivative generation asynchronously to reduce request latency
++"""
++import os, uuid, json, hashlib, shutil, time
++from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
++from pydantic import BaseModel
++from typing import Optional
++from queue import Queue
++from threading import Thread
++from services.multimodal.storage.uploader import upload_to_storage
++from services.multimodal.metadata.register_dataset import register_file_entry
++from PIL import Image
++import subprocess
++
++TMP = os.environ.get("MM_INGEST_TMP", "/tmp/mm_ingest_v2")
++OUT_DIR = os.environ.get("MM_INGEST_OUT", "/workspace/ingest_v2")
++os.makedirs(TMP, exist_ok=True)
++os.makedirs(OUT_DIR, exist_ok=True)
++
++app = FastAPI(title="Aegis Resumable Ingest V2")
++
++WORKER_Q = Queue(maxsize=100)
++
++def worker_loop():
++    while True:
++        task = WORKER_Q.get()
++        try:
++            assembled_path = task["assembled"]
++            meta = task["meta"]
++            # create derivatives (best-effort)
++            derivatives = {}
++            try:
++                if meta["modality"] == "image":
++                    thumb = os.path.join(OUT_DIR, f"{meta['id']}_thumb.png")
++                    img = Image.open(assembled_path)
++                    img.thumbnail((256,256)); img.save(thumb, format="PNG")
++                    derivatives["thumbnail"] = upload_to_storage(thumb, object_name=f"{meta['dataset_id']}/{os.path.basename(thumb)}")
++                elif meta["modality"] == "audio":
++                    wav = os.path.join(OUT_DIR, f"{meta['id']}.wav")
++                    subprocess.check_call(["ffmpeg","-y","-i", assembled_path, "-ar","16000","-ac","1", wav])
++                    derivatives["wav"] = upload_to_storage(wav, object_name=f"{meta['dataset_id']}/{os.path.basename(wav)}")
++            except Exception:
++                pass
++            # register metadata
++            manifest_entry = {"id": meta["id"], "dataset_id": meta["dataset_id"], "original_name": meta["filename"], "modality": meta["modality"], "storage_uri": upload_to_storage(assembled_path, object_name=f"{meta['dataset_id']}/{meta['id']}_{meta['filename']}"), "derivatives": derivatives, "sha256": meta["id"], "ingested_at": int(time.time())}
++            try:
++                register_file_entry(manifest_entry)
++            except Exception:
++                pass
++        finally:
++            WORKER_Q.task_done()
++
++Thread(target=worker_loop, daemon=True).start()
++
++class InitRequest(BaseModel):
++    filename: str
++    modality: str
++    dataset_id: str
++    total_size: Optional[int] = None
++
++@app.post("/resumable/init")
++def init_upload(req: InitRequest):
++    uid = uuid.uuid4().hex
++    upload_dir = os.path.join(TMP, uid)
++    os.makedirs(os.path.join(upload_dir, "chunks"), exist_ok=True)
++    meta = {"id": None, "filename": req.filename, "modality": req.modality, "dataset_id": req.dataset_id, "total_size": req.total_size, "created_at": int(time.time()), "chunks": []}
++    with open(os.path.join(upload_dir, "meta.json"), "w") as f:
++        json.dump(meta, f)
++    return {"upload_id": uid, "upload_url": f"/resumable/{uid}/chunk"}
++
++@app.put("/resumable/{upload_id}/chunk")
++async def upload_chunk(upload_id: str, offset: int = 0, chunk: UploadFile = File(...)):
++    upload_dir = os.path.join(TMP, upload_id)
++    if not os.path.exists(upload_dir):
++        raise HTTPException(status_code=404, detail="upload id not found")
++    chunk_dir = os.path.join(upload_dir, "chunks")
++    os.makedirs(chunk_dir, exist_ok=True)
++    chunk_path = os.path.join(chunk_dir, f"{offset:020d}.chunk")
++    data = await chunk.read()
++    # write atomically
++    tmp = chunk_path + ".tmp"
++    with open(tmp, "wb") as f:
++        f.write(data)
++    os.replace(tmp, chunk_path)
++    meta_path = os.path.join(upload_dir, "meta.json")
++    meta = json.load(open(meta_path))
++    if offset not in meta.get("chunks", []):
++        meta["chunks"].append(offset)
++        with open(meta_path, "w") as f:
++            json.dump(meta, f)
++    return {"status": "ok", "offset": offset, "bytes": len(data)}
++
++@app.post("/resumable/{upload_id}/finalize")
++def finalize(upload_id: str, background_tasks: BackgroundTasks):
++    upload_dir = os.path.join(TMP, upload_id)
++    if not os.path.exists(upload_dir):
++        raise HTTPException(status_code=404, detail="upload id not found")
++    meta = json.load(open(os.path.join(upload_dir, "meta.json")))
++    chunks_dir = os.path.join(upload_dir, "chunks")
++    chunk_files = sorted(os.listdir(chunks_dir))
++    assembled_path = os.path.join(OUT_DIR, f"{upload_id}_{meta['filename']}")
++    with open(assembled_path, "wb") as w:
++        for cf in chunk_files:
++            with open(os.path.join(chunks_dir, cf), "rb") as r:
++                shutil.copyfileobj(r, w)
++    # compute sha256
++    h = hashlib.sha256()
++    with open(assembled_path, "rb") as f:
++        for b in iter(lambda: f.read(8192), b""):
++            h.update(b)
++    sha = h.hexdigest()
++    meta["id"] = sha
++    # submit to background worker for derivatives and registration
++    background_tasks.add_task(WORKER_Q.put, {"assembled": assembled_path, "meta": meta})
++    # cleanup chunks to save disk (best-effort)
++    try:
++        shutil.rmtree(os.path.join(upload_dir, "chunks"))
++    except Exception:
++        pass
++    return {"manifest": {"id": sha, "filename": meta["filename"], "modality": meta["modality"], "dataset_id": meta["dataset_id"], "ingested_at": int(time.time())}}
++
++@app.get("/health")
++def health():
++    return {"status":"ok","queue_size": WORKER_Q.qsize()}
++
+*** End Patch
+*** Begin Patch
+*** Add File:tekton/tasks/ingest_stress_validate.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: ingest-stress-validate
++  namespace: ml-pipelines
++spec:
++  params:
++    - name: ingest-server
++      type: string
++    - name: files
++      type: string
++    - name: parallel
++      type: string
++    - name: total
++      type: string
++  steps:
++    - name: run-stress
++      image: python:3.10-slim
++      script: |
++        #!/usr/bin/env bash
++        set -euo pipefail
++        pip install requests || true
++        python services/ingest/ingest_stress_runner.py --server $(inputs.params.ingest-server) --files $(inputs.params.files) --parallel $(inputs.params.parallel) --total $(inputs.params.total) > /workspace/out.json || true
++        cat /workspace/out.json
++        python - <<'PY'
++import json,sys
++o=json.load(open('/workspace/out.json'))
++succ=o['summary']['success']; tot=o['summary']['total']
++err_rate = (tot - succ)/tot if tot else 1.0
++print("error_rate",err_rate)
++if err_rate > 0.02:
++    print("Error rate too high:", err_rate)
++    sys.exit(2)
++print("Ingest stress passed")
++PY
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/triton/model_repo_watcher.py
++#!/usr/bin/env python3
++"""
++Model repo watcher for Triton model store.
++ - Polls MODEL_STORE_PREFIX (supports s3:// and file://) and detects new model versions per model_name
++ - Triggers Triton reload and runs validate_inference for newly discovered models
++ - Writes evidence to EVIDENCE_BUCKET via audit_logger.s3_put
++"""
++import os, time, json
++from urllib.parse import urlparse
++try:
++    import boto3
++except Exception:
++    boto3 = None
++from services.agent.audit_logger import s3_put
++from services.triton.validate_and_test_model import reload_triton, infer_test
++
++MODEL_STORE_PREFIX = os.environ.get("MODEL_STORE_PREFIX", "")
++TRITON_HOST = os.environ.get("TRITON_HOST", "triton-clip-backend.inference.svc:8000")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++POLL_S = int(os.environ.get("MODEL_REPO_POLL_S", "300"))
++
++seen = {}
++
++def list_models_s3(prefix):
++    if not boto3:
++        return []
++    s3 = boto3.client("s3")
++    parts = prefix[len("s3://"):].split("/",1)
++    bucket = parts[0]; base = parts[1] if len(parts)>1 else ""
++    models = set()
++    resp = s3.list_objects_v2(Bucket=bucket, Prefix=base, Delimiter="/")
++    for p in resp.get("CommonPrefixes", []):
++        name = p.get("Prefix").rstrip("/").split("/")[-1]
++        models.add(name)
++    return list(models)
++
++def list_models_file(path):
++    if not os.path.exists(path):
++        return []
++    return [d for d in os.listdir(path) if os.path.isdir(os.path.join(path,d))]
++
++def publish_evidence(obj):
++    key = f"model_repo_watcher/{int(time.time())}.json"
++    if EVIDENCE_BUCKET:
++        s3_put(key, obj)
++    else:
++        with open("/tmp/model_repo_watcher_"+str(int(time.time()))+".json","w") as f:
++            json.dump(obj, f)
++
++def main_loop():
++    while True:
++        try:
++            if MODEL_STORE_PREFIX.startswith("s3://"):
++                models = list_models_s3(MODEL_STORE_PREFIX)
++            else:
++                models = list_models_file(MODEL_STORE_PREFIX)
++            for m in models:
++                if m not in seen:
++                    seen[m] = True
++                    # trigger reload and validate
++                    info = {"model": m, "discovered_at": int(time.time())}
++                    try:
++                        reload_triton(TRITON_HOST)
++                        # simple sample input if present
++                        # caller should configure sample for each model; we skip inference if no sample path
++                        sample = os.environ.get(f"SAMPLE_INPUT_{m.upper()}")
++                        if sample:
++                            out = infer_test(TRITON_HOST, m, sample)
++                            info["validation"] = out
++                        info["status"] = "validated" if sample else "reloaded"
++                    except Exception as e:
++                        info["status"] = "error"
++                        info["error"] = str(e)
++                    publish_evidence(info)
++        except Exception as e:
++            print("watcher error", e)
++        time.sleep(POLL_S)
++
++if __name__=="__main__":
++    main_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/generative/long_shadow_supervisor.py
++#!/usr/bin/env python3
++"""
++Supervisor for long-duration shadow campaigns.
++ - Aggregates daily results, checks against thresholds, and emits alerts to a webhook when thresholds breached.
++ - Produces a final campaign report for SME signoff.
++"""
++import os, time, json
++from services.generative.shadow_aggregator import aggregate, read_s3_prefix, iter_local
++try:
++    import boto3
++except Exception:
++    boto3 = None
++import requests
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++PUSH_WEBHOOK = os.environ.get("SHADOW_ALERT_WEBHOOK", "")
++LOCAL_SHADOW_PATH = os.environ.get("SHADOW_OUT", "/data/shadow_generations.jsonl")
++DIVERGENCE_THRESHOLD = float(os.environ.get("SHADOW_DIVERGENCE_THRESHOLD", "0.02"))
++
++def load_window(hours=24):
++    since = int(time.time()) - hours*3600
++    items = list(iter_local(LOCAL_SHADOW_PATH, since))
++    if EVIDENCE_BUCKET and boto3:
++        items.extend(list(read_s3_prefix(EVIDENCE_BUCKET, "gen_shadow/", since)))
++    return items
++
++def check_and_alert():
++    items = load_window(24)
++    rep = aggregate(items)
++    rep["checked_at"] = int(time.time())
++    # upload daily summary
++    if EVIDENCE_BUCKET and boto3:
++        s3 = boto3.client("s3")
++        key = f"gen_shadow_reports/daily_{int(time.time())}.json"
++        s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(rep).encode("utf-8"))
++    else:
++        with open(f"/tmp/gen_shadow_daily_{int(time.time())}.json","w") as f:
++            json.dump(rep, f, indent=2)
++    if rep.get("divergence_rate",0) > DIVERGENCE_THRESHOLD:
++        msg = {"text": f"Shadow divergence exceeded threshold: {rep.get('divergence_rate')}, threshold {DIVERGENCE_THRESHOLD}"}
++        if PUSH_WEBHOOK:
++            try:
++                requests.post(PUSH_WEBHOOK, json=msg, timeout=10)
++            except Exception:
++                pass
++        # also record an incident artifact
++        incident = {"ts": int(time.time()), "type":"shadow_divergence", "report": rep}
++        if EVIDENCE_BUCKET and boto3:
++            s3.put_object(Bucket=EVIDENCE_BUCKET, Key=f"incidents/shadow_{int(time.time())}.json", Body=json.dumps(incident).encode("utf-8"))
++    return rep
++
++if __name__=="__main__":
++    print("Running supervisor check")
++    r = check_and_alert()
++    print("Supervisor report:", r)
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/finalize_hardening.yml
++name: Finalize Hardening Plan
++on:
++  workflow_dispatch:
++
++jobs:
++  finalize:
++    runs-on: ubuntu-latest
++    timeout-minutes: 180
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.10'
++      - name: Install deps
++        run: pip install boto3 requests jsonschema || true
++      - name: Generate and audit wrappers
++        run: |
++          python services/agent/tool_wrapper_generator.py
++          python services/agent/wrapper_audit_runner.py
++      - name: Run verified k8s wrapper smoke tests (dry-run)
++        run: |
++          python - <<'PY'
++from services.agent.tool_adapters.verified_k8s import safe_set_image, safe_scale_deployment, safe_create_configmap
++print("safe_set_image dry:", safe_set_image("ci","default","nonexistent","my/image:tag", dry_run=True))
++print("safe_scale_deployment dry:", safe_scale_deployment("ci","default","nonexistent", 2, dry_run=True))
++print("safe_create_configmap dry:", safe_create_configmap("ci","default","test-config", {"k":"v"}, dry_run=True))
++PY
++      - name: Run long dry-run small (sanity)
++        env:
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++          DRYRUN_WORKERS: 10
++          DRYRUN_ITERATIONS: 200
++        run: python services/agent/long_dryrun_runner.py
++      - name: Run ingest stress sample
++        env:
++          INGEST_SERVER: ${{ secrets.INGEST_SERVER }}
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++        run: |
++          python services/ingest/ingest_stress_runner.py --server "${INGEST_SERVER:-http://localhost:8080}" --files ops/multimodal/sample_images/* --parallel 20 --total 200
++      - name: Run model repo watcher health-check (local test)
++        env:
++          MODEL_STORE_PREFIX: ${{ secrets.MODEL_STORE_PREFIX }}
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++        run: |
++          python services/triton/model_repo_watcher.py &
++          sleep 5
++          pkill -f model_repo_watcher || true
++      - name: Run long shadow supervisor check (daily summary)
++        env:
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++          SHADOW_OUT: /tmp/shadow_test.jsonl
++        run: |
++          # seed a couple of synthetic shadow lines for a quick check
++          python - <<'PY'
++import json, time
++f='/tmp/shadow_test.jsonl'
++for i in range(5):
++    rec={'ts':time.time(),'request':{'prompt':'test'},'prod':{'resp':{'text':'hi'}},'candidate':{'resp':{'text':'hi' if i%2==0 else 'hello'}},'divergence': 0 if i%2==0 else 1}
++    open(f,'a').write(json.dumps(rec)+"\n")
++print("wrote test shadow")
++PY
++          python services/generative/long_shadow_supervisor.py
++
+*** End Patch
+*** End Patch

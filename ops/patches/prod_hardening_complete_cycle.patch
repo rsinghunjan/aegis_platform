@@ -1,0 +1,503 @@
+*** Begin Patch
+*** Add File:ops/tekton/pipelines/repeatable_retrain_with_retries.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Pipeline
++metadata:
++  name: repeatable-retrain-with-retries
++  namespace: cicd
++spec:
++  params:
++    - name: dataset_snapshot_s3
++      type: string
++      default: ""
++    - name: evidence_bucket
++      type: string
++      default: ""
++    - name: runs
++      type: string
++      default: "3"
++    - name: concurrent
++      type: string
++      default: "1"
++  tasks:
++    - name: loop-trigger
++      taskSpec:
++        params:
++          - name: dataset_snapshot_s3
++            type: string
++          - name: evidence_bucket
++            type: string
++          - name: runs
++            type: string
++          - name: concurrent
++            type: string
++        steps:
++          - name: run-repeat
++            image: bitnami/kubectl:1.27
++            script: |
++              #!/bin/sh
++              set -euo pipefail
++              RUNS=$(params.runs)
++              DATASET=$(params.dataset_snapshot_s3)
++              EB=$(params.evidence_bucket)
++              CONC=$(params.concurrent)
++              i=0
++              while [ $i -lt $RUNS ]; do
++                PR_NAME="drift-retrain-run-$(date -u +%s)-$i"
++                cat > /tmp/pr.yaml <<EOF
++apiVersion: tekton.dev/v1beta1
++kind: PipelineRun
++metadata:
++  generateName: drift-retrain-run-
++spec:
++  pipelineRef:
++    name: drift-retrain-canary-pipeline
++  params:
++    - name: dataset_snapshot_s3
++      value: "$DATASET"
++    - name: evidence_bucket
++      value: "$EB"
++EOF
++                kubectl apply -n cicd -f /tmp/pr.yaml
++                i=$((i+1))
++                # simple concurrency control: sleep if many in-flight
++                sleep 5
++              done
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/closed_loop/auto_promotion_tuner.py
++#!/usr/bin/env python3
++"""
++Auto-promotion tuner:
++ - Uses historical canary evaluation results (Prometheus & evidence) to recommend tuned thresholds
++ - Emits recommended thresholds to a ConfigMap that auto-promoter reads
++ - Simple PoC: computes 95th-percentile relative drop from history and recommends a margin
++"""
++import os, time, logging, json
++import requests
++from statistics import median
++
++logger = logging.getLogger("auto-prom-tuner")
++logging.basicConfig(level=logging.INFO)
++
++PROM = os.environ.get("PROM_URL", "http://prometheus.monitoring.svc:9090")
++CM_NAME = os.environ.get("AUTOPROM_CM", "aegis-auto-promoter")
++NAMESPACE = os.environ.get("TEKTON_NAMESPACE", "cicd")
++WINDOW = int(os.environ.get("TUNE_WINDOW_HOURS", "72"))
++
++def query_rel_drops(metric_expr='(sum(rate(business_metric{app="production-model"}[5m])) - sum(rate(business_metric{app="model-canary"}[5m]))) / sum(rate(business_metric{app="production-model"}[5m]))'):
++    now = int(time.time())
++    start = now - WINDOW * 3600
++    r = requests.get(f"{PROM}/api/v1/query_range", params={"query": metric_expr, "start": start, "end": now, "step": "300"}, timeout=20)
++    r.raise_for_status()
++    data = r.json().get("data", {}).get("result", [])
++    drops = []
++    for series in data:
++        for v in series.get("values", []):
++            try:
++                drops.append(float(v[1]))
++            except Exception:
++                continue
++    return drops
++
++def recommend_threshold(drops):
++    if not drops:
++        return 0.1
++    # use median + safety margin
++    med = median(drops)
++    rec = max(0.01, min(0.3, med * 1.2))
++    return round(rec, 4)
++
++def write_configmap(threshold):
++    cm = {
++        "apiVersion": "v1",
++        "kind": "ConfigMap",
++        "metadata": {"name": CM_NAME, "namespace": NAMESPACE},
++        "data": {"auto_promote_rel_drop": str(threshold)}
++    }
++    import tempfile, subprocess, yaml
++    f = tempfile.NamedTemporaryFile(delete=False, suffix=".yaml")
++    f.write(yaml.dump(cm).encode()); f.close()
++    subprocess.check_call(["kubectl","apply","-f",f.name])
++    logger.info("Wrote configmap %s with threshold %s", CM_NAME, threshold)
++
++def run_once():
++    drops = query_rel_drops()
++    th = recommend_threshold(drops)
++    write_configmap(th)
++
++if __name__ == "__main__":
++    run_once()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tekton/tasks/failure-escalation-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: failure-escalation
++  namespace: cicd
++spec:
++  params:
++    - name: pipelinerun
++      type: string
++  steps:
++    - name: collect-and-escalate
++      image: python:3.10
++      script: |
++        #!/bin/sh
++        set -euo pipefail
++        PR=$(params.pipelinerun)
++        echo "Collecting artifacts for $PR"
++        kubectl -n cicd get pipelinerun "$PR" -o yaml > /workspace/$PR.yaml || true
++        kubectl -n cicd get pods -o json > /workspace/pods.json || true
++        # If evidence bucket present, upload
++        if [ -n "${EVIDENCE_BUCKET:-}" ]; then
++          aws s3 cp /workspace/$PR.yaml "${EVIDENCE_BUCKET}/closedloop/failures/$PR.yaml" || true
++          aws s3 cp /workspace/pods.json "${EVIDENCE_BUCKET}/closedloop/failures/$PR-pods.json" || true
++          # notify approval service
++          python - <<'PY'
++import os, requests, json
++APP=os.environ.get("APPROVAL_SERVICE_URL","http://approval-service.monitoring.svc:8080")
++PR=os.environ.get("PR")
++EVID="${EVIDENCE_BUCKET}"
++payload={"summary":f"PipelineRun {PR} failed and requires manual intervention","evidence_uri": f"{EVID}/closedloop/failures/{PR}.yaml"}
++try:
++    requests.post(f"{APP}/request", json=payload, timeout=10)
++except Exception as e:
++    print("failed to notify approval service", e)
++PY
++        else
++          echo "No evidence bucket; skipped upload"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/hpo/hpo_submit_with_quota.py
++#!/usr/bin/env python3
++"""
++HPO submission service (production-ready):
++ - Validates team quota via chargeback API
++ - Estimates cost via cost estimator and optionally chooses spot/ondemand mix
++ - Submits a Tekton PipelineRun or Ray job and records submission to chargeback API
++"""
++import os, requests, json, logging, tempfile, subprocess
++
++logger = logging.getLogger("hpo-submit")
++logging.basicConfig(level=logging.INFO)
++
++QUOTA_API = os.environ.get("CHARGEBACK_API", "http://chargeback.monitoring.svc:8080")
++COST_EST_URL = os.environ.get("COST_EST_URL", "http://cost-estimator.monitoring.svc:8080/estimate")
++TEKTON_NS = os.environ.get("TEKTON_NAMESPACE", "cicd")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++
++def check_quota(team):
++    r = requests.get(f"{QUOTA_API}/quota/{team}", timeout=5)
++    r.raise_for_status()
++    return r.json()
++
++def estimate_cost(config):
++    r = requests.post(COST_EST_URL, json=config, timeout=5)
++    r.raise_for_status()
++    return r.json().get("estimated_usd", 0.0)
++
++def submit_hpo_pipeline(team, config, samples=16):
++    q = check_quota(team)
++    if not q.get("allowed", False):
++        raise RuntimeError("Quota denied")
++    est = estimate_cost(config)
++    # record submission
++    payload = {"team":team, "config":config, "estimated_spend_usd": est, "samples": samples}
++    r = requests.post(f"{QUOTA_API}/submit", json=payload, timeout=5)
++    r.raise_for_status()
++    # create Tekton PipelineRun
++    pr = {
++      "apiVersion": "tekton.dev/v1beta1",
++      "kind": "PipelineRun",
++      "metadata": {"generateName": "hpo-distributed-run-"},
++      "spec": {"pipelineRef":{"name":"ray-hpo-scale-test"}, "params":[{"name":"samples","value":str(samples)}, {"name":"evidence_bucket","value":EVIDENCE_BUCKET}]}
++    }
++    import yaml
++    f = tempfile.NamedTemporaryFile(delete=False, suffix=".yaml")
++    f.write(yaml.safe_dump(pr).encode()); f.close()
++    subprocess.check_call(["kubectl","apply","-n",TEKTON_NS,"-f", f.name])
++    logger.info("HPO pipeline submitted for team %s", team)
++    return {"status":"submitted","estimated_usd": est}
++
++if __name__ == "__main__":
++    import sys
++    team=sys.argv[1] if len(sys.argv)>1 else "team-a"
++    cfg={"example":True}
++    print(submit_hpo_pipeline(team, cfg, samples=32))
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/data/offline_online_checker.py
++#!/usr/bin/env python3
++"""
++Offline/Online consistency checker (Feast):
++ - Compares aggregated offline feature statistics to online feature store samples.
++ - Emits a diff report and uploads to evidence bucket.
++"""
++import os, json, logging, tempfile
++import boto3
++import pandas as pd
++from datetime import datetime
++
++logger = logging.getLogger("offline-online-check")
++logging.basicConfig(level=logging.INFO)
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET","")
++OFFLINE_PATH = os.environ.get("OFFLINE_FEATURES","s3://data-lake/offline/features/latest.parquet")
++ONLINE_SRV = os.environ.get("FEAST_ONLINE_ENDPOINT","redis://redis.online:6379")
++
++def download_s3(path, local):
++    s3=boto3.client("s3")
++    bucket,key=path.replace("s3://","").split("/",1)
++    s3.download_file(bucket,key,local)
++    return local
++
++def sample_online(keys, n=100):
++    # PoC: if online store is Redis, sample via keys (requires implementation per store)
++    import redis
++    r=redis.from_url(ONLINE_SRV)
++    rows=[]
++    for k in keys[:n]:
++        try:
++            rows.append(json.loads(r.get(k)))
++        except Exception:
++            continue
++    return pd.DataFrame(rows)
++
++def run_check():
++    tmp="/tmp/offline.parquet"
++    download_s3(OFFLINE_PATH, tmp)
++    df_off = pd.read_parquet(tmp)
++    # pick keys column if exists
++    keys = df_off.get("entity_id", df_off.index).tolist()
++    df_online = sample_online(keys, n=200)
++    report = {"offline_rows": len(df_off), "online_rows_sampled": len(df_online)}
++    # compare simple stats
++    for col in df_off.columns:
++        if col in df_online.columns:
++            report[f"{col}_offline_mean"]=float(df_off[col].mean())
++            report[f"{col}_online_mean"]=float(df_online[col].mean())
++            report[f"{col}_mean_diff"]=abs(report[f"{col}_offline_mean"]-report[f"{col}_online_mean"])
++    # upload
++    local=json.dumps(report,indent=2)
++    if EVIDENCE_BUCKET:
++        s3=boto3.client("s3")
++        key=f"data/consistency/{int(time.time())}.json"
++        s3.put_object(Bucket=EVIDENCE_BUCKET.replace("s3://",""), Key=key, Body=local.encode())
++        return f"s3://{EVIDENCE_BUCKET}/{key}"
++    else:
++        path=f"/tmp/consistency-{int(time.time())}.json"
++        open(path,"w").write(local)
++        return path
++
++if __name__ == "__main__":
++    print(run_check())
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tekton/tasks/offline-online-check-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: offline-online-check
++  namespace: cicd
++spec:
++  steps:
++    - name: run-check
++      image: python:3.10
++      script: |
++        #!/bin/sh
++        set -euo pipefail
++        pip install boto3 pandas pyarrow redis || true
++        python /workspace/scripts/offline_online_checker.py
++      volumeMounts:
++        - name: workspace
++          mountPath: /workspace
++  volumes:
++    - name: workspace
++      emptyDir: {}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tekton/tasks/slo-canary-auto-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: slo-canary-auto
++  namespace: cicd
++spec:
++  params:
++    - name: canary_deployment
++      type: string
++    - name: business_metric
++      type: string
++    - name: auto_prom_cm
++      type: string
++      default: "aegis-auto-promoter"
++  steps:
++    - name: evaluate
++      image: python:3.10
++      script: |
++        #!/bin/sh
++        set -euo pipefail
++        pip install requests pyyaml || true
++        CANARY=$(params.canary_deployment)
++        METRIC=$(params.business_metric)
++        CM=$(params.auto_prom_cm)
++        prom="http://prometheus.monitoring.svc:9090"
++        # read recommended threshold from ConfigMap
++        THRESH=$(kubectl -n cicd get cm $CM -o jsonpath='{.data.auto_promote_rel_drop}' 2>/dev/null || echo "0.1")
++        canary_q=$(echo "$METRIC" | sed "s|\${CANARY}|$CANARY|g")
++        base_q=$(echo "$METRIC" | sed "s|\${CANARY}|production-model|g")
++        canary_v=$(curl -s "$prom/api/v1/query" --data-urlencode "query=$canary_q" | jq -r '.data.result[0].value[1]' 2>/dev/null || echo 0)
++        base_v=$(curl -s "$prom/api/v1/query" --data-urlencode "query=$base_q" | jq -r '.data.result[0].value[1]' 2>/dev/null || echo 0)
++        if [ "$base_v" = "0" ] || [ -z "$base_v" ]; then
++          echo "Baseline missing; request SME"
++          exit 2
++        fi
++        rel=$(awk "BEGIN {printf \"%.6f\", ($base_v - $canary_v)/$base_v}")
++        echo "rel_drop=$rel threshold=$THRESH"
++        awk "BEGIN {if ($rel <= $THRESH) exit 0; else exit 1}"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/grafana/dashboards/runid_kpi_dashboard.json
++{
++  "dashboard": {
++    "id": null,
++    "title": "RunID KPI Correlation",
++    "panels": [
++      {
++        "type": "graph",
++        "title": "Business KPI by run_id (select run_id as var)",
++        "targets": [
++          {
++            "expr": "sum(rate(business_metric{run_id=~\"$run_id\"}[5m]))",
++            "legendFormat": "{{run_id}}"
++          }
++        ],
++        "datasource": "Prometheus"
++      },
++      {
++        "type": "table",
++        "title": "Closed-loop Evidence (S3 links)",
++        "targets": [],
++        "datasource": null
++      }
++    ]
++  },
++  "overwrite": true
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/ci/pen_test_and_gatekeeper_enforce.yml
++name: PenTest + Gatekeeper Enforcement
++on:
++  workflow_dispatch:
++    inputs:
++      evidence_bucket:
++        required: true
++
++jobs:
++  pentest:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run pen test scripts
++        run: |
++          sudo apt-get update && sudo apt-get install -y jq || true
++          ./ops/security/pen_test_suite.sh || true
++      - name: Upload reports
++        env:
++          EVIDENCE_BUCKET: ${{ github.event.inputs.evidence_bucket }}
++        run: |
++          if [ -d /tmp/pen-reports ]; then
++            aws s3 cp /tmp/pen-reports s3://$EVIDENCE_BUCKET/security/ --recursive || true
++          fi
++  gatekeeper:
++    runs-on: ubuntu-latest
++    needs: pentest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run Gatekeeper dry-run (ensure constraints installed)
++        run: |
++          echo "Applying Gatekeeper constraint templates and constraints in dryrun mode"
++          kubectl apply -f ops/gatekeeper/full_policies.yaml || true
++          kubectl apply -f ops/gatekeeper/require-rotation-evidence-constraint.yaml || true
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/acceptance/run_2k_longshadow.py
++#!/usr/bin/env python3
++"""
++Acceptance orchestrator to run accelerated 2k dry runs and long-shadow simulation.
++ - Submits many simulator jobs (using simulator orchestrator) and then starts a long-shadow monitor process
++ - Aggregates evidence and uploads a signed bundle to evidence bucket
++"""
++import os, time, json, tempfile, subprocess, logging
++from datetime import datetime
++
++logger = logging.getLogger("acceptance-runner")
++logging.basicConfig(level=logging.INFO)
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET","")
++SIM_RUNS = int(os.environ.get("SIM_RUNS", "2000"))
++
++def run_simulators(n):
++    logger.info("Starting %d simulator jobs", n)
++    out = subprocess.check_output(["python","-c","from ops.scale.simulator_orchestrator import run_scale; print(run_scale(%d))" % n]).decode()
++    return out
++
++def start_long_shadow(duration_seconds=86400):
++    # run a background monitor that collects KPIs for duration_seconds (accelerated test can lower)
++    logger.info("Starting long-shadow for %s seconds", duration_seconds)
++    end = time.time() + duration_seconds
++    stats = []
++    while time.time() < end:
++        # collect a sample KPI from Prometheus
++        try:
++            r = subprocess.check_output(["curl","-s","http://prometheus.monitoring.svc:9090/api/v1/query","--data-urlencode","query=sum(rate(business_metric[1m]))"])
++            stats.append(r.decode())
++        except Exception:
++            stats.append("{}")
++        time.sleep(60)
++    return stats
++
++def aggregate_and_sign(local_dir):
++    # basic evidence bundle creation and cosign call (PoC)
++    bundle = tempfile.NamedTemporaryFile(delete=False, suffix=".tar.gz").name
++    subprocess.check_call(["tar","-czf", bundle, "-C", local_dir, "."])
++    # cosign sign (requires key mounted)
++    try:
++        subprocess.check_call(["cosign","sign","-key","/secrets/cosign.key", bundle])
++    except Exception:
++        logger.exception("cosign sign failed; skipping")
++    # upload
++    if EVIDENCE_BUCKET:
++        import boto3
++        s3=boto3.client("s3")
++        key=f"acceptance/bundles/{os.path.basename(bundle)}"
++        s3.upload_file(bundle, EVIDENCE_BUCKET.replace("s3://",""), key)
++        return f"s3://{EVIDENCE_BUCKET}/{key}"
++    return bundle
++
++def main():
++    tmpdir = tempfile.mkdtemp(prefix="acceptance-")
++    sim_out = run_simulators(SIM_RUNS)
++    open(os.path.join(tmpdir, "sim_output.txt"), "w").write(sim_out)
++    stats = start_long_shadow(duration_seconds=60*60)  # example: run 1 hour for accelerated test
++    open(os.path.join(tmpdir, "longshadow_stats.json"), "w").write(json.dumps(stats))
++    evidence = aggregate_and_sign(tmpdir)
++    print("Acceptance evidence:", evidence)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** End Patch

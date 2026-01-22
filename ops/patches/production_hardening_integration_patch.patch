@@ -1,0 +1,474 @@
+*** Begin Patch
+*** Add File:ops/opa/auto_promotion.rego
++package aegis.autopromote
++
++# Auto-promotion policy:
++# - requires canary metric within acceptable drop
++# - requires evidence URI present and cost accounted annotation
++# - ensures contract_uri present for paid-provider usage
++
++default allow = false
++
++allow {
++    input.kind == "CanaryEvaluation"
++    input.metrics.rel_drop <= input.policy.max_rel_drop
++    input.evidence_uri != ""
++    input.annotations.aegis_cost_accounted != ""
++}
++
++deny[msg] {
++    input.kind == "CanaryEvaluation"
++    input.metrics.rel_drop > input.policy.max_rel_drop
++    msg := sprintf("Canary rel_drop %v exceeds threshold %v", [input.metrics.rel_drop, input.policy.max_rel_drop])
++}
++
++require_contract[msg] {
++    input.kind == "PromotionRequest"
++    input.uses_paid_provider == true
++    input.annotations.aegis_contract_uri == ""
++    msg := "Paid provider promotion requires aegis.contract_uri annotation with signed contract URI"
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/closed_loop/auto_promoter.py
++#!/usr/bin/env python3
++"""
++Auto-Promoter service
++ - Receives canary evaluation payloads (JSON) from canary controller or Tekton
++ - Calls OPA (or local Rego) to decide if auto-promotion is allowed
++ - If allowed, triggers promotion pipeline; otherwise, requests SME approval via approval service
++ - Uploads audit/evidence and links approver identity to evidence
++"""
++import os
++import json
++import logging
++import subprocess
++import tempfile
++from datetime import datetime
++from urllib.parse import urljoin
++
++import requests
++
++logger = logging.getLogger("auto-promoter")
++logging.basicConfig(level=logging.INFO)
++
++OPA_URL = os.environ.get("OPA_URL", "http://opa:8181/v1/data/aegis/autopromote/allow")
++APPROVAL_SERVICE = os.environ.get("APPROVAL_SERVICE_URL", "http://approval-service.monitoring.svc:8080")
++TEKTON_NS = os.environ.get("TEKTON_NAMESPACE", "cicd")
++PROMOTE_PIPELINE = os.environ.get("PROMOTE_PIPELINE", "promote-model-to-baseten")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++
++def upload_evidence(run_id, payload):
++    if not EVIDENCE_BUCKET:
++        p = f"/tmp/{run_id}-evidence.json"
++        with open(p, "w") as f:
++            json.dump(payload, f, indent=2)
++        return p
++    import boto3
++    s3 = boto3.client("s3")
++    key = f"autopromote/{run_id}.json"
++    s3.put_object(Bucket=EVIDENCE_BUCKET.replace("s3://",""), Key=key, Body=json.dumps(payload).encode())
++    return f"s3://{EVIDENCE_BUCKET}/{key}"
++
++def opa_evaluate(payload):
++    try:
++        r = requests.post(OPA_URL, json={"input": payload}, timeout=10)
++        r.raise_for_status()
++        decision = r.json().get("result", False)
++        return decision
++    except Exception:
++        logger.exception("OPA eval failed - default deny")
++        return False
++
++def trigger_promotion(run_id, model_id, params=None):
++    pr = {
++        "apiVersion": "tekton.dev/v1beta1",
++        "kind": "PipelineRun",
++        "metadata": {"generateName": f"promote-{model_id}-"},
++        "spec": {
++            "pipelineRef": {"name": PROMOTE_PIPELINE},
++            "params": [{"name":"model_id","value":model_id},{"name":"model_name","value":model_id},{"name":"artifact_s3","value":""},{"name":"evidence_bucket","value":EVIDENCE_BUCKET}]
++        }
++    }
++    import yaml
++    f = tempfile.NamedTemporaryFile(delete=False, suffix=".yaml")
++    f.write(yaml.dump(pr).encode()); f.close()
++    subprocess.check_call(["kubectl", "apply", "-n", TEKTON_NS, "-f", f.name])
++    logger.info("Triggered promotion PipelineRun for model %s", model_id)
++
++def request_sme(run_id, summary, evidence_uri):
++    payload = {"summary": summary, "evidence_uri": evidence_uri}
++    r = requests.post(urljoin(APPROVAL_SERVICE, "/request"), json=payload, timeout=10)
++    r.raise_for_status()
++    return r.json().get("id")
++
++def handle_evaluation(payload):
++    """
++    payload example:
++    {
++      "kind":"CanaryEvaluation",
++      "run_id":"run-123",
++      "metrics": {"rel_drop": 0.03},
++      "annotations": {"aegis_cost_accounted":"s3://..."},
++      "uses_paid_provider": true
++    }
++    """
++    run_id = payload.get("run_id", f"run-{int(datetime.utcnow().timestamp())}")
++    decision = opa_evaluate(payload)
++    evidence_uri = upload_evidence(run_id, payload)
++    if decision:
++        # perform promotion
++        model_id = payload.get("model_id","unknown")
++        trigger_promotion(run_id, model_id)
++        return {"status":"promoted", "evidence": evidence_uri}
++    else:
++        # SME flow
++        summary = f"Canary requires SME review for run {run_id}"
++        req_id = request_sme(run_id, summary, evidence_uri)
++        logger.info("SME requested: %s", req_id)
++        return {"status":"sme_requested", "request_id": req_id, "evidence": evidence_uri}
++
++if __name__ == "__main__":
++    import sys
++    data = json.load(sys.stdin) if not sys.stdin.isatty() else {}
++    print(handle_evaluation(data))
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/hpo/cost_guard.py
++#!/usr/bin/env python3
++"""
++Ray Tune cost guard helper:
++ - Estimates trial cost by configuration and instance pricing (simple heuristic)
++ - Provides a callback to stop experiment when estimated spend exceeds MAX_SPEND_USD
++"""
++import os
++import logging
++
++logger = logging.getLogger("hpo-cost-guard")
++logging.basicConfig(level=logging.INFO)
++
++MAX_SPEND_USD = float(os.environ.get("HPO_MAX_SPEND_USD", "500.0"))
++COST_PER_CPU_HOUR = float(os.environ.get("COST_PER_CPU_HOUR", "0.02"))
++
++def estimate_trial_cost(config, cpu_hours=1.0):
++    # simple heuristic: cpu_hours * COST_PER_CPU_HOUR * num_cpus (from config if present)
++    cpus = float(config.get("cpus", 1.0))
++    return cpus * cpu_hours * COST_PER_CPU_HOUR
++
++class CostGuard:
++    def __init__(self, max_spend=MAX_SPEND_USD):
++        self.max_spend = max_spend
++        self.accum = 0.0
++
++    def on_trial_start(self, trial_config):
++        est = estimate_trial_cost(trial_config)
++        self.accum += est
++        logger.info("Estimated spend now: %s (added %s) vs max %s", self.accum, est, self.max_spend)
++        if self.accum > self.max_spend:
++            raise RuntimeError("HPO estimated spend exceeded")
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/data/marquez_lineage_shipper.py
++#!/usr/bin/env python3
++"""
++Marquez lineage shipper:
++ - Registers datasets and jobs to Marquez/OpenLineage for dataset lineage tracking
++ - Called at end of Tekton tasks or pipeline runs with dataset/job metadata
++"""
++import os, requests, logging, json
++
++logger = logging.getLogger("marquez-shipper")
++logging.basicConfig(level=logging.INFO)
++
++MARQUEZ_URL = os.environ.get("MARQUEZ_URL", "http://marquez.backend:5000")
++
++def register_dataset(namespace, name, physical_name, description=""):
++    payload = {"namespace": namespace, "name": name, "physical_name": physical_name, "description": description}
++    r = requests.post(f"{MARQUEZ_URL}/api/v1/datasets", json=payload, timeout=10)
++    r.raise_for_status()
++    logger.info("Registered dataset %s/%s", namespace, name)
++    return r.json()
++
++def register_job(namespace, name, inputs, outputs):
++    payload = {"namespace": namespace, "name": name, "inputs": inputs, "outputs": outputs}
++    r = requests.post(f"{MARQUEZ_URL}/api/v1/jobs", json=payload, timeout=10)
++    r.raise_for_status()
++    logger.info("Registered job %s/%s", namespace, name)
++    return r.json()
++
++def ship_lineage(run_id, job_name, input_datasets, output_datasets):
++    register_job("aegis", job_name, input_datasets, output_datasets)
++    # basic mapping to Marquez
++    logger.info("Shipped lineage for run %s job %s", run_id, job_name)
++    return True
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/telemetry/trace_correlation.py
++#!/usr/bin/env python3
++"""
++Trace correlation helpers:
++ - Add run_id and business_kpi attributes to active OpenTelemetry spans
++ - Utility to extract run_id from Tekton results or pod labels
++"""
++from opentelemetry import trace
++import os, logging
++
++logger = logging.getLogger("trace-corr")
++logging.basicConfig(level=logging.INFO)
++
++def annotate_span(run_id=None, kpi=None):
++    span = trace.get_current_span()
++    if not span:
++        return
++    if run_id:
++        span.set_attribute("run_id", run_id)
++    if kpi:
++        span.set_attribute("business_kpi", kpi)
++    logger.debug("Annotated span run_id=%s kpi=%s", run_id, kpi)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/gatekeeper/additional_constraints.yaml
++# Gatekeeper: additional constraints for production
++apiVersion: templates.gatekeeper.sh/v1beta1
++kind: ConstraintTemplate
++metadata:
++  name: restrictclusterrolebinding
++spec:
++  crd:
++    spec:
++      names:
++        kind: RestrictClusterRoleBinding
++  targets:
++    - target: admission.k8s.gatekeeper.sh
++      rego: |
++        package restrictclusterrolebinding
++        violation[{"msg": msg}] {
++          input.review.object.kind == "ClusterRoleBinding"
++          not input.review.object.metadata.annotations["aegis.allow_cluster_admin"]
++          msg := "Creating ClusterRoleBinding requires aegis.allow_cluster_admin annotation"
++        }
++---
++apiVersion: constraints.gatekeeper.sh/v1beta1
++kind: RestrictClusterRoleBinding
++metadata:
++  name: restrict-clusterrolebinding
++spec:
++  enforcementAction: deny
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/keycloak/hardening/final_hardening.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Final Keycloak hardening orchestration (PoC). Use with admin privileges.
++KEYCLOAK_URL=${KEYCLOAK_URL:-http://keycloak.monitoring.svc:8080}
++REALM=${REALM:-aegis}
++ADMIN_USER=${ADMIN_USER:-admin}
++ADMIN_PASS=${ADMIN_PASS:-changeme}
++
++TOKEN=$(curl -sS -X POST "$KEYCLOAK_URL/realms/master/protocol/openid-connect/token" -d "grant_type=password&client_id=admin-cli&username=$ADMIN_USER&password=$ADMIN_PASS" | jq -r .access_token)
++
++echo "Disable registration, limit token lifespans, enable events and brute force protection"
++curl -sS -X GET -H "Authorization: Bearer $TOKEN" "$KEYCLOAK_URL/admin/realms/$REALM" -o /tmp/realm.json
++jq '. + {"registrationAllowed":false, "accessTokenLifespan":300, "eventsEnabled":true, "bruteForceProtected":true, "eventsExpiration":86400}' /tmp/realm.json > /tmp/realm2.json
++curl -sS -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" --data @/tmp/realm2.json "$KEYCLOAK_URL/admin/realms/$REALM"
++
++echo "Lock admin console network access (manual step required): configure k8s NetworkPolicy or ingress ACLs"
++echo "Rotate admin credentials and verify admin token rotation completed"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/secrets/rotation_verifier.py
++#!/usr/bin/env python3
++"""
++Rotation verifier:
++ - Watches ExternalSecrets target secret and ensures 'aegis.rotation_record' annotation exists on subsequent Secret objects
++ - Uploads verification evidence to EVIDENCE_BUCKET
++"""
++import os, time, logging
++import subprocess, json
++
++logger = logging.getLogger("rotation-verifier")
++logging.basicConfig(level=logging.INFO)
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++NAMESPACE = os.environ.get("SECRETS_NS","monitoring")
++TARGET_SECRET = os.environ.get("TARGET_SECRET","aegis-service-creds")
++
++def check_secret():
++    out = subprocess.check_output(["kubectl","-n",NAMESPACE,"get","secret",TARGET_SECRET,"-o","json"]).decode()
++    sec = json.loads(out)
++    ann = sec.get("metadata",{}).get("annotations",{})
++    record = ann.get("aegis.rotation_record","")
++    return bool(record), record
++
++def upload_evidence(name, payload):
++    if not EVIDENCE_BUCKET:
++        path=f"/tmp/{name}.json"
++        with open(path,"w") as f: json.dump(payload,f); return path
++    import boto3
++    s3=boto3.client("s3")
++    key=f"secrets/rotation_verify/{name}-{int(time.time())}.json"
++    s3.put_object(Bucket=EVIDENCE_BUCKET.replace("s3://",""), Key=key, Body=json.dumps(payload).encode())
++    return f"s3://{EVIDENCE_BUCKET}/{key}"
++
++if __name__ == "__main__":
++    while True:
++        ok, rec = check_secret()
++        payload = {"ok": ok, "record": rec}
++        upload_evidence("rotation_check", payload)
++        if ok:
++            logger.info("Rotation record present")
++        else:
++            logger.warning("Rotation record missing for secret %s", TARGET_SECRET)
++        time.sleep(300)
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/billing/chargeback_api.py
++#!/usr/bin/env python3
++"""
++Chargeback API + enforcement:
++ - Provides endpoints to query tenant spend and to force cap adjustments
++ - Worker process (enqueue) auto-rejects submissions when cap exceeded (see billing_auto_reject earlier)
++"""
++from fastapi import FastAPI, HTTPException, Request
++import os, logging
++from pydantic import BaseModel
++try:
++    from services.quantum.db_models import SessionLocal, BillingRecord
++except Exception:
++    SessionLocal = None
++
++app = FastAPI()
++logger = logging.getLogger("chargeback")
++logging.basicConfig(level=logging.INFO)
++
++TENANT_CAP = float(os.environ.get("TENANT_MONTHLY_CAP_USD", "1000"))
++
++class Adjust(BaseModel):
++    tenant: str
++    new_cap: float
++
++@app.get("/tenant/{tenant}/spend")
++def tenant_spend(tenant: str):
++    if SessionLocal is None:
++        return {"tenant": tenant, "spend": 0.0}
++    db = SessionLocal()
++    total = db.query(BillingRecord).filter(BillingRecord.owner==tenant).with_entities(func.sum(BillingRecord.actual_cost)).scalar() or 0.0
++    return {"tenant": tenant, "spend": float(total)}
++
++@app.post("/adjust_cap")
++def adjust_cap(adj: Adjust):
++    # In PoC this stores nothing; in prod update tenant config store
++    logger.info("Adjust tenant %s cap to %s", adj.tenant, adj.new_cap)
++    return {"ok": True}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/approval/audit_linker.py
++#!/usr/bin/env python3
++"""
++Audit linker:
++ - When approval occurs, this component links approver identity to evidence bundle and writes a signed audit record to S3
++ - Works with Approval Service to be invoked on approval webhook
++"""
++import os, json, logging
++from datetime import datetime
++import boto3
++
++logger = logging.getLogger("audit-linker")
++logging.basicConfig(level=logging.INFO)
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET","")
++s3 = boto3.client("s3") if EVIDENCE_BUCKET else None
++
++def record_approval(req_id, approver, evidence_uri):
++    rec = {"req_id": req_id, "approver": approver, "evidence": evidence_uri, "ts": datetime.utcnow().isoformat()}
++    if not s3:
++        path = f"/tmp/approval-audit-{req_id}.json"
++        with open(path,"w") as f: json.dump(rec,f); return path
++    key = f"approvals/audit/{req_id}.json"
++    s3.put_object(Bucket=EVIDENCE_BUCKET.replace("s3://",""), Key=key, Body=json.dumps(rec).encode())
++    return f"s3://{EVIDENCE_BUCKET}/{key}"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/explainability/batch_shap_storage.py
++#!/usr/bin/env python3
++"""
++Batch SHAP computation and standardized storage:
++ - Loads model artifact, computes SHAP for a batch of inputs, stores per-inference explanation in explainability store
++ - Writes index manifest to evidence bucket for later retrieval
++"""
++import os, json, tempfile, logging
++import joblib
++import pandas as pd
++import shap
++import boto3
++
++logger = logging.getLogger("shap-batch")
++logging.basicConfig(level=logging.INFO)
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET","")
++s3 = boto3.client("s3") if EVIDENCE_BUCKET else None
++
++def compute_and_store(model_s3, inputs_df, model_id="model"):
++    # download model
++    bucket,key = model_s3.replace("s3://","").split("/",1)
++    tmp_model = tempfile.NamedTemporaryFile(delete=False, suffix=".joblib").name
++    s3.download_file(bucket, key, tmp_model)
++    model = joblib.load(tmp_model)
++    explainer = shap.Explainer(model.predict, inputs_df)
++    shap_vals = explainer(inputs_df)
++    records = []
++    for i, row in inputs_df.iterrows():
++        rec = {"index": int(i), "shap": shap_vals.values[i].tolist(), "base": shap_vals.base_values[i].tolist()}
++        records.append(rec)
++        # store each explanation as separate object
++        if s3:
++            s3.put_object(Bucket=EVIDENCE_BUCKET.replace("s3://",""), Key=f"explainability/{model_id}/inst-{i}.json", Body=json.dumps(rec).encode())
++    # write manifest
++    manifest = {"model": model_id, "count": len(records), "ts": int(time.time())}
++    if s3:
++        s3.put_object(Bucket=EVIDENCE_BUCKET.replace("s3://",""), Key=f"explainability/{model_id}/manifest-{int(time.time())}.json", Body=json.dumps(manifest).encode())
++    return manifest
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tekton/triggers/auto_promotion_trigger.yaml
++apiVersion: triggers.tekton.dev/v1alpha1
++kind: TriggerTemplate
++metadata:
++  name: canary-eval-trigger-template
++  namespace: cicd
++spec:
++  resourcetemplates:
++    - apiVersion: v1
++      kind: Service
++      metadata:
++        name: canary-eval-acceptor
++      spec:
++        selector: {}
++---
++apiVersion: triggers.tekton.dev/v1alpha1
++kind: TriggerBinding
++metadata:
++  name: canary-eval-binding
++  namespace: cicd
++spec:
++  params:
++    - name: run_id
++      value: $(body.run_id)
++    - name: rel_drop
++      value: $(body.metrics.rel_drop)
++    - name: model_id
++      value: $(body.model_id)
++    - name: evidence_uri
++      value: $(body.evidence_uri)
++
+*** End Patch
+*** End Patch

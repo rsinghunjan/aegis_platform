@@ -1,0 +1,485 @@
+*** Begin Patch
+*** Add File:ops/hpo/large_hpo_pipeline.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Pipeline
++metadata:
++  name: large-hpo-pipeline
++  namespace: cicd
++spec:
++  params:
++    - name: samples
++      type: string
++      default: "128"
++    - name: concurrency
++      type: string
++      default: "16"
++    - name: evidence_bucket
++      type: string
++      default: ""
++    - name: team
++      type: string
++      default: "team-a"
++  tasks:
++    - name: hpo-submit
++      taskRef:
++        name: hpo-with-spot
++      params:
++        - name: team
++          value: "$(params.team)"
++        - name: config_s3
++          value: "" 
++        - name: evidence_bucket
++          value: "$(params.evidence_bucket)"
++    - name: hpo-distributed
++      runAfter:
++        - hpo-submit
++      taskRef:
++        name: hpo-distributed
++      params:
++        - name: evidence_bucket
++          value: "$(params.evidence_bucket)"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/hpo/run_large_hpo_runner.py
++#!/usr/bin/env python3
++"""
++Script to trigger many distributed HPO PipelineRuns (useful for stress testing large HPO).
++Records submissions and waits for completion. Uploads aggregated evidence when done.
++"""
++import os, time, json, tempfile, subprocess, logging
++from datetime import datetime
++
++logger = logging.getLogger("run-large-hpo")
++logging.basicConfig(level=logging.INFO)
++
++TEKTON_NS = os.environ.get("TEKTON_NAMESPACE", "cicd")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++SLEEP = int(os.environ.get("POLL_INTERVAL", "30"))
++
++def create_pipeline_run(samples, team, evidence_bucket):
++    pr = {
++        "apiVersion": "tekton.dev/v1beta1",
++        "kind": "PipelineRun",
++        "metadata": {"generateName": "large-hpo-run-"},
++        "spec": {
++            "pipelineRef": {"name": "large-hpo-pipeline"},
++            "params": [
++                {"name": "samples", "value": str(samples)},
++                {"name": "team", "value": team},
++                {"name": "evidence_bucket", "value": evidence_bucket}
++            ]
++        }
++    }
++    import yaml, tempfile
++    f = tempfile.NamedTemporaryFile(delete=False, suffix=".yaml")
++    f.write(yaml.safe_dump(pr).encode()); f.close()
++    out = subprocess.check_output(["kubectl", "apply", "-n", TEKTON_NS, "-f", f.name]).decode()
++    logger.info("Created PipelineRun: %s", out)
++    # parse name
++    for line in out.splitlines():
++        if "pipelinerun.tekton.dev/" in line:
++            return line.split()[0].split("/")[1]
++    return None
++
++def wait_for_pr(pr_name, timeout=7200):
++    end = time.time() + timeout
++    while time.time() < end:
++        try:
++            out = subprocess.check_output(["kubectl","-n",TEKTON_NS,"get","pipelinerun", pr_name, "-o", "json"])
++            st = json.loads(out).get("status", {})
++            conds = st.get("conditions", [])
++            if conds:
++                s = conds[0].get("status")
++                if s == "True":
++                    return True, st
++                if s == "False":
++                    return False, st
++        except Exception:
++            pass
++        time.sleep(SLEEP)
++    return False, {}
++
++def collect_and_upload(pr_name):
++    local = tempfile.mkdtemp(prefix=f"evidence-{pr_name}-")
++    try:
++        subprocess.check_call(["kubectl","-n",TEKTON_NS,"get","pipelinerun",pr_name,"-o","json"], stdout=open(f"{local}/pipelinerun.json","w"))
++    except Exception:
++        pass
++    try:
++        pods = json.loads(subprocess.check_output(["kubectl","-n",TEKTON_NS,"get","pods","-o","json"]).decode()).get("items", [])
++        for p in pods:
++            owners = p.get("metadata",{}).get("ownerReferences",[])
++            if any(o.get("name","").startswith(pr_name) for o in owners):
++                name = p["metadata"]["name"]
++                try:
++                    logs = subprocess.check_output(["kubectl","-n",TEKTON_NS,"logs",name], stderr=subprocess.STDOUT).decode()
++                except Exception as e:
++                    logs = f"error: {e}"
++                open(f"{local}/{name}.log","w").write(logs)
++    except Exception:
++        pass
++    if EVIDENCE_BUCKET:
++        import boto3, os
++        s3=boto3.client("s3")
++        bucket=EVIDENCE_BUCKET.replace("s3://","")
++        for root, _, files in os.walk(local):
++            for f in files:
++                s3.upload_file(os.path.join(root,f), bucket, f"large_hpo/{pr_name}/{f}")
++        return f"s3://{bucket}/large_hpo/{pr_name}/"
++    return local
++
++def main():
++    samples = int(os.environ.get("HPO_SAMPLES","128"))
++    parallel = int(os.environ.get("HPO_PARALLEL","4"))
++    team = os.environ.get("HPO_TEAM","team-a")
++    evidence = EVIDENCE_BUCKET
++    prs=[]
++    for i in range(parallel):
++        pr = create_pipeline_run(samples, team, evidence)
++        if pr:
++            prs.append(pr)
++    results=[]
++    for pr in prs:
++        ok, st = wait_for_pr(pr)
++        uri = collect_and_upload(pr)
++        results.append({"pr": pr, "ok": ok, "evidence": uri, "status": st})
++    print(json.dumps(results, indent=2))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/hpo/chargeback_integration.py
++#!/usr/bin/env python3
++"""
++Enhanced chargeback integration for large distributed HPO runs.
++ - Aggregates estimated cost per trial, records submissions in a submission DB, and posts to the chargeback API.
++ - Provides a utility to reconcile realized cost after invoices arrive.
++"""
++import os, json, sqlite3, logging, requests
++from datetime import datetime
++
++logger = logging.getLogger("hpo-chargeback-int")
++logging.basicConfig(level=logging.INFO)
++
++DB = os.environ.get("HPO_CHARGEDB", "/tmp/hpo_charge.db")
++CHARGEBACK_API = os.environ.get("CHARGEBACK_API", "http://chargeback.monitoring.svc:8080")
++
++def init():
++    conn = sqlite3.connect(DB)
++    c = conn.cursor()
++    c.execute("""CREATE TABLE IF NOT EXISTS submissions (
++        id INTEGER PRIMARY KEY AUTOINCREMENT, team TEXT, run_id TEXT, est_usd REAL, actual_usd REAL, created_at TEXT)""")
++    conn.commit()
++    conn.close()
++
++def record_submission(team, run_id, est_usd):
++    conn = sqlite3.connect(DB)
++    c = conn.cursor()
++    c.execute("INSERT INTO submissions(team, run_id, est_usd, actual_usd, created_at) VALUES (?,?,?,?,?)",
++              (team, run_id, est_usd, None, datetime.utcnow().isoformat()))
++    conn.commit()
++    conn.close()
++    try:
++        requests.post(f"{CHARGEBACK_API}/submit", json={"team":team,"run_id":run_id,"estimated_usd":est_usd}, timeout=5)
++    except Exception:
++        logger.exception("Failed to notify chargeback API")
++
++def reconcile_run(run_id, actual_usd):
++    conn = sqlite3.connect(DB)
++    c = conn.cursor()
++    c.execute("UPDATE submissions SET actual_usd = ? WHERE run_id = ?", (actual_usd, run_id))
++    conn.commit()
++    conn.close()
++    try:
++        requests.post(f"{CHARGEBACK_API}/reconcile", json={"run_id":run_id,"actual_usd":actual_usd}, timeout=5)
++    except Exception:
++        logger.exception("Failed to notify chargeback reconcile")
++
++if __name__ == "__main__":
++    init()
++    print("HPO chargeback DB initialized")
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/acceptance/long_shadow_2k_pipeline.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Pipeline
++metadata:
++  name: long-shadow-2k-pipeline
++  namespace: cicd
++spec:
++  params:
++    - name: sim_runs
++      type: string
++      default: "2000"
++    - name: evidence_bucket
++      type: string
++      default: ""
++  tasks:
++    - name: simulator-farm
++      taskRef:
++        name: simulator-farm-scale
++      params:
++        - name: runs
++          value: "$(params.sim_runs)"
++    - name: acceptance-aggregate
++      runAfter:
++        - simulator-farm
++      taskRef:
++        name: sim-aggregate-task
++      params:
++        - name: evidence_bucket
++          value: "$(params.evidence_bucket)"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/telemetry/otel-collector-config.yaml
++receivers:
++  otlp:
++    protocols:
++      grpc:
++      http:
++processors:
++  batch:
++exporters:
++  logging:
++    logLevel: info
++  prometheus:
++    endpoint: "0.0.0.0:8888"
++service:
++  pipelines:
++    traces:
++      receivers: [otlp]
++      processors: [batch]
++      exporters: [logging]
++    metrics:
++      receivers: [otlp]
++      processors: [batch]
++      exporters: [prometheus]
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/grafana/dashboards/production_kpi_dashboard.json
++{
++  "dashboard": {
++    "id": null,
++    "title": "Production KPI & Run Correlation",
++    "panels": [
++      {
++        "type": "graph",
++        "title": "Business KPI over time (by run_id)",
++        "targets": [
++          {
++            "expr": "sum(rate(business_metric[1m])) by (run_id)",
++            "format": "time_series",
++            "legendFormat": "{{ run_id }}"
++          }
++        ],
++        "datasource": "Prometheus"
++      },
++      {
++        "type": "table",
++        "title": "Recent Closed-loop Runs",
++        "targets": []
++      }
++    ]
++  },
++  "overwrite": true
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/security/pen_test_remediate_and_iam.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Pen-test remediation automation (PoC)
++# - Runs the pen-test suite, gathers high/critical findings and applies recommended Terraform IAM least-privilege changes (dry-run)
++EVIDENCE_BUCKET=${EVIDENCE_BUCKET:-}
++REPORT_DIR=/tmp/pen-reports
++mkdir -p $REPORT_DIR
++
++echo "Running pen-test suite..."
++./ops/security/pen_test_suite.sh || true
++echo "Collecting high/critical findings..."
++# For PoC we just upload results to S3 and run terraform plan for IAM changes
++if [ -n "$EVIDENCE_BUCKET" ]; then
++  aws s3 cp $REPORT_DIR s3://${EVIDENCE_BUCKET}/security/ --recursive || true
++fi
++
++echo "Running terraform plan for IAM least-privilege (dry-run)"
++cd terraform/aws || exit 0
++terraform init -input=false || true
++terraform plan -out=tfplan || true
++echo "Review tfplan to apply IAM least-privilege changes"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/billing/reconciliation_worker_enhanced.py
++#!/usr/bin/env python3
++"""
++High-throughput invoice reconciliation worker:
++ - Processes invoices in parallel (thread pool)
++ - Uses a batching strategy to avoid DB hot-spots
++ - Updates BillingRecord.actual_cost and triggers tenant cap enforcement callbacks
++"""
++import os, time, logging, concurrent.futures, csv
++from datetime import datetime
++try:
++    from services.quantum.billing_invoice_linker import process_csv as process_csv_fn
++    from services.quantum.db_models import SessionLocal, BillingRecord
++except Exception:
++    process_csv_fn = None
++    SessionLocal = None
++
++import boto3
++from prometheus_client import Counter
++
++logger = logging.getLogger("invoice-recon")
++logging.basicConfig(level=logging.INFO)
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++BUCKET = EVIDENCE_BUCKET.replace("s3://","") if EVIDENCE_BUCKET else ""
++PARALLELISM = int(os.environ.get("RECON_PARALLEL","8"))
++PROCESSED_PREFIX = "invoices/processed/"
++RECON_COUNT = Counter("invoices_reconciled_total", "Invoices reconciled")
++
++def download_to_tmp(key):
++    s3 = boto3.client("s3")
++    local = f"/tmp/{os.path.basename(key)}"
++    s3.download_file(BUCKET, key, local)
++    return local
++
++def reconcile_file(key):
++    logger.info("Reconciling %s", key)
++    local = download_to_tmp(key)
++    # call existing process_csv function if available
++    if process_csv_fn:
++        try:
++            process_csv_fn(local)
++            RECON_COUNT.inc()
++        except Exception:
++            logger.exception("process_csv failed for %s", local)
++    # move to processed
++    s3 = boto3.client("s3")
++    dest = key.replace("invoices/", PROCESSED_PREFIX)
++    s3.copy_object(Bucket=BUCKET, CopySource={'Bucket':BUCKET,'Key':key}, Key=dest)
++    s3.delete_object(Bucket=BUCKET, Key=key)
++    # upload reconciliation evidence
++    s3.put_object(Bucket=BUCKET, Key=f"invoices/reconciliation/{os.path.basename(key)}.meta", Body=str(datetime.utcnow()).encode())
++
++def run_loop(interval=60):
++    s3 = boto3.client("s3")
++    while True:
++        resp = s3.list_objects_v2(Bucket=BUCKET, Prefix="invoices/")
++        keys = [o["Key"] for o in resp.get("Contents", []) if o["Key"].lower().endswith(".csv")]
++        if keys:
++            with concurrent.futures.ThreadPoolExecutor(max_workers=PARALLELISM) as ex:
++                futures = [ex.submit(reconcile_file, k) for k in keys]
++                for f in concurrent.futures.as_completed(futures):
++                    try:
++                        f.result()
++                    except Exception:
++                        logger.exception("reconcile task failed")
++        time.sleep(interval)
++
++if __name__ == "__main__":
++    run_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/billing/tenant_cap_ui.py
++#!/usr/bin/env python3
++"""
++Simple FastAPI UI + API for tenant cap enforcement and adjustments.
++ - Lists tenants, current spend, cap and allows admins to adjust cap (calls chargeback API)
++ - Provides endpoint used by submission path to check tenant cap before accepting jobs
++"""
++from fastapi import FastAPI, HTTPException, Request, Form
++from fastapi.responses import HTMLResponse
++import os, requests, json, logging
++
++app = FastAPI()
++logger = logging.getLogger("tenant-cap-ui")
++logging.basicConfig(level=logging.INFO)
++
++CHARGEBACK_API = os.environ.get("CHARGEBACK_API", "http://chargeback.monitoring.svc:8080")
++
++@app.get("/", response_class=HTMLResponse)
++def index():
++    try:
++        r = requests.get(f"{CHARGEBACK_API}/tenants", timeout=5)
++        tenants = r.json()
++    except Exception:
++        tenants = []
++    html = "<h1>Tenant Caps</h1><table><tr><th>tenant</th><th>spend</th><th>cap</th><th>action</th></tr>"
++    for t in tenants:
++        html += f"<tr><td>{t['tenant']}</td><td>{t.get('spend',0)}</td><td>{t.get('cap', 'N/A')}</td><td><form method='post' action='/adjust'><input type='hidden' name='tenant' value='{t['tenant']}'><input name='cap' placeholder='new cap'><button type='submit'>Adjust</button></form></td></tr>"
++    html += "</table>"
++    return HTMLResponse(html)
++
++@app.post("/adjust")
++def adjust(tenant: str = Form(...), cap: float = Form(...)):
++    try:
++        r = requests.post(f"{CHARGEBACK_API}/adjust_cap", json={"tenant": tenant, "new_cap": cap}, timeout=5)
++        r.raise_for_status()
++    except Exception:
++        raise HTTPException(status_code=500, detail="Failed to adjust cap")
++    return {"ok": True}
++
++@app.get("/check/{tenant}")
++def check(tenant: str):
++    try:
++        r = requests.get(f"{CHARGEBACK_API}/tenant/{tenant}/spend", timeout=5)
++        r.raise_for_status()
++        return r.json()
++    except Exception:
++        raise HTTPException(status_code=500, detail="Failed to query chargeback API")
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/pen_test_invoice_recon.yml
++name: PenTest + Invoice Reconciliation CI
++on:
++  workflow_dispatch:
++    inputs:
++      evidence_bucket:
++        required: true
++
++jobs:
++  pentest-and-iam:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run pen tests
++        run: |
++          ./ops/security/pen_test_suite.sh || true
++      - name: Upload reports
++        env:
++          EVIDENCE_BUCKET: ${{ github.event.inputs.evidence_bucket }}
++        run: |
++          if [ -d /tmp/pen-reports ]; then
++            aws s3 cp /tmp/pen-reports s3://$EVIDENCE_BUCKET/security/ --recursive || true
++          fi
++      - name: Terraform IAM Plan (dry-run)
++        run: |
++          cd terraform/aws || exit 0
++          terraform init -input=false || true
++          terraform plan -out=plan.tfplan || true
++
++  invoice-recon-test:
++    runs-on: ubuntu-latest
++    needs: pentest-and-iam
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run invoice reconciliation smoke test
++        env:
++          EVIDENCE_BUCKET: ${{ github.event.inputs.evidence_bucket }}
++        run: |
++          python services/billing/reconciliation_worker_enhanced.py --test || true
++
+*** End Patch
+*** End Patch

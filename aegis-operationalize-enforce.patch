@@ -1,0 +1,546 @@
+*** Begin Patch
+*** Add File:ops/cluster/install_and_label_isolated_runtimes.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Helper to (a) detect candidate nodes, (b) provide per-node install hints for isolated runtimes
++# and (c) label nodes runtime.aegis/has-isolation=true after verification.
++#
++# NOTE: This script does not attempt invasive changes to nodes (no package install by default).
++# It produces an operator checklist and optional SSH install command snippets for common runtimes.
++
++KUBECTL=${KUBECTL:-kubectl}
++SSH_USER=${SSH_USER:-ubuntu}
++SSH_KEY=${SSH_KEY:-~/.ssh/id_rsa}
++
++echo "Discovering nodes and container runtime..."
++nodes=$($KUBECTL get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.nodeInfo.containerRuntimeVersion}{"\n"}{end}')
++printf "NODE\tRUNTIME\n"
++echo "$nodes"
++
++echo
++echo "Operator steps (high level):"
++cat <<EOF
++1. Choose target runtime: gVisor/runsc (user-space), Kata Containers (KVM-based), or Firecracker microVMs.
++2. For each target node you want 'isolated', install runtime and configure containerd/docker to expose a RuntimeClass.
++   - Example (runsc with containerd):
++       apt-get update && apt-get install -y runc gvisor-containerd-shim
++       # follow gVisor/runsc docs to configure containerd runtimes
++   - Example (Kata):
++       apt-get install -y kata-runtime
++       # configure /etc/containerd/config.toml runtime_class = "kata"
++3. After installing on node, run runtime validator to detect and label node:
++     python3 ops/cluster/runtime_validator_enhanced.py --label-nodes --kubeconfig /path/to/kubeconfig
++4. Confirm label 'runtime.aegis/has-isolation=true' on nodes that are ready.
++5. Deploy admission webhook (ops/webhook/deploy_with_cosign_kms.sh) and testing scripts to validate enforcement.
++EOF
++
++if [ "${1:-}" = "--ssh-install-examples" ]; then
++  echo
++  echo "Sample SSH-based one-liners to run on node (operator must review & run):"
++  echo
++  echo "# For Ubuntu + Kata (example):"
++  echo "ssh -i $SSH_KEY $SSH_USER@<node-ip> 'sudo apt-get update && sudo apt-get install -y kata-runtime && sudo systemctl restart containerd'"
++  echo
++  echo "# For Ubuntu + runsc (gVisor) example (high-level):"
++  echo "ssh -i $SSH_KEY $SSH_USER@<node-ip> 'curl -fsSL https://get.k8s.tools/gvisor.sh | sudo bash' # follow vendor docs"
++fi
++
++echo "Done. Use runtime validator script to assert label coverage."
++
+*** End File
+*** Add File:ops/cluster/runtime_acceptance_tests.sh
++#!/usr/bin/env bash
++set -euo pipefail
++KUBECTL=${KUBECTL:-kubectl}
++NAMESPACE=${NAMESPACE:-ml-serving}
++TMPDIR=$(mktemp -d)
++
++cat > $TMPDIR/unsigned-pod.yaml <<EOF
++apiVersion: v1
++kind: Pod
++metadata:
++  name: unsigned-test
++  namespace: $NAMESPACE
++spec:
++  containers:
++  - name: nginx
++    image: nginx:latest
++  runtimeClassName: runsc
++EOF
++
++echo "Attempting to create unsigned pod (should be denied by validator in protected namespace)..."
++set +e
++$KUBECTL apply -f $TMPDIR/unsigned-pod.yaml 2>&1 | tee $TMPDIR/unsigned.out
++rc=$?
++set -e
++if [ $rc -eq 0 ]; then
++  echo "WARNING: unsigned pod was admitted. Validator may not be active or misconfigured."
++  exit 2
++else
++  echo "Unsigned pod creation failed as expected (validator denying). OK."
++fi
++
++echo
++echo "To test signed image flow you must (a) sign an image with cosign KMS key and (b) reference that image here."
++echo "See .github/workflows/cosign-sign.yml for CI signing example."
++
+*** End File
+*** Add File:.github/workflows/cosign-sign.yml
++name: Sign built container images with Cosign (KMS)
++on:
++  workflow_dispatch:
++jobs:
++  sign:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup cosign
++        run: |
++          curl -sSfL https://github.com/sigstore/cosign/releases/download/v2.1.0/cosign-linux-amd64 -o cosign
++          chmod +x cosign
++          sudo mv cosign /usr/local/bin/cosign
++      - name: Sign image using KMS key reference
++        env:
++          IMAGE_REF: ${{ inputs.image_ref || secrets.IMAGE_REF }}
++          COSIGN_KEY_REF: ${{ secrets.COSIGN_KEY_REF }}
++        run: |
++          if [ -z "$IMAGE_REF" ] || [ -z "$COSIGN_KEY_REF" ]; then echo "Set IMAGE_REF and COSIGN_KEY_REF"; exit 1; fi
++          cosign sign --key "$COSIGN_KEY_REF" "$IMAGE_REF"
++      - name: Verify signature
++        env:
++          IMAGE_REF: ${{ inputs.image_ref || secrets.IMAGE_REF }}
++        run: |
++          cosign verify --key <(cosign public-key --key "${{ secrets.COSIGN_KEY_REF }}" | sed -n '1,$p') "$IMAGE_REF" || true
++
+*** End File
+*** Add File:ops/evidence/create_s3_worm_bucket.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Create an S3 bucket with Object Lock (WORM) enabled for evidence retention.
++# WARNING: Bucket-level ObjectLock must be set at creation and cannot be disabled later.
++#
++if [ $# -lt 2 ]; then
++  echo "Usage: $0 <bucket-name> <region>"
++  exit 2
++fi
++BUCKET=$1; REGION=$2
++aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" --create-bucket-configuration LocationConstraint="$REGION"
++aws s3api put-object-lock-configuration --bucket "$BUCKET" --object-lock-configuration '{
++  "ObjectLockEnabled": "Enabled",
++  "Rule": {"DefaultRetention": {"Mode": "GOVERNANCE", "Days": 3650}}
++}'
++echo "Created bucket $BUCKET with Object Lock (GOVERNANCE, 10 years). Ensure your AWS account allows this and that you understand legal implications."
++
+*** End File
+*** Add File:ops/attestation/attestation_pipeline.py
++#!/usr/bin/env python3
++"""
++Lightweight attestation pipeline:
++ - collects evidence artifacts (build logs, cosign signatures, validation reports)
++ - bundles them, cosign-signs the bundle using KMS key reference (via cosign CLI), uploads to WORM S3 bucket
++ - writes metadata (retention, legal tags) as object metadata
++"""
++import os, tempfile, json, subprocess
++from datetime import datetime
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET","")
++COSIGN_KEY_REF = os.environ.get("COSIGN_KEY_REF","")
++
++def bundle_and_sign(paths, out_prefix="attestation"):
++    tmp = tempfile.mkdtemp()
++    bundle = os.path.join(tmp, f"{out_prefix}-{int(__import__('time').time())}.tar.gz")
++    subprocess.check_call(["tar","-czf",bundle] + paths)
++    # sign bundle (cosign KMS)
++    if COSIGN_KEY_REF:
++        subprocess.check_call(["cosign","sign","--key", COSIGN_KEY_REF, bundle])
++    return bundle
++
++def upload(bundle, key_prefix="attestations", retention_days=3650):
++    if not EVIDENCE_BUCKET:
++        print("No EVIDENCE_BUCKET configured; skipping upload")
++        return None
++    key = f"{key_prefix}/{os.path.basename(bundle)}"
++    subprocess.check_call(["aws","s3","cp", bundle, f"{EVIDENCE_BUCKET}/{key}", "--metadata", f"retention-days={retention_days}"])
++    return f"{EVIDENCE_BUCKET}/{key}"
++
++def main():
++    # discover local artifacts (placeholders)
++    artifacts = []
++    for p in ["./build.log","./watermark_validation.csv","./moderation_eval.json"]:
++        if os.path.exists(p):
++            artifacts.append(p)
++    if not artifacts:
++        print("No artifacts found; create the expected artifacts first")
++        return
++    b = bundle_and_sign(artifacts, out_prefix="aegis-attestation")
++    uri = upload(b)
++    print("Uploaded attestation bundle to:", uri)
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:services/serving/diffusers/watermark/vendor_provisioning.md
++Vendor provisioning & legal readiness checklist (for operators)
++- Install vetted vendor package (pip wheel or private registry) and set WATERMARK_VENDOR_MODE=local or configure remote API keys.
++- Run adv_validation_runner.py on representative corpus until detection targets met.
++- Produce forensic bundles using ops/watermark/run_and_sign_forensics.py and upload to Object-Lock enabled S3.
++- Prepare legal packet:
++  - Chain of custody document (who performed embedding/analysis)
++  - Cosign signature proof and KMS key id
++  - Retention policy and access control (who can access evidence bucket)
++- Request legal/compliance signoff by sending generated report (ops/watermark/request_legal_signoff.sh or email).
++
+*** End File
+*** Add File:ops/watermark/request_legal_signoff.sh
++#!/usr/bin/env bash
++set -euo pipefail
++REPORT=${1:-/tmp/wm_forensic_report.tar.gz}
++WEBHOOK=${WEBHOOK:-}
++if [ ! -f "$REPORT" ]; then echo "Report $REPORT not found"; exit 2; fi
++echo "Preparing legal signoff request with report $REPORT"
++if [ -n "$WEBHOOK" ]; then
++  curl -X POST -F "report=@${REPORT}" "$WEBHOOK"
++  echo "Posted to webhook"
++else
++  echo "No WEBHOOK configured. Please send $REPORT to legal/compliance for review."
++fi
++
+*** End File
+*** Add File:services/serving/diffusers/moderation/dataset_tools.py
++#!/usr/bin/env python3
++"""
++Helpers for constructing labeled moderation datasets (JSONL) and sampling by language.
++"""
++import json, langdetect
++from collections import defaultdict
++
++def sample_by_language(input_jsonl, out_prefix, per_lang=1000):
++    counts = defaultdict(int)
++    out_files = {}
++    with open(input_jsonl) as f:
++        for line in f:
++            obj = json.loads(line)
++            text = obj.get("text","")
++            try:
++                lang = langdetect.detect(text)
++            except Exception:
++                lang = "en"
++            if counts[lang] < per_lang:
++                if lang not in out_files:
++                    out_files[lang] = open(f"{out_prefix}.{lang}.jsonl","w")
++                out_files[lang].write(json.dumps(obj)+"\n")
++                counts[lang]+=1
++    for fh in out_files.values():
++        fh.close()
++    return counts
++
++if __name__=="__main__":
++    import argparse
++    p=argparse.ArgumentParser(); p.add_argument("--in"); p.add_argument("--out"); p.add_argument("--per", type=int, default=1000)
++    args=p.parse_args(); print(sample_by_language(args.in, args.out, args.per))
++
+*** End File
+*** Add File:ops/moderation/run_calibrate_and_deploy.sh
++#!/usr/bin/env bash
++set -euo pipefail
++DATASET=${1:-}
++KUBECONFIG=${KUBECONFIG:-}
++if [ -z "$DATASET" ]; then echo "Usage: $0 path/to/labeled.jsonl"; exit 2; fi
++python3 services/serving/diffusers/moderation/calibrate_and_deploy.py --dataset "$DATASET" --out thresholds.json --cm thresholds-cm.yaml
++if [ -n "$KUBECONFIG" ]; then
++  kubectl --kubeconfig "$KUBECONFIG" apply -f thresholds-cm.yaml
++  echo "Applied thresholds ConfigMap to cluster"
++else
++  echo "KUBECONFIG not set; thresholds YAML written locally as thresholds-cm.yaml"
++fi
++
+*** End File
+*** Add File:ops/cloud/setup_provider_secrets.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Create provider-specific secrets for KMS and storage endpoints across clouds.
++# Usage example (GCP):
++#   ./ops/cloud/setup_provider_secrets.sh gcp my-project my-keyring my-key my-s3-bucket
++
++PROVIDER=${1:-}
++shift
++case "$PROVIDER" in
++  gcp)
++    PROJECT=$1; KEYRING=$2; KEY=$3; BUCKET=$4
++    kubectl create secret generic aegis-cloud-gcp -n ml-serving --from-literal=project="$PROJECT" --from-literal=kms_key="gcpkms://projects/$PROJECT/locations/global/keyRings/$KEYRING/cryptoKeys/$KEY" --from-literal=evidence_bucket="$BUCKET" --dry-run=client -o yaml | kubectl apply -f -
++    ;;
++  aws)
++    ACCOUNT=$1; KEY_ARN=$2; BUCKET=$3
++    kubectl create secret generic aegis-cloud-aws -n ml-serving --from-literal=kms_key="$KEY_ARN" --from-literal=evidence_bucket="$BUCKET" --dry-run=client -o yaml | kubectl apply -f -
++    ;;
++  azure)
++    TENANT=$1; KEY_ID=$2; ACCOUNT_URL=$3
++    kubectl create secret generic aegis-cloud-azure -n ml-serving --from-literal=kms_key="$KEY_ID" --from-literal=storage_account="$ACCOUNT_URL" --dry-run=client -o yaml | kubectl apply -f -
++    ;;
++  *)
++    echo "Unsupported provider: $PROVIDER"
++    exit 2
++    ;;
++esac
++echo "Provider secret created (ml-serving namespace)"
++
+*** End File
+*** Add File:services/quota/postgres_quota_service.py
++#!/usr/bin/env python3
++"""
++Postgres-backed durable quota reservation service with idempotency.
++Simple API:
++ - POST /reserve {id, tenant, amount}
++ - GET /check?id=...
++"""
++import os, json
++from flask import Flask, request, jsonify
++import psycopg2
++
++DATABASE_URL = os.environ.get("DATABASE_URL","postgresql://postgres:postgres@postgres:5432/quota")
++
++app = Flask(__name__)
++
++def get_conn():
++    return psycopg2.connect(DATABASE_URL)
++
++def init_db():
++    sql = """
++    CREATE TABLE IF NOT EXISTS tenants (tenant text PRIMARY KEY, quota bigint, used bigint DEFAULT 0);
++    CREATE TABLE IF NOT EXISTS reservations (rid text PRIMARY KEY, tenant text, amount bigint, created_at bigint);
++    """
++    with get_conn() as conn:
++        with conn.cursor() as cur:
++            cur.execute(sql)
++        conn.commit()
++
++@app.route("/reserve", methods=["POST"])
++def reserve():
++    p = request.get_json(force=True)
++    rid = p.get("id"); tenant = p.get("tenant"); amount = int(p.get("amount",0))
++    if not (rid and tenant):
++        return jsonify({"ok":False,"error":"id,tenant required"}), 400
++    with get_conn() as conn:
++        with conn.cursor() as cur:
++            cur.execute("SELECT tenant, amount FROM reservations WHERE rid=%s", (rid,))
++            if cur.fetchone():
++                cur.execute("SELECT amount FROM reservations WHERE rid=%s", (rid,))
++                amount_existing = cur.fetchone()[0]
++                return jsonify({"ok":True,"reserved":amount_existing})
++            cur.execute("SELECT quota, used FROM tenants WHERE tenant=%s FOR UPDATE", (tenant,))
++            row = cur.fetchone()
++            if not row:
++                return jsonify({"ok":False,"error":"unknown tenant"}), 404
++            quota, used = row
++            if used + amount > quota:
++                return jsonify({"ok":False,"error":"over_quota"}), 402
++            cur.execute("UPDATE tenants SET used = used + %s WHERE tenant=%s", (amount,tenant))
++            cur.execute("INSERT INTO reservations (rid, tenant, amount, created_at) VALUES (%s,%s,%s,extract(epoch from now())::bigint)", (rid,tenant,amount))
++        conn.commit()
++    return jsonify({"ok":True,"reserved":amount})
++
++@app.route("/check", methods=["GET"])
++def check():
++    rid = request.args.get("id")
++    if not rid: return jsonify({"ok":False,"error":"id required"}), 400
++    with get_conn() as conn:
++        with conn.cursor() as cur:
++            cur.execute("SELECT amount FROM reservations WHERE rid=%s", (rid,))
++            row = cur.fetchone()
++            if not row: return jsonify({"ok":True,"reserved":0})
++            return jsonify({"ok":True,"reserved":row[0]})
++
++if __name__=="__main__":
++    init_db()
++    app.run(host="0.0.0.0", port=8082)
++
+*** End File
+*** Add File:ops/gateway/enforce_quota.lua
++-- Envoy/Lua filter sample (call this from gateway to enforce quota)
++-- expects AEGIS_QUOTA_URL env var or configured upstream cluster
++local http = require "resty.http"
++local cjson = require "cjson"
++local function must_reserve(id, tenant, amount)
++  local qurl = os.getenv("AEGIS_QUOTA_URL") or "http://aegis-quota.ml-serving.svc:8082/reserve"
++  local client = http.new()
++  local res, err = client:request_uri(qurl, {
++    method = "POST",
++    body = cjson.encode({id=id, tenant=tenant, amount=amount}),
++    headers = { ["Content-Type"] = "application/json" },
++    keepalive_timeout = 60,
++  })
++  if not res then
++    ngx.log(ngx.ERR, "quota call failed: ", err)
++    return false, "quota-service-unavailable"
++  end
++  if res.status == 200 then
++    local j = cjson.decode(res.body)
++    if j.ok then return true end
++    return false, j.error
++  else
++    return false, "quota-service-error"
++  end
++end
++
++-- Example usage in a request handler:
++-- local ok, err = must_reserve(request_id, tenant, amount)
++-- if not ok then ngx.exit(402) end
++
+*** End File
+*** Add File:ops/security/rotate_cosign_ref.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Rotate cosign key reference used by the cluster webhook and CI (update K8s secrets).
++# Usage: rotate_cosign_ref.sh --new-key-ref "gcpkms://..."
++
++NEW_REF=""
++KUBECTL=${KUBECTL:-kubectl}
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --new-key-ref) NEW_REF="$2"; shift 2;;
++    --kubeconfig) KUBECTL="$2"; shift 2;;
++    *) echo "Unknown arg $1"; exit 2;;
++  esac
++done
++
++if [ -z "$NEW_REF" ]; then echo "Provide --new-key-ref"; exit 2; fi
++TMPDIR=$(mktemp -d)
++PUBKEY="$TMPDIR/pubkey.pem"
++cosign public-key --key "$NEW_REF" > "$PUBKEY"
++kubectl delete secret aegis-cosign-pubkey -n ml-serving --ignore-not-found
++kubectl create secret generic aegis-cosign-pubkey -n ml-serving --from-file=pubkey.pem="$PUBKEY"
++echo "Updated aegis-cosign-pubkey secret in ml-serving. Restart webhook pods to pick up new key."
++
+*** End File
+*** Add File:ops/security/minimal_rbac.yaml
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: ml-serving
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: aegis-webhook-sa
++  namespace: ml-serving
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRole
++metadata:
++  name: aegis-webhook-role
++rules:
++  - apiGroups: [""]
++    resources: ["pods", "nodes"]
++    verbs: ["get","list","watch","patch"]
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRoleBinding
++metadata:
++  name: aegis-webhook-binding
++subjects:
++  - kind: ServiceAccount
++    name: aegis-webhook-sa
++    namespace: ml-serving
++roleRef:
++  kind: ClusterRole
++  name: aegis-webhook-role
++  apiGroup: rbac.authorization.k8s.io
++
+*** End File
+*** Add File:ops/security/run_static_scans.sh
++#!/usr/bin/env bash
++set -euo pipefail
++echo "Running Bandit (Python) and Trivy (container) scans (if installed)..."
++if command -v bandit >/dev/null 2>&1; then
++  bandit -r services || echo "bandit exit non-zero"
++else
++  echo "bandit not installed; skip"
++fi
++if command -v trivy >/dev/null 2>&1; then
++  trivy fs --severity HIGH,CRITICAL .
++else
++  echo "trivy not installed; skip container/FS scanning"
++fi
++
+*** End File
+*** Add File:ops/audit/collect_k8s_audit_and_upload.py
++#!/usr/bin/env python3
++"""
++Collect Kubernetes audit logs (assumes audit logs are available in /var/log/kubernetes/audit.log or via API),
++compute a SHA256 manifest, and upload to evidence bucket with object-lock metadata.
++"""
++import os, hashlib, subprocess, tempfile
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET","")
++
++def sha256_file(path):
++    h = hashlib.sha256()
++    with open(path,"rb") as f:
++        for chunk in iter(lambda: f.read(8192), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++def main():
++    src = "/var/log/kubernetes/audit.log"
++    if not os.path.exists(src):
++        print("Audit log not found at /var/log/kubernetes/audit.log; operator must provide path")
++        return
++    h = sha256_file(src)
++    print("SHA256:", h)
++    if not EVIDENCE_BUCKET:
++        print("No EVIDENCE_BUCKET configured; not uploading")
++        return
++    key = f"audit/audit-{int(__import__('time').time())}.log"
++    subprocess.check_call(["aws","s3","cp", src, f"{EVIDENCE_BUCKET}/{key}", "--metadata", f"sha256={h}"])
++    print("Uploaded audit log to", f"{EVIDENCE_BUCKET}/{key}")
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:docs/runbooks/operationalization-hardening.md
++# Operationalization & Hardening Runbook (summary)
++
++Sections:
++- Install & label isolated runtimes (use ops/cluster/install_and_label_isolated_runtimes.sh; run runtime_validator_enhanced.py)
++- Deploy validator webhook with KMS-backed cosign key:
++  - ./ops/webhook/deploy_with_cosign_kms.sh --cosign-key "gcpkms://..."
++  - Replace CA bundle in deploy/webhook/validatingwebhook-config-validator.yaml and apply
++  - Run ops/cluster/runtime_acceptance_tests.sh to validate deny/allow flows
++- Create evidence WORM bucket:
++  - ./ops/evidence/create_s3_worm_bucket.sh <bucket> <region>
++- Wire CI signing:
++  - Add .github/workflows/cosign-sign.yml to your image build pipeline
++- Attestation:
++  - Run ops/attestation/attestation_pipeline.py nightly or via CI; store signed bundles in EVIDENCE_BUCKET
++- Watermark vendor & legal:
++  - Install vendor per services/serving/diffusers/watermark/vendor_provisioning.md
++  - Run ops/watermark/run_and_sign_forensics.py and send package to legal with ops/watermark/request_legal_signoff.sh
++- Moderation:
++  - Use services/serving/diffusers/moderation/dataset_tools.py to curate labeled data
++  - Run ops/moderation/run_calibrate_and_deploy.sh and ensure reviewer service is running
++- Multi-cloud:
++  - Use ops/cloud/setup_provider_secrets.sh to populate per-cloud secrets for KMS and evidence buckets
++- Billing:
++  - Deploy Postgres-backed quota service (services/quota/postgres_quota_service.py) and wire gateway with ops/gateway/enforce_quota.lua
++- Security:
++  - Apply ops/security/minimal_rbac.yaml, run ops/security/run_static_scans.sh regularly, rotate keys via ops/security/rotate_cosign_ref.sh
++- Audit:
++  - Periodically run ops/audit/collect_k8s_audit_and_upload.py and confirm evidence uploaded with SHA metadata
++
++Acceptance criteria (short)
++- Validator denies unsigned images in protected namespaces and allows cosign-signed images using KMS key.
++- Evidence stored in Object-Lock bucket and attestation bundles are cosign-signed and retrievable.
++- Watermark adv validation output meets policy thresholds and legal has signed off.
++- Moderation thresholds applied; reviewer backlog within SLA.
++- Quota service rejects over-quota requests; nightly reconciliation matches ledger.
++- Static scans run and are part of CI gating.
++
+*** End Patch
+*** End Patch

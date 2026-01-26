@@ -1,0 +1,417 @@
+*** Begin Patch
+*** Add File:ops/monitoring/energy_accountant.py
++#!/usr/bin/env python3
++"""
++Energy accountant: compute per-job GPU energy (kWh) by querying Prometheus/DCGM metrics.
++
++Usage (example):
++  python ops/monitoring/energy_accountant.py --start 1610000000 --end 1610000600 --pod my-pod
++
++Important:
++ - Prometheus must scrape DCGM exporter and expose a power metric such as:
++     dcgm_gpu_power_draw_watts or nvidia_gpu_power_draw_watts or dcgm_gpu_power
++ - Prefer querying by pod label when available; otherwise query by node/gpu index.
++ - This is a best-effort implementation. For accurate accounting prefer host-level power telemetry or per-job GPU allocation tracking.
++"""
++import os
++import time
++import requests
++from urllib.parse import urljoin
++import argparse
++
++PROM_URL = os.environ.get("PROMETHEUS_URL", "http://prometheus.monitoring.svc:9090")
++# Candidate metric names to try (common DCGM exporter / community exporters)
++POWER_METRICS = [
++    "dcgm_gpu_power_draw_watts",
++    "nvidia_gpu_power_draw_watts",
++    "dcgm_gpu_power"
++]
++
++def _prom_range_query(query, start_ts, end_ts, step_s=10):
++    url = urljoin(PROM_URL, "/api/v1/query_range")
++    params = {"query": query, "start": str(start_ts), "end": str(end_ts), "step": f"{step_s}s"}
++    r = requests.get(url, params=params, timeout=30)
++    r.raise_for_status()
++    j = r.json()
++    return j.get("data", {}).get("result", [])
++
++def compute_energy_kwh(start_ts, end_ts, pod_name=None, node_name=None, gpu_index=None, step_s=10):
++    """
++    Compute energy in kWh by integrating power (watts) over time window [start_ts, end_ts].
++    Filters:
++      - If pod_name provided, tries to filter metrics with pod label
++      - Else if node_name/gpu_index provided, tries to filter by node and minor_number/gpu
++    Returns total_kwh (float) or None if no metric samples found.
++    """
++    total_wh = 0.0
++    any_samples = False
++    for metric in POWER_METRICS:
++        # build filter
++        label_selector = ""
++        if pod_name:
++            label_selector = f'{{pod="{pod_name}"}}'
++        elif node_name and gpu_index is not None:
++            # some exporters use 'device' or 'minor_number' or 'index' labels; try common ones
++            label_selector = f'{{node="{node_name}", minor_number="{gpu_index}"}}'
++        elif node_name:
++            label_selector = f'{{node="{node_name}"}}'
++        query = f"{metric}{label_selector}"
++        try:
++            results = _prom_range_query(query, start_ts, end_ts, step_s=step_s)
++        except Exception:
++            results = []
++        for series in results:
++            # series['values'] is list of [timestamp, value]
++            vals = series.get("values", [])
++            if not vals:
++                continue
++            any_samples = True
++            # integrate using rectangle rule: sum(value * dt)
++            prev_t = None
++            for t_str, v_str in vals:
++                t = float(t_str)
++                try:
++                    v = float(v_str)
++                except Exception:
++                    v = 0.0
++                if prev_t is not None:
++                    dt = t - prev_t
++                    total_wh += v * dt / 3600.0 * 1000.0  # v in Watts * dt seconds -> Wh (note: *1000 if v was kW; keep careful)
++                prev_t = t
++    if not any_samples:
++        return None
++    # total_wh is in (W*s)/3600 -> Wh; convert to kWh
++    total_kwh = total_wh / 1000.0
++    return total_kwh
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--start", required=True, type=float, help="start timestamp (epoch seconds)")
++    p.add_argument("--end", required=True, type=float, help="end timestamp (epoch seconds)")
++    p.add_argument("--pod", default=None)
++    p.add_argument("--node", default=None)
++    p.add_argument("--gpu-index", type=int, default=None)
++    p.add_argument("--step", type=int, default=10)
++    args = p.parse_args()
++    kwh = compute_energy_kwh(args.start, args.end, pod_name=args.pod, node_name=args.node, gpu_index=args.gpu_index, step_s=args.step)
++    print({"start": args.start, "end": args.end, "kwh": kwh})
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:services/telemetry/carbon_lookup.py
++#!/usr/bin/env python3
++"""
++Carbon intensity lookup helper.
++ - Primary implementation: call configured CARBON_API_URL (e.g., ElectricityMap or provider API)
++ - Fallback: use static default intensity (gCO2e/kWh)
++
++Environment:
++ - CARBON_API_URL (optional) - e.g., https://api.electricitymap.org/v3/co2-intensity
++ - CARBON_API_KEY (optional) - API key / token header
++ - CARBON_DEFAULT_GCO2_PER_KWH (optional) - fallback numeric (default 400 gCO2e/kWh)
++"""
++import os
++import time
++import requests
++
++CARBON_API_URL = os.environ.get("CARBON_API_URL", "")
++CARBON_API_KEY = os.environ.get("CARBON_API_KEY", "")
++DEFAULT_G_PER_KWH = float(os.environ.get("CARBON_DEFAULT_GCO2_PER_KWH", "400"))
++
++def lookup_co2_intensity(region: str = None, at_timestamp: float = None) -> float:
++    """
++    Return gCO2e per kWh for given region and timestamp.
++    If API not configured or lookup fails, return DEFAULT_G_PER_KWH.
++    """
++    if not CARBON_API_URL:
++        return DEFAULT_G_PER_KWH
++    params = {}
++    if region:
++        params["zone"] = region
++    if at_timestamp:
++        params["datetime"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at_timestamp))
++    headers = {}
++    if CARBON_API_KEY:
++        headers["auth-token"] = CARBON_API_KEY
++    try:
++        r = requests.get(CARBON_API_URL, params=params, headers=headers, timeout=10)
++        r.raise_for_status()
++        j = r.json()
++        # adapt to common ElectricityMap response: { data: { carbonIntensity: {forecast...} } } or { carbonIntensity: 123 }
++        if isinstance(j, dict):
++            # try common shapes
++            if "carbonIntensity" in j:
++                return float(j["carbonIntensity"])
++            if "data" in j and isinstance(j["data"], dict) and "carbonIntensity" in j["data"]:
++                return float(j["data"]["carbonIntensity"])
++            # electricitymap: j['data']['carbonIntensity'] or j['data'] may contain 'gCO2'
++        # fallback
++        return DEFAULT_G_PER_KWH
++    except Exception:
++        return DEFAULT_G_PER_KWH
++
+*** End File
+*** Add File:ops/telemetry/billing_uploader_v2.py
++#!/usr/bin/env python3
++"""
++Billing uploader v2
++ - Accepts billing records including energy_kwh and (optionally) co2e_kg
++ - If co2e_kg missing, will call carbon_lookup to compute and attach it
++ - Sends to finance webhook via finance_connector.send_charge and persists locally if unavailable
++"""
++import os
++import json
++from services.telemetry import carbon_lookup
++from services.telemetry.finance_connector import send_charge
++
++def prepare_and_send_charge(record: dict):
++    """
++    record should contain:
++      - id, tenant, cost_usd, energy_kwh (optional), co2e_kg (optional), metadata
++    """
++    rec = dict(record)
++    energy = rec.get("energy_kwh")
++    if energy is None:
++        # cannot compute energy here; caller should provide energy per-job
++        rec["energy_kwh"] = None
++    if rec.get("co2e_kg") is None and rec.get("energy_kwh"):
++        # compute carbon
++        intensity_g = carbon_lookup.lookup_co2_intensity(region=rec.get("region"))
++        rec["co2e_kg"] = rec["energy_kwh"] * (intensity_g / 1000.0)
++    # attach timestamp
++    rec.setdefault("ts", int(__import__("time").time()))
++    ok = send_charge(rec)
++    return ok
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--record", help="json string of billing record")
++    args = p.parse_args()
++    r = json.loads(args.record)
++    print("send result:", prepare_and_send_charge(r))
++
+*** End File
+*** Add File:services/serving/diffusers/worker_instrumentation.py
++#!/usr/bin/env python3
++"""
++Worker instrumentation helpers to start/stop per-job energy metering and attach results to evidence.
++ - Lightweight file-backed meter is used for portability in PoC; recommend replacing with Redis or durable store.
++ - Usage:
++     start_meter(job_id, pod_name)
++     ... run job ...
++     stop_meter(job_id, pod_name) -> returns { energy_kwh, co2e_kg }
++"""
++import os
++import json
++import time
++from pathlib import Path
++from ops.monitoring.energy_accountant import compute_energy_kwh
++from services.telemetry import carbon_lookup
++from ops.telemetry import billing_uploader_v2
++
++METER_DIR = os.environ.get("JOB_METER_DIR", "/tmp/aegis_job_meters")
++Path(METER_DIR).mkdir(parents=True, exist_ok=True)
++
++def start_meter(job_id: str, pod_name: str = None, node_name: str = None, gpu_index: int = None):
++    path = os.path.join(METER_DIR, f"{job_id}.json")
++    rec = {"job_id": job_id, "pod": pod_name, "node": node_name, "gpu_index": gpu_index, "start_ts": int(time.time())}
++    with open(path, "w") as f:
++        json.dump(rec, f)
++    return rec
++
++def stop_meter(job_id: str, region: str = None):
++    path = os.path.join(METER_DIR, f"{job_id}.json")
++    if not os.path.exists(path):
++        raise FileNotFoundError("meter not started for job " + job_id)
++    rec = json.load(open(path))
++    rec["end_ts"] = int(time.time())
++    # compute energy (best-effort)
++    kwh = compute_energy_kwh(rec["start_ts"], rec["end_ts"], pod_name=rec.get("pod"), node_name=rec.get("node"), gpu_index=rec.get("gpu_index"))
++    rec["energy_kwh"] = kwh
++    if kwh:
++        g_per_kwh = carbon_lookup.lookup_co2_intensity(region=region)
++        rec["co2e_kg"] = kwh * (g_per_kwh / 1000.0)
++    else:
++        rec["co2e_kg"] = None
++    # attach to billing record and attempt to send
++    billing_rec = {"id": f"bill-{job_id}", "tenant": "unknown", "cost_usd": 0.0, "energy_kwh": rec.get("energy_kwh"), "co2e_kg": rec.get("co2e_kg"), "region": region}
++    try:
++        billing_uploader_v2.prepare_and_send_charge(billing_rec)
++    except Exception as e:
++        print("billing send failed", e)
++    # persist evidence locally in meter dir (caller should also upload to S3)
++    with open(path, "w") as f:
++        json.dump(rec, f, indent=2)
++    return rec
++
+*** End File
+*** Add File:services/quantum/connector.py
++#!/usr/bin/env python3
++"""
++Quantum connector scaffold.
++ - Provides an adapter interface to run quantum circuits on a simulator or (optionally) a cloud QPU provider.
++ - This is a PoC: submit_to_provider is a stub that should be extended per provider (AWS Braket, IBM, Azure).
++ - All runs should produce an evidence bundle with circuit, backend id, shots, timestamps, and result.
++"""
++import os
++import time
++from services.quantum import simulator_adapter
++try:
++    import requests
++except Exception:
++    requests = None
++
++DEFAULT_SIMULATOR = os.environ.get("QUANTUM_SIMULATOR", "local")
++
++class QuantumConnector:
++    def __init__(self):
++        pass
++
++    def run_on_simulator(self, circuit_desc: dict, shots: int = 1024):
++        """
++        circuit_desc: vendor-agnostic description (dict). For PoC, simulator_adapter accepts simple dicts.
++        """
++        start = time.time()
++        result = simulator_adapter.run_simulator(circuit_desc, shots=shots)
++        end = time.time()
++        evidence = {
++            "backend": "simulator",
++            "simulator": DEFAULT_SIMULATOR,
++            "circuit": circuit_desc,
++            "shots": shots,
++            "result": result,
++            "start_ts": start,
++            "end_ts": end
++        }
++        return evidence
++
++    def submit_to_provider(self, circuit_desc: dict, provider: str = "braket", backend: str = None, shots: int = 1024):
++        """
++        Stub: provider submission should be implemented per-target.
++        Return structure similar to run_on_simulator with provider-specific metadata.
++        """
++        if provider == "simulator" or provider == "local":
++            return self.run_on_simulator(circuit_desc, shots=shots)
++        # Example placeholder for cloud provider integration:
++        if provider == "braket":
++            # Implement AWS Braket submission using boto3/amazon-braket-sdk
++            raise NotImplementedError("Braket submission not implemented in PoC")
++        if provider == "ibm":
++            raise NotImplementedError("IBM provider submission not implemented in PoC")
++        raise RuntimeError("unsupported provider")
++
+*** End File
+*** Add File:services/agents/tool_adapter_quantum.py
++#!/usr/bin/env python3
++"""
++Tool adapter for orchestrator to run quantum steps.
++ - Exposes run_quantum(tool_input) which the orchestrator worker can call similar to other tool adapters.
++ - Returns evidence dict suitable for storage by orchestrator worker.
++"""
++from services.quantum.connector import QuantumConnector
++
++qc = QuantumConnector()
++
++def run_tool_quantum(input_payload: dict):
++    """
++    input_payload example:
++      { "circuit": {...}, "provider": "simulator", "backend": null, "shots": 1024 }
++    """
++    circuit = input_payload.get("circuit", {})
++    provider = input_payload.get("provider", "simulator")
++    backend = input_payload.get("backend")
++    shots = int(input_payload.get("shots", 1024))
++    if provider in ("simulator", "local"):
++        return qc.run_on_simulator(circuit, shots=shots)
++    else:
++        return qc.submit_to_provider(circuit, provider=provider, backend=backend, shots=shots)
++
+*** End File
+*** Add File:services/quantum/simulator_adapter.py
++#!/usr/bin/env python3
++"""
++Simulator adapter: try to use qiskit or pennylane if available, otherwise run a simple mock simulator.
++ - Input: a minimal circuit description: { "ops": [ {"gate":"h","qubits":[0]}, {"gate":"cx","qubits":[0,1]}, ... ], "n_qubits": 2 }
++ - Returns: dict with counts/probabilities
++"""
++import random
++try:
++    from qiskit import QuantumCircuit, Aer, execute
++    _HAS_QISKIT = True
++except Exception:
++    _HAS_QISKIT = False
++
++def _mock_simulator(circuit_desc, shots=1024):
++    # Return uniform random counts as PoC
++    counts = {}
++    for _ in range(shots):
++        out = format(random.getrandbits(circuit_desc.get("n_qubits", 1)), f'0{circuit_desc.get("n_qubits",1)}b')
++        counts[out] = counts.get(out, 0) + 1
++    return {"counts": counts, "shots": shots}
++
++def run_simulator(circuit_desc: dict, shots: int = 1024):
++    if _HAS_QISKIT:
++        n = circuit_desc.get("n_qubits", 1)
++        qc = QuantumCircuit(n, n)
++        for op in circuit_desc.get("ops", []):
++            gate = op.get("gate")
++            qs = op.get("qubits", [])
++            if gate.lower() == "h":
++                qc.h(qs[0])
++            elif gate.lower() == "x":
++                qc.x(qs[0])
++            elif gate.lower() == "cx" and len(qs) >= 2:
++                qc.cx(qs[0], qs[1])
++            # add more gate translations as needed
++        qc.measure(range(n), range(n))
++        backend = Aer.get_backend('qasm_simulator')
++        job = execute(qc, backend=backend, shots=shots)
++        res = job.result().get_counts()
++        return {"counts": res, "shots": shots}
++    else:
++        return _mock_simulator(circuit_desc, shots=shots)
++
+*** End File
+*** Add File:docs/runbooks/carbon_and_quantum.md
++# Carbon accounting & Quantum connector runbook (PoC)
++
++Overview
++- This document explains how to use the newly added carbon accounting and quantum connector scaffolds.
++
++Carbon accounting (per-job)
++- Requirements:
++  - Prometheus scraping DCGM exporter with a power metric (dcgm_gpu_power_draw_watts or similar)
++  - PROMETHEUS_URL env var pointing to Prometheus server
++  - Optional CARBON_API_URL + CARBON_API_KEY for carbon intensity API (ElectricityMap or cloud provider)
++
++- Flow:
++  1. Worker calls start_meter(job_id, pod_name, node_name, gpu_index) at job start.
++  2. Worker calls stop_meter(job_id, region) at job end.
++  3. stop_meter will call energy_accountant.compute_energy_kwh to integrate power samples and compute kWh.
++  4. stop_meter will call carbon_lookup to compute gCO2e/kWh and compute co2e_kg.
++  5. Billing uploader will attach energy_kwh and co2e_kg to charge record and attempt to post it.
++
++- Acceptance test:
++  - Run a sample job instrumented with start/stop meter; verify evidence file in /tmp/aegis_job_meters/<job_id>.json contains energy_kwh and co2e_kg.
++
++Quantum connector (PoC)
++- Components:
++  - services/quantum/connector.py : high-level connector
++  - services/quantum/simulator_adapter.py : uses Qiskit if available, else mock
++  - services/agents/tool_adapter_quantum.py : tool adapter used by orchestrator
++
++- Flow:
++  1. Orchestrator submits a tool step that references tool "quantum" with a circuit payload.
++  2. Orchestrator worker calls tool_adapter_quantum.run_tool_quantum which invokes connector.
++  3. Connector returns evidence dict which the orchestrator worker stores with per-step evidence.
++
++- Next steps to productionize:
++  - Implement provider-specific adapters (AWS Braket, IBM, Azure)
++  - Add provider credential management, quota accounting, and billing hooks
++  - Capture provider calibration metadata and noise model for reproducibility
++
+*** End File
+*** End Patch

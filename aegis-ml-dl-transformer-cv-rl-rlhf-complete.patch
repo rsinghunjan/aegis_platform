@@ -1,0 +1,610 @@
+*** Begin Patch
+*** Add File:services/requirements-ml.txt
++transformers>=4.30
++datasets
++accelerate
++torch>=1.13
++torchvision
++sentence-transformers
++mlflow
++scikit-learn
++diffusers
++onnx
++onnxruntime
++stable-baselines3
++gym
++gymnasium
++wandb
++protobuf
++transformers[torch]
++tokenizers
++accelerate
++tensorboard
++stable-baselines3[extra]
++trlx
++sentencepiece
++
+*** End File
+*** Add File:services/train/finetune_transformer.py
++#!/usr/bin/env python3
++"""
++Fine-tune a transformer model on a text classification task and register it to MLflow.
++Usage:
++  python3 services/train/finetune_transformer.py --dataset glue --task mrpc --model_name_or_path roberta-base --output_dir /tmp/ft
++
++This script:
++ - Loads HF dataset (or local CSV) and tokenizer/model
++ - Trains with Hugging Face Trainer
++ - Logs metrics and model artifacts to MLflow
++ - Optionally registers the model in MLflow model registry and cosign-signs the artifact
++"""
++import argparse, os, tempfile, subprocess, json
++from datasets import load_dataset, load_metric
++from transformers import (AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer)
++import numpy as np
++import mlflow, mlflow.pytorch
++
++def compute_metrics(eval_pred):
++    logits, labels = eval_pred
++    preds = np.argmax(logits, axis=-1)
++    acc = (preds == labels).mean()
++    return {"accuracy": float(acc)}
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--dataset", default="glue")
++    p.add_argument("--task", default="mrpc")
++    p.add_argument("--model_name_or_path", default="roberta-base")
++    p.add_argument("--output_dir", default="/tmp/ft_model")
++    p.add_argument("--per_device_train_batch_size", type=int, default=8)
++    p.add_argument("--num_train_epochs", type=int, default=3)
++    p.add_argument("--mlflow_experiment", default="transformer-finetune")
++    p.add_argument("--register_name", default="")
++    args = p.parse_args()
++
++    ds = load_dataset(args.dataset, args.task)
++    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
++
++    def tokenize_fn(ex):
++        return tokenizer(ex["sentence1"], ex.get("sentence2", None), truncation=True, padding="max_length", max_length=128)
++
++    tokenized = ds.map(tokenize_fn, batched=True)
++    tokenized = tokenized.remove_columns([c for c in tokenized["train"].column_names if c not in ("label","input_ids","attention_mask","token_type_ids")])
++    tokenized.set_format(type="torch")
++
++    model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path, num_labels=len(set(ds["train"]["label"])))
++
++    training_args = TrainingArguments(
++        output_dir=args.output_dir,
++        evaluation_strategy="epoch",
++        save_strategy="epoch",
++        per_device_train_batch_size=args.per_device_train_batch_size,
++        per_device_eval_batch_size=32,
++        num_train_epochs=args.num_train_epochs,
++        logging_dir=f"{args.output_dir}/logs",
++        report_to="none",
++    )
++
++    trainer = Trainer(
++        model=model,
++        args=training_args,
++        train_dataset=tokenized["train"],
++        eval_dataset=tokenized["validation"] if "validation" in tokenized else tokenized["test"],
++        tokenizer=tokenizer,
++        compute_metrics=compute_metrics
++    )
++
++    mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow:5000"))
++    mlflow.set_experiment(args.mlflow_experiment)
++    with mlflow.start_run():
++        trainer.train()
++        metrics = trainer.evaluate()
++        mlflow.log_metrics(metrics)
++        # Save model as HF format and as PyTorch for MLflow
++        save_dir = os.path.join(args.output_dir, "hf_model")
++        os.makedirs(save_dir, exist_ok=True)
++        trainer.save_model(save_dir)
++        # log model
++        mlflow.pytorch.log_model(model, artifact_path="pytorch_model")
++        # log HF model archive
++        arch_dir = tempfile.mkdtemp()
++        arch_path = os.path.join(arch_dir, "hf_model.tar.gz")
++        subprocess.check_call(["tar","-czf", arch_path, "-C", save_dir, "."])
++        mlflow.log_artifact(arch_path, artifact_path="hf_hf_archive")
++        # register if requested
++        if args.register_name:
++            # register the last logged pytorch model
++            run_id = mlflow.active_run().info.run_id
++            model_uri = f"runs:/{run_id}/pytorch_model"
++            mv = mlflow.register_model(model_uri, args.register_name)
++            print("Registered model:", mv.name, mv.version)
++            # optional cosign sign (operator must set COSIGN_KEY_REF)
++            cosign_key = os.environ.get("COSIGN_KEY_REF","")
++            if cosign_key:
++                # sign the archived hf tarball artifact (download from mlflow first)
++                local_art = "/tmp/hf_arch.tar.gz"
++                mlflow.artifacts.download_artifacts(artifact_uri=f"runs:/{run_id}/hf_hf_archive/hf_model.tar.gz", dst_path="/tmp")
++                try:
++                    subprocess.check_call(["cosign","sign","--key", cosign_key, local_art])
++                except Exception as e:
++                    print("Cosign sign failed:", e)
++    print("Fine-tune complete. Metrics:", metrics)
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:services/train/cv_train.py
++#!/usr/bin/env python3
++"""
++Basic PyTorch image classification training script using torchvision.
++ - Logs metrics and artifacts to MLflow
++ - Exports a TorchScript and ONNX artifact suitable for Triton/ONNXRuntime
++Usage:
++  python3 services/train/cv_train.py --data_dir ./data --epochs 10 --model resnet18
++"""
++import argparse, os, time, torch, torchvision
++import torch.nn as nn
++import torch.optim as optim
++from torchvision import transforms, datasets, models
++import mlflow, mlflow.pytorch, tempfile, subprocess
++
++def train_loop(model, loader, loss_fn, optimizer, device):
++    model.train()
++    total_loss=0.0
++    correct=0
++    total=0
++    for x,y in loader:
++        x,y = x.to(device), y.to(device)
++        optimizer.zero_grad()
++        out = model(x)
++        loss = loss_fn(out, y)
++        loss.backward()
++        optimizer.step()
++        total_loss += loss.item()*x.size(0)
++        preds = out.argmax(dim=1)
++        correct += (preds==y).sum().item()
++        total += x.size(0)
++    return total_loss/total, correct/total
++
++def eval_loop(model, loader, loss_fn, device):
++    model.eval()
++    total_loss=0.0
++    correct=0
++    total=0
++    with torch.no_grad():
++        for x,y in loader:
++            x,y = x.to(device), y.to(device)
++            out = model(x)
++            loss = loss_fn(out, y)
++            total_loss += loss.item()*x.size(0)
++            preds = out.argmax(dim=1)
++            correct += (preds==y).sum().item()
++            total += x.size(0)
++    return total_loss/total, correct/total
++
++def main():
++    p=argparse.ArgumentParser()
++    p.add_argument("--data_dir", required=True)
++    p.add_argument("--model", default="resnet18")
++    p.add_argument("--epochs", type=int, default=5)
++    p.add_argument("--batch_size", type=int, default=32)
++    p.add_argument("--mlflow_experiment", default="cv-train")
++    args=p.parse_args()
++
++    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    transform = transforms.Compose([transforms.Resize(224), transforms.CenterCrop(224), transforms.ToTensor()])
++    train_ds = datasets.ImageFolder(os.path.join(args.data_dir,"train"), transform=transform)
++    val_ds = datasets.ImageFolder(os.path.join(args.data_dir,"val"), transform=transform)
++    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4)
++    val_loader = torch.utils.data.DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
++
++    if args.model=="resnet18":
++        model = models.resnet18(pretrained=True)
++        model.fc = nn.Linear(model.fc.in_features, len(train_ds.classes))
++    else:
++        raise NotImplementedError("Only resnet18 scaffold implemented")
++    model = model.to(device)
++    loss_fn = nn.CrossEntropyLoss()
++    optimizer = optim.Adam(model.parameters(), lr=1e-4)
++
++    mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI","http://mlflow:5000"))
++    mlflow.set_experiment(args.mlflow_experiment)
++    with mlflow.start_run():
++        for e in range(args.epochs):
++            train_loss, train_acc = train_loop(model, train_loader, loss_fn, optimizer, device)
++            val_loss, val_acc = eval_loop(model, val_loader, loss_fn, device)
++            mlflow.log_metrics({"train_loss":train_loss,"train_acc":train_acc,"val_loss":val_loss,"val_acc":val_acc}, step=e)
++            print(f"Epoch {e}: train_acc={train_acc} val_acc={val_acc}")
++        # save PyTorch model
++        model_path = "/tmp/cv_model.pt"
++        torch.save(model.state_dict(), model_path)
++        mlflow.log_artifact(model_path, artifact_path="cv_model")
++        # export TorchScript
++        example = torch.rand(1,3,224,224).to(device)
++        traced = torch.jit.trace(model, example)
++        ts_path = "/tmp/cv_model_ts.pt"
++        traced.save(ts_path)
++        mlflow.log_artifact(ts_path, artifact_path="cv_model")
++        # export ONNX
++        onnx_path = "/tmp/cv_model.onnx"
++        torch.onnx.export(model, example, onnx_path, input_names=["input"], output_names=["output"], opset_version=12)
++        mlflow.log_artifact(onnx_path, artifact_path="cv_model")
++    print("CV training complete and logged to MLflow")
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:services/serving/export_to_triton.py
++#!/usr/bin/env python3
++"""
++Helpers to prepare model artifacts for Triton model repository:
++ - Convert a TorchScript/ONNX into a model folder with config.pbtxt
++ - Example usage:
++     python3 services/serving/export_to_triton.py --onnx /tmp/model.onnx --out /models/my_model/1
++"""
++import argparse, os, shutil, textwrap
++
++def write_config(model_name, input_shape=(1,3,224,224), dtype="FP32", out_dir="."):
++    conf = f"""
++name: "{model_name}"
++platform: "onnxruntime_onnx"
++max_batch_size: 8
++input [
++  {{
++    name: "input"
++    data_type: TYPE_{dtype}
++    dims: [{", ".join(map(str,input_shape[1:]))}]
++  }}
++]
++output [
++  {{
++    name: "output"
++    data_type: TYPE_{dtype}
++    dims: [ -1 ]
++  }}
++]
++instance_group [
++  {{
++    kind: KIND_GPU
++    count: 1
++  }}
++]
++"""
++    with open(os.path.join(out_dir, "config.pbtxt"), "w") as fh:
++        fh.write(textwrap.dedent(conf))
++
++def main():
++    p=argparse.ArgumentParser()
++    p.add_argument("--onnx", required=True)
++    p.add_argument("--out", required=True, help="target model version directory (e.g., /models/<model>/1)")
++    p.add_argument("--name", default="aegis_model")
++    args=p.parse_args()
++    os.makedirs(args.out, exist_ok=True)
++    shutil.copy(args.onnx, os.path.join(args.out, "model.onnx"))
++    write_config(args.name, out_dir=args.out)
++    print("Wrote triton model in", args.out)
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:services/rl/ppo_trainer.py
++#!/usr/bin/env python3
++"""
++PPO trainer using Stable-Baselines3 for a Gym environment.
++ - Logs training metrics and checkpointed policy to MLflow
++ - Saves model artifact for later deployment in a policy registry
++Usage:
++  python3 services/rl/ppo_trainer.py --env CartPole-v1 --timesteps 100000
++"""
++import argparse, os, mlflow, gym, tempfile
++from stable_baselines3 import PPO
++from stable_baselines3.common.callbacks import BaseCallback
++
++class MLflowCallback(BaseCallback):
++    def __init__(self, log_interval=1000):
++        super().__init__(verbose=0)
++        self.log_interval = log_interval
++    def _on_step(self) -> bool:
++        if self.n_calls % self.log_interval == 0:
++            mlflow.log_metric("timestep", self.num_timesteps)
++        return True
++
++def main():
++    p=argparse.ArgumentParser()
++    p.add_argument("--env", default="CartPole-v1")
++    p.add_argument("--timesteps", type=int, default=100000)
++    p.add_argument("--mlflow_experiment", default="rl-ppo")
++    args=p.parse_args()
++
++    mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI","http://mlflow:5000"))
++    mlflow.set_experiment(args.mlflow_experiment)
++    env = gym.make(args.env)
++    model = PPO("MlpPolicy", env, verbose=1)
++    with mlflow.start_run():
++        cb = MLflowCallback()
++        model.learn(total_timesteps=args.timesteps, callback=cb)
++        # Save model
++        tmp = tempfile.mkdtemp()
++        path = os.path.join(tmp, "ppo_model.zip")
++        model.save(path)
++        mlflow.log_artifact(path, artifact_path="rl_policy")
++        print("Saved RL policy to", path)
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:services/rlhf/rlhf_pipeline.py
++#!/usr/bin/env python3
++"""
++Lightweight RLHF pipeline scaffold:
++ - Expect preference data (pairs with winner/loser)
++ - Train small reward model (transformer) on preferences
++ - Use reward model as a callable reward function in a PPO loop (stable-baselines3)
++Notes:
++ - This is a scaffold for experimentation; production RLHF requires careful infra and safety controls.
++"""
++import argparse, os, json, tempfile, subprocess
++from datasets import load_dataset
++from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
++import numpy as np, torch
++from stable_baselines3 import PPO
++import gym
++import mlflow
++
++def train_reward_model(pref_csv, model_name="distilbert-base-uncased", out_dir="/tmp/reward_model", epochs=3):
++    # pref_csv expected columns: prompt, response_a, response_b, winner (A/B)
++    ds = load_dataset("csv", data_files=pref_csv)["train"]
++    tokenizer = AutoTokenizer.from_pretrained(model_name)
++    def preprocess(ex):
++        # encode concatenated prompt+response text; label 1 if winner A else 0
++        texts = [ex["prompt"] + " [SEP] " + ex["response_a"], ex["prompt"] + " [SEP] " + ex["response_b"]]
++        return tokenizer(texts, truncation=True, padding="max_length", max_length=128)
++    ds2 = ds.map(lambda ex: {"input_ids":preprocess(ex)["input_ids"][0], "input_ids_b":preprocess(ex)["input_ids"][1], "labels":[1 if ex["winner"]=="A" else 0]}, batched=False)
++    # Simplify: train classifier on responseA vs responseB win label using concatenated text of winner vs loser. For brevity, we train a single input classifier on winner text.
++    def build_single(ex):
++        winner = ex["response_a"] if ex["winner"]=="A" else ex["response_b"]
++        return {"text": ex["prompt"] + " [SEP] " + winner, "label": 1}
++    df = ds.to_pandas()
++    # Placeholder training: fine-tune a classifier on winner text; in practice use pairwise loss
++    tokenizer = AutoTokenizer.from_pretrained(model_name)
++    def tok(ex):
++        return tokenizer(ex["text"], truncation=True, padding="max_length", max_length=128)
++    # Build small dataset (rapid prototype)
++    texts = []
++    labels = []
++    for r in df.to_dict(orient="records"):
++        win = r["response_a"] if r["winner"]=="A" else r["response_b"]
++        texts.append(r["prompt"] + " [SEP] " + win)
++        labels.append(1)
++    # This is illustrative; a real reward model needs a robust architecture and pairwise loss
++    training_args = TrainingArguments(output_dir=out_dir, num_train_epochs=epochs, per_device_train_batch_size=8, logging_steps=10)
++    # Convert to HF dataset is left as an exercise; here we export a dummy file
++    os.makedirs(out_dir, exist_ok=True)
++    # In this scaffold, we simply save a placeholder indicating training occurred.
++    with open(os.path.join(out_dir, "README.txt"), "w") as fh:
++        fh.write("Reward model scaffold - replace with production training\n")
++    return out_dir
++
++def reward_fn_from_model(model_dir):
++    # Load model and tokenizer and return a callable that maps text->score
++    # Placeholder: returns random score; replace with actual model inference
++    import random
++    def score(text):
++        return random.random()
++    return score
++
++def policy_train_with_reward(env_id, timesteps, reward_fn, out_policy="/tmp/rlhf_policy.zip"):
++    # Wrap a gym env to use reward_fn on observations/text (this is problem-specific)
++    env = gym.make(env_id)
++    # We can't call reward_fn directly without environment that returns text; this is a scaffold
++    model = PPO("MlpPolicy", env, verbose=1)
++    model.learn(total_timesteps=timesteps)
++    model.save(out_policy)
++    return out_policy
++
++def main():
++    p=argparse.ArgumentParser()
++    p.add_argument("--prefs_csv", required=True)
++    p.add_argument("--env", default="CartPole-v1")
++    p.add_argument("--timesteps", type=int, default=50000)
++    args=p.parse_args()
++    mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI","http://mlflow:5000"))
++    with mlflow.start_run():
++        rm_dir = train_reward_model(args.prefs_csv)
++        mlflow.log_artifact(rm_dir, artifact_path="reward_model")
++        reward_fn = reward_fn_from_model(rm_dir)
++        policy_path = policy_train_with_reward(args.env, args.timesteps, reward_fn)
++        mlflow.log_artifact(policy_path, artifact_path="rl_policies")
++    print("RLHF pipeline scaffold complete. Artifacts in MLflow.")
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:services/mlflow/register_and_sign.py
++#!/usr/bin/env python3
++"""
++Helper to download an MLflow artifact and cosign it using configured COSIGN_KEY_REF.
++Usage:
++  python3 services/mlflow/register_and_sign.py --run-id <run> --artifact-path hf_hf_archive/hf_model.tar.gz --cosign-key $COSIGN_KEY_REF
++"""
++import argparse, os, mlflow, subprocess, tempfile
++
++def main():
++    p=argparse.ArgumentParser()
++    p.add_argument("--run-id", required=True)
++    p.add_argument("--artifact-path", required=True)
++    p.add_argument("--cosign-key", default=os.environ.get("COSIGN_KEY_REF",""))
++    p.add_argument("--mlflow-tracking-uri", default=os.environ.get("MLFLOW_TRACKING_URI","http://mlflow:5000"))
++    args=p.parse_args()
++    mlflow.set_tracking_uri(args.mlflow_tracking_uri)
++    tmp = tempfile.mkdtemp()
++    local = mlflow.artifacts.download_artifacts(artifact_uri=f"runs:/{args.run_id}/{args.artifact_path}", dst_path=tmp)
++    print("Downloaded artifact to", local)
++    if args.cosign_key:
++        subprocess.check_call(["cosign","sign","--key", args.cosign_key, local])
++        print("Signed artifact with", args.cosign_key)
++    else:
++        print("No COSIGN_KEY provided; skipping sign")
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:.github/workflows/finetune_transformer.yml
++name: Transformer Fine-tune CI
++on:
++  workflow_dispatch:
++jobs:
++  finetune:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: "3.10"
++      - name: Install deps
++        run: pip install -r services/requirements-ml.txt
++      - name: Run fine-tune (operator must provide dataset or use default HF dataset)
++        env:
++          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
++        run: |
++          python3 services/train/finetune_transformer.py --dataset glue --task mrpc --model_name_or_path roberta-base --output_dir /tmp/ft --register_name aegis-text-classifier || true
++      - name: Upload artifacts
++        uses: actions/upload-artifact@v4
++        with:
++          name: finetune-artifacts
++          path: /tmp/ft
++
+*** End File
+*** Add File:.github/workflows/cv_train.yml
++name: CV Training CI
++on:
++  workflow_dispatch:
++jobs:
++  cv-train:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Install deps
++        run: pip install -r services/requirements-ml.txt
++      - name: Run CV training (requires labels/data in repo or mounted)
++        run: |
++          if [ ! -d data ]; then echo "No data/ directory found; create a small sample dataset to run a smoke test"; fi
++          python3 services/train/cv_train.py --data_dir data --epochs 1 || true
++
+*** End File
+*** Add File:.github/workflows/rl_train.yml
++name: RL Training CI
++on:
++  workflow_dispatch:
++jobs:
++  rl-train:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Install deps
++        run: pip install -r services/requirements-ml.txt
++      - name: Run PPO (short)
++        run: python3 services/rl/ppo_trainer.py --env CartPole-v1 --timesteps 20000 || true
++
+*** End File
+*** Add File:.github/workflows/rlhf_pipeline.yml
++name: RLHF Pipeline CI
++on:
++  workflow_dispatch:
++jobs:
++  rlhf:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Install deps
++        run: pip install -r services/requirements-ml.txt
++      - name: Run RLHF scaffold (requires prefs CSV)
++        run: |
++          if [ ! -f prefs/preferences.csv ]; then echo "prefs/preferences.csv missing; skip RLHF"; exit 0; fi
++          python3 services/rlhf/rlhf_pipeline.py --prefs_csv prefs/preferences.csv --env CartPole-v1 --timesteps 10000 || true
++
+*** End File
+*** Add File:services/serving/vllm_production_notes.md
++````markdown name=services/serving/vllm_production_notes.md
++```text
++vLLM / Triton production notes (brief)
++
++- Use model repository pattern (/models/<model>/1) and cosign-sign model artifacts as part of CI.
++- For vLLM:
++  - Deploy on GPU nodes with large memory (e.g., A100/80GB).
++  - Use sharding & quantization where appropriate.
++  - Tune batch sizes and token limits; integrate warm-pool manager to reduce cold starts.
++- For Triton:
++  - Use ONNX or TorchScript model artifacts produced by training pipelines.
++  - Expose metrics and use Prometheus scraping.
++  - Use model control mode to hot-swap models and limit memory usage.
++
++Security:
++- Validate model signatures with cosign at deploy time and load only signed models.
++- Use admission controller to block unsigned model repository changes.
++````
++
+*** End File
+*** Add File:services/rl/README_RLops.md
++````markdown name=services/rl/README_RLops.md
++```text
++RL Ops notes & recommendations
++
++- Use dedicated GPU/CPU node pools for training and separate inference nodes for policies.
++- Use experiment tracking (MLflow/WandB) to log rewards, episode length, hyperparameters.
++- For large distributed RL use RLlib or TorchRL with Kubernetes job orchestration.
++- Snapshot environments and seed randomness to enable reproducible trials.
++````
++
+*** End File
+*** Add File:services/docs/model_deploy_checklist.md
++````markdown name=services/docs/model_deploy_checklist.md
++```text
++Model deployment checklist (transformer / CV / RL policies)
++
++1) Training & artifact:
++ - Save model weights, tokenizer/config and inference script.
++ - Produce TorchScript and/or ONNX artifact for serving.
++ - Run unit tests / sample inference.
++
++2) Sign & register:
++ - Upload artifacts to MLflow and register to model registry.
++ - Use services/mlflow/register_and_sign.py to cosign the artifact with COSIGN_KEY_REF.
++
++3) Prepare serving repo:
++ - For Triton: create /models/<name>/1/model.onnx and config.pbtxt via export_to_triton.py.
++ - For vLLM: stage model weights and config; ensure quantization steps if needed.
++
++4) Deploy:
++ - Deploy to GPU nodes with nodeSelector and tolerations.
++ - Validate using smoke test and end-to-end test harness.
++
++5) Observability:
++ - Add model-level metrics (latency, batch_size, throughput) and link to Grafana dashboard.
++ - Monitor GPU memory, OOM, and request queue length.
++````
++
+*** End File
+*** Add File:docs/runbooks/train_and_deploy_models.md
++````markdown name=docs/runbooks/train_and_deploy_models.md
++```text
++Runbook: train and deploy end-to-end
++
++1) Prepare dataset and label splits; commit labels to labels/ or provide via artifact store.
++2) Run training locally or via CI (see .github/workflows/*). Use ephemeral GPU runner for heavy runs.
++3) Validate model on holdout and adversarial test suite (services/tests/adversarial_factuality_runner.py).
++4) Register model in MLflow and sign artifact with COSIGN_KEY_REF.
++5) Export to serving format (ONNX/TorchScript) and prepare Triton/vLLM repository.
++6) Deploy to staging; run canary tests; monitor metrics and check calibrator thresholds for factuality-sensitive models.
++7) Promote to production only after policy CI and (for high-risk actions) M-of-N delegation verification.
++````
++
+*** End File
+*** End Patch

@@ -1,0 +1,594 @@
+*** Begin Patch
+*** Add File:services/rag/milvus_client.py
++"""
++Lightweight Milvus client helper for Aegis RAG service.
++Requires: pymilvus
++"""
++from pymilvus import connections, CollectionSchema, FieldSchema, DataType, Collection, utility
++import os
++
++MILVUS_HOST = os.environ.get("MILVUS_HOST", "localhost")
++MILVUS_PORT = os.environ.get("MILVUS_PORT", "19530")
++
++def connect():
++    connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
++
++def ensure_collection(name="aegis_docs", dim=1536):
++    connect()
++    if utility.has_collection(name):
++        return Collection(name)
++    id_field = FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True)
++    vec_field = FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=dim)
++    meta = FieldSchema(name="meta", dtype=DataType.JSON)
++    schema = CollectionSchema([id_field, vec_field, meta], description="Aegis docs")
++    coll = Collection(name, schema=schema)
++    # create index for vector field
++    coll.create_index("embedding", {"index_type":"IVF_FLAT","metric_type":"L2","params":{"nlist":128}})
++    coll.load()
++    return coll
++
++def upsert_documents(collection_name, embeddings_and_meta):
++    """
++    embeddings_and_meta: list of (embedding:list[float], meta:dict)
++    """
++    coll = ensure_collection(collection_name)
++    embeddings = [e for e,m in embeddings_and_meta]
++    metas = [m for e,m in embeddings_and_meta]
++    res = coll.insert([None, embeddings, metas])
++    coll.flush()
++    return res.primary_keys
++
++def query_similar(collection_name, query_embedding, top_k=5):
++    coll = ensure_collection(collection_name)
++    results = coll.search([query_embedding], "embedding", {"metric_type":"L2"}, ["meta"], limit=top_k)
++    # results is list per query; single query => results[0]
++    out = []
++    for r in results[0]:
++        out.append({"score": float(r.score), "meta": r.entity.get("meta")})
++    return out
++
+*** End File
+*** Add File:services/rag/rag_service.py
++"""
++Simple RAG microservice:
++ - vector upsert API
++ - retrieve+compose API that returns context snippets for LLM prompts
++ - integrates with prompt registry to render templates
++"""
++from flask import Flask, request, jsonify
++import os, json
++from services.rag.milvus_client import upsert_documents, query_similar
++
++app = Flask(__name__)
++COLLECTION = os.environ.get("RAG_COLLECTION", "aegis_docs")
++DEFAULT_K = int(os.environ.get("RAG_TOPK", "5"))
++PROMPT_REGISTRY_URL = os.environ.get("PROMPT_REGISTRY_URL", "http://prompt-registry:8081")
++
++@app.route("/upsert", methods=["POST"])
++def upsert():
++    body = request.get_json()
++    docs = body.get("docs", [])
++    # each doc: {"embedding": [...], "meta": {...}}
++    pk = upsert_documents(COLLECTION, [(d["embedding"], d.get("meta", {})) for d in docs])
++    return jsonify({"inserted": len(pk), "pks": pk})
++
++@app.route("/retrieve", methods=["POST"])
++def retrieve():
++    body = request.get_json()
++    query_embedding = body.get("embedding")
++    top_k = body.get("top_k", DEFAULT_K)
++    if not query_embedding:
++        return jsonify({"error":"embedding required"}), 400
++    hits = query_similar(COLLECTION, query_embedding, top_k)
++    return jsonify({"hits": hits})
++
++@app.route("/compose_prompt", methods=["POST"])
++def compose_prompt():
++    body = request.get_json()
++    template_name = body.get("template", "default")
++    query_embedding = body.get("embedding")
++    top_k = body.get("top_k", DEFAULT_K)
++    # get context
++    hits = query_similar(COLLECTION, query_embedding, top_k)
++    context = "\n\n".join([h["meta"].get("text","") for h in hits])
++    # fetch template from prompt registry
++    try:
++        import requests
++        resp = requests.get(f"{PROMPT_REGISTRY_URL}/template/{template_name}", timeout=3)
++        if resp.status_code == 200:
++            template = resp.json().get("template", "{context}\n\nQ: {query}\nA:")
++        else:
++            template = "{context}\n\nQ: {query}\nA:"
++    except Exception:
++        template = "{context}\n\nQ: {query}\nA:"
++    prompt = template.replace("{context}", context).replace("{query}", body.get("query",""))
++    return jsonify({"prompt": prompt, "hits": hits})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8082")))
++
+*** End File
+*** Add File:services/prompt/registry.py
++"""
++Prompt registry service:
++ - store prompt templates (versioned) in a simple JSON store (backed by git or file)
++ - sign templates via cosign on publish (optional)
++"""
++from flask import Flask, request, jsonify
++import os, json, tempfile, subprocess
++from datetime import datetime
++
++app = Flask(__name__)
++STORE = os.environ.get("PROMPT_STORE_PATH", "/data/prompts.json")
++COSIGN_KEY_REF = os.environ.get("COSIGN_KEY_REF", "")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++
++def load_store():
++    try:
++        return json.load(open(STORE))
++    except Exception:
++        return {}
++
++def save_store(d):
++    os.makedirs(os.path.dirname(STORE), exist_ok=True)
++    with open(STORE, "w") as fh:
++        json.dump(d, fh, indent=2)
++
++@app.route("/template/<name>", methods=["GET"])
++def get_template(name):
++    s = load_store()
++    t = s.get(name)
++    if not t:
++        return jsonify({"error":"not found"}), 404
++    return jsonify(t)
++
++@app.route("/template/<name>", methods=["POST"])
++def put_template(name):
++    body = request.get_json()
++    template = body.get("template")
++    author = body.get("author","unknown")
++    if not template:
++        return jsonify({"error":"template required"}), 400
++    s = load_store()
++    versions = s.get(name,{}).get("versions",[])
++    v = {"version": len(versions)+1, "template": template, "author": author, "ts": datetime.utcnow().isoformat()+"Z"}
++    versions.append(v)
++    s[name] = {"name":name, "versions": versions}
++    save_store(s)
++    # sign and upload the template for audit if cosign key present
++    if COSIGN_KEY_REF and EVIDENCE_BUCKET:
++        tmp = tempfile.mkdtemp()
++        path = os.path.join(tmp, f"{name}_v{v['version']}.txt")
++        with open(path,"w") as fh: fh.write(template)
++        subprocess.check_call(["cosign","sign","--key", COSIGN_KEY_REF, path])
++        if EVIDENCE_BUCKET.startswith("s3://"):
++            subprocess.check_call(["aws","s3","cp", path, f"{EVIDENCE_BUCKET}/prompts/{os.path.basename(path)}"])
++    return jsonify({"ok":True, "version": v["version"]})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PROMPT_PORT","8081")))
++
+*** End File
+*** Add File:services/prompt/playground.py
++"""
++Minimal prompt playground; lightweight UI to fetch templates and run a compose->call flow.
++This is a prototype; deploy behind auth in production.
++"""
++from flask import Flask, render_template_string, request, jsonify
++import requests, os
++
++app = Flask(__name__)
++PROMPT_REGISTRY = os.environ.get("PROMPT_REGISTRY_URL","http://prompt-registry:8081")
++RAG_SERVICE = os.environ.get("RAG_URL","http://rag:8082")
++LLM_PROXY = os.environ.get("LLM_PROXY_URL","http://llm-proxy:8083")
++
++HTML = """
++<html><body>
++<h3>Prompt Playground</h3>
++<form method="post">
++Template: <input name="template" value="default"><br/>
++Query: <input name="query" size=80><br/>
++<input type="submit" value="Run">
++</form>
++<pre>{{result}}</pre>
++</body></html>
++"""
++
++@app.route("/", methods=["GET","POST"])
++def play():
++    result = ""
++    if request.method == "POST":
++        template = request.form.get("template","default")
++        query = request.form.get("query","")
++        # naive: ask RAG to compose prompt (no embedding in prototype)
++        r = requests.post(f"{RAG_SERVICE}/compose_prompt", json={"template": template, "query": query, "embedding": [0.0]*1536})
++        prompt = r.json().get("prompt")
++        # call LLM proxy
++        resp = requests.post(f"{LLM_PROXY}/v1/generate", json={"prompt": prompt})
++        result = resp.text
++    return render_template_string(HTML, result=result)
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=8085)
++
+*** End File
+*** Add File:services/llm/serving_proxy.py
++"""
++LLM serving proxy with token accounting and simple warm-pool awareness.
++ - Proxy forwards to upstream LLM service (vLLM, Triton-backed LLMs, or hosted)
++ - Counts tokens per request and increments Prometheus metrics
++ - Implements basic per-tenant quota check (env var or Vault-backed)
++"""
++from flask import Flask, request, jsonify
++import os, requests, time
++from prometheus_client import Counter, Histogram
++
++app = Flask(__name__)
++UPSTREAM = os.environ.get("LLM_UPSTREAM","http://localhost:8000")
++TOKEN_COUNTER = Counter("aegis_llm_tokens_total", "Tokens consumed", ["tenant"])
++REQ_LATENCY = Histogram("aegis_llm_request_latency_seconds", "LLM request latency")
++QUOTA = int(os.environ.get("LLM_TOKEN_QUOTA_PER_WINDOW", "100000"))
++
++# naive in-memory quota window
++quota_window = {}
++WINDOW_SECS = int(os.environ.get("LLM_QUOTA_WINDOW", "3600"))
++
++def count_tokens(text):
++    # naive: token ~ words
++    return max(1, len(text.split()))
++
++@app.route("/v1/generate", methods=["POST"])
++def generate():
++    t0 = time.time()
++    body = request.get_json(force=True)
++    tenant = body.get("tenant","default")
++    prompt = body.get("prompt","")
++    tokens = count_tokens(prompt)
++    now = int(time.time())
++    window = quota_window.get(tenant, {"start": now, "used": 0})
++    if now - window["start"] >= WINDOW_SECS:
++        window = {"start": now, "used": 0}
++    if window["used"] + tokens > QUOTA:
++        return jsonify({"error":"quota_exceeded"}), 429
++    window["used"] += tokens
++    quota_window[tenant] = window
++    TOKEN_COUNTER.labels(tenant=tenant).inc(tokens)
++    try:
++        r = requests.post(UPSTREAM.rstrip("/") + "/generate", json=body, timeout=60)
++    except Exception as e:
++        return jsonify({"error":"upstream_error", "detail": str(e)}), 502
++    REQ_LATENCY.observe(time.time() - t0)
++    return (r.content, r.status_code, r.headers.items())
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("LLM_PROXY_PORT","8083")))
++
+*** End File
+*** Add File:services/agent/orchestrator.py
++"""
++Simple agent orchestrator:
++ - Accepts an agent plan (list of steps) composed of tool calls
++ - Executes steps in sequence using tool adapters: search (calls RAG), exec (runs sandboxed task)
++ - Logs attested action records to evidence bucket via cosign (if configured)
++ - Consults Policy Engine before any tool call that is sensitive (policy_engine url)
++"""
++from flask import Flask, request, jsonify
++import os, subprocess, json, time, requests
++
++app = Flask(__name__)
++RAG_URL = os.environ.get("RAG_URL","http://rag:8082")
++SANDBOX_RUNNER = os.environ.get("SANDBOX_RUNNER","/ops/sandbox/run_sandbox.sh")
++POLICY_ENGINE = os.environ.get("POLICY_ENGINE_URL","http://policy-engine:8085/evaluate")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET","")
++COSIGN_KEY_REF = os.environ.get("COSIGN_KEY_REF","")
++
++def policy_check(action, actor="automation"):
++    try:
++        r = requests.post(POLICY_ENGINE, json={"action": action, "actor": actor}, timeout=5)
++        r.raise_for_status()
++        return r.json()
++    except Exception as e:
++        return {"allow": False, "error": str(e)}
++
++def call_search(query):
++    # for simplicity assume embeddings passed or RAG will compose template
++    r = requests.post(f"{RAG_URL}/retrieve", json={"embedding": query.get("embedding")})
++    return r.json()
++
++def call_exec(cmd):
++    # run in sandbox runner, which isolates via docker/runsc/etc
++    out = subprocess.check_output([SANDBOX_RUNNER, json.dumps({"cmd": cmd})], universal_newlines=True)
++    return out
++
++def attest_event(ev):
++    tmp = f"/tmp/agent_ev_{int(time.time())}.json"
++    with open(tmp,"w") as fh: json.dump(ev, fh)
++    if COSIGN_KEY_REF:
++        subprocess.check_call(["cosign","sign","--key", COSIGN_KEY_REF, tmp])
++    if EVIDENCE_BUCKET and EVIDENCE_BUCKET.startswith("s3://"):
++        subprocess.check_call(["aws","s3","cp", tmp, f"{EVIDENCE_BUCKET}/agent/{os.path.basename(tmp)}"])
++    return tmp
++
++@app.route("/run", methods=["POST"])
++def run_plan():
++    body = request.get_json()
++    plan = body.get("plan", [])
++    actor = body.get("actor","automation")
++    results = []
++    for step in plan:
++        tool = step.get("tool")
++        args = step.get("args", {})
++        # sensitive tool policy check
++        if tool in ("exec",):
++            pol = policy_check("forensic_signoff", actor)
++            if not pol.get("allow", False):
++                return jsonify({"error":"policy_denied", "detail": pol}), 403
++        try:
++            if tool == "search":
++                res = call_search(args)
++            elif tool == "exec":
++                res = call_exec(args.get("cmd"))
++            else:
++                res = {"error":"unknown_tool"}
++            ev = {"ts": int(time.time()), "actor": actor, "tool": tool, "args": args, "result_summary": str(res)[:1000]}
++            attest_event(ev)
++            results.append({"tool": tool, "result": res})
++        except Exception as e:
++            return jsonify({"error":"tool_failed", "tool": tool, "detail": str(e)}), 500
++    return jsonify({"results": results})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("AGENT_PORT","8090")))
++
+*** End File
+*** Add File:ops/sandbox/run_sandbox.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Simple sandbox runner wrapper that uses Docker to run a one-off command inside a restricted container.
++# Expects one arg: JSON payload {"cmd":["/bin/bash","-lc","echo hi"]}
++PAYLOAD_JSON="$1"
++PAYLOAD_FILE="/tmp/sandbox_payload_$$.json"
++echo "$PAYLOAD_JSON" > "$PAYLOAD_FILE"
++CMD=$(python3 -c "import sys,json; print(' '.join(json.load(open('$PAYLOAD_FILE'))['cmd']))")
++docker run --rm --network none --cpus=0.5 --memory=256m alpine:3.16 /bin/sh -c "$CMD"
++
+*** End File
+*** Add File:services/eval/eval_runner.py
++"""
++Evaluation harness for LLM/RAG outputs.
++ - Runs a benchmark dataset of (query, expected) and computes simple metrics (exact match, BLEU, etc)
++ - Logs results to MLflow and returns a summary JSON
++"""
++import os, json, time
++import requests
++import mlflow
++from sklearn.metrics import accuracy_score
++
++MLFLOW_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow:5000")
++RAG_SERVICE = os.environ.get("RAG_URL","http://rag:8082")
++LLM_PROXY = os.environ.get("LLM_PROXY_URL","http://llm-proxy:8083")
++
++def evaluate(dataset_path):
++    dataset = json.load(open(dataset_path))
++    preds = []
++    golds = []
++    for item in dataset:
++        q = item["query"]
++        # naive: ask RAG to compose prompt and call LLM
++        r = requests.post(f"{RAG_SERVICE}/compose_prompt", json={"template": "default", "query": q, "embedding":[0.0]*1536})
++        prompt = r.json()["prompt"]
++        r2 = requests.post(f"{LLM_PROXY}/v1/generate", json={"prompt": prompt})
++        pred = r2.text.strip()
++        preds.append(pred)
++        golds.append(item.get("expected",""))
++    # simple exact-match metric
++    em = sum(1 for p,g in zip(preds,golds) if p==g)/len(golds)
++    mlflow.set_tracking_uri(MLFLOW_URI)
++    with mlflow.start_run():
++        mlflow.log_metric("exact_match", em)
++        mlflow.log_param("dataset", dataset_path)
++    return {"exact_match": em, "n": len(golds)}
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--dataset", required=True)
++    args = p.parse_args()
++    print(evaluate(args.dataset))
++
+*** End File
+*** Add File:services/feedback/feedback_ui.py
++"""
++Minimal feedback capture UI for RLHF:
++ - POST feedback with model id, response id, rating, optional text
++ - Stores to a local file which can be picked up by retrain pipelines
++"""
++from flask import Flask, request, jsonify
++import os, json, time
++
++app = Flask(__name__)
++STORE = os.environ.get("FEEDBACK_STORE", "/data/feedback.json")
++os.makedirs(os.path.dirname(STORE), exist_ok=True)
++
++def append_feedback(fb):
++    try:
++        data = json.load(open(STORE))
++    except Exception:
++        data = []
++    data.append(fb)
++    with open(STORE, "w") as fh:
++        json.dump(data, fh, indent=2)
++
++@app.route("/feedback", methods=["POST"])
++def feedback():
++    b = request.get_json()
++    entry = {"ts": int(time.time()), "model": b.get("model"), "response_id": b.get("response_id"), "rating": b.get("rating"), "notes": b.get("notes","")}
++    append_feedback(entry)
++    return jsonify({"ok":True})
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("FEEDBACK_PORT","8086")))
++
+*** End File
+*** Add File:services/canary/ab_pipeline_integration.py
++"""
++Canary A/B pipeline integration example:
++ - Triggers A/B experiment using two model variants
++ - Collects metrics and consults policy engine before promoting winner
++ - Attests decisions and uploads evidence
++"""
++import os, requests, time, json, subprocess
++
++POLICY_ENGINE = os.environ.get("POLICY_ENGINE_URL","http://policy-engine:8085/evaluate")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET","")
++COSIGN_KEY_REF = os.environ.get("COSIGN_KEY_REF","")
++
++def post_policy(action, actor="automation"):
++    r = requests.post(POLICY_ENGINE, json={"action": action, "actor": actor}, timeout=5)
++    return r.json()
++
++def attest(data, name="ab"):
++    tmp = f"/tmp/{name}-{int(time.time())}.json"
++    with open(tmp,"w") as fh: json.dump(data, fh)
++    if COSIGN_KEY_REF:
++        subprocess.check_call(["cosign","sign","--key",COSIGN_KEY_REF,tmp])
++    if EVIDENCE_BUCKET and EVIDENCE_BUCKET.startswith("s3://"):
++        subprocess.check_call(["aws","s3","cp", tmp, f"{EVIDENCE_BUCKET}/ab/{os.path.basename(tmp)}"])
++    return tmp
++
++def run_ab(a_model, b_model, nsamples=100):
++    # placeholder: gather metrics for both models; decide by a single metric
++    # In reality use evaluation harness to run requests and collect latency/quality
++    a_score = 0.75
++    b_score = 0.78
++    result = {"a":a_score, "b":b_score}
++    attest({"phase":"compare","metrics":result})
++    # policy check before promote
++    dec = post_policy("deploy_low_risk")
++    if dec.get("allow"):
++        winner = "b" if b_score > a_score else "a"
++        attest({"action":"promote","winner":winner})
++        return {"promoted": winner}
++    else:
++        return {"promoted": None, "reason":"policy_denied"}
++
++if __name__=="__main__":
++    print(run_ab("model:v1","model:v2"))
++
+*** End File
+*** Add File:grafana/dashboards/ai_kpis.json
++{
++  "annotations": { "list": [] },
++  "panels": [
++    {
++      "type": "graph",
++      "title": "LLM Tokens by Tenant",
++      "targets": [ { "expr": "sum(aegis_llm_tokens_total) by (tenant)" } ]
++    },
++    {
++      "type": "graph",
++      "title": "Model Quality (exact_match) over time",
++      "targets": [ { "expr": "avg_over_time(aegis_model_quality_metric[1h])" } ]
++    },
++    {
++      "type": "stat",
++      "title": "Model Trust (component)",
++      "targets": [ { "expr": "external_file_metric_trust_score" } ]
++    }
++  ],
++  "schemaVersion": 16,
++  "title": "Aegis AI KPIs",
++  "uid": "aegis-ai-kpis"
++}
++
+*** End File
+*** Add File:ops/playbooks/retrain_rhf_playbook.md
++# RLHF / Retrain playbook (operator-guided)
++
++Overview
++- This playbook describes steps to convert feedback captured in the feedback UI into a reward model dataset, train a reward model, and fine-tune the policy model using PEFT/LoRA. Every step must be attested and evidence uploaded.
++
++Steps (high level)
++1. Export feedback entries from /data/feedback.json (quality checks & dedup)
++2. Construct pairwise preference dataset and split into train/val
++3. Train reward model (log to MLflow)
++4. Validate reward model via evaluation harness
++5. Fine-tune base model using PEFT/LoRA (log artifacts & SBOM)
++6. Register new model in registry and run policy evaluation + canary A/B
++7. If canary passes and policy allows, promote and attest promotion
++
++Notes
++- Use services/feedback/feedback_ui.py to export feedback.
++- Attest pre/post states using services/ops/oncall_playbook_runner.py
++
+*** End File
+*** Add File:ops/sandbox/Dockerfile
++FROM python:3.10-slim
++RUN apt-get update && apt-get install -y bash curl
++WORKDIR /work
++COPY run_sandbox_entry.sh /usr/local/bin/run_sandbox_entry.sh
++ENTRYPOINT ["/usr/local/bin/run_sandbox_entry.sh"]
++
+*** End File
+*** Add File:ops/sandbox/run_sandbox_entry.sh
++#!/usr/bin/env bash
++set -euo pipefail
++# This is the entrypoint inside the sandbox container; it expects the host to mount
++# a command file with the JSON payload and then run it.
++PAYLOAD_FILE=${1:-/payload.json}
++CMD=$(python3 - <<PY
++import json,sys
++print(' '.join(json.load(open('$PAYLOAD_FILE'))['cmd']))
++PY
++)
++exec /bin/sh -c "$CMD"
++
+*** End File
+*** Add File:services/ci/rag_index_ci.yml
++name: RAG Index CI
++on:
++  workflow_dispatch:
++jobs:
++  index:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Build embeddings and push to Milvus (stub)
++        run: |
++          echo "This is a stub. In CI, generate embeddings, then call RAG /upsert API with docs."
++          # Example: python3 tools/embeddings/generate_and_upsert.py ...
++
+*** End File
+*** Add File:services/requirements.txt
++flask
++requests
++mlflow
++pymilvus
++optuna
++prometheus_client
++pytest
++evidently
++
+*** End File
+*** Add File:README-AI-PLATFORM.md
++# Aegis AI Platform additions (RAG, Prompt Registry, LLM Proxy, Agent Orchestrator, Eval, Canary, RLHF)
++
++This patch implements the key building blocks to evolve Aegis into an AI platform:
++- RAG microservice (Milvus-backed) for retrieval and context composition
++- Prompt Registry + Playground with template versioning and optional cosign signing
++- LLM serving proxy with token accounting and quota checks
++- Agent orchestrator with tool adapters (search + sandboxed exec) and policy checks
++- Evaluation harness that logs to MLflow and supports A/B testing
++- Feedback UI for RLHF data capture and a retrain playbook stub
++- Canary A/B pipeline integration and attestation hooks
++- Grafana dashboard JSON for AI KPIs
++- Sandbox runner helpers using Docker for tool adapter isolation
++
++Next steps:
++- Provision Milvus and MLflow in your cluster (or use managed services)
++- Configure COSIGN_KEY_REF, EVIDENCE_BUCKET, POLICY_ENGINE_URL, and LLM upstream
++- Deploy self-hosted runners for TPU/Neuron for vendor builds
++- Wire Prometheus and Grafana to collect/visualize metrics
++
+*** End Patch

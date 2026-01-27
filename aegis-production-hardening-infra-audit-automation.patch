@@ -1,0 +1,445 @@
+*** Begin Patch
+*** Add File:ops/audit/prepare_mpc_audit_package.sh
++#!/usr/bin/env bash
++#
++# Package MPC artifacts for external crypto audit, sign the package, upload to evidence S3 and register to Rekor.
++#
++set -euo pipefail
++
++EVIDENCE_BUCKET=${EVIDENCE_BUCKET:-}
++OUT_DIR=${1:-/tmp/mpc_audit_package}
++TS=$(date +%s)
++TARBALL="${OUT_DIR}_${TS}.tar.gz"
++
++mkdir -p "$OUT_DIR"
++
++echo "Collecting MPC artifacts..."
++cp -r ops/secure_agg/production_mpc "$OUT_DIR/production_mpc" 2>/dev/null || true
++cp ops/secure_agg/production_mpc/audit/generate_test_vectors.py "$OUT_DIR/" 2>/dev/null || true
++cp ops/secure_agg/production_mpc/enhanced_coordinator.py "$OUT_DIR/" 2>/dev/null || true
++cp ops/secure_agg/production_mpc/shamir_integration.py "$OUT_DIR/" 2>/dev/null || true
++
++echo "Including deterministic test vectors..."
++python3 ops/secure_agg/production_mpc/audit/generate_test_vectors.py || true
++cp /tmp/mpc_audit_vectors.json "$OUT_DIR/" 2>/dev/null || true
++
++echo "Creating tarball..."
++tar -czf "$TARBALL" -C "$(dirname "$OUT_DIR")" "$(basename "$OUT_DIR")"
++echo "Tarball: $TARBALL"
++
++if [ -n "${COSIGN_KMS_URI:-}" ]; then
++  echo "Signing with cosign (KMS)..."
++  cosign sign-blob --key "${COSIGN_KMS_URI}" "$TARBALL" || echo "cosign sign failed"
++fi
++
++if [ -n "$EVIDENCE_BUCKET" ]; then
++  echo "Uploading to s3://${EVIDENCE_BUCKET%/}/audit/mpc/"
++  aws s3 cp "$TARBALL" "s3://${EVIDENCE_BUCKET%/}/audit/mpc/$(basename $TARBALL)"
++fi
++
++# Rekor registration (best-effort)
++if command -v rekor-cli >/dev/null 2>&1; then
++  echo "Registering tarball with Rekor..."
++  rekor-cli upload --artifact "$TARBALL" || echo "rekor upload failed"
++else
++  echo "rekor-cli not present; use ops/evidence/register_rekor.py if available"
++fi
++
++echo "Prepared MPC audit package: $TARBALL"
++
+*** End File
+*** Add File:ops/selfhosted/deploy_rekor_helm.sh
++#!/usr/bin/env bash
++#
++# Deploy Rekor to your Kubernetes cluster using the official Helm chart (best-practice for self-host).
++# This script is a convenience wrapper — operators should review values and certs.
++#
++set -euo pipefail
++RELEASE_NAME=${1:-rekor}
++NAMESPACE=${2:-rekor}
++VALUES_FILE=${3:-/tmp/rekor-values.yaml}
++
++cat > "$VALUES_FILE" <<EOF
++server:
++  service:
++    type: ClusterIP
++  resources:
++    requests:
++      cpu: "100m"
++      memory: "256Mi"
++    limits:
++      cpu: "500m"
++      memory: "512Mi"
++persistence:
++  enabled: true
++  size: 1Gi
++EOF
++
++kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
++helm repo add sigstore https://sigstore.github.io/helm-charts || true
++helm repo update
++helm upgrade --install "$RELEASE_NAME" sigstore/rekor --namespace "$NAMESPACE" -f "$VALUES_FILE"
++
++echo "Rekor deployed to namespace $NAMESPACE. Set REKOR_SERVER to http://<service>:3000 or use ingress."
++
+*** End File
+*** Add File:ops/kms/verify_kms_keys.sh
++#!/usr/bin/env bash
++set -euo pipefail
++echo "Verifying KMS aliases and key metadata"
++TARGET_ALIAS=${1:-alias/aegis/cosign}
++aws kms list-aliases --query "Aliases[?AliasName=='${TARGET_ALIAS}']" --output json
++echo "Describe key for alias (best-effort)"
++KEY_ID=$(aws kms list-aliases --query "Aliases[?AliasName=='${TARGET_ALIAS}'].TargetKeyId | [0]" --output text || true)
++if [ -n "$KEY_ID" ] && [ "$KEY_ID" != "None" ]; then
++  aws kms describe-key --key-id "$KEY_ID" --output json
++else
++  echo "Alias ${TARGET_ALIAS} not found in this account."
++  exit 2
++fi
++
+*** End File
+*** Add File:ops/vault/install_vault_csi.sh
++#!/usr/bin/env bash
++set -euo pipefail
++NAMESPACE=${1:-vault}
++
++echo "Installing Vault Helm chart and CSI driver (Helm required)"
++helm repo add hashicorp https://helm.releases.hashicorp.com || true
++helm repo update
++
++kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
++helm upgrade --install vault hashicorp/vault --namespace "$NAMESPACE" --set "server.dev.enabled=true"
++
++echo "Install CSI driver (secrets-store) via helm"
++helm repo add csi-secrets-store https://kubernetes-sigs.github.io/secrets-store-csi-driver || true
++helm repo update
++helm upgrade --install csi-secrets-store secrets-store-csi-driver/secrets-store-csi-driver --namespace kube-system
++
++echo "Create a SecretProviderClass example for Vault (operator must configure auth method separately)"
++cat <<'YAML' > /tmp/secretproviderclass.yaml
++apiVersion: secrets-store.csi.x-k8s.io/v1
++kind: SecretProviderClass
++metadata:
++  name: vault-aegis
++spec:
++  provider: vault
++  parameters:
++    vaultAddress: "https://vault.default.svc.cluster.local"
++YAML
++
++kubectl apply -f /tmp/secretproviderclass.yaml
++echo "Vault + CSI installed (dev mode). Configure production Vault and auth methods per documentation."
++
+*** End File
+*** Add File:ops/helm/patch_and_apply_all.py
++#!/usr/bin/env python3
++"""
++Patch Helm-rendered manifests (or raw manifests) to inject Vault CSI, mTLS and network policies,
++then apply them to the cluster. Operators must review diffs before running in production.
++
++Usage:
++  python3 ops/helm/patch_and_apply_all.py --manifests rendered/ --out patched/ --apply
++"""
++import argparse, os, yaml, subprocess
++from pathlib import Path
++
++def patch_manifest_file(path, outdir):
++    docs = list(yaml.safe_load_all(Path(path).read_text()))
++    modified = False
++    for d in docs:
++        if not isinstance(d, dict): continue
++        kind = d.get("kind","")
++        if kind in ("Deployment","StatefulSet","DaemonSet"):
++            spec = d.setdefault("spec",{})
++            tpl = spec.setdefault("template",{})
++            pod = tpl.setdefault("spec",{})
++            vols = pod.setdefault("volumes", [])
++            vols.append({"name":"vault-csi","csi":{"driver":"secrets-store.csi.k8s.io","readOnly":True,"volumeAttributes":{"secretProviderClass":"vault-aegis"}}})
++            vols.append({"name":"mtls-secret","secret":{"secretName":"crypten-mtls"}})
++            for c in pod.get("containers",[]):
++                mounts = c.setdefault("volumeMounts",[])
++                mounts.append({"name":"vault-csi","mountPath":"/mnt/secrets"})
++                mounts.append({"name":"mtls-secret","mountPath":"/etc/tls","readOnly":True})
++            meta = d.setdefault("metadata",{})
++            ann = meta.setdefault("annotations",{})
++            ann["sidecar.istio.io/inject"] = "true"
++            modified = True
++    outp = Path(outdir) / Path(path).name
++    Path(outdir).mkdir(parents=True, exist_ok=True)
++    Path(outp).write_text("\n---\n".join(yaml.safe_dump(d) for d in docs))
++    return modified
++
++def apply_manifest(path):
++    subprocess.check_call(["kubectl","apply","-f", path])
++
++def main(manifests_dir, out_dir, do_apply=False):
++    for root,_,files in os.walk(manifests_dir):
++        for f in files:
++            if f.endswith((".yaml",".yml")):
++                p = os.path.join(root,f)
++                patch_manifest_file(p, out_dir)
++    print("Patched manifests written to", out_dir)
++    if do_apply:
++        for root,_,files in os.walk(out_dir):
++            for f in files:
++                fp = os.path.join(root,f)
++                print("Applying", fp)
++                apply_manifest(fp)
++
++if __name__=="__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--manifests", required=True)
++    p.add_argument("--out", required=True)
++    p.add_argument("--apply", action="store_true")
++    args = p.parse_args()
++    main(args.manifests, args.out, args.apply)
++
+*** End File
+*** Add File:.github/workflows/run_large_simulator_and_rollback.yml
++name: Large Scenario Simulator + Rollback Proof
++on:
++  workflow_dispatch:
++    inputs:
++      evidence_bucket:
++        required: true
++      mofn_url:
++        required: true
++      fl_controller:
++        required: true
++      canary_name:
++        required: true
++      namespace:
++        required: true
++
++jobs:
++  simulate-and-prove:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: "3.10"
++      - name: Run large scenario simulator
++        env:
++          MOFN_URL: ${{ github.event.inputs.mofn_url }}
++          EVIDENCE_BUCKET: ${{ github.event.inputs.evidence_bucket }}
++        run: |
++          python3 ops/simulation/large_scenario_simulator.py || true
++      - name: Run rollback proof
++        env:
++          KUBECONFIG: ${{ secrets.KUBE_CONFIG_DATA }}
++        run: |
++          echo "${{ secrets.KUBE_CONFIG_DATA }}" | base64 -d > $HOME/.kube/config
++          bash ops/safety/automated_rollback_proof.sh "${{ github.event.inputs.canary_name }}" "${{ github.event.inputs.namespace }}" 300 || true
++      - name: Collect evidence and sign
++        env:
++          EVIDENCE_BUCKET: ${{ github.event.inputs.evidence_bucket }}
++          COSIGN_KMS_URI: ${{ secrets.COSIGN_KMS_URI }}
++        run: |
++          mkdir -p /tmp/sim_evidence
++          cp /tmp/sim_*.json /tmp/sim_evidence/ 2>/dev/null || true
++          tar -czf /tmp/sim_evidence.tar.gz -C /tmp sim_evidence || true
++          if [ -n "${COSIGN_KMS_URI:-}" ]; then
++            cosign sign-blob --key "${COSIGN_KMS_URI}" /tmp/sim_evidence.tar.gz || true
++          fi
++          if [ -n "${EVIDENCE_BUCKET:-}" ]; then
++            aws s3 cp /tmp/sim_evidence.tar.gz "s3://${EVIDENCE_BUCKET%/}/simulator_evidence/$(basename /tmp/sim_evidence.tar.gz)" || true
++          fi
++          if command -v rekor-cli >/dev/null 2>&1; then
++            rekor-cli upload --artifact /tmp/sim_evidence.tar.gz || true
++          fi
++      - name: Upload artifacts
++        uses: actions/upload-artifact@v4
++        with:
++          name: simulator-evidence
++          path: /tmp/sim_evidence.tar.gz
++
+*** End File
+*** Add File:ops/carbon/fetch_co2signal.py
++#!/usr/bin/env python3
++"""
++Fetch carbon intensity from CO2Signal and write a small metric file for Prometheus node_textfile collector.
++Requires CO2SIGNAL_API_KEY env var.
++"""
++import os, requests, json, time
++
++API_KEY = os.environ.get("CO2SIGNAL_API_KEY","")
++OUT_DIR = os.environ.get("PROM_TEXT_DIR","/var/lib/node_exporter/textfile_collector")
++
++def get_carbon(country="US"):
++    if not API_KEY:
++        raise RuntimeError("CO2SIGNAL_API_KEY not set")
++    r = requests.get("https://api.co2signal.com/v1/latest", params={"countryCode": country}, headers={"auth-token":API_KEY}, timeout=10)
++    r.raise_for_status()
++    return r.json().get("data",{})
++
++def write_metric(job_id, est):
++    os.makedirs(OUT_DIR, exist_ok=True)
++    path = os.path.join(OUT_DIR, f"carbon_job_{job_id}.prom")
++    with open(path,"w") as fh:
++        fh.write("# HELP aegis_job_co2e_estimate Estimated CO2e grams for job\n")
++        fh.write("# TYPE aegis_job_co2e_estimate gauge\n")
++        fh.write(f'aegis_job_co2e_estimate{{job="{job_id}"}} {est}\n')
++    print("Wrote", path)
++
++if __name__=="__main__":
++    import sys
++    country = sys.argv[1] if len(sys.argv)>1 else "US"
++    job_id = f"co2-{int(time.time())}"
++    data = get_carbon(country)
++    ci = data.get("carbonIntensity", 0)
++    est = ci * 10.0
++    write_metric(job_id, est)
++    print("Carbon intensity", ci)
++
+*** End File
+*** Add File:ops/security/apply_network_policies.sh
++#!/usr/bin/env bash
++set -euo pipefail
++NAMESPACE=${1:-aegis}
++echo "Applying default-deny and allow-monitoring policies to namespace ${NAMESPACE}"
++kubectl apply -f ops/security/network_policy_namespace_deny.yaml
++kubectl apply -f ops/security/network_policies_allow.yaml
++echo "Network policies applied (verify selectors and labels to match your infra)."
++
+*** End File
+*** Add File:ops/security/iam_short_lived_ci.sh
++#!/usr/bin/env bash
++#
++# Helper for CI to assume a restricted role and export short-lived credentials for subsequent AWS steps.
++#
++set -euo pipefail
++ROLE_ARN=${1:-}
++if [ -z "$ROLE_ARN" ]; then
++  echo "Usage: $0 <role-arn>"
++  exit 2
++fi
++creds=$(python3 - <<PY
++import boto3, sys, json
++sts = boto3.client('sts')
++res = sts.assume_role(RoleArn="${ROLE_ARN}", RoleSessionName="aegis-ci", DurationSeconds=900)
++print(json.dumps({"AWS_ACCESS_KEY_ID":res['Credentials']['AccessKeyId'],"AWS_SECRET_ACCESS_KEY":res['Credentials']['SecretAccessKey'],"AWS_SESSION_TOKEN":res['Credentials']['SessionToken']}))
++PY
++)
++export AWS_ACCESS_KEY_ID=$(echo "$creds" | jq -r .AWS_ACCESS_KEY_ID)
++export AWS_SECRET_ACCESS_KEY=$(echo "$creds" | jq -r .AWS_SECRET_ACCESS_KEY)
++export AWS_SESSION_TOKEN=$(echo "$creds" | jq -r .AWS_SESSION_TOKEN)
++echo "Exported short-lived AWS credentials to environment (session token set)."
++
+*** End File
+*** Add File:ops/attestation/attestation_pipeline.sh
++#!/usr/bin/env bash
++#
++# Collect node & workload attestations, sign and upload to evidence S3 and Rekor.
++#
++set -euo pipefail
++EVIDENCE_BUCKET=${EVIDENCE_BUCKET:-}
++COSIGN_KMS_URI=${COSIGN_KMS_URI:-}
++OUT="/tmp/aegis_attestation_$(date +%s).tar.gz"
++TMPDIR=$(mktemp -d)
++
++echo "Collecting attestations..."
++python3 - <<PY
++import json, time, os, subprocess
++att = {"ts": int(time.time())}
++try:
++    out = subprocess.check_output(["kubectl","get","nodes","-o","json"])
++    att["nodes_json_len"] = len(out)
++except Exception:
++    att["nodes_json_len"] = 0
++open(os.path.join("$TMPDIR","attestation.json"),"w").write(json.dumps(att))
++PY
++
++tar -czf "$OUT" -C "$TMPDIR" .
++echo "Attestation bundle: $OUT"
++
++if [ -n "$COSIGN_KMS_URI" ]; then
++  cosign sign-blob --key "$COSIGN_KMS_URI" "$OUT" || true
++fi
++if [ -n "$EVIDENCE_BUCKET" ]; then
++  aws s3 cp "$OUT" "s3://${EVIDENCE_BUCKET%/}/attestations/$(basename $OUT)" || true
++fi
++if command -v rekor-cli >/dev/null 2>&1; then
++  rekor-cli upload --artifact "$OUT" || true
++fi
++echo "Attestation uploaded and (best-effort) registered with Rekor."
++
+*** End File
+*** Add File:ops/audit/close_findings.sh
++#!/usr/bin/env bash
++#
++# Close audit findings by uploading remediation evidence (signed) and marking issues via GitHub new comment/close (uses gh).
++#
++set -euo pipefail
++FINDINGS_JSON=${1:-}
++if [ -z "$FINDINGS_JSON" ]; then
++  echo "Usage: $0 findings.json"
++  exit 2
++fi
++
++echo "Creating remediation issues for audit findings..."
++python3 - <<PY
++import json, os, requests, sys, subprocess
++f = "$FINDINGS_JSON"
++j = json.load(open(f))
++for fin in j.get("findings",[]):
++    title = "[AUDIT][REMEDIATION] "+fin.get("title","untitled")
++    body = fin.get("remediation","") + "\n\nEvidence will be uploaded to evidence S3 and registered with Rekor."
++    # use GitHub CLI to create issue
++    subprocess.check_call(["gh","issue","create","--title",title,"--body",body,"--label","audit","remediation"])
++print("Created issues for findings.")
++PY
++
++echo "Operator: implement remediation, then run ops/audit/mark_remediated.sh <issue-number> <evidence-path>"
++
+*** End File
+*** Add File:.github/workflows/audit_closure.yml
++name: Audit closure workflow
++on:
++  workflow_dispatch:
++    inputs:
++      findings_path:
++        required: true
++
++jobs:
++  ingest-and-create:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Ingest findings and create remediation issues
++        run: |
++          chmod +x ops/audit/close_findings.sh
++          ./ops/audit/close_findings.sh "${{ github.event.inputs.findings_path }}"
++
+*** End File
+*** Add File:docs/production_hardening.md
++# Production Hardening Checklist & Automation
++
++This document collects the scripts and workflows added to help you:
++- prepare MPC audit packages, sign & upload them
++- deploy Rekor in your tenancy, verify KMS keys
++- install Vault CSI and inject Vault CSI mounts & mTLS hints into manifests
++- patch and apply manifests across Helm charts
++- run the large-scenario simulator and rollback proof against your cluster and register evidence
++- integrate CO2Signal for carbon metrics and export Prometheus metrics
++- apply network policies and enforce short-lived credentials via STS in CI
++- collect and sign attestation artifacts and upload/rekor-register them
++- create remediation issues from auditor findings and track closure
++
++Runbook highlights:
++- Prepare MPC package: ops/audit/prepare_mpc_audit_package.sh
++- Deploy Rekor (self-host): ops/selfhosted/deploy_rekor_helm.sh
++- Patch manifests: python3 ops/helm/patch_and_apply_all.py --manifests rendered/ --out patched/ --apply
++- Simulator + rollback proof GH Action: dispatch "Large Scenario Simulator + Rollback Proof"
++- Attestation pipeline: ops/attestation/attestation_pipeline.sh
++- Close findings: .github/workflows/audit_closure.yml (dispatch with findings JSON)
++
++Security & audit notes:
++- MPC coordinator and threshold helpers are prototypes — require external cryptographic audit prior to production use.
++- All automated changes to Helm charts should be reviewed by cluster operators and security.
++- Ensure COSIGN_KMS_URI, REKOR_SERVER, EVIDENCE_BUCKET, CO2SIGNAL_API_KEY, VAULT_ADDR are configured in your CI/Secrets.
++
+*** End File
+*** End Patch

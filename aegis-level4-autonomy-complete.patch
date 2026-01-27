@@ -1,0 +1,663 @@
+*** Begin Patch
+*** Add File:.github/workflows/progressive_canary.yml
++name: Build, Push, Progressive Canary Deploy (Flagger)
++on:
++  workflow_dispatch:
++    inputs:
++      image_tag:
++        description: 'Optional image tag to deploy (defaults to SHA)'
++        required: false
++        default: ''
++      deploy:
++        description: 'Deploy to staging (true/false)'
++        required: false
++        default: 'true'
++
++permissions:
++  contents: read
++  packages: write
++  id-token: write
++
++jobs:
++  build-push-deploy-progressive:
++    runs-on: ubuntu-latest
++    env:
++      IMAGE_REPO: ghcr.io/${{ github.repository_owner }}/admission-webhook
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: Set up Docker Buildx
++        uses: docker/setup-buildx-action@v2
++
++      - name: Login to GHCR
++        uses: docker/login-action@v2
++        with:
++          registry: ghcr.io
++          username: ${{ github.actor }}
++          password: ${{ secrets.GITHUB_TOKEN }}
++
++      - name: Build and push image
++        id: build
++        uses: docker/build-push-action@v4
++        with:
++          context: ./ops/webhook
++          file: ./ops/webhook/Dockerfile
++          push: true
++          tags: |
++            ${{ env.IMAGE_REPO }}:latest
++            ${{ env.IMAGE_REPO }}:${{ github.sha }}
++
++      - name: Determine image tag
++        run: |
++          echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_ENV
++          if [ -n "${{ github.event.inputs.image_tag }}" ]; then
++            echo "IMAGE_TAG=${{ github.event.inputs.image_tag }}" >> $GITHUB_ENV
++          fi
++
++      - name: Setup kubeconfig for staging
++        if: ${{ github.event.inputs.deploy == 'true' && secrets.KUBE_CONFIG_DATA }}
++        run: |
++          echo "${{ secrets.KUBE_CONFIG_DATA }}" | base64 -d > $HOME/.kube/config
++
++      - name: Ensure Flagger & metrics available (staging)
++        if: ${{ github.event.inputs.deploy == 'true' && secrets.KUBE_CONFIG_DATA }}
++        run: |
++          kubectl -n flagger get deployment flagger || echo "Ensure Flagger is installed in staging"
++
++      - name: Deploy primary release (if missing)
++        if: ${{ github.event.inputs.deploy == 'true' && secrets.KUBE_CONFIG_DATA }}
++        run: |
++          helm upgrade --install aegis-admission-webhook helm/admission-webhook \
++            --namespace aegis --create-namespace \
++            --set image.repository=${{ env.IMAGE_REPO }} \
++            --set image.tag=latest \
++            --wait --timeout 120s
++
++      - name: Create Flagger Canary (apply)
++        if: ${{ github.event.inputs.deploy == 'true' && secrets.KUBE_CONFIG_DATA }}
++        run: |
++          # Apply the provided Flagger Canary manifest which points to the primary deployment/service
++          kubectl apply -f ops/canary/flagger_canary.yaml
++          echo "Flagger canary created. Waiting for analysis..."
++          # Wait loop: check canary status via kubectl. Timeout 10 minutes.
++          for i in $(seq 1 60); do
++            status=$(kubectl -n aegis get canary aegis-admission-webhook -o jsonpath='{.status.conditions[?(@.type=="Progressing")].status}' 2>/dev/null || echo "")
++            echo "canary progressing status: $status"
++            if kubectl -n aegis get canary aegis-admission-webhook -o jsonpath='{.status.canaryAnalysis}' 2>/dev/null | grep -q "true"; then
++              echo "Analysis started..."
++            fi
++            # Inspect final status
++            succeeded=$(kubectl -n aegis get canary aegis-admission-webhook -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
++            echo "Phase: $succeeded"
++            if [ "$succeeded" = "Succeeded" ]; then
++              echo "Canary succeeded; primary promoted by Flagger"
++              exit 0
++            fi
++            if [ "$succeeded" = "Failed" ]; then
++              echo "Canary failed; Flagger rolled back"
++              kubectl -n aegis describe canary aegis-admission-webhook || true
++              exit 1
++            fi
++            sleep 10
++          done
++          echo "Timeout waiting for canary analysis"
++          exit 2
++
+*** End File
+*** Add File:ops/canary/flagger_canary.yaml
++apiVersion: flagger.app/v1beta1
++kind: Canary
++metadata:
++  name: aegis-admission-webhook
++  namespace: aegis
++spec:
++  targetRef:
++    apiVersion: apps/v1
++    kind: Deployment
++    name: aegis-admission-webhook
++  service:
++    port: 443
++    targetPort: 8443
++  analysis:
++    interval: 15s
++    threshold: 10
++    maxWeight: 50
++    stepWeight: 20
++    metrics:
++      - name: request-success-rate
++        threshold: 99
++        interval: 15s
++      - name: request-duration
++        threshold: 0.5
++        interval: 15s
++    webhooks:
++      - name: "smoke-test"
++        type: pre-rollout
++        url: "http://flagger.cluster.local/smoke-test" # placeholder; operator should implement smoke webhook to validate behavior
++        timeout: 5s
++
+*** End File
+*** Add File:ops/secure_agg/secure_secretshare_aggregator.py
++#!/usr/bin/env python3
++"""
++Secure aggregator using Shamir Secret Sharing over integer-quantized vectors.
++
++This POC:
++ - Clients quantize float vectors to integers (scale factor configurable) and split into shares (n, k)
++ - Share distribution: each aggregator instance receives one share per client (in this single-server POC we collect all shares)
++ - Reconstruction sums client contributions by reconstructing each client's secret and summing elementwise
++
++Note: for production, runs must be authenticated (mTLS) and shares should be distributed across aggregator replicas.
++This POC uses the `secretsharing` library and simple quantization; floats are multiplied by SCALE and cast to int.
++"""
++import os, json, base64, threading, time
++from http.server import BaseHTTPRequestHandler, HTTPServer
++from secretsharing import SecretSharer
++import numpy as np
++
++SCALE = int(os.environ.get("SECAGG_SCALE", "1000000"))  # scale floats to integers
++STORAGE_DIR = os.environ.get("SECAGG_STORAGE", "/tmp/secagg_shares")
++os.makedirs(STORAGE_DIR, exist_ok=True)
++
++CLIENT_SHARES = {}  # client_id -> list of shares (each share is string)
++LOCK = threading.Lock()
++
++def quantize(arr):
++    return [int(round(float(x) * SCALE)) for x in arr]
++
++def dequantize(int_arr):
++    return [x / SCALE for x in int_arr]
++
++class Handler(BaseHTTPRequestHandler):
++    def _read_json(self):
++        length = int(self.headers.get("Content-Length","0"))
++        raw = self.rfile.read(length)
++        return json.loads(raw.decode())
++
++    def do_POST(self):
++        if self.path == "/submit_shares":
++            j = self._read_json()
++            client_id = j.get("client_id")
++            shares = j.get("shares")  # list of share strings
++            if not client_id or not shares:
++                self.send_response(400); self.end_headers(); return
++            with LOCK:
++                CLIENT_SHARES[client_id] = shares
++            self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
++            return
++        if self.path == "/aggregate":
++            # Reconstruct each client secret and sum
++            with LOCK:
++                clients = list(CLIENT_SHARES.items())
++            total = None
++            for client_id, shares in clients:
++                try:
++                    secret_hex = SecretSharer.recover_secret(shares)
++                    # secret_hex is hex representation of bytes; decode to string of comma-separated ints
++                    secret_str = bytes.fromhex(secret_hex).decode()
++                    int_arr = [int(x) for x in secret_str.split(",")]
++                    if total is None:
++                        total = np.array(int_arr, dtype=np.int64)
++                    else:
++                        total = total + np.array(int_arr, dtype=np.int64)
++                except Exception as e:
++                    print("Failed to reconstruct for", client_id, e)
++                    continue
++            if total is None:
++                self.send_response(404); self.end_headers(); return
++            floats = dequantize(total.tolist())
++            self.send_response(200); self.end_headers()
++            self.wfile.write(json.dumps({"aggregate": floats}).encode())
++            return
++        self.send_response(404); self.end_headers()
++
++if __name__=="__main__":
++    host = os.environ.get("SECAGG_HOST","0.0.0.0")
++    port = int(os.environ.get("SECAGG_PORT","8300"))
++    server = HTTPServer((host, port), Handler)
++    print("Secret-share aggregator listening on", host, port)
++    server.serve_forever()
++
+*** End File
+*** Add File:ops/secure_agg/requirements_secureagg.txt
++secretsharing
++numpy
++
+*** End File
+*** Add File:ops/secure_agg/tests/test_secretshare.py
++#!/usr/bin/env python3
++import requests, json, base64, threading, time
++from secretsharing import SecretSharer
++import subprocess, sys, os
++
++SERVER_SCRIPT = os.path.join(os.path.dirname(__file__), "..", "secure_secretshare_aggregator.py")
++
++def start_server():
++    return subprocess.Popen([sys.executable, SERVER_SCRIPT], cwd=os.path.dirname(SERVER_SCRIPT))
++
++def make_shares_for_vector(vec, n=5, k=3):
++    # Represent vector as comma-separated ints hex-encoded
++    SCALE=1000000
++    ints = [int(round(v * SCALE)) for v in vec]
++    s = ",".join(str(x) for x in ints)
++    hexs = s.encode().hex()
++    shares = SecretSharer.split_secret(hexs, k, n)
++    return shares
++
++def test_roundtrip():
++    srv = start_server()
++    time.sleep(1)
++    try:
++        vec_a=[0.1,0.2,0.3]
++        vec_b=[0.4,0.1,0.0]
++        shares_a = make_shares_for_vector(vec_a)
++        shares_b = make_shares_for_vector(vec_b)
++        # Submit full set of shares for each client in the single-server POC
++        import requests
++        requests.post("http://127.0.0.1:8300/submit_shares", json={"client_id":"a","shares":shares_a})
++        requests.post("http://127.0.0.1:8300/submit_shares", json={"client_id":"b","shares":shares_b})
++        r = requests.post("http://127.0.0.1:8300/aggregate")
++        agg = r.json().get("aggregate")
++        assert len(agg)==3
++        assert abs(agg[0] - (vec_a[0]+vec_b[0])) < 1e-6
++    finally:
++        srv.terminate()
++
++if __name__=="__main__":
++    test_roundtrip()
++    print("secretshare test passed")
++
+*** End File
+*** Add File:ops/hsm/rotate_kms_alias_and_sign.py
++#!/usr/bin/env python3
++"""
++Rotate KMS key by creating a new key, attaching alias atomically (alias update),
++write an evidence manifest, upload to S3, and sign manifest using cosign with KMS key.
++
++This script performs an alias swap: creates a new key, points chosen alias to it,
++and records old key metadata in the manifest for audit.
++"""
++import argparse, boto3, time, json, os, subprocess
++
++def create_kms_key(desc, region=None):
++    client = boto3.client("kms", region_name=region) if region else boto3.client("kms")
++    resp = client.create_key(Description=desc, KeyUsage='SIGN_VERIFY', Origin='AWS_KMS')
++    return resp['KeyMetadata']
++
++def update_alias(alias, key_id, region=None):
++    client = boto3.client("kms", region_name=region) if region else boto3.client("kms")
++    try:
++        client.create_alias(AliasName=alias, TargetKeyId=key_id)
++    except client.exceptions.AlreadyExistsException:
++        client.update_alias(AliasName=alias, TargetKeyId=key_id)
++
++def upload_manifest(bucket, path):
++    if not bucket:
++        return None
++    s3 = boto3.client("s3")
++    key = f"kms-rotation/{os.path.basename(path)}"
++    s3.upload_file(path, bucket, key)
++    return f"s3://{bucket}/{key}"
++
++def sign_with_cosign_kms(kms_uri, manifest_path):
++    # cosign sign-blob --key=aws-kms://<arn> <file>
++    try:
++        subprocess.check_call(["cosign","sign-blob","--key", kms_uri, manifest_path])
++        return manifest_path + ".sig"
++    except Exception as e:
++        print("cosign sign failed:", e)
++        return None
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--alias", required=True)
++    p.add_argument("--desc", default="Aegis auto rotation key")
++    p.add_argument("--evidence-bucket", default=os.environ.get("EVIDENCE_BUCKET",""))
++    p.add_argument("--region", default=os.environ.get("AWS_REGION",""))
++    p.add_argument("--cosign-kms-uri", default=os.environ.get("COSIGN_KMS_URI",""))
++    args = p.parse_args()
++
++    old = None
++    client = boto3.client("kms", region_name=args.region) if args.region else boto3.client("kms")
++    try:
++        alias_info = client.describe_key(KeyId=args.alias)
++        old = alias_info.get("KeyMetadata",{})
++    except Exception:
++        # alias might not exist
++        pass
++
++    new_meta = create_kms_key(args.desc, region=args.region)
++    new_key_id = new_meta['KeyId']
++    update_alias(args.alias, new_key_id, region=args.region)
++    # prepare manifest
++    manifest = {
++        "timestamp": int(time.time()),
++        "alias": args.alias,
++        "new_key_id": new_key_id,
++        "new_key_arn": new_meta.get("Arn"),
++        "old_key": old or {},
++        "rotated_by": os.environ.get("USER") or "ci"
++    }
++    path = f"/tmp/kms_rotation_{int(time.time())}.json"
++    with open(path,"w") as fh:
++        json.dump(manifest, fh, indent=2)
++
++    s3_uri = upload_manifest(args.evidence_bucket, path)
++    if s3_uri:
++        print("Uploaded manifest to", s3_uri)
++    sig = None
++    kms_uri = args.cosign_kms_uri
++    if kms_uri:
++        sig = sign_with_cosign_kms(kms_uri, path)
++        if sig:
++            print("Signed manifest at", sig)
++    print("Rotation complete. Manifest:", path, "s3:", s3_uri, "sig:", sig)
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:.github/workflows/hsm_rotation_full.yml
++name: KMS Alias Rotation + Sign & Upload (Operator Trigger)
++on:
++  workflow_dispatch:
++jobs:
++  rotate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Install deps
++        run: pip install boto3
++      - name: Rotate and record KMS alias
++        env:
++          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
++          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
++          AWS_REGION: ${{ secrets.AWS_REGION }}
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++          COSIGN_KMS_URI: ${{ secrets.COSIGN_KMS_URI }}
++        run: |
++          python3 ops/hsm/rotate_kms_alias_and_sign.py --alias alias/aegis/cosign --evidence-bucket "$EVIDENCE_BUCKET" --region "$AWS_REGION" --cosign-kms-uri "$COSIGN_KMS_URI"
++
+*** End File
+*** Add File:services/privacy/dp_accounting_service.py
++#!/usr/bin/env python3
++"""
++DP Accounting service: tracks per-run epsilon and enforces a project-level epsilon budget.
++ - POST /report_round  { "project": "...", "run_id": "...", "epsilon": 0.5 }
++ - GET  /status?project=...  -> returns {"used":sum, "budget":..., "remaining":...}
++ - POST /check_run { "project": "...", "epsilon": 0.1 } -> returns 200 if allowed, 403 if budget exceeded
++
++This service uses a simple additive composition (conservative). For production,
++integrate advanced composition (RDP accountant) from Opacus.
++"""
++from flask import Flask, request, jsonify
++import os, sqlite3, threading
++
++DB = os.environ.get("DP_DB", "/tmp/dp_accounting.db")
++BUDGET_DEFAULT = float(os.environ.get("DP_DEFAULT_BUDGET", "10.0"))
++LOCK = threading.Lock()
++
++def init_db():
++    conn = sqlite3.connect(DB)
++    c = conn.cursor()
++    c.execute("CREATE TABLE IF NOT EXISTS runs (project TEXT, run_id TEXT PRIMARY KEY, epsilon REAL, ts INTEGER)")
++    c.execute("CREATE TABLE IF NOT EXISTS budgets (project TEXT PRIMARY KEY, budget REAL)")
++    conn.commit()
++    conn.close()
++
++init_db()
++
++app = Flask(__name__)
++
++def get_budget(project):
++    conn = sqlite3.connect(DB)
++    c = conn.cursor()
++    c.execute("SELECT budget FROM budgets WHERE project=?", (project,))
++    r = c.fetchone()
++    conn.close()
++    return r[0] if r else BUDGET_DEFAULT
++
++def current_used(project):
++    conn = sqlite3.connect(DB)
++    c = conn.cursor()
++    c.execute("SELECT SUM(epsilon) FROM runs WHERE project=?", (project,))
++    r = c.fetchone()[0] or 0.0
++    conn.close()
++    return float(r)
++
++@app.route("/report_round", methods=["POST"])
++def report_round():
++    j = request.get_json() or {}
++    project = j.get("project")
++    run_id = j.get("run_id")
++    eps = float(j.get("epsilon", 0.0))
++    if not project or not run_id:
++        return jsonify({"error":"project and run_id required"}), 400
++    with LOCK:
++        conn = sqlite3.connect(DB)
++        c = conn.cursor()
++        try:
++            c.execute("INSERT INTO runs (project,run_id,epsilon,ts) VALUES (?,?,?,strftime('%s','now'))", (project,run_id,eps))
++            conn.commit()
++        except sqlite3.IntegrityError:
++            conn.close()
++            return jsonify({"error":"run_id exists"}), 409
++        conn.close()
++    return jsonify({"ok": True})
++
++@app.route("/status", methods=["GET"])
++def status():
++    project = request.args.get("project")
++    if not project:
++        return jsonify({"error":"project required"}), 400
++    used = current_used(project)
++    budget = get_budget(project)
++    return jsonify({"project":project, "used":used, "budget":budget, "remaining": max(0.0, budget-used)})
++
++@app.route("/check_run", methods=["POST"])
++def check_run():
++    j = request.get_json() or {}
++    project = j.get("project")
++    eps = float(j.get("epsilon", 0.0))
++    if not project:
++        return jsonify({"error":"project required"}), 400
++    used = current_used(project)
++    budget = get_budget(project)
++    if used + eps > budget:
++        return jsonify({"allowed": False, "reason":"budget_exceeded","used":used,"budget":budget}), 403
++    return jsonify({"allowed": True, "used":used, "budget":budget})
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8310")))
++
+*** End File
+*** Add File:services/policy/m_of_n_service.py
++#!/usr/bin/env python3
++"""
++Simple M-of-N approval service for governance.
++ - POST /request_action {action_id, payload, required: m}
++    -> returns request_id
++ - POST /approve {request_id, approver_id, signature(optional)}
++ - GET  /status?request_id=...
++
++Approvals are recorded and once >= m approvals are present the action is marked approved.
++In production, approvals should be authenticated (OIDC), and signatures cryptographically verified.
++"""
++from flask import Flask, request, jsonify
++import sqlite3, threading, os, time
++
++DB = os.environ.get("M_OF_N_DB", "/tmp/mofn.db")
++LOCK = threading.Lock()
++
++def init():
++    conn = sqlite3.connect(DB)
++    c = conn.cursor()
++    c.execute("CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, action_id TEXT, payload TEXT, m INTEGER, created_ts INTEGER, approved INTEGER DEFAULT 0)")
++    c.execute("CREATE TABLE IF NOT EXISTS approvals (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT, approver TEXT, ts INTEGER)")
++    conn.commit()
++    conn.close()
++
++init()
++app = Flask(__name__)
++
++@app.route("/request_action", methods=["POST"])
++def request_action():
++    j = request.get_json() or {}
++    request_id = j.get("request_id") or f"req-{int(time.time())}"
++    action_id = j.get("action_id")
++    payload = j.get("payload","")
++    m = int(j.get("m",1))
++    with LOCK:
++        conn = sqlite3.connect(DB)
++        c = conn.cursor()
++        c.execute("INSERT INTO requests (id,action_id,payload,m,created_ts) VALUES (?,?,?,?,strftime('%s','now'))", (request_id, action_id, payload, m))
++        conn.commit(); conn.close()
++    return jsonify({"request_id": request_id})
++
++@app.route("/approve", methods=["POST"])
++def approve():
++    j = request.get_json() or {}
++    rid = j.get("request_id")
++    approver = j.get("approver")
++    if not rid or not approver:
++        return jsonify({"error":"request_id and approver required"}), 400
++    with LOCK:
++        conn = sqlite3.connect(DB)
++        c = conn.cursor()
++        c.execute("INSERT INTO approvals (request_id, approver, ts) VALUES (?,?,strftime('%s','now'))", (rid, approver))
++        conn.commit()
++        # count approvals
++        c.execute("SELECT COUNT(*) FROM approvals WHERE request_id=?", (rid,))
++        count = c.fetchone()[0]
++        c.execute("SELECT m FROM requests WHERE id=?", (rid,))
++        m = c.fetchone()[0]
++        if count >= m:
++            c.execute("UPDATE requests SET approved=1 WHERE id=?", (rid,))
++            conn.commit()
++            conn.close()
++            return jsonify({"approved": True, "approvals": count})
++        conn.close()
++    return jsonify({"approved": False, "approvals": count})
++
++@app.route("/status", methods=["GET"])
++def status():
++    rid = request.args.get("request_id")
++    if not rid:
++        return jsonify({"error":"request_id required"}), 400
++    conn = sqlite3.connect(DB)
++    c = conn.cursor()
++    c.execute("SELECT action_id,payload,m,approved FROM requests WHERE id=?", (rid,))
++    r = c.fetchone()
++    c.execute("SELECT approver,ts FROM approvals WHERE request_id=?", (rid,))
++    approvals = [{"approver":row[0],"ts":row[1]} for row in c.fetchall()]
++    conn.close()
++    if not r:
++        return jsonify({"error":"not found"}), 404
++    return jsonify({"request_id": rid, "action_id": r[0], "payload": r[1], "m": r[2], "approved": bool(r[3]), "approvals": approvals})
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8320")))
++
+*** End File
+*** Add File:.github/workflows/calibrator_policy_gate_mofn.yml
++name: Calibrator Policy Gate with M-of-N
++on:
++  pull_request:
++    types: [opened, synchronize, reopened, edited]
++
++jobs:
++  calibrator-mofn-check:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Get changed files
++        run: |
++          git fetch origin ${{ github.base_ref }} --depth=1 || true
++          git diff --name-only origin/${{ github.base_ref }}...HEAD > changed_files.txt || git diff --name-only HEAD^...HEAD > changed_files.txt
++          cat changed_files.txt
++      - name: Check calibrator changes and query M-of-N approval
++        env:
++          MOFN_URL: ${{ secrets.MOFN_URL }}
++        run: |
++          CHANGED=$(cat changed_files.txt)
++          echo "$CHANGED" | grep -E "^services/safety/calibrator_pytorch_train.py|^services/safety/calibrator_pytorch_service.py|^helm/calibrator" && CHANGED_CALIBRATOR=true || CHANGED_CALIBRATOR=false
++          if [ "$CHANGED_CALIBRATOR" = "true" ]; then
++            echo "Calibrator change detected. Checking M-of-N approval for action calibrator-update..."
++            # The workflow expects an MOFN request to be created beforehand and the request_id set as a repo secret or PR comment
++            REQUEST_ID=$(gh pr view --json body -q ".body" | grep -o 'mofn-request:[^ ]*' | sed 's/mofn-request://' | head -n1)
++            if [ -z "$REQUEST_ID" ]; then
++              echo "MOFN request id not found in PR body (format: mofn-request:<id>). Fail the gate."
++              exit 1
++            fi
++            echo "Using MOFN request id: $REQUEST_ID"
++            STATUS=$(curl -sS "${MOFN_URL}/status?request_id=${REQUEST_ID}")
++            echo "MOFN status: $STATUS"
++            APPROVED=$(echo "$STATUS" | jq -r '.approved')
++            if [ "$APPROVED" != "true" ]; then
++              echo "M-of-N approval not satisfied for calibrator change. Block merge."
++              exit 1
++            fi
++            echo "M-of-N approval satisfied. Proceeding."
++          else
++            echo "No calibrator changes; gate passed."
++          fi
++
+*** End File
+*** Add File:docs/runbooks/level4_migration.md
++````markdown name=docs/runbooks/level4_migration.md
++```text
++Aegis Level-4 Migration Runbook — Summary & Steps
++
++Goal: reach Level 4 autonomy with cryptographic guarantees, closed-loop SLO-driven promotions,
++automated HSM/KMS lifecycle, DP accounting and governance via M-of-N signoffs.
++
++Preconditions:
++ - Staging cluster with Flagger & metrics server (Prometheus) + service mesh (Istio)
++ - Vault configured, EVIDENCE_BUCKET available, COSIGN_KMS_URI configured for KMS signing
++ - GitHub secrets: KUBE_CONFIG_DATA, VAULT tokens, AWS credentials
++
++Steps
++1) Deploy Flagger in staging and ensure Prometheus metrics accessible
++   - Install Flagger and configure Prometheus metrics endpoint for request-success-rate & latency
++   - Apply ops/canary/flagger_canary.yaml and ensure analysis runs
++
++2) Progressive canary CI
++   - Use .github/workflows/progressive_canary.yml to run canary, wait for Flagger analysis, auto-promote or rollback
++   - Test multiple failure modes; rehearse rollback (vwc_rollback.sh)
++
++3) Harden secure aggregation (POC -> pilot)
++   - Run ops/secure_agg/secure_secretshare_aggregator.py tests (ops/secure_agg/tests/test_secretshare.py)
++   - If scaling required, implement share distribution across aggregator replicas and TLS/mTLS for endpoints
++   - Move to MPC library (CrypTen/PySyft) for cryptographic guarantees; schedule external crypto review
++
++4) Automate KMS rotation with evidence
++   - Use ops/hsm/rotate_kms_alias_and_sign.py to rotate alias and write signed manifest
++   - CI job .github/workflows/hsm_rotation_full.yml runs operator-triggered rotation
++   - Verify manifest and signature in evidence bucket & Rekor
++
++5) Enable DP accounting service
++   - Deploy services/privacy/dp_accounting_service.py as part of FL control plane
++   - FL orchestrator should call /check_run before each heavy round and /report_round after
++   - Enforce project-level epsilon budgets in Vault and fail jobs if budget depleted
++
++6) Governance: M-of-N approvals
++   - Deploy services/policy/m_of_n_service.py
++   - Integrate PR workflows to require MOFN approval for calibrator/model threshold changes
++   - Use recorded approvals as part of evidence and cosign signing workflow
++
++7) Observability & Alerts
++   - Add metrics for DP usage, secure-agg latency, calibrator pass rate, RAG recall
++   - Build Grafana dashboards and Alertmanager rules to trigger rollbacks or operator notifications
++
++8) Audit & external review
++   - Engage third-party cryptographers to review MPC implementation
++   - Run penetration & privacy audits; document results in evidence bucket with Rekor/cosign signatures
++
++Rollback & Emergency
++ - VWC rollback: ops/webhook/vwc_rollback.sh ignore|fail|delete
++ - Flagger rollback happens automatically on metric breach; use helm/rollback to revert primary if needed
++
++````
++
+*** End File
+*** End Patch

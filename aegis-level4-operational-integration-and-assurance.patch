@@ -1,0 +1,656 @@
+*** Begin Patch
+*** Add File:services/fl/fl_controller_dp_wrapper.py
++#!/usr/bin/env python3
++"""
++FL controller DP integration wrapper.
++
++This module provides helper functions the federated learning controller should call
++before starting a round (check_and_start_round) and after completing a round
++(report_round). It calls the DP accounting service, records evidence manifests,
++and raises exceptions to prevent rounds when budgets would be exceeded.
++
++Usage (example):
++  from services.fl.fl_controller_dp_wrapper import check_and_start_round, report_round
++  run_id = check_and_start_round(project="default", noise=1.0, sample_rate=0.01, steps=1)
++  ... run FL round ...
++  report_round(project="default", run_id=run_id, epsilon=0.5)
++
++This file is intended to be imported into your FL orchestrator main loop.
++"""
++import os
++import uuid
++import time
++import requests
++import json
++from services.privacy.rdp_accountant import compute_epsilon
++
++DP_URL = os.environ.get("DP_ACCOUNTING_URL", "http://dp-accounting:8310")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++COSIGN_KMS_URI = os.environ.get("COSIGN_KMS_URI", "")
++RETRY = int(os.environ.get("DP_RETRIES", "3"))
++TIMEOUT = int(os.environ.get("DP_TIMEOUT", "10"))
++
++def _upload_manifest(path):
++    # best-effort upload to S3 if configured
++    if not EVIDENCE_BUCKET:
++        return None
++    try:
++        import subprocess
++        subprocess.check_call(["aws","s3","cp", path, f"{EVIDENCE_BUCKET.rstrip('/')}/dp_evidence/"])
++        return f"s3://{EVIDENCE_BUCKET.rstrip('/')}/dp_evidence/{os.path.basename(path)}"
++    except Exception:
++        return None
++
++def check_and_start_round(project, noise, sample_rate, steps, delta=1e-5):
++    """Call DP /check_run; return run_id if allowed, otherwise raise."""
++    payload = {"project": project, "noise": float(noise), "sample_rate": float(sample_rate), "steps": int(steps), "delta": float(delta)}
++    last_err = None
++    for attempt in range(RETRY):
++        try:
++            r = requests.post(f"{DP_URL}/check_run", json=payload, timeout=TIMEOUT)
++            r.raise_for_status()
++            j = r.json()
++            if not j.get("allowed", False):
++                raise RuntimeError("DP budget exceeded or check rejected: " + json.dumps(j))
++            run_id = str(uuid.uuid4())
++            # Create an evidence manifest for the attempted run
++            manifest = {
++                "type": "dp_check",
++                "project": project,
++                "noise": noise,
++                "sample_rate": sample_rate,
++                "steps": steps,
++                "delta": delta,
++                "ts": int(time.time()),
++                "dp_response": j,
++                "run_id": run_id
++            }
++            out = f"/tmp/dp_check_{run_id}.json"
++            with open(out, "w") as fh:
++                json.dump(manifest, fh, indent=2)
++            _upload_manifest(out)
++            return run_id
++        except Exception as e:
++            last_err = e
++            time.sleep(1)
++    raise RuntimeError("DP check failed after retries: " + str(last_err))
++
++def report_round(project, run_id, epsilon):
++    """Report completed round to DP accounting service and record evidence."""
++    payload = {"project": project, "run_id": run_id, "epsilon": float(epsilon)}
++    try:
++        r = requests.post(f"{DP_URL}/report_round", json=payload, timeout=TIMEOUT)
++        r.raise_for_status()
++        j = r.json()
++    except Exception as e:
++        raise RuntimeError("Failed to report round: " + str(e))
++    manifest = {
++        "type": "dp_report",
++        "project": project,
++        "run_id": run_id,
++        "epsilon": epsilon,
++        "ts": int(time.time()),
++        "dp_response": j
++    }
++    out = f"/tmp/dp_report_{run_id}.json"
++    with open(out, "w") as fh:
++        json.dump(manifest, fh, indent=2)
++    _upload_manifest(out)
++    return j
++
+*** End File
+*** Add File:ops/canary/flagger_postroll_handler.py
++#!/usr/bin/env python3
++"""
++Flagger post-rollout webhook handler.
++
++This service listens for Flagger post-rollout webhook callbacks and:
++ - generates a signed evidence manifest describing the canary promotion outcome,
++ - signs the manifest with cosign (KMS) if configured,
++ - uploads manifest and signature to EVIDENCE_BUCKET (S3),
++ - registers the manifest in Rekor (optional).
++
++Environment:
++ FLAGGER_WEBHOOK_SECRET: optional secret to validate incoming request header "X-Flagger-Token"
++ EVIDENCE_BUCKET, COSIGN_KMS_URI, REKOR_SERVER
++
++Deploy via Helm or as a small Deployment in the aegis namespace and configure Flagger's canary postRollout webhook to call it.
++"""
++import os
++import json
++import time
++import subprocess
++from flask import Flask, request, jsonify, abort
++
++app = Flask(__name__)
++FLAGGER_WEBHOOK_SECRET = os.environ.get("FLAGGER_WEBHOOK_SECRET", "")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++COSIGN_KMS_URI = os.environ.get("COSIGN_KMS_URI", "")
++REKOR_SERVER = os.environ.get("REKOR_SERVER", "")
++
++def sign_manifest(path):
++    sig = None
++    if COSIGN_KMS_URI:
++        try:
++            subprocess.check_call(["cosign","sign-blob","--key",COSIGN_KMS_URI, path])
++            sig = path + ".sig"
++        except subprocess.CalledProcessError:
++            pass
++    return sig
++
++def upload_and_rekor(path):
++    s3uri = None
++    if EVIDENCE_BUCKET:
++        subprocess.check_call(["aws","s3","cp", path, f"{EVIDENCE_BUCKET.rstrip('/')}/canary_evidence/"])
++        s3uri = f"s3://{EVIDENCE_BUCKET.rstrip('/')}/canary_evidence/{os.path.basename(path)}"
++    if REKOR_SERVER:
++        try:
++            subprocess.check_call(["rekor-cli","upload","--artifact", path, "--rekor_server", REKOR_SERVER])
++        except Exception:
++            pass
++    return s3uri
++
++@app.route("/postroll", methods=["POST"])
++def postroll():
++    # Optional secret verification
++    if FLAGGER_WEBHOOK_SECRET:
++        token = request.headers.get("X-Flagger-Token","")
++        if token != FLAGGER_WEBHOOK_SECRET:
++            abort(401)
++    payload = request.get_json() or {}
++    ts = int(time.time())
++    manifest = {
++        "type": "canary_promotion",
++        "payload": payload,
++        "ts": ts
++    }
++    out = f"/tmp/canary_manifest_{ts}.json"
++    with open(out, "w") as fh:
++        json.dump(manifest, fh, indent=2)
++    sig = sign_manifest(out)
++    s3uri = upload_and_rekor(out)
++    return jsonify({"ok": True, "manifest": out, "sig": sig, "s3": s3uri})
++
++@app.route("/healthz")
++def health():
++    return jsonify({"ok": True})
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8401")))
++
+*** End File
+*** Add File:ops/canary/register_flagger_webhook.sh
++#!/usr/bin/env bash
++#
++# Register the post-rollout webhook endpoint for a Flagger canary resource.
++# Example:
++#   ./ops/canary/register_flagger_webhook.sh aegis aegis-admission-webhook https://canary-signer.aegis.svc.cluster.local:8401/postroll
++#
++set -euo pipefail
++NAMESPACE=${1:-aegis}
++CANARY=${2:-aegis-admission-webhook}
++URL=${3:-}
++
++if [ -z "$URL" ]; then
++  echo "Usage: $0 <namespace> <canary-name> <postroll-url>"
++  exit 2
++fi
++
++kubectl -n "$NAMESPACE" patch canary "$CANARY" --type='merge' -p "{\"spec\":{\"webhooks\":{\"postrollout\":[{\"type\":\"generic\",\"url\":\"$URL\",\"timeout\":\"30s\"}]}}}"
++echo "Patched canary $CANARY with postrollout webhook $URL"
++
+*** End File
+*** Add File:ops/hsm/rotate_kms_alias_and_sign_guarded.py
++#!/usr/bin/env python3
++"""
++Guarded KMS alias rotation flow.
++
++This script performs a KMS key rotation dry-run, creates a manifest, signs it, uploads evidence,
++and then creates an M-of-N approval request. Only when the M-of-N approval is satisfied will the
++alias swap be executed. This prevents accidental alias swaps and ensures gatekeeping by approvers.
++
++Environment:
++ - EVIDENCE_BUCKET, COSIGN_KMS_URI, MOFN_URL (e.g., http://mofn.aegis.svc:8320)
++
++Usage:
++  python3 ops/hsm/rotate_kms_alias_and_sign_guarded.py --alias alias/aegis/cosign --apply
++
++The --apply flag will perform the alias swap once M-of-N approval is observed.
++Without --apply the script performs a dry-run and creates an M-of-N request to approve.
++"""
++import os
++import json
++import time
++import argparse
++import subprocess
++import requests
++import uuid
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++COSIGN_KMS_URI = os.environ.get("COSIGN_KMS_URI", "")
++MOFN_URL = os.environ.get("MOFN_URL", "")
++REKOR_SERVER = os.environ.get("REKOR_SERVER", "")
++
++def create_key():
++    out = subprocess.check_output(["aws","kms","create-key","--description","Aegis rotation candidate"])
++    j = json.loads(out)
++    kid = j["KeyMetadata"]["KeyId"]
++    return kid, j
++
++def build_manifest(new_key_id, alias, dry=True):
++    manifest = {
++        "ts": int(time.time()),
++        "new_key_id": new_key_id,
++        "alias": alias,
++        "dry_run": bool(dry),
++        "note": "guarded rotation - create manifest"
++    }
++    path = f"/tmp/kms_rotation_{new_key_id}.json"
++    with open(path, "w") as fh:
++        json.dump(manifest, fh, indent=2)
++    return path
++
++def sign_and_upload(path):
++    sig = None
++    if COSIGN_KMS_URI:
++        subprocess.check_call(["cosign","sign-blob","--key", COSIGN_KMS_URI, path])
++        sig = path + ".sig"
++    if EVIDENCE_BUCKET:
++        subprocess.check_call(["aws","s3","cp", path, f"{EVIDENCE_BUCKET.rstrip('/')}/kms-rotation/"])
++    if REKOR_SERVER:
++        try:
++            subprocess.check_call(["rekor-cli","upload","--artifact", path, "--rekor_server", REKOR_SERVER])
++        except Exception:
++            pass
++    return sig
++
++def create_mofn_request(manifest_path, m=2):
++    if not MOFN_URL:
++        raise RuntimeError("MOFN_URL not configured")
++    req = {"request_id": str(uuid.uuid4()), "action_id": "kms_alias_rotate", "payload": manifest_path, "m": m}
++    r = requests.post(f"{MOFN_URL}/request_action", json=req, timeout=10)
++    r.raise_for_status()
++    return req["request_id"]
++
++def poll_mofn(request_id, timeout=60*60):
++    start = time.time()
++    while time.time() - start < timeout:
++        r = requests.get(f"{MOFN_URL}/status", params={"request_id": request_id}, timeout=10)
++        if r.status_code == 200:
++            j = r.json()
++            if j.get("approved"):
++                return True
++        time.sleep(5)
++    return False
++
++def swap_alias(alias, new_key_id):
++    # Perform the alias update: set-alias to new key
++    subprocess.check_call(["aws","kms","create-alias","--alias-name", alias, "--target-key-id", new_key_id])
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--alias", required=True)
++    p.add_argument("--apply", action="store_true")
++    p.add_argument("--approvals", type=int, default=2)
++    args = p.parse_args()
++
++    new_key_id, key_meta = create_key()
++    manifest_path = build_manifest(new_key_id, args.alias, dry=not args.apply)
++    sig = sign_and_upload(manifest_path)
++    print("Created manifest:", manifest_path, "sig:", sig)
++    request_id = create_mofn_request(manifest_path, m=args.approvals)
++    print("Created M-of-N request:", request_id)
++    if args.apply:
++        print("Waiting for M-of-N approval...")
++        ok = poll_mofn(request_id, timeout=60*60)
++        if not ok:
++            print("Approval not received within timeout; aborting alias swap")
++            return
++        print("Approval received; performing alias swap")
++        swap_alias(args.alias, new_key_id)
++        final_manifest_path = build_manifest(new_key_id, args.alias, dry=False)
++        sign_and_upload(final_manifest_path)
++        print("Alias swap completed and final manifest signed & uploaded")
++    else:
++        print("Dry-run completed; use --apply to wait for approvals and perform alias swap")
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:ops/secure_agg/production_mpc/secureagg.proto
++syntax = "proto3";
++package secureagg;
++
++message Share {
++  string client_id = 1;
++  bytes share = 2; // opaque share bytes (application-specific)
++  string vector_id = 3;
++  int32 chunk_id = 4;
++  int32 chunk_count = 5;
++}
++
++message ShareResponse {
++  bool accepted = 1;
++  string message = 2;
++}
++
++message AggregateRequest {
++  string vector_id = 1;
++}
++
++message AggregateResponse {
++  bool ready = 1;
++  bytes aggregate = 2;
++  string message = 3;
++}
++
++service SecureAggregator {
++  rpc SubmitShare(Share) returns (ShareResponse);
++  rpc Aggregate(AggregateRequest) returns (AggregateResponse);
++}
++
+*** End File
+*** Add File:ops/secure_agg/production_mpc/grpc_coordinator.py
++#!/usr/bin/env python3
++"""
++gRPC coordinator for secure aggregation (reference implementation).
++
++This basic coordinator receives shares (as opaque bytes) and performs a naive
++aggregation when all expected shares are present. It demonstrates:
++ - mTLS-capable gRPC server (instructions to provide certs)
++ - streaming/chunking support via chunk_id / chunk_count in the proto
++ - simple validation and evidence logging
++
++This is a reference; a production implementation must run with hardened crypto,
++threshold secret sharing, and audited protocols.
++"""
++import os
++import time
++import logging
++from concurrent import futures
++import grpc
++from pathlib import Path
++import json
++
++# Generate gRPC code at startup if needed
++def _ensure_generated():
++    try:
++        import secureagg_pb2, secureagg_pb2_grpc  # type: ignore
++    except Exception:
++        from grpc_tools import protoc
++        proto_path = os.path.join(os.path.dirname(__file__), "secureagg.proto")
++        protoc.main((
++            "",
++            f"-I{os.path.dirname(__file__)}",
++            f"--python_out={os.path.dirname(__file__)}",
++            f"--grpc_python_out={os.path.dirname(__file__)}",
++            proto_path,
++        ))
++
++_ensure_generated()
++import secureagg_pb2, secureagg_pb2_grpc  # type: ignore
++
++EVIDENCE_DIR = os.environ.get("MPC_EVIDENCE_DIR", "/tmp/mpc_evidence")
++Path(EVIDENCE_DIR).mkdir(parents=True, exist_ok=True)
++EXPECTED_PARTIES = int(os.environ.get("MPC_EXPECTED_PARTIES", "3"))
++
++class Coordinator(secureagg_pb2_grpc.SecureAggregatorServicer):
++    def __init__(self):
++        self._store = {}  # vector_id -> { chunk_id -> list of (client_id, share_bytes) }
++
++    def SubmitShare(self, request, context):
++        vid = request.vector_id
++        chunk = request.chunk_id
++        cnt = request.chunk_count
++        self._store.setdefault(vid, {})
++        self._store[vid].setdefault(chunk, [])
++        # Basic sanity checks
++        if not request.client_id or not request.share:
++            return secureagg_pb2.ShareResponse(accepted=False, message="invalid share")
++        # Append share
++        self._store[vid][chunk].append((request.client_id, request.share))
++        # Log evidence
++        manifest = {
++            "type": "mpc_share_received",
++            "vector_id": vid,
++            "chunk_id": chunk,
++            "client_id": request.client_id,
++            "timestamp": int(time.time()),
++        }
++        out = os.path.join(EVIDENCE_DIR, f"share_{vid}_{chunk}_{int(time.time())}.json")
++        with open(out, "w") as fh:
++            json.dump(manifest, fh)
++        return secureagg_pb2.ShareResponse(accepted=True, message="ok")
++
++    def Aggregate(self, request, context):
++        vid = request.vector_id
++        if vid not in self._store:
++            return secureagg_pb2.AggregateResponse(ready=False, message="no shares")
++        # Check for completeness across chunks
++        aggregated = bytearray()
++        for chunk_id, shares in sorted(self._store[vid].items()):
++            if len(shares) < EXPECTED_PARTIES:
++                return secureagg_pb2.AggregateResponse(ready=False, message=f"chunk {chunk_id} incomplete")
++            # Naive aggregation: xor across shares (placeholder)
++            acc = bytearray(shares[0][1])
++            for _, s in shares[1:]:
++                for i, b in enumerate(s):
++                    acc[i] = acc[i] ^ b
++            aggregated.extend(acc)
++        # Record aggregate evidence
++        out = os.path.join(EVIDENCE_DIR, f"aggregate_{vid}_{int(time.time())}.bin")
++        with open(out, "wb") as fh:
++            fh.write(bytes(aggregated))
++        return secureagg_pb2.AggregateResponse(ready=True, aggregate=bytes(aggregated), message="aggregated")
++
++def serve():
++    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
++    secureagg_pb2_grpc.add_SecureAggregatorServicer_to_server(Coordinator(), server)
++    # mTLS configuration (optional)
++    cert_dir = os.environ.get("MPC_CERT_DIR", "/etc/mpc-certs")
++    server_key = os.path.join(cert_dir, "server.key")
++    server_crt = os.path.join(cert_dir, "server.crt")
++    ca_crt = os.path.join(cert_dir, "ca.crt")
++    if os.path.exists(server_key) and os.path.exists(server_crt) and os.path.exists(ca_crt):
++        with open(server_key, 'rb') as f:
++            private_key = f.read()
++        with open(server_crt, 'rb') as f:
++            certificate_chain = f.read()
++        with open(ca_crt, 'rb') as f:
++            root_certificates = f.read()
++        server_credentials = grpc.ssl_server_credentials([(private_key, certificate_chain)], root_certificates, require_client_auth=True)
++        server.add_secure_port('[::]:50051', server_credentials)
++        print("gRPC server starting with mTLS on 0.0.0.0:50051")
++    else:
++        server.add_insecure_port('[::]:50051')
++        print("gRPC server starting insecure on 0.0.0.0:50051 (use mTLS in production)")
++    server.start()
++    try:
++        while True:
++            time.sleep(3600)
++    except KeyboardInterrupt:
++        server.stop(0)
++
++if __name__=="__main__":
++    logging.basicConfig(level=logging.INFO)
++    serve()
++
+*** End File
+*** Add File:ops/secure_agg/production_mpc/grpc_client.py
++#!/usr/bin/env python3
++"""
++Simple gRPC client to submit shares to the coordinator and request aggregation.
++This is a reference for clients/parties to interact with the coordinator.
++"""
++import os
++import sys
++import grpc
++from time import sleep
++
++# generate pb2 if needed (coordinator handles generation when run)
++from ops.secure_agg.production_mpc import secureagg_pb2, secureagg_pb2_grpc  # type: ignore
++
++def get_channel(target="localhost:50051", cert_dir="/etc/mpc-certs"):
++    server_cert = os.path.join(cert_dir, "server.crt")
++    ca_crt = os.path.join(cert_dir, "ca.crt")
++    client_key = os.path.join(cert_dir, "client.key")
++    client_crt = os.path.join(cert_dir, "client.crt")
++    if os.path.exists(client_key) and os.path.exists(client_crt) and os.path.exists(ca_crt):
++        with open(ca_crt, 'rb') as f:
++            trusted_certs = f.read()
++        with open(client_key, 'rb') as f:
++            key = f.read()
++        with open(client_crt, 'rb') as f:
++            cert = f.read()
++        creds = grpc.ssl_channel_credentials(root_certificates=trusted_certs, private_key=key, certificate_chain=cert)
++        return grpc.secure_channel(target, creds)
++    else:
++        return grpc.insecure_channel(target)
++
++def submit_sample_shares(target="localhost:50051"):
++    ch = get_channel(target)
++    stub = secureagg_pb2_grpc.SecureAggregatorStub(ch)
++    # demo: submit 3 shares for single vector/chunk
++    for cid, s in [("client1", b"\x01\x02\x03"), ("client2", b"\x00\xff\x00"), ("client3", b"\x01\x01\x01")]:
++        share = secureagg_pb2.Share(client_id=cid, share=s, vector_id="vec1", chunk_id=0, chunk_count=1)
++        r = stub.SubmitShare(share)
++        print("submit:", r.accepted, r.message)
++    a = secureagg_pb2.AggregateRequest(vector_id="vec1")
++    resp = stub.Aggregate(a)
++    print("aggregate ready:", resp.ready, "message:", resp.message, "len:", len(resp.aggregate))
++
++if __name__=="__main__":
++    submit_sample_shares(sys.argv[1] if len(sys.argv)>1 else "localhost:50051")
++
+*** End File
+*** Add File:config/dp_policy.yaml
++---
++# DP-first policy configuration
++dp_first: true         # when true, MPC will remain disabled in production unless explicitly approved by auditors
++epsilon_threshold_default: 2.0
++max_rounds_per_day: 10
++notify_on_exceed: ["privacy-team@example.com"]
++
+*** End File
+*** Add File:.github/workflows/canary_rollback_test.yml
++name: Canary Rollback Test
++on:
++  workflow_dispatch:
++jobs:
++  run-roll-back:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup kubeconfig
++        if: ${{ secrets.KUBE_CONFIG_DATA }}
++        run: echo "${{ secrets.KUBE_CONFIG_DATA }}" | base64 -d > $HOME/.kube/config
++      - name: Trigger failing traffic to canary (create fault injection)
++        run: |
++          # This assumes your webhook test harness exposes a /fault endpoint to enable failures
++          kubectl -n aegis exec deploy/aegis-admission-webhook -- curl -s -X POST http://127.0.0.1:8080/fault/enable || true
++      - name: Wait for Flagger to detect and rollback
++        run: |
++          for i in $(seq 1 60); do
++            phase=$(kubectl -n aegis get canary aegis-admission-webhook -o jsonpath='{.status.phase}' || echo "")
++            echo "Phase: $phase"
++            if [ "$phase" = "Failed" ] || [ "$phase" = "Progressing" ]; then
++              echo "Observed phase: $phase"
++            fi
++            if [ "$phase" = "Failed" ]; then
++              echo "Canary rolled back OK"
++              exit 0
++            fi
++            sleep 10
++          done
++          echo "Timeout waiting for rollback"
++          exit 2
++
+*** End File
+*** Add File:docs/approver_roles.md
++# Approver roles & responsibilities (M‑of‑N)
++
++Purpose
++- Define approver roles for the M‑of‑N service, their responsibilities, and rotation/retirement procedures.
++
++Roles
++- Security Approver
++  - Responsible for KMS/HSM operations, key rotation approvals, and emergency key procedures.
++  - Required for KMS alias swaps (M-of-N threshold: 2 of [Security, Infra]).
++
++- Infra Approver
++  - Responsible for deployments, canary promotions in staging/production, and Flagger configuration changes.
++  - Required for production promotions (M-of-N threshold: 2 of [Infra, Product]).
++
++- Privacy Approver
++  - Responsible for DP budgets, privacy decisions, and approving DP exceptions.
++  - Required for any run that would exceed epsilon budget (M-of-N threshold: Privacy + 1).
++
++Approvals lifecycle
++- New approvers added via change control request and recorded in audit log.
++- Approver rotation: document replacement and record signed entries in evidence bucket.
++
++Emergency approvals
++- In critical incidents, a time‑boxed emergency approval flow may be used (requires 2 emergency approvers and is logged).
++
+*** End File
+*** Add File:docs/incident_playbooks.md
++# Incident Playbooks — Key operational runbooks
++
++1) Canary failure / bad rollout
++ - Detect: Prometheus alert WebhookHighErrorRate or Flagger indicates Failed phase.
++ - Action:
++   1. Flagger auto-rollback (if configured) — verify rollback manifest and evidence in S3.
++   2. If auto-rollback failed: run vwc_rollback.sh or set ValidatingWebhookConfiguration.failurePolicy=Ignore.
++   3. Create GitHub incident issue with logs and signed evidence.
++ - Postmortem: within 48 hours, run root cause analysis and update canary thresholds.
++
++2) KMS key compromise or rotation failure
++ - Detect: inability to sign artifacts, cosign failures, or suspicious alias changes.
++ - Action:
++   1. Immediately disable affected services' signing workflows.
++   2. Create a new key via guarded rotation dry-run script; create M‑of‑N approval request.
++   3. Upon approvals, rotate alias per guarded procedure; log & sign manifest and upload to evidence S3 + Rekor.
++ - Postmortem: full audit of key usage & IAM policies.
++
++3) DP budget exhaustion / privacy incident
++ - Detect: DPBudgetLow alert or failed /check_run responses.
++ - Action:
++   1. Halt new FL rounds until Privacy Approver signs a decision.
++   2. Run privacy sweep and generate decision report; upload to evidence.
++   3. If data exposure suspected, notify DPO and follow breach procedures.
++ - Postmortem: review DP accounting parameters and retrain models if needed.
++
++4) MPC suspicious shares / aggregator failure
++ - Detect: aggregator rejects shares or reports malformed shares alert.
++ - Action:
++   1. Quarantine offending clients; do not include their shares in aggregation.
++   2. Run malicious-share tests and gather evidence.
++   3. If suspected compromise, revert to DP-first workflow for affected vectors.
++
+*** End File
+*** Add File:security/external_audit_remediation_plan.md
++# External Audit & Remediation Plan
++
++1) Scope & deliverables
++ - Cryptography audit (MPC & key lifecycle)
++ - Privacy composition audit (DP accountant & FL composition)
++ - Security review of control plane (webhook, signing, M‑of‑N)
++
++2) Pre-audit checklist (operator)
++ - Produce audit packet (ops/evidence/build_full_audit_packet.sh)
++ - Ensure evidence S3 and Rekor entries for recent drills present
++ - Provide access & contact info to auditor
++
++3) Remediation workflow
++ - Triage findings by severity (Critical / High / Medium / Low)
++ - Assign owner, ETA, and acceptance criteria for each finding in a ticket system
++ - For cryptography criticals: halt MPC usage in production (enable DP-first) until fixed
++ - Record remediation evidence (code changes, tests, attestation) in evidence bucket
++
++4) Re-review & sign-off
++ - After remediation, request re-audit for fixed items or provide detailed evidence for auditor assessment
++ - Maintain an audit trail in the evidence bucket and Rekor for all audit and remediation artifacts
++
+*** End File
+*** End Patch

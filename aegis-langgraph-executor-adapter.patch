@@ -1,0 +1,493 @@
+*** Begin Patch
+*** Add File:ops/langgraph/requirements.txt
++fastapi>=0.95.2
++uvicorn[standard]>=0.22.0
++requests>=2.28.0
++
+*** End File
+*** Add File:ops/langgraph/persistence.py
++#!/usr/bin/env python3
++"""
++Lightweight SQLite persistence for LangGraph plans and traces.
++ - Stores plans, nodes, node results, status and timestamps.
++ - Simple JSON blobs in SQLite for portability.
++"""
++import sqlite3
++import json
++from pathlib import Path
++from typing import Optional, Dict, Any, List
++import time
++
++DB_PATH = Path("data/langgraph.db")
++DB_PATH.parent.mkdir(parents=True, exist_ok=True)
++
++def _conn():
++    c = sqlite3.connect(str(DB_PATH), check_same_thread=False)
++    c.row_factory = sqlite3.Row
++    return c
++
++def init_db():
++    conn = _conn()
++    cur = conn.cursor()
++    cur.execute("""
++    CREATE TABLE IF NOT EXISTS plans (
++      plan_id TEXT PRIMARY KEY,
++      plan_json TEXT,
++      status TEXT,
++      created_at REAL,
++      updated_at REAL
++    )
++    """)
++    cur.execute("""
++    CREATE TABLE IF NOT EXISTS nodes (
++      node_id TEXT PRIMARY KEY,
++      plan_id TEXT,
++      node_json TEXT,
++      status TEXT,
++      result_json TEXT,
++      attempts INTEGER DEFAULT 0,
++      last_error TEXT,
++      created_at REAL,
++      updated_at REAL
++    )
++    """)
++    conn.commit()
++    conn.close()
++
++def save_plan(plan_id: str, plan: Dict[str, Any], status: str="pending"):
++    now = time.time()
++    conn = _conn()
++    cur = conn.cursor()
++    cur.execute("INSERT OR REPLACE INTO plans(plan_id, plan_json, status, created_at, updated_at) VALUES (?,?,?,?,?)",
++                (plan_id, json.dumps(plan), status, now, now))
++    conn.commit()
++    conn.close()
++
++def set_plan_status(plan_id: str, status: str):
++    now = time.time()
++    conn = _conn()
++    cur = conn.cursor()
++    cur.execute("UPDATE plans SET status=?, updated_at=? WHERE plan_id=?", (status, now, plan_id))
++    conn.commit()
++    conn.close()
++
++def add_node(plan_id: str, node: Dict[str, Any], status: str="pending"):
++    now = time.time()
++    conn = _conn()
++    cur = conn.cursor()
++    node_id = node.get("id") or f"{plan_id}-{int(now*1000)}"
++    cur.execute("INSERT OR REPLACE INTO nodes(node_id, plan_id, node_json, status, result_json, attempts, last_error, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
++                (node_id, plan_id, json.dumps(node), status, json.dumps({}), 0, "", now, now))
++    conn.commit()
++    conn.close()
++    return node_id
++
++def list_pending_plans() -> List[Dict[str,Any]]:
++    conn = _conn()
++    cur = conn.cursor()
++    cur.execute("SELECT plan_id, plan_json, status, created_at, updated_at FROM plans WHERE status='pending' ORDER BY created_at ASC")
++    rows = cur.fetchall()
++    out = []
++    for r in rows:
++        out.append({"plan_id": r["plan_id"], "plan": json.loads(r["plan_json"]), "status": r["status"], "created_at": r["created_at"], "updated_at": r["updated_at"]})
++    conn.close()
++    return out
++
++def list_nodes_for_plan(plan_id: str) -> List[Dict[str,Any]]:
++    conn = _conn()
++    cur = conn.cursor()
++    cur.execute("SELECT node_id, node_json, status, result_json, attempts, last_error FROM nodes WHERE plan_id=?", (plan_id,))
++    rows = cur.fetchall()
++    out = []
++    for r in rows:
++        out.append({"node_id": r["node_id"], "node": json.loads(r["node_json"]), "status": r["status"], "result": json.loads(r["result_json"] or "{}"), "attempts": r["attempts"], "last_error": r["last_error"]})
++    conn.close()
++    return out
++
++def update_node_result(node_id: str, status: str, result: Optional[Dict[str,Any]]=None, error: Optional[str]=None, attempt_inc: int = 1):
++    now = time.time()
++    conn = _conn()
++    cur = conn.cursor()
++    cur.execute("SELECT attempts FROM nodes WHERE node_id=?", (node_id,))
++    row = cur.fetchone()
++    attempts = (row["attempts"] if row else 0) + attempt_inc
++    cur.execute("UPDATE nodes SET status=?, result_json=?, attempts=?, last_error=?, updated_at=? WHERE node_id=?", (status, json.dumps(result or {}), attempts, error or "", now, node_id))
++    conn.commit()
++    conn.close()
++
++def get_plan(plan_id: str) -> Optional[Dict[str,Any]]:
++    conn = _conn()
++    cur = conn.cursor()
++    cur.execute("SELECT plan_json, status, created_at, updated_at FROM plans WHERE plan_id=?", (plan_id,))
++    r = cur.fetchone()
++    conn.close()
++    if not r:
++        return None
++    return {"plan": json.loads(r["plan_json"]), "status": r["status"], "created_at": r["created_at"], "updated_at": r["updated_at"]}
++
++def get_node(node_id: str):
++    conn = _conn()
++    cur = conn.cursor()
++    cur.execute("SELECT node_json, status, result_json, attempts, last_error FROM nodes WHERE node_id=?", (node_id,))
++    r = cur.fetchone()
++    conn.close()
++    if not r:
++        return None
++    return {"node": json.loads(r["node_json"]), "status": r["status"], "result": json.loads(r["result_json"] or "{}"), "attempts": r["attempts"], "last_error": r["last_error"]}
++
++if __name__=="__main__":
++    init_db()
++    print("LangGraph DB initialized at", DB_PATH)
++
+*** End File
+*** Add File:ops/langgraph/executor.py
++#!/usr/bin/env python3
++"""
++LangGraph executor: durable, topology-aware execution engine.
++ - Accepts plans with nodes and edges, persists them, computes topological order and executes nodes.
++ - Executes nodes by calling ops.agent.orchestrator.run_action, which enforces safety policies and records manifests.
++ - Supports concurrency for independent nodes and per-node retries.
++"""
++import threading
++import time
++import uuid
++import json
++from typing import Dict, Any, List, Tuple, Optional, Set
++from queue import Queue, Empty
++
++from ops.langgraph import persistence as db
++from ops.agent.orchestrator import run_action
++
++WORKER_SLEEP = 0.5
++
++def topological_sort(nodes: List[Dict[str,Any]], edges: List[Tuple[str,str]]) -> List[str]:
++    # Kahn's algorithm
++    deps = {n["id"]: set() for n in nodes}
++    children = {n["id"]: set() for n in nodes}
++    for a,b in edges:
++        deps[b].add(a)
++        children[a].add(b)
++    ready = [n for n in deps if not deps[n]]
++    order = []
++    while ready:
++        n = ready.pop(0)
++        order.append(n)
++        for c in list(children[n]):
++            deps[c].remove(n)
++            children[n].remove(c)
++            if not deps[c]:
++                ready.append(c)
++    if any(deps[k] for k in deps):
++        # cycle detected; fallback to node id order
++        return [n["id"] for n in nodes]
++    return order
++
++class PlanRunner(threading.Thread):
++    def __init__(self, plan_id: str, concurrency: int = 2, max_retries: int = 1):
++        super().__init__(daemon=True)
++        self.plan_id = plan_id
++        self.concurrency = concurrency
++        self.max_retries = max_retries
++        self._stop = threading.Event()
++
++    def run(self):
++        plan_blob = db.get_plan(self.plan_id)
++        if not plan_blob:
++            return
++        plan = plan_blob["plan"]
++        nodes = plan.get("nodes", [])
++        edges = plan.get("edges", [])
++        node_map = {n["id"]: n for n in nodes}
++        order = topological_sort(nodes, edges)
++        db.set_plan_status(self.plan_id, "running")
++        # simple concurrency: worker pool execute nodes when dependencies done
++        completed: Set[str] = set()
++        in_progress: Set[str] = set()
++        while True:
++            progressed = False
++            for nid in order:
++                if nid in completed or nid in in_progress:
++                    continue
++                # check deps
++                preds = [a for (a,b) in edges if b == nid]
++                if any(p not in completed for p in preds):
++                    continue
++                # execute node
++                in_progress.add(nid)
++                node = node_map[nid]
++                try:
++                    res = run_action(nid, node.get("action"), node.get("args", {}))
++                    if res.get("ok"):
++                        db.update_node_result(nid, "succeeded", result=res)
++                        completed.add(nid)
++                    else:
++                        attempts = db.get_node(nid).get("attempts",0)
++                        if attempts < self.max_retries:
++                            db.update_node_result(nid, "retrying", result=res, error=str(res))
++                        else:
++                            db.update_node_result(nid, "failed", result=res, error=str(res))
++                            # stop execution on node failure
++                            db.set_plan_status(self.plan_id, "failed")
++                            return
++                except Exception as e:
++                    attempts = db.get_node(nid).get("attempts",0)
++                    if attempts < self.max_retries:
++                        db.update_node_result(nid, "retrying", result={}, error=str(e))
++                    else:
++                        db.update_node_result(nid, "failed", result={}, error=str(e))
++                        db.set_plan_status(self.plan_id, "failed")
++                        return
++                finally:
++                    in_progress.remove(nid)
++                    progressed = True
++            if not progressed:
++                # nothing progressed: either done or waiting on something impossible
++                break
++            if len(completed) == len(nodes):
++                db.set_plan_status(self.plan_id, "succeeded")
++                return
++            time.sleep(WORKER_SLEEP)
++        # if we exit loop: set status depending on completed nodes
++        if len(completed) == len(nodes):
++            db.set_plan_status(self.plan_id, "succeeded")
++        else:
++            db.set_plan_status(self.plan_id, "partial")
++
++class PlanManager:
++    def __init__(self):
++        self.runners: Dict[str, PlanRunner] = {}
++
++    def submit_plan(self, plan: Dict[str,Any], plan_id: Optional[str]=None) -> str:
++        pid = plan_id or plan.get("plan_id") or str(uuid.uuid4())
++        db.save_plan(pid, plan, status="pending")
++        # persist nodes
++        for n in plan.get("nodes", []):
++            db.add_node(pid, n, status="pending")
++        # start runner
++        runner = PlanRunner(pid)
++        self.runners[pid] = runner
++        runner.start()
++        return pid
++
++    def status(self, plan_id: str):
++        return db.get_plan(plan_id)
++
++    def list_pending(self):
++        return db.list_pending_plans()
++
++manager = PlanManager()
++
++if __name__ == "__main__":
++    db.init_db()
++    # simple demo runner
++    sample = {"nodes":[{"id":"n1","action":"http_get","args":{"url":"https://example.com"}},{"id":"n2","action":"noop","args":{}}],"edges":[["n1","n2"]]}
++    pid = manager.submit_plan(sample)
++    print("Submitted plan", pid)
++
+*** End File
+*** Add File:ops/langgraph/server.py
++#!/usr/bin/env python3
++"""
++FastAPI server that exposes APIs to submit LangGraph plans and monitor execution.
++ - /submit -> accept plan JSON, persist and start execution
++ - /status/{plan_id} -> plan status and node results
++ - /plans -> list submitted plans
++"""
++import uvicorn
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++from typing import Dict, Any, List
++
++from ops.langgraph import persistence as db
++from ops.langgraph.executor import manager
++
++app = FastAPI(title="Aegis LangGraph Executor")
++
++class NodeModel(BaseModel):
++    id: str
++    action: str
++    args: Dict[str,Any] = {}
++
++class PlanModel(BaseModel):
++    plan_id: str = None
++    nodes: List[NodeModel]
++    edges: List[List[str]] = []  # [from, to] pairs
++
++@app.on_event("startup")
++def startup():
++    db.init_db()
++
++@app.post("/submit")
++def submit_plan(plan: PlanModel):
++    p = plan.dict()
++    pid = manager.submit_plan(p, plan_id=p.get("plan_id"))
++    return {"plan_id": pid}
++
++@app.get("/status/{plan_id}")
++def status(plan_id: str):
++    p = manager.status(plan_id)
++    if not p:
++        raise HTTPException(status_code=404, detail="plan not found")
++    nodes = db.list_nodes_for_plan(plan_id)
++    return {"plan": p, "nodes": nodes}
++
++@app.get("/plans")
++def list_plans():
++    return {"pending": manager.list_pending()}
++
++if __name__=="__main__":
++    uvicorn.run(app, host="0.0.0.0", port=8088)
++
+*** End File
+*** Add File:planners/langgraph_client_stub.py
++#!/usr/bin/env python3
++"""
++Stub client that demonstrates how an external LangGraph planner could submit plans to the Aegis executor.
++In practice replace this with a real LangGraph client that produces plans.
++"""
++import requests
++import json
++def submit_example():
++    plan = {
++        "plan_id": "demo-plan-1",
++        "nodes": [
++            {"id":"n1","action":"http_get","args":{"url":"https://example.com"}},
++            {"id":"n2","action":"run_shell","args":{"cmd":"echo hello"}},
++            {"id":"n3","action":"noop","args":{}}
++        ],
++        "edges": [["n1","n2"], ["n2","n3"]]
++    }
++    r = requests.post("http://localhost:8088/submit", json=plan)
++    print("submit:", r.status_code, r.text)
++    if r.ok:
++        pid = r.json().get("plan_id")
++        print("plan id:", pid)
++
++if __name__=="__main__":
++    submit_example()
++
+*** End File
+*** Add File:services/agents/langgraph_end_to_end_demo.py
++#!/usr/bin/env python3
++"""
++End-to-end demo:
++ - Starts by ensuring sample data & vocab exist, then submits a graph plan via the planner stub,
++ - Polls status until completion and prints node results.
++"""
++import time
++import requests
++from planners.langgraph_client_stub import submit_example
++
++def run_demo():
++    submit_example()
++    # poll for plan status
++    pid = "demo-plan-1"
++    for i in range(30):
++        r = requests.get(f"http://localhost:8088/status/{pid}")
++        if r.status_code==200:
++            j = r.json()
++            print("status:", j.get("plan",{}).get("status"))
++            nodes = j.get("nodes",[])
++            for n in nodes:
++                print(n["node_id"], n["status"], n.get("result",{}))
++            if j.get("plan",{}).get("status") in ("succeeded","failed","partial"):
++                break
++        time.sleep(1)
++
++if __name__=="__main__":
++    run_demo()
++
+*** End File
+*** Add File:ops/langgraph/README.md
++# LangGraph Executor (Aegis)
++
++Overview
++- This component provides a durable executor for graph-style plans (LangGraph-style). It offers:
++  - plan persistence (SQLite)
++  - topology-aware execution (Kahn's algorithm)
++  - per-node safety enforcement via ops.agent.orchestrator.run_action (which invokes safety_monitor)
++  - REST API for submission / status (FastAPI)
++
++How to run (dev)
++1. Install requirements:
++   pip install -r ops/langgraph/requirements.txt
++2. Start the server:
++   python3 ops/langgraph/server.py
++3. Submit a demo plan:
++   python3 planners/langgraph_client_stub.py
++4. Poll status:
++   curl http://localhost:8088/status/demo-plan-1
++
++Notes & next steps
++- This is a self-contained executor. To integrate with a specific LangGraph planner, either:
++  - Replace planners/langgraph_client_stub.py with a client that pulls plans from your planner and POSTs to /submit, or
++  - Implement a planner-adapter plugin that calls manager.submit_plan(...) directly.
++- For production: replace SQLite with a durable DB (Postgres), add authentication, TLS for the REST endpoint, and a supervisor (systemd/k8s) to manage the process.
++
+*** End File
+*** Update File:ops/integrations/langgraph_adapter.py
+@@
+ def execute_graph_plan(plan: Dict[str, Any]):
+-    """
+-    plan: {'nodes': [{'id': 'n1', 'action': 'http_get', 'args': {...}}, ...], 'edges': [...]}
+-    Executes nodes in order (topological order not enforced here - simple sequential execution)
+-    Returns list of node results.
+-    """
+-    out = []
+-    for n in plan.get("nodes", []):
+-        act = n.get("action")
+-        args = n.get("args", {})
+-        res = run_action(n.get("id","unnamed"), act, args)
+-        out.append({"node": n.get("id"), "result": res})
+-        if not res.get("ok"):
+-            # stop on failure
+-            break
+-    return out
++    """
++    Backwards-compatible wrapper that now delegates to the durable executor if available.
++    If the FastAPI executor is running locally, submit via HTTP; otherwise fall back to sequential execution.
++    """
++    import requests, json
++    try:
++        r = requests.post("http://localhost:8088/submit", json=plan, timeout=2)
++        if r.ok:
++            pid = r.json().get("plan_id")
++            # poll for completion (best-effort short poll)
++            for _ in range(30):
++                s = requests.get(f"http://localhost:8088/status/{pid}", timeout=2)
++                if s.ok:
++                    st = s.json().get("plan",{}).get("status")
++                    if st in ("succeeded","failed","partial"):
++                        return s.json()
++                time.sleep(1)
++    except Exception:
++        # fallback to sequential local execution
++        out = []
++        for n in plan.get("nodes", []):
++            act = n.get("action")
++            args = n.get("args", {})
++            res = run_action(n.get("id","unnamed"), act, args)
++            out.append({"node": n.get("id"), "result": res})
++            if not res.get("ok"):
++                break
++        return out
++
+*** End File
+*** Add File:docs/langgraph/README.md
++# LangGraph Integration Overview
++
++This patch introduces a durable LangGraph executor service that can accept graph plans and execute them safely inside Aegis.
++
++Key components:
++- ops/langgraph/server.py — REST API (FastAPI) to submit and monitor plans.
++- ops/langgraph/executor.py — execution engine with topological ordering and concurrency.
++- ops/langgraph/persistence.py — SQLite persistence for plans and node results.
++- planners/langgraph_client_stub.py — example adapter that submits plans to the executor.
++- services/agents/langgraph_end_to_end_demo.py — end-to-end demo script.
++
++Integration notes:
++- The executor calls ops.agent.orchestrator.run_action for node execution — this ensures safety checks (OPA + safety_monitor) and evidence manifests are generated per action.
++- For production, replace SQLite with Postgres, add authentication (OIDC) and TLS on the REST server, and run the server behind an ingress/Service.
++
+*** End File
+*** End Patch

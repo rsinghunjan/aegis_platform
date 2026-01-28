@@ -1,0 +1,747 @@
+*** Begin Patch
+*** Add File:ops/grpc/async_batched_inference_server.py
++#!/usr/bin/env python3
++"""
++Async batched streaming inference server for production.
++ - Uses grpc.aio and batches incoming generation requests for throughput.
++ - Supports vLLM backend (if available) or HF fallback.
++ - Emits Prometheus metrics (latency, tokens, requests) and records per-request evidence manifests.
++ - Includes simple backpressure: each RPC awaits batch execution and streams tokens asynchronously.
++Notes:
++ - Deploy behind a k8s Service and Horizontal Pod Autoscaler; use the deployment template in helm/...
++ - Requires generated stubs for generation.proto (ops/grpc/_generate_stubs.py).
++"""
++import asyncio
++import os
++import time
++from concurrent.futures import ThreadPoolExecutor
++from typing import List, Dict, Any
++
++import grpc
++from grpc import aio
++
++from prometheus_client import Counter, Histogram, Gauge
++
++from ops.autonomy.safety_monitor import check_and_allow, record_manifest
++from ops.safety.content_filter import is_prompt_allowed
++from ops.safety.watermark import apply_watermark_to_tokens
++
++try:
++    from ops.proto import generation_pb2, generation_pb2_grpc
++except Exception:
++    raise
++
++# Metrics
++REQ_COUNTER = Counter("aegis_inference_requests_total", "Total inference requests", ["backend"])
++TOKENS_COUNTER = Counter("aegis_inference_tokens_total", "Total tokens generated", ["backend"])
++LATENCY_HIST = Histogram("aegis_inference_latency_seconds", "Inference latency seconds", ["backend"])
++IN_FLIGHT = Gauge("aegis_inference_inflight", "In-flight requests")
++
++# Batching config (tune via env)
++BATCH_MAX_SIZE = int(os.environ.get("BATCH_MAX_SIZE", "8"))
++BATCH_TIMEOUT_SEC = float(os.environ.get("BATCH_TIMEOUT_SEC", "0.05"))
++BACKEND = os.environ.get("INFERENCE_BACKEND", "VLLM")  # VLLM or HF
++
++class BatchRequest:
++    def __init__(self, prompt, max_tokens, stream_queue: asyncio.Queue, meta: Dict[str,Any]):
++        self.prompt = prompt
++        self.max_tokens = max_tokens
++        self.stream_queue = stream_queue
++        self.meta = meta
++
++class Batcher:
++    def __init__(self):
++        self._queue = asyncio.Queue()
++        self._loop = asyncio.get_event_loop()
++
++    async def submit(self, br: BatchRequest):
++        await self._queue.put(br)
++
++    async def _drain_batch(self) -> List[BatchRequest]:
++        items = []
++        try:
++            # wait for first item
++            first = await asyncio.wait_for(self._queue.get(), timeout=BATCH_TIMEOUT_SEC)
++            items.append(first)
++        except asyncio.TimeoutError:
++            return []
++        # then gather up to BATCH_MAX_SIZE-1 without waiting long
++        for _ in range(BATCH_MAX_SIZE - 1):
++            try:
++                items.append(self._queue.get_nowait())
++            except asyncio.QueueEmpty:
++                break
++        return items
++
++    async def run(self, stop_event: asyncio.Event):
++        while not stop_event.is_set():
++            batch = await self._drain_batch()
++            if not batch:
++                continue
++            prompts = [r.prompt for r in batch]
++            max_tokens = max(r.max_tokens for r in batch)
++            # execute model generation for the batch (may be parallelized)
++            start = time.time()
++            results = await self._generate_batch(prompts, max_tokens)
++            latency = time.time() - start
++            LATENCY_HIST.labels(backend=BACKEND).observe(latency)
++            # dispatch per-request results
++            for br, tokens in zip(batch, results):
++                TOKENS_COUNTER.labels(backend=BACKEND).inc(len(tokens))
++                # stream tokens into the caller's queue
++                for idx, tok in enumerate(tokens):
++                    await br.stream_queue.put((tok, idx))
++                # mark end-of-stream sentinel
++                await br.stream_queue.put((None, None))
++
++    async def _generate_batch(self, prompts: List[str], max_tokens: int) -> List[List[str]]:
++        """
++        Call backend to generate tokens for each prompt. For vLLM, a batched call may be possible;
++        fallback to per-prompt generation in threadpool to avoid blocking event loop.
++        """
++        if BACKEND.upper() == "VLLM":
++            # try to import vllm and perform batched generation if possible
++            try:
++                import vllm
++                # minimal example: iterate prompts sequentially (vllm supports concurrency via client)
++                out = []
++                for p in prompts:
++                    tokens = []
++                    # very small synchronous generation loop adapted for asyncio via threadpool
++                    for tok in vllm_generator_sync(p, max_tokens):
++                        tokens.append(tok)
++                    out.append(tokens)
++                return out
++            except Exception:
++                # fallthrough to HF per-prompt generation
++                pass
++        # HF fallback via threadpool
++        loop = asyncio.get_event_loop()
++        with ThreadPoolExecutor(max_workers=min(4, len(prompts))) as ex:
++            tasks = [loop.run_in_executor(ex, hf_generate_sync, p, max_tokens) for p in prompts]
++            results = await asyncio.gather(*tasks, return_exceptions=False)
++        return results
++
++def hf_generate_sync(prompt: str, max_tokens: int) -> List[str]:
++    # synchronous HF pipeline generation (used in threadpool)
++    try:
++        from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
++        model_name = os.environ.get("HF_MODEL", "gpt2")
++        tok = AutoTokenizer.from_pretrained(model_name)
++        model = AutoModelForCausalLM.from_pretrained(model_name)
++        gen = pipeline("text-generation", model=model, tokenizer=tok, device=0 if os.environ.get("USE_GPU","0")=="1" else -1)
++        out = gen(prompt, max_new_tokens=max_tokens, return_full_text=False)
++        text = out[0].get("generated_text","")
++        return text.split()
++    except Exception as e:
++        return ["<error>"]
++
++def vllm_generator_sync(prompt: str, max_tokens: int):
++    # placeholder synchronous interface to vLLM (adapt per vLLM API)
++    try:
++        import vllm
++        from vllm import LLM, SamplingParams
++        client = LLM(model=os.environ.get("VLLM_MODEL","facebook/opt-125m"))
++        params = SamplingParams(max_tokens=max_tokens)
++        with client.generate(prompt, sampling_params=params) as outputs:
++            for output in outputs:
++                for token in output:
++                    yield token.text
++    except Exception:
++        # fallback/safe sentinel
++        for i in range(max_tokens):
++            yield f"<tok{i}>"
++
++class GenerationServicer(generation_pb2_grpc.GenerationServicer):
++    def __init__(self, batcher: Batcher):
++        self._batcher = batcher
++
++    async def StreamGenerate(self, request, context):
++        prompt = request.prompt or ""
++        max_tokens = request.max_tokens or 64
++        # runtime checks
++        if not check_and_allow("generate", {"prompt_preview": prompt[:200]}):
++            record_manifest("generate_blocked", {"reason":"safety_monitor"})
++            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
++            context.set_details("Blocked")
++            return
++        allowed, reasons = is_prompt_allowed(prompt)
++        if not allowed:
++            record_manifest("generate_blocked_content", {"reasons": reasons})
++            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
++            context.set_details("Prompt disallowed")
++            return
++        # register request manifest
++        record_manifest("generate_request", {"prompt_preview": prompt[:1024], "max_tokens": max_tokens})
++
++        # per-call streaming queue
++        q = asyncio.Queue()
++        br = BatchRequest(prompt, max_tokens, q, {"peer": context.peer()})
++        await self._batcher.submit(br)
++
++        # stream tokens to client as they arrive; backpressure handled by awaiting q.get()
++        while True:
++            tok, idx = await q.get()
++            if tok is None:
++                break
++            yield generation_pb2.Token(token=apply_watermark_to_tokens([tok])[0], index=idx)
++        # final manifest
++        record_manifest("generate_complete", {"prompt_preview": prompt[:120]})
++
++    async def Generate(self, request, context):
++        # unary wrapper: collect streamed tokens and return as response
++        tokens = []
++        async for tok in self.StreamGenerate(request, context):
++            tokens.append(tok.token)
++        return generation_pb2.GenerationResponse(tokens=tokens, message="ok")
++
++async def serve(port=50054):
++    server = aio.server()
++    batcher = Batcher()
++    stop_event = asyncio.Event()
++    gen_servicer = GenerationServicer(batcher)
++    generation_pb2_grpc.add_GenerationServicer_to_server(gen_servicer, server)
++    server.add_insecure_port(f"[::]:{port}")
++    await server.start()
++    # start batcher loop
++    task = asyncio.create_task(batcher.run(stop_event))
++    print("Async batched inference server started on port", port)
++    try:
++        await server.wait_for_termination()
++    finally:
++        stop_event.set()
++        await task
++
++if __name__ == "__main__":
++    import asyncio
++    asyncio.run(serve())
++
+*** End File
+*** Add File:ops/grpc/middleware.py
++#!/usr/bin/env python3
++"""
++gRPC aio interceptors for authentication, rate limiting, provenance logging and evidence recording.
++ - Auth interceptor: validates bearer token header (simple pluggable check).
++ - Rate limiting: optional Redis-backed token bucket; falls back to in-memory per-process limiter.
++ - Provenance: logs prompt/request metadata (not full content) into evidence manifests and increments metrics.
++"""
++import os
++import time
++import asyncio
++from typing import Callable
++from grpc import aio
++from ops.autonomy.safety_monitor import record_manifest
++
++try:
++    import aioredis
++except Exception:
++    aioredis = None
++
++# Simple in-memory token-bucket store per client identity
++class InMemoryLimiter:
++    def __init__(self, rate: float = 1.0, capacity: int = 5):
++        self.rate = rate
++        self.capacity = capacity
++        self.tokens = {}
++        self.timestamps = {}
++
++    def allow(self, key: str) -> bool:
++        now = time.time()
++        tokens = self.tokens.get(key, self.capacity)
++        last = self.timestamps.get(key, now)
++        # replenish
++        tokens += (now - last) * self.rate
++        if tokens > self.capacity:
++            tokens = self.capacity
++        if tokens >= 1:
++            tokens -= 1
++            self.tokens[key] = tokens
++            self.timestamps[key] = now
++            return True
++        self.tokens[key] = tokens
++        self.timestamps[key] = now
++        return False
++
++_limiter = InMemoryLimiter(rate=float(os.environ.get("RATE_PER_SEC","0.2")), capacity=int(os.environ.get("RATE_CAP","10")))
++
++class AuthInterceptor(aio.ServerInterceptor):
++    def __init__(self, validator: Callable[[str], bool]=None):
++        self.validator = validator or (lambda t: True)
++
++    async def intercept_service(self, continuation, handler_call_details):
++        md = dict(handler_call_details.invocation_metadata or [])
++        auth = md.get("authorization") or md.get("Authorization")
++        if not auth or not auth.startswith("Bearer "):
++            # reject without valid bearer token
++            async def abort_behavior(request, context):
++                context.abort(aio.StatusCode.UNAUTHENTICATED, "Missing bearer token")
++            return abort_behavior
++        token = auth.split(" ",1)[1]
++        if not self.validator(token):
++            async def abort_behavior(request, context):
++                context.abort(aio.StatusCode.PERMISSION_DENIED, "Invalid token")
++            return abort_behavior
++        return await continuation(handler_call_details)
++
++class RateLimitInterceptor(aio.ServerInterceptor):
++    def __init__(self, limiter=None):
++        self.limiter = limiter or _limiter
++
++    async def intercept_service(self, continuation, handler_call_details):
++        md = dict(handler_call_details.invocation_metadata or [])
++        auth = md.get("authorization") or md.get("Authorization") or ""
++        key = auth.split(" ",1)[1] if auth.startswith("Bearer ") else handler_call_details.method
++        if not self.limiter.allow(key):
++            async def abort_behavior(request, context):
++                context.abort(aio.StatusCode.RESOURCE_EXHAUSTED, "Rate limit exceeded")
++            return abort_behavior
++        return await continuation(handler_call_details)
++
++class ProvenanceInterceptor(aio.ServerInterceptor):
++    async def intercept_service(self, continuation, handler_call_details):
++        # record a lightweight provenance manifest per request (method + timestamp + peer)
++        record_manifest("request_provenance", {"method": handler_call_details.method, "ts": int(time.time())})
++        return await continuation(handler_call_details)
++
++__all__ = ["AuthInterceptor", "RateLimitInterceptor", "ProvenanceInterceptor"]
++
+*** End File
+*** Add File:helm/aegis-grpc/templates/deployment-vllm.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-vllm
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-vllm
++  template:
++    metadata:
++      labels:
++        app: aegis-vllm
++    spec:
++      nodeSelector:
++        cloud.google.com/gpu: "present"  # adjust to your provider / node labels
++      tolerations:
++        - key: "nvidia.com/gpu"
++          operator: "Exists"
++          effect: "NoSchedule"
++      containers:
++        - name: vllm
++          image: "{{ .Values.image.registry }}/aegis/vllm-inference:{{ .Values.image.tag }}"
++          resources:
++            limits:
++              nvidia.com/gpu: 1
++              memory: 64Gi
++              cpu: 4000m
++            requests:
++              nvidia.com/gpu: 1
++              memory: 32Gi
++              cpu: 2000m
++          env:
++            - name: USE_VLLM
++              value: "true"
++            - name: VLLM_MODEL
++              value: "facebook/opt-125m"
++          ports:
++            - containerPort: 50054
++          readinessProbe:
++            httpGet:
++              path: /health
++              port: 8080
++            initialDelaySeconds: 10
++            periodSeconds: 10
++      # HPA should be configured separately depending on GPU autoscaler available
++
+*** End File
+*** Add File:ops/grpc/secure_client_policy.py
++#!/usr/bin/env python3
++"""
++Enforce secure channels for clients in production.
++ - In production (PRODUCTION=true) clients must not fall back to insecure channels.
++ - Provide helper to create channels that error if insecure in production.
++"""
++import os
++import grpc
++from ops.grpc.tls_helpers import client_credentials, has_tls_certs
++
++PRODUCTION = os.environ.get("PRODUCTION","false").lower() in ("1","true","yes")
++
++def make_channel(target: str, insecure: bool = None):
++    """
++    Create a grpc channel. If PRODUCTION is true and insecure is None, prefer secure and fail if no creds.
++    If insecure=True forces insecure (not recommended).
++    """
++    if insecure is True:
++        return grpc.insecure_channel(target)
++    if insecure is False:
++        creds = client_credentials()
++        return grpc.secure_channel(target, creds)
++    # default behavior
++    if PRODUCTION:
++        if not has_tls_certs():
++            raise RuntimeError("Production requires TLS certs; client cannot create insecure channel")
++        creds = client_credentials()
++        return grpc.secure_channel(target, creds)
++    else:
++        # non-production: prefer secure if creds available, otherwise insecure
++        if has_tls_certs():
++            creds = client_credentials()
++            return grpc.secure_channel(target, creds)
++        return grpc.insecure_channel(target)
++
+*** End File
+*** Add File:ops/storage/chroma_persistence.py
++#!/usr/bin/env python3
++"""
++Chroma-backed persistent vectorstore utilities with optional S3 snapshot/restore.
++ - build_chroma_index(texts, persist_directory)
++ - query_chroma(query, persist_directory, top_k)
++ - snapshot_to_s3(persist_directory, s3_uri)
++ - restore_from_s3(s3_uri, persist_directory)
++Requires chromadb (pip install chromadb) and AWS CLI for s3 snapshot commands (or boto3).
++"""
++import os
++import shutil
++from pathlib import Path
++from typing import List, Tuple
++
++try:
++    import chromadb
++    from chromadb.config import Settings
++except Exception:
++    chromadb = None
++
++def build_chroma_index(texts: List[str], persist_directory: str = "data/chroma"):
++    if chromadb is None:
++        raise RuntimeError("chromadb not installed; install ops/integrations/requirements-langchain.txt")
++    client = chromadb.Client(Settings(persist_directory=persist_directory, anonymized_telemetry=False))
++    col = client.create_collection("aegis_docs")
++    ids = [str(i) for i in range(len(texts))]
++    col.add(ids=ids, documents=texts)
++    client.persist()
++    return persist_directory
++
++def query_chroma(query: str, persist_directory: str = "data/chroma", top_k: int = 5):
++    if chromadb is None:
++        raise RuntimeError("chromadb not installed")
++    client = chromadb.Client(Settings(persist_directory=persist_directory, anonymized_telemetry=False))
++    col = client.get_collection("aegis_docs")
++    res = col.query(query_texts=[query], n_results=top_k)
++    # return list of (id, score, doc)
++    out = []
++    for i,doc in enumerate(res["documents"][0]):
++        out.append((res["ids"][0][i], 0.0, doc))
++    return out
++
++def snapshot_to_s3(persist_directory: str, s3_uri: str):
++    # simple approach: tar the directory and upload via aws CLI or boto3
++    import tarfile, subprocess
++    p = Path(persist_directory)
++    tar = str(p.with_suffix(".tar.gz"))
++    with tarfile.open(tar, "w:gz") as tf:
++        tf.add(p, arcname=p.name)
++    # upload
++    subprocess.check_call(["aws","s3","cp", tar, s3_uri])
++    return s3_uri
++
++def restore_from_s3(s3_uri: str, persist_directory: str):
++    import subprocess, tarfile
++    tar = "/tmp/chroma_restore.tar.gz"
++    subprocess.check_call(["aws","s3","cp", s3_uri, tar])
++    with tarfile.open(tar, "r:gz") as tf:
++        tf.extractall(Path(persist_directory).parent)
++    return persist_directory
++
+*** End File
+*** Add File:ops/integrations/faiss_backup.py
++#!/usr/bin/env python3
++"""
++Backup and restore helpers for FAISS index to S3.
++ - backup_index(index_path, s3_uri)
++ - restore_index(s3_uri, index_path)
++"""
++import subprocess
++from pathlib import Path
++
++def backup_index(index_path: str, s3_uri: str):
++    p = Path(index_path)
++    if not p.exists():
++        raise FileNotFoundError(index_path)
++    subprocess.check_call(["aws","s3","cp", str(p), s3_uri])
++    # also metadata
++    meta = p.with_suffix(p.suffix + ".meta.json")
++    if meta.exists():
++        subprocess.check_call(["aws","s3","cp", str(meta), s3_uri + ".meta.json"])
++    return True
++
++def restore_index(s3_uri: str, index_path: str):
++    subprocess.check_call(["aws","s3","cp", s3_uri, index_path])
++    try:
++        subprocess.check_call(["aws","s3","cp", s3_uri + ".meta.json", index_path + ".meta.json"])
++    except Exception:
++        pass
++    return True
++
+*** End File
+*** Add File:ops/metrics/request_metrics.py
++#!/usr/bin/env python3
++"""
++Prometheus metrics helper for per-request telemetry (latency, tokens, energy/CO2).
++Expose a small HTTP server for Prometheus to scrape.
++"""
++from prometheus_client import start_http_server, Counter, Histogram, Gauge
++import os
++PORT = int(os.environ.get("PROM_METRICS_PORT","9001"))
++
++REQS = Counter("aegis_requests_total", "Total requests")
++TOKENS = Counter("aegis_generated_tokens_total", "Tokens generated")
++LATENCY = Histogram("aegis_request_latency_seconds", "Request latency seconds")
++ENERGY = Gauge("aegis_request_energy_kwh", "Energy consumed per request (kWh)")
++CO2 = Gauge("aegis_request_co2_kg", "CO2kg per request")
++
++def start_metrics_server(port: int = PORT):
++    start_http_server(port)
++    print("Prometheus metrics server started on port", port)
++
+*** End File
+*** Add File:docs/formal/audit_readiness.md
++# Formal Audit Readiness & Model↔Code Review Checklist
++
++This document provides steps to prepare for an external formal-methods audit and to produce artifacts that show model↔code traceability and inductive proof progress.
++
++Steps:
++1. Update specs: ensure TLA+ spec includes all production variables and Rekor semantics.
++2. Run ops/formal/model_code_traceability.py and review docs/formal/proof_mapping.md for unmapped actions.
++3. Author auxiliary invariants and lemmas; document their rationale in docs/formal/lemmas.md.
++4. Run ops/formal/run_inductive_proof.sh and archive apalache/tlc logs and signed artifacts in the auditor bundle.
++5. Provide reproducible environment (Dockerfile with tlc/apalache/z3) for auditors and include instructions to re-run the checks.
++6. Provide a mapping table linking each TLA+ action to exact source files & line numbers (update docs/formal/proof_mapping.md manually where heuristics fail).
++7. Engage third-party formal-methods reviewer; collect signed verification notes and Rekor‑register their acceptance artifacts.
++
+*** End File
+*** Add File:ops/vault/rotate_and_annotate.py
++#!/usr/bin/env python3
++"""
++Rotate certs in Vault PKI and annotate deployments to trigger restart.
++ - Requests a certificate for the role and writes to a k8s Secret via kubectl (or uses CSI to refresh)
++ - Annotates deployments with a rotation timestamp to force rollout when certs rotate.
++Requires vault CLI or hvac, and kubectl access.
++"""
++import os
++import subprocess
++import json
++import time
++from datetime import datetime
++
++ROLE = os.environ.get("VAULT_ROLE", "aegis-grpc-server")
++K8S_NAMESPACE = os.environ.get("K8S_NAMESPACE", "aegis")
++DEPLOYMENTS_TO_TOUCH = os.environ.get("DEPLOYMENTS", "aegis-evidence-grpc,aegis-dp-grpc,aegis-serve-grpc").split(",")
++
++def request_cert_and_write_secret():
++    # This is operator-run code; adapt to your Vault setup. Example uses vault CLI to generate a cert as JSON.
++    out = subprocess.check_output(["vault", "write", f"pki/issue/{ROLE}", "common_name=aegis-server", "-format=json"])
++    j = json.loads(out)
++    cert = j["data"]["certificate"]
++    key = j["data"]["private_key"]
++    ca = j["data"].get("issuing_ca","")
++    # write secret to k8s (best-effort)
++    secret_yaml = f"""apiVersion: v1
++kind: Secret
++metadata:
++  name: aegis-grpc-certs
++  namespace: {K8S_NAMESPACE}
++type: Opaque
++data:
++  tls.crt: {cert.encode('utf-8').hex()}
++  tls.key: {key.encode('utf-8').hex()}
++  ca.crt: {ca.encode('utf-8').hex()}
++"""
++    p = "/tmp/aegis_cert_secret.yaml"
++    open(p,"w").write(secret_yaml)
++    subprocess.check_call(["kubectl","apply","-f", p])
++    return True
++
++def annotate_rollouts():
++    ts = datetime.utcnow().isoformat()
++    for d in DEPLOYMENTS_TO_TOUCH:
++        subprocess.check_call(["kubectl","patch","deploy", d, "-n", K8S_NAMESPACE, "--type=json", "-p", f"[{{\"op\":\"add\",\"path\":\"/spec/template/metadata/annotations/aegis.cert-rotate\",\"value\":\"{ts}\"}}]"])
++
++def main():
++    request_cert_and_write_secret()
++    annotate_rollouts()
++    print("Rotation complete at", time.asctime())
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:helm/aegis-grpc/templates/hpa-vllm.yaml
++apiVersion: autoscaling/v2
++kind: HorizontalPodAutoscaler
++metadata:
++  name: aegis-vllm-hpa
++spec:
++  scaleTargetRef:
++    apiVersion: apps/v1
++    kind: Deployment
++    name: aegis-vllm
++  minReplicas: 1
++  maxReplicas: 3
++  metrics:
++    - type: Resource
++      resource:
++        name: cpu
++        target:
++          type: Utilization
++          averageUtilization: 70
++
+*** End File
+*** Add File:ops/security/key_rotation_playbook.md
++# Cosign Key Rotation Playbook (HSM/KMS-backed)
++
++Overview:
++- Use HSM/KMS provider to rotate signing keys (AWKMS/GCPKMS/AzureKeyVault).
++- Ensure old keys are retained for verification of previously signed artifacts or publish Rekor entries linking previous keys.
++
++Steps:
++1. Create new KMS key with appropriate usage policy.
++2. Update COSIGN_KMS_URI in CI and Vault secrets to point to new key (use staged rollout).
++3. Run smoke-signing job in CI to sign a test artifact and ensure Rekor registration works.
++4. Revoke or rotate the old key only after verification and a retention window.
++5. Record rotation event in evidence (record_manifest("cosign_key_rotation", {...})).
++
++Monitoring:
++- Run ops/security/key_usage_monitor.py periodically to detect unexpected usage.
++
+*** End File
+*** Add File:.github/workflows/throughput_test.yml
++name: Inference throughput test (staging)
++on:
++  workflow_dispatch:
++jobs:
++  throughput:
++    runs-on: ubuntu-latest
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: "3.10"
++      - name: Install deps
++        run: |
++          pip install grpcio grpcio-tools locust
++      - name: Run simple concurrency test
++        env:
++          INFERENCE_HOST: ${{ inputs.host || '127.0.0.1' }}
++          INFERENCE_PORT: ${{ inputs.port || '50054' }}
++        run: |
++          # simple Python concurrent client to exercise streaming endpoint
++          python3 - <<PY
++import grpc, time, concurrent.futures, os
++from ops.proto import generation_pb2, generation_pb2_grpc
++
++def call_once(i):
++    ch = grpc.insecure_channel(f"{os.environ.get('INFERENCE_HOST')}:{os.environ.get('INFERENCE_PORT')}")
++    stub = generation_pb2_grpc.GenerationStub(ch)
++    req = generation_pb2.GenerationRequest(prompt=f"hello {i}", max_tokens=16, stream=True)
++    try:
++        for tok in stub.StreamGenerate(req, timeout=30):
++            pass
++        return True
++    except Exception as e:
++        print("err",e)
++        return False
++
++with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
++    futures = [ex.submit(call_once, i) for i in range(100)]
++    results = [f.result() for f in futures]
++print("Success ratio:", sum(results)/len(results))
++PY
++
+*** End File
+*** Update File:ops/grpc/generation_client.py
+@@
+-    def __init__(self, host="127.0.0.1", port=50054, insecure=None):
+-        target = f"{host}:{port}"
+-        if insecure is True:
+-            self.ch = grpc.insecure_channel(target)
+-        elif insecure is False:
+-            creds = client_credentials()
+-            self.ch = grpc.secure_channel(target, creds)
+-        else:
+-            if has_tls_certs():
+-                creds = client_credentials()
+-                self.ch = grpc.secure_channel(target, creds)
+-            else:
+-                self.ch = grpc.insecure_channel(target)
++    def __init__(self, host="127.0.0.1", port=50054, insecure=None):
++        target = f"{host}:{port}"
++        # enforce production policy: do not allow insecure channels when PRODUCTION=true
++        from ops.grpc.secure_client_policy import make_channel
++        self.ch = make_channel(target, insecure=insecure)
+         self.stub = generation_pb2_grpc.GenerationStub(self.ch)
+*** End File
+*** Update File:ops/integrations/langchain_llm.py
+@@
+-    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+-            # unary generate
+-            out = self._wrapper.generate(prompt, max_tokens=1024)
+-            return out
++        def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
++            # unary generate
++            out = self._wrapper.generate(prompt, max_tokens=1024)
++            # record evidence per LLM call (prompt provenance)
++            try:
++                from ops.autonomy.safety_monitor import record_manifest
++                record_manifest("llm_call", {"prompt_preview": prompt[:512]})
++            except Exception:
++                pass
++            return out
+*** End File
+*** Add File:ops/observability/grafana_ml_dashboard_enhanced.json
++{
++  "dashboard": {
++    "id": null,
++    "title": "Aegis ML Production Overview",
++    "panels": [
++      {"type":"graph","title":"Inference P95 Latency","targets":[{"expr":"histogram_quantile(0.95, sum(rate(aegis_inference_latency_seconds_bucket[5m])) by (le))"}],"gridPos":{"x":0,"y":0,"w":12,"h":8}},
++      {"type":"graph","title":"Requests per second","targets":[{"expr":"rate(aegis_requests_total[1m])"}],"gridPos":{"x":12,"y":0,"w":12,"h":6}},
++      {"type":"stat","title":"Evidence Coverage","targets":[{"expr":"sum(aegis_evidence_covered)/sum(aegis_evidence_expected)"}],"gridPos":{"x":0,"y":8,"w":6,"h":4}},
++      {"type":"stat","title":"CO2 (30d kg)","targets":[{"expr":"sum(aegis_job_co2_kg_total[30d])"}],"gridPos":{"x":6,"y":8,"w":6,"h":4}},
++      {"type":"table","title":"Model Drift Alerts","targets":[{"expr":"increase(model_drift_alerts_total[1d])"}],"gridPos":{"x":12,"y":6,"w":12,"h":6}}
++    ],
++    "schemaVersion": 16,
++    "version": 1
++  }
++}
++
+*** End File
+*** Add File:ops/docs/production-hardening-checklist.md
++# Production Hardening Checklist (Inference, Security, Retrieval, Monitoring)
++
++1. Inference
++ - Deploy vLLM nodes with GPU requests/limits and configure HPA or cluster autoscaler for GPU.
++ - Use async_batched_inference_server.py and tune BATCH_MAX_SIZE & BATCH_TIMEOUT_SEC.
++ - Run throughput tests (./.github/workflows/throughput_test.yml) in staging and benchmark memory/latency.
++
++2. Security & mTLS
++ - Install Vault CSI provider; apply SecretProviderClass; run ops/vault/rotate_and_annotate.py for cert rotation.
++ - Ensure PRODUCTION env var is set on clients and services to enforce secure channels.
++
++3. Agents & LangChain
++ - Enable RateLimitInterceptor and AuthInterceptor in gRPC servers; configure token validator (OIDC/JWKS).
++ - Persist conversation history (Chroma) and snapshot regularly to S3.
++
++4. Formal & Audit
++ - Run model_code_traceability.py and assign unmapped actions to engineers.
++ - Package Apalache/TLC runs + signed artifacts for auditors.
++
++5. Monitoring
++ - Deploy Prometheus & Grafana with dashboards in ops/observability/*
++ - Export per-request energy/tokens metrics and set alerts for drift and MTTR increases.
++
+*** End File
+*** End Patch

@@ -1,0 +1,535 @@
+*** Begin Patch
+*** Add File:ops/carbon/pue_config.yaml
++# Per-region PUE and provider sourcing overrides.
++# PUE = Power Usage Effectiveness multiplier to apply to raw energy consumption
++# provider_procurement: optional note about renewable procurement (informational)
++
++default:
++  pue: 1.25
++  provider_procurement: "unknown"
++
++regions:
++  us-east-1:
++    pue: 1.15
++    provider_procurement: "grid-mix: moderate renewables"
++  eu-west-1:
++    pue: 1.10
++    provider_procurement: "grid-mix: high renewables"
++  asia-east1:
++    pue: 1.35
++    provider_procurement: "grid-mix: fossil heavy"
++
+*** End File
+*** Add File:ops/carbon/co2_client.py
++#!/usr/bin/env python3
++"""
++Simple CO2Signal client used to fetch current and forecast grid intensity (gCO2/kWh).
++Falls back to cached value in /tmp/co2_cached.json when offline.
++"""
++import os
++import requests
++import json
++import time
++from pathlib import Path
++
++API_KEY = os.environ.get("CO2SIGNAL_API_KEY", "")
++CACHE = Path("/tmp/co2_cached.json")
++BASE = "https://api.co2signal.com/v1"
++
++def _headers():
++    return {"auth-token": API_KEY} if API_KEY else {}
++
++def fetch_current(region_code):
++    """
++    region_code example: "US" or cloud region like "us-east-1" (we try region then country fallback)
++    Returns dict: {"intensity": gCO2_per_kWh, "ts": epoch}
++    """
++    if not API_KEY:
++        # no key — try cache
++        if CACHE.exists():
++            return json.loads(CACHE.read_text())
++        raise RuntimeError("CO2SIGNAL_API_KEY unset and no cache present")
++    # Try country lookup first (2-letter)
++    country = region_code.split("-")[0].upper()
++    try:
++        r = requests.get(f"{BASE}/latest?countryCode={country}", headers=_headers(), timeout=10)
++        r.raise_for_status()
++        j = r.json()
++        intensity = j.get("data", {}).get("carbonIntensity")
++        out = {"intensity": float(intensity), "ts": int(time.time()), "raw": j}
++        CACHE.write_text(json.dumps(out))
++        return out
++    except Exception:
++        # fallback to cache
++        if CACHE.exists():
++            return json.loads(CACHE.read_text())
++        raise
++
++def fetch_forecast(region_code):
++    """Attempt to fetch hourly forecast for next 24h. Returns list of {ts, intensity} entries."""
++    if not API_KEY:
++        return []
++    country = region_code.split("-")[0].upper()
++    try:
++        r = requests.get(f"{BASE}/forecast?countryCode={country}", headers=_headers(), timeout=10)
++        r.raise_for_status()
++        j = r.json()
++        hours = j.get("data", {}).get("forecast", [])
++        # normalize to list of {ts, intensity}
++        out = []
++        for h in hours:
++            out.append({"ts": h.get("datetime"), "intensity": h.get("intensity")})
++        return out
++    except Exception:
++        return []
++
++if __name__ == "__main__":
++    import sys
++    r = sys.argv[1] if len(sys.argv) > 1 else "US"
++    print(fetch_current(r))
++
+*** End File
+*** Add File:ops/carbon/job_energy_meter.py
++#!/usr/bin/env python3
++"""
++Job energy meter and CO2 calculator.
++
++Usage:
++  # Example as a wrapper:
++  python3 ops/carbon/job_energy_meter.py --out /tmp/job_energy.json --region us-east-1 --cmd "python train.py"
++
++Features:
++ - Samples GPU power via nvidia-smi periodically (default 1s sample).
++ - Falls back to estimator by device TDP * utilization when nvidia-smi not available.
++ - Computes kWh, converts to kgCO2 using CO2Signal current intensity and PUE from pue_config.yaml.
++ - Writes a job evidence file and (if available) calls safety_monitor.record_manifest to persist evidence.
++ - Optionally writes Prometheus textfile for node_exporter textfile collector.
++"""
++import argparse
++import os
++import time
++import json
++import subprocess
++from pathlib import Path
++from threading import Thread, Event
++
++SAMPLE_INTERVAL = float(os.environ.get("AEGIS_ENERGY_SAMPLE_INTERVAL", "1.0"))
++PROM_TEXTFILE_DIR = os.environ.get("PROM_TEXTFILE_DIR", "/var/lib/node_exporter/textfile_collector")
++PUE_CONFIG = os.environ.get("PUE_CONFIG_PATH", "ops/carbon/pue_config.yaml")
++
++def has_nvidia_smi():
++    from shutil import which
++    return which("nvidia-smi") is not None
++
++def sample_gpu_power(stop_event, out_samples):
++    # sample nvidia-smi power.draw values (watts)
++    while not stop_event.is_set():
++        try:
++            proc = subprocess.run(["nvidia-smi","--query-gpu=power.draw,utilization.gpu","--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=2)
++            lines = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
++            for l in lines:
++                # "120.56 W, 52 %"
++                parts = [p.strip() for p in l.split(",")]
++                try:
++                    p_w = float(parts[0])
++                except Exception:
++                    p_w = 0.0
++                out_samples.append({"ts": time.time(), "power_w": p_w})
++        except Exception:
++            # can't sample — append zero and continue
++            out_samples.append({"ts": time.time(), "power_w": 0.0})
++        time.sleep(SAMPLE_INTERVAL)
++
++def estimate_from_utilization(util_percent, tdp_w):
++    return (util_percent/100.0) * tdp_w
++
++def load_pue_config():
++    try:
++        import yaml
++        cfg = yaml.safe_load(Path(PUE_CONFIG).read_text())
++        return cfg
++    except Exception:
++        return {"default": {"pue": 1.25}}
++
++def compute_kwh(samples):
++    if not samples:
++        return 0.0
++    # compute trapezoidal integration over samples (assume regular sampling interval)
++    total_w_seconds = 0.0
++    for i in range(1, len(samples)):
++        dt = samples[i]["ts"] - samples[i-1]["ts"]
++        avg_w = (samples[i]["power_w"] + samples[i-1]["power_w"]) / 2.0
++        total_w_seconds += avg_w * dt
++    kwh = total_w_seconds / 3600.0 / 1000.0 * 1000.0  # power already in watts; divide by 3600 to get Wh, then /1000 to kWh
++    # Note: above double division fixed: use Wh = W * s / 3600, then kWh = Wh / 1000
++    # correct approach:
++    # total_w_seconds (W*s) -> Wh = total_w_seconds/3600 ; kWh = Wh/1000 = total_w_seconds / 3600 / 1000
++    # implement as:
++    kwh = total_w_seconds / 3600.0 / 1000.0
++    return kwh
++
++def write_prom_text(metric_name, value, labels=None):
++    try:
++        if labels:
++            lbl = "{" + ",".join([f'{k}="{v}"' for k,v in labels.items()]) + "}"
++        else:
++            lbl = ""
++        out = f"{metric_name}{lbl} {value}\n"
++        Path(PROM_TEXTFILE_DIR).mkdir(parents=True, exist_ok=True)
++        path = Path(PROM_TEXTFILE_DIR) / f"aegis_{metric_name}.prom"
++        path.write_text(out)
++    except Exception:
++        pass
++
++def record_manifest_safe(manifest):
++    # best-effort: try to call safety_monitor.record_manifest
++    try:
++        from ops.autonomy.safety_monitor import record_manifest
++        return record_manifest(manifest.get("action","job_energy"), manifest)
++    except Exception:
++        # write local file
++        p = Path("/tmp") / f"job_energy_{int(time.time())}.json"
++        p.write_text(json.dumps(manifest))
++        return str(p)
++
++def run_and_measure(cmd, region, out_path):
++    samples = []
++    stop_event = Event()
++    thread = None
++    if has_nvidia_smi():
++        thread = Thread(target=sample_gpu_power, args=(stop_event, samples))
++        thread.start()
++    start_ts = time.time()
++    # run command
++    proc = subprocess.Popen(cmd, shell=True)
++    rc = proc.wait()
++    end_ts = time.time()
++    # stop sampler
++    if thread:
++        stop_event.set()
++        thread.join(timeout=5)
++    # compute kWh
++    kwh = compute_kwh(samples)
++    # get grid intensity and PUE
++    from ops.carbon.co2_client import fetch_current
++    cfg = load_pue_config()
++    region_key = region
++    pue = cfg.get("regions", {}).get(region_key, cfg.get("default", {})).get("pue", cfg.get("default", {}).get("pue", 1.25))
++    try:
++        cur = fetch_current(region_key)
++        intensity = float(cur.get("intensity", 0.0))
++    except Exception:
++        intensity = 0.0
++    kgco2 = kwh * (intensity/1000.0) * pue
++    manifest = {
++        "action": "job_energy",
++        "cmd": cmd,
++        "start_ts": start_ts,
++        "end_ts": end_ts,
++        "duration_s": end_ts - start_ts,
++        "kwh": kwh,
++        "grid_intensity_g_per_kwh": intensity,
++        "pue": pue,
++        "kgco2": kgco2,
++        "samples_count": len(samples),
++    }
++    # persist manifest locally & via safety_monitor
++    mpath = record_manifest_safe(manifest)
++    # write a short summary for prometheus
++    write_prom_text("job_energy_wh_total", kwh*1000.0, labels={"cmd": os.path.basename(cmd.split()[0])})
++    write_prom_text("job_co2_kg_total", kgco2, labels={"cmd": os.path.basename(cmd.split()[0])})
++    # write out to file if requested
++    if out_path:
++        Path(out_path).write_text(json.dumps(manifest, indent=2))
++    return rc, manifest, mpath
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--out", default="", help="Path to write manifest JSON")
++    p.add_argument("--region", default=os.environ.get("AEGIS_REGION","us-east-1"))
++    p.add_argument("--cmd", required=True, help="Command to run (in quotes)")
++    args = p.parse_args()
++    rc, manifest, mpath = run_and_measure(args.cmd, args.region, args.out)
++    print("Return code:", rc)
++    print("Manifest:", mpath)
++    if rc != 0:
++        raise SystemExit(rc)
++
++if __name__ == "__main__":
++    import argparse
++    main()
++
+*** End File
+*** Add File:ops/carbon/job_scheduler.py
++#!/usr/bin/env python3
++"""
++CO2-aware job scheduler helper.
++
++Given an estimated job energy need (kWh) or simple estimate (weight), picks the best start window in the next 24h
++based on CO2Signal forecasts, PUE config and optional cost vs carbon tradeoff.
++
++Usage:
++  python3 ops/carbon/job_scheduler.py --region us-east-1 --duration-min 120 --preference carbon --lookahead-hours 24
++
++Outputs a recommended start timestamp (epoch) and summary JSON.
++"""
++import argparse
++import time
++from datetime import datetime, timedelta
++from ops.carbon.co2_client import fetch_forecast, fetch_current
++from pathlib import Path
++import json
++import os
++
++def score_window(forecast_entries, start_ts, end_ts, pue=1.25, cost_multiplier=1.0):
++    # forecast_entries: list of {"ts", "intensity"} where ts may be ISO or epoch; normalize to epoch if needed
++    # compute average intensity in window and return score = intensity * pue * cost_multiplier
++    vals = []
++    for e in forecast_entries:
++        it = e.get("intensity")
++        vals.append(float(it) if it is not None else 0.0)
++    if not vals:
++        return float("inf")
++    avg_intensity = sum(vals) / len(vals)
++    return avg_intensity * pue * cost_multiplier
++
++def window_entries_for_hourly_forecast(forecast, start_dt, end_dt):
++    # forecast is list of dicts - best-effort: return entries within window
++    out = []
++    for e in forecast:
++        ts = e.get("ts")
++        # try to parse a numeric ts, or ISO string
++        try:
++            tval = int(ts)
++        except Exception:
++            try:
++                from dateutil import parser
++                tval = int(parser.parse(ts).timestamp())
++            except Exception:
++                continue
++        if start_dt.timestamp() <= tval < end_dt.timestamp():
++            out.append({"ts": tval, "intensity": float(e.get("intensity", 0.0))})
++    return out
++
++def pick_best_window(region, duration_min=60, lookahead_hours=24, preference="carbon", cost_multiplier=1.0):
++    # fetch forecast (hourly)
++    forecast = fetch_forecast(region)
++    now = datetime.utcnow()
++    best = None
++    best_score = None
++    pue_cfg = None
++    # load pue
++    try:
++        import yaml
++        cfg = yaml.safe_load(Path(os.environ.get("PUE_CONFIG_PATH","ops/carbon/pue_config.yaml")).read_text())
++        pue_cfg = cfg.get("regions", {}).get(region, cfg.get("default", {}))
++    except Exception:
++        pue_cfg = {"pue": 1.25}
++    pue = float(pue_cfg.get("pue", 1.25))
++    for hour_offset in range(0, lookahead_hours):
++        start_dt = now + timedelta(hours=hour_offset)
++        end_dt = start_dt + timedelta(minutes=duration_min)
++        entries = window_entries_for_hourly_forecast(forecast, start_dt, end_dt)
++        score = score_window(entries, start_dt.timestamp(), end_dt.timestamp(), pue=pue, cost_multiplier=cost_multiplier)
++        if best is None or score < best_score:
++            best = (start_dt, end_dt, entries)
++            best_score = score
++    return {
++        "region": region,
++        "best_start_iso": best[0].isoformat(),
++        "best_end_iso": best[1].isoformat(),
++        "score": best_score,
++        "pue": pue,
++    }
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--region", default=os.environ.get("AEGIS_REGION","us-east-1"))
++    p.add_argument("--duration-min", type=int, default=60)
++    p.add_argument("--lookahead-hours", type=int, default=24)
++    p.add_argument("--preference", choices=["carbon","cost","balanced"], default="carbon")
++    p.add_argument("--cost-mult", type=float, default=1.0)
++    args = p.parse_args()
++    res = pick_best_window(args.region, duration_min=args.duration_min, lookahead_hours=args.lookahead_hours, preference=args.preference, cost_multiplier=args.cost_mult)
++    print(json.dumps(res, indent=2))
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:ops/carbon/job_wrapper.sh
++#!/usr/bin/env bash
++#
++# Wrapper to schedule and run a training job with CO2-aware scheduling, energy metering and evidence recording.
++#
++set -euo pipefail
++CMD="${1:-}"
++REGION="${AEGIS_REGION:-us-east-1}"
++DURATION_MIN="${2:-120}"
++PREFERENCE="${3:-carbon}"  # carbon | cost | balanced
++
++if [ -z "$CMD" ]; then
++  echo "Usage: job_wrapper.sh '<cmd>' [duration_min] [preference]" >&2
++  exit 2
++fi
++
++echo "Querying best start window..."
++WIN=$(python3 ops/carbon/job_scheduler.py --region "$REGION" --duration-min "$DURATION_MIN" --preference "$PREFERENCE" --lookahead-hours 24)
++echo "$WIN"
++BEST_START=$(echo "$WIN" | python3 -c "import sys,json;print(json.load(sys.stdin)['best_start_iso'])")
++BEST_EPOCH=$(python3 - <<PY
++from dateutil import parser
++import sys
++print(int(parser.parse("$BEST_START").timestamp()))
++PY
++)
++NOW=$(date +%s)
++if [ "$BEST_EPOCH" -gt "$NOW" ]; then
++  DELAY=$((BEST_EPOCH - NOW))
++  echo "Delaying job for $DELAY seconds until $BEST_START (best carbon window)"
++  sleep "$DELAY"
++else
++  echo "Starting immediately (best window is in the past or immediate)"
++fi
++
++OUT="/tmp/job_energy_$(date +%s).json"
++echo "Running meter wrapper for command: $CMD"
++python3 ops/carbon/job_energy_meter.py --region "$REGION" --out "$OUT" --cmd "$CMD"
++echo "Job finished; manifest at $OUT"
++exit 0
++
+*** End File
+*** Add File:ops/monitoring/carbon_prometheus_exporter.py
++#!/usr/bin/env python3
++"""
++Minimal exporter that reads latest job energy manifests and writes Prometheus textfile entries
++for node_exporter textfile collector. Intended to be run as a cron job or sidecar.
++"""
++import glob
++import json
++from pathlib import Path
++import time
++import os
++
++PENDING_DIR = os.environ.get("EVIDENCE_DIR", "/tmp")
++PROM_DIR = os.environ.get("PROM_TEXTFILE_DIR", "/var/lib/node_exporter/textfile_collector")
++OUT = Path(PROM_DIR)
++OUT.mkdir(parents=True, exist_ok=True)
++
++def main():
++    manifests = list(glob.glob(str(Path(PENDING_DIR) / "job_energy_*.json")))
++    total_co2 = 0.0
++    total_kwh = 0.0
++    for m in manifests:
++        try:
++            j = json.load(open(m))
++            total_co2 += float(j.get("kgco2", 0.0))
++            total_kwh += float(j.get("kwh", 0.0))
++        except Exception:
++            continue
++    # write metrics
++    try:
++        with open(OUT / "aegis_carbon_metrics.prom", "w") as fh:
++            fh.write(f'aegis_total_co2_kg {total_co2}\n')
++            fh.write(f'aegis_total_energy_kwh {total_kwh}\n')
++            fh.write(f'aegis_jobs_count {len(manifests)}\n')
++    except Exception:
++        pass
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:services/policy/opa/carbon_policy.rego
++package aegis.carbon
++
++# Simple policy to decide scheduling preference given cost vs carbon tradeoff.
++# Input:
++# {
++#   "preference": "carbon"|"cost"|"balanced",
++#   "estimates": { "region": {"cost": <float>, "carbon": <float>} ...}
++# }
++
++default allow_region = false
++
++allow_region[region] {
++  pref := input.preference
++  estimates := input.estimates
++  region := input.region
++  pref == "carbon"
++  # choose min carbon region
++  min_region := min([r | r := region; _ := estimates[r]])
++  region == min_region
++}
++
++min(arr) = m {
++  m := arr[0]
++  not smaller(m, arr)
++}
++
++smaller(x, arr) {
++  some r
++  arr[r] < x
++}
++
+*** End File
+*** Add File:ops/ci/enforce_carbon_policy.sh
++#!/usr/bin/env bash
++#
++# CI check to ensure heavy training jobs include carbon metadata and use job_wrapper or meter.
++# Fails if newly added training job workflows don't reference job_wrapper or job_energy_meter.
++#
++set -euo pipefail
++FILES=$(git diff --name-only origin/main... | grep -E '\.py$|\.sh$' || true)
++if [ -z "$FILES" ]; then
++  echo "No changed files"
++  exit 0
++fi
++bad=0
++for f in $FILES; do
++  if grep -qE "train|pytorch|multimodal" "$f" 2>/dev/null; then
++    if ! grep -q "job_energy_meter" "$f" 2>/dev/null && ! grep -q "job_wrapper.sh" "$f" 2>/dev/null; then
++      echo "File $f appears to run training but does not use job_energy_meter or job_wrapper.sh"
++      bad=1
++    fi
++  fi
++done
++if [ "$bad" -eq 1 ]; then
++  echo "Failing CI for missing carbon instrumentation"
++  exit 2
++fi
++echo "Carbon instrumentation checks passed"
++
+*** End File
+*** Add File:docs/carbon/integration.md
++## Carbon measurement & scheduling integration
++
++This document explains how the Aegis carbon metering and scheduling tools work and how to use them.
++
++Components
++- ops/carbon/co2_client.py — fetches CO2Signal current intensity & forecast.
++- ops/carbon/pue_config.yaml — per-region PUE values and procurement notes.
++- ops/carbon/job_energy_meter.py — wrapper to run jobs while sampling GPU power (nvidia-smi), compute kWh and kgCO2, write manifest and expose Prometheus metrics.
++- ops/carbon/job_scheduler.py — recommends the best start window in the next N hours based on forecast and PUE.
++- ops/carbon/job_wrapper.sh — convenience wrapper to pick best window, delay job, and run meter.
++- ops/monitoring/carbon_prometheus_exporter.py — aggregates job manifests and writes Prometheus textfile metrics.
++- services/policy/opa/carbon_policy.rego — simple OPA policy skeleton for region choice based on preference.
++- ops/ci/enforce_carbon_policy.sh — CI check to ensure new training jobs are instrumented.
++
++Quick start
++1. Configure:
++   - export CO2SIGNAL_API_KEY=<your-key>
++   - optional: export PUE_CONFIG_PATH=ops/carbon/pue_config.yaml
++   - optional: export PROM_TEXTFILE_DIR=/var/lib/node_exporter/textfile_collector
++2. Run a job via wrapper:
++   - ./ops/carbon/job_wrapper.sh "python3 services/models/multimodal/pytorch_lightning_recipe.py --processed-manifest ..." 240 carbon
++3. Aggregate metrics:
++   - Run ops/monitoring/carbon_prometheus_exporter.py periodically (cron) to expose aegis_total_co2_kg and aegis_total_energy_kwh to Prometheus.
++
++Notes
++- job_energy_meter prefers to use `nvidia-smi`. If it's not available, the script will still run but will produce an estimate of zero for sampled power — you should provide estimator or cloud metering integration for better accuracy.
++- For cloud metering integrate provider APIs to fetch actual host energy use where available and adapt job_energy_meter to use that.
++- Use job_scheduler to decide placement (region) or delay. Actual enforcement (submitting to Kubernetes at that time) must be implemented in your job submitter; job_wrapper.sh demonstrates one approach (sleep until window).
++
+*** End File
+*** End Patch

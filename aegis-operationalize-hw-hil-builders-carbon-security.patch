@@ -1,0 +1,440 @@
+*** Begin Patch
+*** Add File:ops/validation/run_hw_validation_pipeline.py
++#!/usr/bin/env python3
++"""
++Run hardware validation pipeline
++ - Run RT sweeps for a set of targets, validate p99 & safe-stop SLOs, sign and upload proof bundles
++ - Emits remediation suggestions and records evidence via ops.sdk.evidence_sdk.record_manifest
++
++Usage:
++  python3 run_hw_validation_pipeline.py --targets "ecu1:can0,ecu2:can0" --out /tmp/hw_run --cosign kms://... --s3 s3://...
++"""
++import argparse, os, subprocess, json
++from datetime import datetime
++
++def run_target(target, outdir, cosign_key=None, s3=None):
++    os.makedirs(outdir, exist_ok=True)
++    env = os.environ.copy()
++    env["TARGETS"] = target
++    if cosign_key:
++        env["COSIGN_KMS_URI"] = cosign_key
++    if s3:
++        env["S3_UPLOAD"] = s3
++    cmd = ["./ops/av/rt/run_hw_rt_sweep.sh", outdir]
++    print("Running RT sweep:", target, "->", outdir)
++    try:
++        subprocess.check_call(cmd, env=env)
++    except subprocess.CalledProcessError as e:
++        print("RT sweep failed:", e)
++    proof = os.path.join(outdir, "rt_slo_proof.json")
++    return proof if os.path.exists(proof) else None
++
++def validate(proof_path, p99_thresh, safe_thresh):
++    if not proof_path or not os.path.exists(proof_path):
++        return False, ["proof_missing"]
++    with open(proof_path) as fh:
++        j = json.load(fh)
++    issues = []
++    p99 = j.get("p99_ms")
++    safe = j.get("safe_ms")
++    if p99 is None:
++        issues.append("p99_missing")
++    elif p99 > p99_thresh:
++        issues.append(f"p99_too_high:{p99}>{p99_thresh}")
++    if safe is None:
++        issues.append("safe_missing")
++    elif safe > safe_thresh:
++        issues.append(f"safe_too_high:{safe}>{safe_thresh}")
++    return len(issues)==0, issues
++
++def remediate(proof_path, out_remed):
++    try:
++        subprocess.check_call(["python3","ops/validation/rt_remediation_agent.py","--report",proof_path,"--out",out_remed])
++        return True
++    except Exception:
++        with open(out_remed,"w") as fh:
++            json.dump({"note":"remediation_agent_failed"}, fh)
++        return False
++
++def sign_and_upload(bundle, cosign_key=None, s3=None):
++    if cosign_key:
++        try:
++            subprocess.check_call(["cosign","sign","--key",cosign_key,bundle])
++        except Exception as e:
++            print("cosign sign failed (best-effort):", e)
++    if s3:
++        try:
++            subprocess.check_call(["aws","s3","cp",bundle,s3])
++        except Exception as e:
++            print("s3 upload failed (best-effort):", e)
++
++def record_manifest(key, meta):
++    try:
++        from ops.sdk.evidence_sdk import record_manifest
++        record_manifest(key, meta)
++    except Exception as e:
++        print("record_manifest failed (best-effort):", e)
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--targets", required=True, help="comma-separated host:iface entries")
++    p.add_argument("--out", default=f"/tmp/hw_validation_{int(datetime.utcnow().timestamp())}")
++    p.add_argument("--cosign", default=os.environ.get("COSIGN_KMS_URI",""))
++    p.add_argument("--s3", default=os.environ.get("S3_UPLOAD",""))
++    p.add_argument("--p99-threshold", type=float, default=0.5)
++    p.add_argument("--safe-threshold-ms", type=float, default=50.0)
++    args = p.parse_args()
++    os.makedirs(args.out, exist_ok=True)
++    targets = [t.strip() for t in args.targets.split(",") if t.strip()]
++    summary = {"started_at": datetime.utcnow().isoformat()+"Z", "results": []}
++    for t in targets:
++        tid = t.replace(":","_")
++        od = os.path.join(args.out, tid)
++        proof = run_target(t, od, cosign_key=args.cosign, s3=args.s3)
++        ok, issues = validate(proof, args.p99_threshold, args.safe_threshold_ms)
++        rem_out = os.path.join(od,"remediation.json")
++        if not ok:
++            remediate(proof or "", rem_out)
++        # package target artifacts
++        bundle = os.path.join(args.out, f"{tid}_proof_bundle.tar.gz")
++        try:
++            subprocess.check_call(["tar","-czf",bundle,"-C",od,"."])
++        except Exception:
++            pass
++        sign_and_upload(bundle, cosign_key=args.cosign, s3=(args.s3.rstrip("/") + f"/{os.path.basename(bundle)}" if args.s3 else None))
++        summary["results"].append({"target": t, "proof": proof, "ok": ok, "issues": issues, "bundle": bundle})
++        record_manifest("hw_proof_target", {"target": t, "bundle": bundle})
++    summary_path = os.path.join(args.out,"summary.json")
++    with open(summary_path,"w") as fh:
++        json.dump(summary, fh, indent=2)
++    record_manifest("hw_proof_summary", {"summary": summary_path})
++    print("Hardware validation finished. Summary:", summary_path)
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:ops/robotics/control/hil_formal_closure_runner.py
++#!/usr/bin/env python3
++"""
++HIL + formal closure runner
++ - Run exhaustive HIL campaigns, run Apalache triage, collect counterexamples, produce signed HIL cert bundles.
++ - Stops and requests operator triage if problems encountered.
++"""
++import argparse, os, subprocess, json
++from datetime import datetime
++
++def record_manifest_safe(k,m):
++    try:
++        from ops.sdk.evidence_sdk import record_manifest
++        record_manifest(k,m)
++    except Exception:
++        pass
++
++def run_campaign(scenarios_file, golden, outdir):
++    cmd = ["python3","ops/robotics/control/certified/hil_campaign_manager.py","--golden",golden,"--out",outdir]
++    with open(scenarios_file) as fh:
++        for l in fh:
++            s=l.strip()
++            if s:
++                cmd += ["--scenarios", s]
++    return subprocess.call(cmd)
++
++def run_apalache(outdir):
++    return subprocess.call(["./ops/formal/apalache_triage_runner.sh", outdir])
++
++def package_and_sign(outdir, cosign_key=None):
++    bundle = outdir.rstrip("/") + "_hil_cert_bundle.tar.gz"
++    subprocess.check_call(["tar","-czf",bundle,"-C",outdir,"."])
++    if cosign_key:
++        try:
++            subprocess.check_call(["cosign","sign","--key",cosign_key,bundle])
++        except Exception:
++            pass
++    return bundle
++
++if __name__=="__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--scenarios-file", required=True)
++    p.add_argument("--golden", required=True)
++    p.add_argument("--out", default=f"/tmp/hil_closure_{int(datetime.utcnow().timestamp())}")
++    p.add_argument("--cosign", default=os.environ.get("COSIGN_KMS_URI",""))
++    p.add_argument("--cert-upload", default="")
++    args = p.parse_args()
++    os.makedirs(args.out, exist_ok=True)
++    rc = run_campaign(args.scenarios_file, args.golden, args.out)
++    if rc != 0:
++        print("HIL campaign returned non-zero; operator triage needed.")
++        record_manifest_safe("hil_campaign_failed", {"out": args.out})
++        raise SystemExit(2)
++    ap_rc = run_apalache(args.out)
++    if ap_rc != 0:
++        print("Apalache reported issues; operator must triage counterexamples.")
++        record_manifest_safe("apalache_issues", {"out": args.out})
++        raise SystemExit(3)
++    bundle = package_and_sign(args.out, cosign_key=args.cosign)
++    record_manifest_safe("hil_cert_bundle", {"bundle": bundle})
++    if args.cert_upload:
++        try:
++            import requests
++            resp = requests.post(args.cert_upload, files={"file": open(bundle,"rb")}, timeout=120)
++            record_manifest_safe("certifier_upload", {"status": resp.status_code})
++        except Exception as e:
++            print("Certifier upload failed:", e)
++    print("HIL + formal closure complete. Bundle:", bundle)
++
+*** End File
+*** Add File:ops/ci/builders/builder_rollout_manager.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Builder rollout manager
++# - Bootstraps builder hardening on new hosts, verifies cosign & rekor tooling, enforces labeling and test-sign pipeline.
++# - Intended to be run by Infra Operator when onboarding builders.
++#
++# Usage:
++#   ./builder_rollout_manager.sh --hosts "builder1,builder2" --labels "role=builder,npu=true"
++
++HOSTS=${1:-}
++LABELS=${LABELS:-"role=builder"}
++if [ -z "$HOSTS" ]; then
++  echo "Usage: $0 --hosts builder1,builder2"
++  exit 1
++fi
++IFS=',' read -r -a hosts <<< "$HOSTS"
++
++for h in "${hosts[@]}"; do
++  echo "Onboarding builder: $h"
++  # best-effort: copy or run remote provisioning scripts (operator must ensure SSH access)
++  scp ops/infra/hardening/provision_and_label_runners.sh "$h":/tmp/
++  ssh "$h" "sudo bash /tmp/provision_and_label_runners.sh LABELS=\"$LABELS\""
++  # test cosign & rekor presence
++  ssh "$h" "which cosign || true; which rekor-cli || true"
++  # run builder smoke: build minimal artifact and sign (operator must supply builder CI script)
++  echo "Request builder to run smoke build and produce cosign+rekor evidence"
++done
++
++echo "Builder rollout completed (operator should verify each host with ops/infra/hardening/check_runner_hardening.sh)"
++
+*** End File
+*** Add File:ops/carbon/production_monitor_and_tune.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Run carbon monitor in production for observation window and produce suggested thresholds + override guidance.
++#
++# Usage:
++#   ./production_monitor_and_tune.sh --duration 1209600 --interval 300 --region US-CA --out /tmp/carbon_prod_tune.json
++
++DURATION=${DURATION:-1209600}
++INTERVAL=${INTERVAL:-300}
++REGION=${REGION:-"US-CA"}
++OUT=${OUT:-/tmp/carbon_prod_tune.json}
++
++echo "Starting carbon monitoring for $DURATION seconds (interval $INTERVAL) in region $REGION"
++python3 ops/carbon/monitor_tune.py --duration-s "$DURATION" --interval-s "$INTERVAL" --region "$REGION" --out "$OUT"
++echo "Tune report at $OUT"
++echo "To create an override artifact (Platform Owner):"
++echo "  python3 ops/carbon/override_signer.py --approval-id PROD-OVR-$(date +%s) --approved-by owner@example.com --scope '{\"manifests\":\"deploy.yaml\"}' --out /tmp/override.json"
++echo "  cosign verify /tmp/override.json"
++
+*** End File
+*** Add File:ops/ops_security/cloud_kms_integration.md
++# Cloud IAM / KMS Integration for COSIGN keys
++
++Purpose
++- Document recommended integration points to store and use COSIGN KMS keys securely and enforce key usage via cloud IAM.
++
++Recommendations
++- Use your cloud KMS (AWS KMS, GCP KMS, Azure Key Vault) to host signing keys and grant least-privilege access to runner/service accounts.
++- Use short-lived credentials for CI runs (OIDC), and bind KMS key usage to specific principals (Platform Owner / CI role).
++- Example: set COSIGN_KMS_URI=kms://projects/<proj>/locations/global/keyRings/<ring>/cryptoKeys/<key>
++- In GitHub Actions, prefer OIDC and not long lived secrets; use action identity to request temporary access to KMS when signing artifacts.
++- Log all cosign sign operations and record signed artifact metadata into Rekor; record manifest with ops.sdk.evidence_sdk for audit.
++
++Operational checklist
++- Ensure KMS key rotation policy is defined.
++- Audit who has Encrypt/Sign/Decrypt permissions in KMS.
++- Enable KMS activity logs and ship to central logging (Cloud Logging / Splunk / ELK).
++
+*** End File
+*** Add File:ops/ops_security/runner_hardening_checklist.md
++# Runner & Host Hardening Checklist
++
++Minimum host hardening items for builders & runners:
++- OS updates & minimal packages; disable unnecessary services.
++- Kernel tuning for realtime: PREEMPT_RT kernel where required.
++- CPU isolation and cgroups: reserve cores for RT tasks.
++- Network hardening: restrict SSH, proper firewall rules, isolate build network.
++- Install and verify cosign & rekor-cli are present and pinned to approved versions.
++- Centralized logging: send syslog/journald to remote logging endpoint.
++- Monitoring: node exporter, process exporter for RT processes.
++- Vulnerability scanning: run container and host scans on a schedule.
++- Access control: enforce MFA, restrict sudo to infra operators.
++
++Verification
++- ops/infra/hardening/check_runner_hardening.sh should pass.
++- Periodically run automated vulnerability_scan.sh and review alerts.
++
+*** End File
+*** Add File:ops/security/vulnerability_scan.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Lightweight vulnerability scan runner (best-effort)
++# - Runs container image scan (trivy) and basic host checks
++#
++IMG=${1:-}
++OUT=${2:-/tmp/vuln_scan_$(date +%s).json}
++
++if ! command -v trivy >/dev/null 2>&1; then
++  echo "trivy not installed; install trivy on host or CI runner"
++  exit 2
++fi
++
++if [ -n "$IMG" ]; then
++  echo "Scanning image: $IMG"
++  trivy image --format json -o "$OUT" "$IMG"
++else
++  echo "No image provided; scanning host (root filesystem) - best effort"
++  trivy filesystem --format json -o "$OUT" /
++fi
++
++echo "Vulnerability scan written to $OUT"
++python3 - <<PY
++from ops.sdk.evidence_sdk import record_manifest
++record_manifest("vuln_scan", {"path":"$OUT"})
++print("recorded vuln_scan manifest")
++PY
++
+*** End File
+*** Add File:ops/security/pen_test_stub.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Penetration test stub
++# - Placeholder that documents steps and runs simple checks (nmap, sslscan) for operator to extend
++#
++HOST=${1:-localhost}
++echo "Pen test stub: scanning host $HOST (operator must run full pentest)"
++if command -v nmap >/dev/null 2>&1; then
++  nmap -sS -Pn -p- "$HOST" -oN /tmp/pen_nmap_$HOST.txt || true
++  echo "nmap results: /tmp/pen_nmap_$HOST.txt"
++else
++  echo "nmap not installed: please install and re-run for deeper checks"
++fi
++echo "Record results to evidence and schedule full third-party pentest"
++
+*** End File
+*** Add File:.github/workflows/production_hardening_and_monitor.yml
++name: Production Hardening & Monitor
++on:
++  workflow_dispatch:
++    inputs:
++      targets:
++        required: true
++      manifests:
++        required: true
++      override_artifact:
++        required: false
++jobs:
++  hardware_validation:
++    runs-on: [self-hosted, linux, hardware]
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run hardware validation pipeline
++        env:
++          COSIGN_KMS_URI: ${{ secrets.COSIGN_KMS_URI }}
++          S3_UPLOAD: ${{ secrets.S3_UPLOAD }}
++        run: |
++          python3 ops/validation/run_hw_validation_pipeline.py --targets "${{ github.event.inputs.targets }}" --out /tmp/hw_run --cosign "${{ secrets.COSIGN_KMS_URI }}" --s3 "${{ secrets.S3_UPLOAD }}"
++
++  hil_and_formal:
++    runs-on: [self-hosted, linux, hardware]
++    needs: hardware_validation
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run HIL & Formal closure (operator triage required on failures)
++        env:
++          COSIGN_KMS_URI: ${{ secrets.COSIGN_KMS_URI }}
++          CERTIFIER_UPLOAD_URL: ${{ secrets.CERT_UPLOAD_URL }}
++        run: |
++          python3 ops/robotics/control/hil_formal_closure_runner.py --scenarios-file ops/av/certification/falcon_scenarios.txt --golden /opt/aegis/golden_trace.ndjson --out /tmp/hil_closure --cosign "${{ secrets.COSIGN_KMS_URI }}" --cert-upload "${{ secrets.CERT_UPLOAD_URL }}"
++
++  builder_enforce:
++    runs-on: [self-hosted, linux]
++    needs: hil_and_formal
++    steps:
++      - uses: actions/checkout@v4
++      - name: Ensure builders hardened & enforce provenance
++        env:
++          BUILDERS: ${{ secrets.BUILDERS_LIST }}
++          RUNNER_LABELS_FILE: /etc/aegis-runner-labels
++          IMAGE_MANIFESTS: ${{ github.event.inputs.manifests }}
++          REKOR_SERVER: ${{ secrets.REKOR_SERVER }}
++        run: |
++          python3 ops/ci/promotion_gate/ensure_builder_hardening.py
++          python3 ops/ci/promotion_gate/enforce_builder_provenance.py
++
++  carbon_tune:
++    runs-on: [self-hosted, linux]
++    needs: builder_enforce
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run carbon production monitor & tune (short-run)
++        env:
++          WATTTIME_API_KEY: ${{ secrets.WATTTIME_API_KEY }}
++        run: |
++          ./ops/carbon/production_monitor_and_tune.sh --duration 600 --interval 30 --region US-CA --out /tmp/carbon_prod_tune.json
++
++  security_checks:
++    runs-on: ubuntu-latest
++    needs: carbon_tune
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run vulnerability scan (best-effort)
++        run: |
++          IMAGE=${{ env.IMAGE_TO_SCAN || '' }}
++          python3 ops/security/vulnerability_scan.sh "$IMAGE" /tmp/vuln_scan.json || true
++      - name: Pen-test stub
++        run: |
++          bash ops/security/pen_test_stub.sh localhost || true
++
+*** End File
+*** Add File:ops/runbooks/top_operational_risks_and_mitigations.md
++# Top operational risks & mitigations
++
++Risk: Unvalidated timing on real topology
++- Likelihood: High until RT sweeps are run on representative hardware
++- Mitigation:
++  - Run ops/validation/run_hw_validation_pipeline.py across all ECU/bridge topologies
++  - Record signed rt_slo_proof bundles and keep them in S3
++  - Add p99 & safe_stop metrics to Prometheus/Grafana
++
++Risk: Blocking certification due to unresolved formal counterexamples or waveform mismatches
++- Mitigation:
++  - Run ops/robotics/control/hil_formal_closure_runner.py to drive HIL + Apalache closures
++  - Triage counterexamples as owner-assigned tasks; add failing scenarios to backlog and re-run
++  - Keep signed HIL bundles with waveform compare outputs for certifier
++
++Risk: Perception long-tail compute/time burden
++- Mitigation:
++  - Use scale_orchestrator.py and Argo to parallelize simulation packs
++  - Prioritize scenario families and incremental retraining
++  - Use spot/preemptible compute for large sim runs and keep evidence artifacts small (NDJSON references)
++
++Risk: CI gates ineffective if builders not hardened
++- Mitigation:
++  - Use builder_rollout_manager.sh and ops/ci/builders/auto_harden_builders.sh to onboard builders
++  - Enforce ops/ci/promotion_gate/enforce_builder_provenance.py in staging & production workflows
++
++Risk: Carbon enforcement false positives
++- Mitigation:
++  - Run production_monitor_and_tune.sh for observation window and set thresholds conservatively
++  - Document override workflow and require cosign-signed artifact from Platform Owner
++
++General ops/security mitigations
++- Integrate KMS & OIDC for signing; centralize logs; run vulnerability scans and third-party penetration tests; rotate keys.
++
+*** End File
+*** End Patch

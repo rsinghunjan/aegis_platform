@@ -1,0 +1,444 @@
+*** Begin Patch
+*** Add File:ops/carbon/README.md
++Carbon awareness components for Aegis
++
++This folder implements:
++- Carbon intensity ingestion (WattTime + cloud provider placeholders)
++- Prometheus exporter for grid carbon intensity
++- Per-job emissions estimator that logs to MLflow and records evidence manifests
++- Simple carbon-aware scheduler daemon that queues heavy jobs and submits when carbon intensity is low
++- Grafana dashboard JSON and CI workflow to generate periodic carbon reports
++
++See README_INTEGRATION.md for deployment and integration steps.
++
+*** End File
+*** Add File:ops/carbon/README_INTEGRATION.md
++Integration & quickstart
++
++1) Prometheus exporter:
++   - Deploy ops/carbon/deployment/carbon-exporter-deployment.yaml to your cluster (or run exporter locally).
++   - Ensure Prometheus scrapes exporter on configured port (default 9810).
++
++2) WattTime API:
++   - Set WATTTIME_API_KEY env var for exporter or local fetch scripts.
++   - If unavailable, exporter can fall back to cloud provider estimated intensities or static values.
++
++3) Per-job emissions:
++   - Invoke ops/carbon/job_emissions.py from training/inference wrappers to estimate and log energy & CO2e to MLflow.
++   - Example: python3 ops/carbon/job_emissions.py --run-id <mlflow_run_id> --duration-sec 3600 --avg-power-w 250
++
++4) Carbon-aware scheduler:
++   - Run carbon_scheduler.py on a control host or as a pod (with RBAC & kubeconfig).
++   - Submit job manifests with ops/carbon/cli_submit.py which places manifests into scheduler queue.
++   - Scheduler will wait for intensity below threshold before kubectl apply.
++
++5) Dashboards & reporting:
++   - Import ops/carbon/grafana/carbon_dashboard.json to Grafana.
++   - Schedule .github/workflows/carbon_report.yml or run locally to aggregate and store carbon reports in MLflow.
++
+*** End File
+*** Add File:ops/carbon/watttime_client.py
++#!/usr/bin/env python3
++"""
++Simple WattTime client to fetch grid carbon intensity (gCO2eq/kWh).
++Requires WATTTIME_API_KEY env var. If not present, returns None.
++"""
++import os
++import requests
++from datetime import datetime, timezone
++
++WATTTIME_BASE = "https://api.watttime.org/v2"
++
++def get_latest_intensity(grid="US-CA", api_key=None):
++    api_key = api_key or os.environ.get("WATTTIME_API_KEY")
++    if not api_key:
++        return None
++    headers = {"Authorization": f"Bearer {api_key}"}
++    # Example endpoint: /data?zone=WECC&start=...
++    # Use best-effort query to get recent point
++    try:
++        r = requests.get(f"{WATTTIME_BASE}/latest?zone={grid}", headers=headers, timeout=10)
++        r.raise_for_status()
++        j = r.json()
++        # Response may contain 'data': {'carbon_intensity': ...} or similar - best-effort parse
++        val = None
++        if "data" in j and isinstance(j["data"], dict):
++            # WattTime v2 might include 'carbon_intensity' or 'carbon' field
++            val = j["data"].get("carbon_intensity") or j["data"].get("carbon")
++        # fallback structure
++        if val is None and "carbonIntensity" in j:
++            val = j["carbonIntensity"]
++        if val is None:
++            return None
++        return float(val)
++    except Exception:
++        return None
++
++if __name__=="__main__":
++    print(get_latest_intensity())
++
+*** End File
+*** Add File:ops/carbon/cloud_carbon_client.py
++#!/usr/bin/env python3
++"""
++Placeholder cloud carbon API clients.
++Implement provider-specific APIs (AWS, GCP) to fetch estimated carbon intensity for selected regions/instance types.
++Currently returns None (no-op).
++"""
++def aws_carbon_estimate(region):
++    # TODO: integrate with AWS Customer Carbon Footprint or billing/energy metrics if available
++    return None
++
++def gcp_carbon_estimate(region):
++    # TODO: integrate with GCP Carbon Footprint APIs
++    return None
++
+*** End File
+*** Add File:ops/carbon/exporter.py
++#!/usr/bin/env python3
++"""
++Prometheus exporter exposing current carbon intensity metric (gCO2eq per kWh).
++Exports:
++ - aegis_carbon_intensity_gco2_per_kwh{region="..."} gauge
++ - aegis_carbon_source{source="watttime|cloud|static"} info
++"""
++from prometheus_client import start_http_server, Gauge, Info
++import time, os
++from ops.carbon.watttime_client import get_latest_intensity
++from ops.carbon.cloud_carbon_client import aws_carbon_estimate, gcp_carbon_estimate
++
++INT_GAUGE = Gauge("aegis_carbon_intensity_gco2_per_kwh", "Grid carbon intensity (gCO2eq/kWh)", ["region"])
++SRC_INFO = Info("aegis_carbon_source", "Source of carbon intensity")
++
++def fetch_and_export(region="US-CA", interval=60):
++    while True:
++        val = None
++        source = "none"
++        # try WattTime
++        wt = get_latest_intensity(grid=region)
++        if wt is not None:
++            val = wt
++            source = "watttime"
++        else:
++            # try cloud APIs
++            c = aws_carbon_estimate(region) or gcp_carbon_estimate(region)
++            if c is not None:
++                val = c
++                source = "cloud"
++        # fallback to static if none available
++        if val is None:
++            val = float(os.environ.get("Aegis_CARBON_STATIC", "400.0"))
++            source = "static"
++        INT_GAUGE.labels(region=region).set(val)
++        SRC_INFO.info({"source": source})
++        time.sleep(interval)
++
++if __name__=="__main__":
++    REGION = os.environ.get("Aegis_CARBON_REGION", "US-CA")
++    PORT = int(os.environ.get("Aegis_CARBON_EXPORTER_PORT", "9810"))
++    start_http_server(PORT)
++    print("Starting carbon exporter on port", PORT, "region", REGION)
++    fetch_and_export(REGION, interval=int(os.environ.get("Aegis_CARBON_FETCH_INTERVAL", "60")))
++
+*** End File
+*** Add File:ops/carbon/job_emissions.py
++#!/usr/bin/env python3
++"""
++Estimate energy and CO2e for a job and log to MLflow and evidence SDK.
++
++Estimation model:
++ - energy_kwh = (avg_power_watt * duration_seconds) / 3600
++ - co2e_g = energy_kwh * carbon_intensity_g_per_kwh
++
++If carbon intensity is unavailable, use static default or WattTime via watttime_client.
++"""
++import os, argparse, json
++from ops.carbon.watttime_client import get_latest_intensity
++from ops.sdk.evidence_sdk import record_manifest
++try:
++    import mlflow
++except Exception:
++    mlflow = None
++
++def estimate_and_log(run_id=None, duration_s=0.0, avg_power_w=0.0, region="US-CA", mlflow_uri=None):
++    intensity = get_latest_intensity(region=region) or float(os.environ.get("Aegis_CARBON_STATIC", "400.0"))
++    energy_kwh = (avg_power_w * duration_s) / 3600.0
++    co2e_g = energy_kwh * intensity
++    payload = {
++        "run_id": run_id,
++        "duration_s": duration_s,
++        "avg_power_w": avg_power_w,
++        "energy_kwh": energy_kwh,
++        "co2e_g": co2e_g,
++        "carbon_intensity_g_per_kwh": intensity,
++    }
++    # record to MLflow if run_id provided
++    if mlflow and mlflow_uri:
++        mlflow.set_tracking_uri(mlflow_uri)
++        with mlflow.start_run(run_id=run_id) if run_id else mlflow.start_run():
++            mlflow.log_metric("energy_kwh", energy_kwh)
++            mlflow.log_metric("co2e_g", co2e_g)
++            mlflow.log_param("avg_power_w", avg_power_w)
++            mlflow.log_param("duration_s", duration_s)
++    # record evidence manifest
++    try:
++        record_manifest("job_emissions", payload)
++    except Exception:
++        pass
++    return payload
++
++if __name__=="__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--run-id", default=None)
++    p.add_argument("--duration-sec", type=float, required=True)
++    p.add_argument("--avg-power-w", type=float, required=True)
++    p.add_argument("--region", default="US-CA")
++    p.add_argument("--mlflow-uri", default=os.environ.get("MLFLOW_TRACKING_URI"))
++    args = p.parse_args()
++    res = estimate_and_log(args.run_id, args.duration_sec, args.avg_power_w, args.region, args.mlflow_uri)
++    print(json.dumps(res, indent=2))
++
+*** End File
+*** Add File:ops/carbon/carbon_scheduler.py
++#!/usr/bin/env python3
++"""
++Simple carbon-aware scheduler daemon.
++
++Behavior:
++ - Maintain a queue directory of job manifests (YAML).
++ - Periodically check grid carbon intensity using exporter/client.
++ - When intensity <= threshold, dequeue and apply job manifest via kubectl.
++
++This is intentionally simple and avoids in-cluster admission webhooks. Run as a controller pod or external daemon with kubeconfig.
++"""
++import os, time, subprocess, yaml
++from pathlib import Path
++from ops.carbon.watttime_client import get_latest_intensity
++
++QUEUE_DIR = Path(os.environ.get("CARBON_QUEUE_DIR","/var/lib/aegis/carbon_queue"))
++THRESHOLD = float(os.environ.get("Aegis_CARBON_THRESHOLD_GCO2_PER_KWH", "250.0"))
++REGION = os.environ.get("Aegis_CARBON_REGION","US-CA")
++POLL_INTERVAL = int(os.environ.get("Aegis_CARBON_SCHED_POLL", "30"))
++
++def ensure_queue():
++    QUEUE_DIR.mkdir(parents=True, exist_ok=True)
++
++def enqueue(manifest_path):
++    ensure_queue()
++    dest = QUEUE_DIR / (Path(manifest_path).name)
++    Path(manifest_path).replace(dest)
++    print("Enqueued", dest)
++
++def dequeue_and_submit(path: Path):
++    print("Submitting job", path)
++    try:
++        subprocess.check_call(["kubectl","apply","-f", str(path)])
++        path.unlink()
++        return True
++    except Exception as e:
++        print("Failed to submit:", e)
++        return False
++
++def run_loop():
++    ensure_queue()
++    while True:
++        intensity = get_latest_intensity(REGION)
++        if intensity is None:
++            print("No intensity available; skipping")
++        else:
++            print("Current intensity:", intensity, "gCO2/kWh (threshold", THRESHOLD, ")")
++            if intensity <= THRESHOLD:
++                # submit up to N jobs
++                for p in sorted(QUEUE_DIR.glob("*.yaml")):
++                    dequeue_and_submit(p)
++            else:
++                print("Intensity above threshold; deferring queued jobs")
++        time.sleep(POLL_INTERVAL)
++
++if __name__=="__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--queue-dir", default=str(QUEUE_DIR))
++    args = p.parse_args()
++    QUEUE_DIR = Path(args.queue_dir)
++    run_loop()
++
+*** End File
+*** Add File:ops/carbon/cli_submit.py
++#!/usr/bin/env python3
++"""
++CLI helper to submit a job manifest into the carbon scheduler queue.
++Usage:
++  ./ops/carbon/cli_submit.py my_heavy_job.yaml
++"""
++import sys, shutil
++from pathlib import Path
++from ops.carbon.carbon_scheduler import enqueue, QUEUE_DIR
++
++if __name__=="__main__":
++    if len(sys.argv) < 2:
++        print("Usage: cli_submit.py <manifest.yaml>")
++        sys.exit(2)
++    src = Path(sys.argv[1])
++    if not src.exists():
++        print("Manifest not found:", src)
++        sys.exit(2)
++    ensure = QUEUE_DIR
++    ensure.mkdir(parents=True, exist_ok=True)
++    dest = ensure / src.name
++    shutil.copy2(src, dest)
++    print("Queued manifest at", dest)
++
+*** End File
+*** Add File:ops/carbon/deployment/carbon-exporter-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-carbon-exporter
++  namespace: aegis
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-carbon-exporter
++  template:
++    metadata:
++      labels:
++        app: aegis-carbon-exporter
++    spec:
++      containers:
++        - name: carbon-exporter
++          image: REGISTRY_PLACEHOLDER/aegis/carbon-exporter:latest
++          env:
++            - name: Aegis_CARBON_REGION
++              value: "US-CA"
++            - name: WATTTIME_API_KEY
++              valueFrom:
++                secretKeyRef:
++                  name: watttime-secret
++                  key: api_key
++          ports:
++            - containerPort: 9810
++              name: metrics
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: aegis-carbon-exporter
++  namespace: aegis
++spec:
++  selector:
++    app: aegis-carbon-exporter
++  ports:
++    - port: 9810
++      targetPort: metrics
++      name: http-metrics
++
+*** End File
+*** Add File:ops/carbon/grafana/carbon_dashboard.json
++{
++  "dashboard": {
++    "id": null,
++    "uid": null,
++    "title": "Aegis Carbon Overview",
++    "panels": [
++      {
++        "type": "graph",
++        "title": "Grid Carbon Intensity (gCO2/kWh)",
++        "targets": [
++          {
++            "expr": "aegis_carbon_intensity_gco2_per_kwh",
++            "legendFormat": "{{region}}"
++          }
++        ],
++        "id": 1
++      },
++      {
++        "type": "graph",
++        "title": "Estimated CO2e per Hour (sample jobs)",
++        "targets": [
++          {
++            "expr": "sum(rate(job_energy_kwh_total[1h]))",
++            "legendFormat": "jobs"
++          }
++        ],
++        "id": 2
++      }
++    ],
++    "schemaVersion": 16
++  }
++}
++
+*** End File
+*** Add File:ops/carbon/examples/heavy_job.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: heavy-train-job
++  labels:
++    aegis/carbon_aware: "true"
++spec:
++  template:
++    spec:
++      containers:
++        - name: trainer
++          image: REGISTRY_PLACEHOLDER/aegis/trainer:latest
++          args: ["--epochs", "10"]
++          resources:
++            limits:
++              cpu: "8"
++              memory: "32Gi"
++      restartPolicy: Never
++
+*** End File
+*** Add File:ops/ci/carbon/estimate_and_log.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Helper to estimate emissions for a job after completion.
++# Usage: estimate_and_log.sh --run-id <mlflow_run> --duration-sec 3600 --avg-power-w 400
++#
++while [[ $# -gt 0 ]]; do
++  case $1 in
++    --run-id) RUN_ID=$2; shift 2;;
++    --duration-sec) DURATION=$2; shift 2;;
++    --avg-power-w) POWER=$2; shift 2;;
++    --mlflow-uri) MLFLOW=$2; shift 2;;
++    *) shift;;
++  esac
++done
++
++python3 ops/carbon/job_emissions.py --run-id "${RUN_ID:-}" --duration-sec "${DURATION:-0}" --avg-power-w "${POWER:-0}" --mlflow-uri "${MLFLOW:-}"
++
+*** End File
+*** Add File:.github/workflows/carbon_report.yml
++name: Carbon Report (daily)
++on:
++  schedule:
++    - cron: '0 6 * * *'  # UTC daily at 06:00
++  workflow_dispatch:
++jobs:
++  report:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Fetch carbon timeseries and create MLflow run
++        run: |
++          python3 - <<PY
++import requests, json, os, time
++from ops.carbon.watttime_client import get_latest_intensity
++from ops.sdk.evidence_sdk import record_manifest
++try:
++    import mlflow
++    mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI","http://mlflow:5000"))
++    with mlflow.start_run(run_name="daily_carbon_report") as r:
++        val = get_latest_intensity() or float(os.environ.get("Aegis_CARBON_STATIC","400.0"))
++        mlflow.log_metric("carbon_current_gco2_per_kwh", float(val))
++        mlflow.log_param("report_time", time.time())
++        record_manifest("daily_carbon_report", {"value": val})
++except Exception as e:
++    print("Failed to log to MLflow:", e)
++PY
++
+*** End File
+*** End Patch

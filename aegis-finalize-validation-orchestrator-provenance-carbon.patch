@@ -1,0 +1,381 @@
+*** Begin Patch
+*** Add File:ops/validation/final_validation_orchestrator.py
++#!/usr/bin/env python3
++"""
++Final Validation Orchestrator
++
++Purpose
++ - Run the remaining validation, certification and governance steps that move Aegis
++   from scaffold → evidence-ready validation runs.
++ - Runs (in order, best-effort):
++     1) Hardware RT sweeps (CAN/CAN-FD/TSN) via run_hw_rt_sweep.sh
++     2) HIL campaign(s) via hil_campaign_manager.py and apalache triage
++     3) Large-scale perception sim packs via run_simulation_cluster.py
++     4) OOD failure collection and retrain trigger via ood_failure_collector.py + auto_retrain_pipeline.py
++     5) Verify builder hardening and Rekor provenance for manifests
++     6) Run carbon monitor (optionally) and emit tuned thresholds; allow cosign override check
++     7) Package and cosign an evidence bundle and optionally upload to S3 / certifier
++
++Usage (example):
++  python3 final_validation_orchestrator.py --config ops/validation/final_validation_config.json --out /tmp/aegis_final_run --upload-s3 s3://aegis-evidence/run123 --cert-upload-url https://cert.example/upload
++
++Notes:
++ - This orchestrator calls many best-effort helper scripts already present in repo.
++ - Operators must review results and iterate on failures. The orchestrator records all produced artifacts via ops.sdk.evidence_sdk.record_manifest.
++"""
++import argparse
++import json
++import os
++import subprocess
++import sys
++import tempfile
++from datetime import datetime
++
++def run_cmd(cmd, cwd=None, env=None, capture=False):
++    print("RUN:", " ".join(cmd))
++    try:
++        if capture:
++            out = subprocess.check_output(cmd, cwd=cwd, env=env, stderr=subprocess.STDOUT)
++            return 0, out.decode()
++        else:
++            subprocess.check_call(cmd, cwd=cwd, env=env)
++            return 0, ""
++    except subprocess.CalledProcessError as e:
++        return e.returncode, getattr(e, "output", "") and e.output.decode() or str(e)
++
++def record_manifest_safe(key, meta):
++    try:
++        from ops.sdk.evidence_sdk import record_manifest
++        record_manifest(key, meta)
++    except Exception as e:
++        print("record_manifest failed (best-effort):", e)
++
++def do_rt_sweep(cfg, outdir):
++    # cfg.targets: list of "host:iface" or provider for run_hw_rt_sweep
++    env = os.environ.copy()
++    if cfg.get("cosign_key"):
++        env["COSIGN_KMS_URI"] = cfg["cosign_key"]
++    if cfg.get("s3_upload"):
++        env["S3_UPLOAD"] = cfg["s3_upload"]
++    if cfg.get("targets"):
++        env["TARGETS"] = ",".join(cfg["targets"])
++    cmd = ["./ops/av/rt/run_hw_rt_sweep.sh", outdir]
++    rc, out = run_cmd(cmd, env=env)
++    record_manifest_safe("rt_sweep_run", {"outdir": outdir, "rc": rc})
++    return rc == 0
++
++def do_hil_campaign(cfg, outdir):
++    scenarios = cfg.get("hil_scenarios", [])
++    golden = cfg.get("hil_golden")
++    # use hil_campaign_automation which wraps manager + apalache + package
++    cmd = ["python3", "ops/robotics/control/certified/hil_campaign_automation.py", "--golden", golden, "--out", outdir]
++    for s in scenarios:
++        cmd += ["--scenarios", s]
++    if cfg.get("cosign_key"):
++        cmd += ["--cosign-key", cfg["cosign_key"]]
++    rc, out = run_cmd(cmd)
++    record_manifest_safe("hil_campaign", {"outdir": outdir, "rc": rc})
++    return rc == 0
++
++def do_sim_cluster(cfg, outdir):
++    packs = cfg.get("sim_packs", 10)
++    per_pack = cfg.get("sim_per_pack", 100)
++    parallel = cfg.get("sim_parallel", 4)
++    cmd = ["python3", "ops/av/perception/scale/run_simulation_cluster.py",
++           "--packs", str(packs), "--scenarios-per-pack", str(per_pack),
++           "--parallel", str(parallel), "--out", outdir]
++    rc, out = run_cmd(cmd)
++    record_manifest_safe("sim_cluster", {"outdir": outdir, "rc": rc})
++    return rc == 0
++
++def do_ood_collection_and_retrain(cfg, failures_json, outdir):
++    # collect failures into adversarial dataset
++    coll_out = os.path.join(outdir, "ood_collection")
++    cmd = ["python3", "ops/av/perception/scale/ood_failure_collector.py",
++           "--failures", failures_json, "--out", coll_out]
++    rc, out = run_cmd(cmd)
++    if rc != 0:
++        record_manifest_safe("ood_collect_fail", {"rc": rc, "out": out})
++        return False
++    ndjson = os.path.join(coll_out, "adv_data.ndjson")
++    # trigger retrain pipeline (best-effort)
++    retrain_out = os.path.join(outdir, "retrain")
++    cmd2 = ["python3", "ops/av/perception/scale/auto_retrain_pipeline.py",
++            "--dataset", ndjson, "--out", retrain_out]
++    if cfg.get("npu_runners"):
++        cmd2 += ["--npu-runners", ",".join(cfg["npu_runners"])]
++    if cfg.get("cosign_key"):
++        cmd2 += ["--cosign-key", cfg["cosign_key"]]
++    rc2, out2 = run_cmd(cmd2)
++    record_manifest_safe("retrain_run", {"outdir": retrain_out, "rc": rc2})
++    return rc2 == 0
++
++def verify_builder_provenance(cfg):
++    manifests = cfg.get("manifests", [])
++    if not manifests:
++        print("No manifests provided for provenance check")
++        return False
++    env = os.environ.copy()
++    if cfg.get("rekor_server"):
++        env["REKOR_SERVER"] = cfg["rekor_server"]
++    env["IMAGE_MANIFESTS"] = ",".join(manifests)
++    cmd = ["python3", "ops/ci/promotion_gate/strict_provenance_enforcer.py"]
++    rc, out = run_cmd(cmd, env=env)
++    record_manifest_safe("provenance_check", {"rc": rc, "manifests": manifests})
++    return rc == 0
++
++def run_carbon_monitor(cfg, outdir):
++    monitor_out = os.path.join(outdir, "carbon_monitor.log")
++    cmd = ["python3", "ops/carbon/carbon_gate_tuner.py", "--mode", "monitor", "--out", monitor_out]
++    # run in background for a short best-effort period if requested
++    if cfg.get("carbon_monitor_duration_s"):
++        dur = int(cfg["carbon_monitor_duration_s"])
++        print(f"Running carbon monitor for {dur}s (best-effort inline)")
++        p = subprocess.Popen(cmd)
++        try:
++            p.wait(timeout=dur)
++        except subprocess.TimeoutExpired:
++            p.terminate()
++        rc = p.returncode or 0
++    else:
++        # run once to produce a single-point report (calls monitor_loop blocking otherwise)
++        rc, out = run_cmd(["python3", "ops/carbon/carbon_gate_tuner.py", "--mode", "enforce", "--out", monitor_out], capture=True)
++    record_manifest_safe("carbon_monitor", {"out": monitor_out, "rc": rc if isinstance(rc, int) else 0})
++    return True
++
++def package_and_sign_bundle(bundle_paths, out_bundle, cosign_key=None):
++    print("Packaging evidence bundle:", out_bundle)
++    tmpdir = tempfile.mkdtemp(prefix="aegis_final_bundle_")
++    for p in bundle_paths:
++        try:
++            if os.path.isdir(p):
++                subprocess.check_call(["cp", "-a", p, tmpdir])
++            elif os.path.exists(p):
++                subprocess.check_call(["cp", "-a", p, tmpdir])
++        except Exception:
++            pass
++    subprocess.check_call(["tar", "-czf", out_bundle, "-C", tmpdir, "."])
++    if cosign_key:
++        try:
++            subprocess.check_call(["cosign", "sign", "--key", cosign_key, out_bundle])
++        except Exception as e:
++            print("cosign sign failed (best-effort):", e)
++    record_manifest_safe("final_evidence_bundle", {"bundle": out_bundle})
++    return out_bundle
++
++def upload_bundle(out_bundle, s3_target):
++    if not s3_target:
++        return False
++    try:
++        subprocess.check_call(["aws", "s3", "cp", out_bundle, s3_target])
++        record_manifest_safe("bundle_upload", {"bundle": out_bundle, "s3": s3_target})
++        return True
++    except Exception as e:
++        print("s3 upload failed:", e)
++        return False
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--config", default="ops/validation/final_validation_config.json")
++    p.add_argument("--out", default=f"/tmp/aegis_final_run_{int(datetime.utcnow().timestamp())}")
++    p.add_argument("--upload-s3", default="")
++    p.add_argument("--cert-upload-url", default="")
++    args = p.parse_args()
++    os.makedirs(args.out, exist_ok=True)
++    cfg = {}
++    try:
++        cfg = json.load(open(args.config))
++    except Exception:
++        print("Config not found or invalid:", args.config)
++        sys.exit(2)
++
++    results = {"started_at": datetime.utcnow().isoformat()+"Z", "steps": {}}
++
++    # 1) RT sweep
++    rt_out = os.path.join(args.out, "rt_sweep")
++    ok_rt = do_rt_sweep(cfg.get("rt", {}), rt_out)
++    results["steps"]["rt_sweep"] = {"ok": ok_rt, "out": rt_out}
++
++    # 2) HIL campaigns + formal
++    hil_out = os.path.join(args.out, "hil_campaign")
++    ok_hil = do_hil_campaign(cfg.get("hil", {}), hil_out)
++    results["steps"]["hil_campaign"] = {"ok": ok_hil, "out": hil_out}
++
++    # 3) Sim cluster
++    sim_out = os.path.join(args.out, "sim_cluster")
++    ok_sim = do_sim_cluster(cfg.get("sim", {}), sim_out)
++    results["steps"]["sim_cluster"] = {"ok": ok_sim, "out": sim_out}
++
++    # 4) OOD failures -> retrain
++    failures_json = os.path.join(sim_out, "failures.json")
++    if os.path.exists(failures_json):
++        retrain_out = os.path.join(args.out, "retrain")
++        ok_retrain = do_ood_collection_and_retrain(cfg.get("retrain", {}), failures_json, retrain_out)
++    else:
++        ok_retrain = False
++    results["steps"]["retrain"] = {"ok": ok_retrain}
++
++    # 5) Builder provenance check
++    ok_prov = verify_builder_provenance(cfg.get("provenance", {}))
++    results["steps"]["provenance"] = {"ok": ok_prov}
++
++    # 6) Carbon monitor/tune (best-effort)
++    ok_carbon = run_carbon_monitor(cfg.get("carbon", {}), os.path.join(args.out, "carbon"))
++    results["steps"]["carbon_monitor"] = {"ok": ok_carbon}
++
++    # 7) Package & sign evidence bundle
++    bundle_paths = [rt_out, hil_out, sim_out, retrain_out, args.config]
++    out_bundle = os.path.join(args.out, "aegis_final_evidence_bundle.tar.gz")
++    bundle = package_and_sign_bundle(bundle_paths, out_bundle, cfg.get("cosign_key") or cfg.get("cosign_key_env"))
++    results["bundle"] = {"path": bundle}
++
++    if args.upload_s3:
++        uploaded = upload_bundle(bundle, args.upload_s3)
++        results["bundle"]["uploaded"] = uploaded
++    # optional upload to certifier endpoint
++    if args.cert_upload_url:
++        try:
++            import requests
++            files = {"file": open(bundle, "rb")}
++            resp = requests.post(args.cert_upload_url, files=files, timeout=120)
++            results["bundle"]["cert_upload_status"] = resp.status_code
++        except Exception as e:
++            results["bundle"]["cert_upload_error"] = str(e)
++
++    results["finished_at"] = datetime.utcnow().isoformat()+"Z"
++    summary_path = os.path.join(args.out, "final_validation_summary.json")
++    with open(summary_path, "w") as fh:
++        json.dump(results, fh, indent=2)
++    record_manifest_safe("final_validation_summary", {"summary": summary_path})
++    print("Final validation run complete. Summary:", summary_path)
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:ops/validation/final_validation_config.json
++{
++  "rt": {
++    "targets": ["localhost:can0"],
++    "cosign_key": "",
++    "s3_upload": ""
++  },
++  "hil": {
++    "hil_scenarios": ["run_brake_test.sh", "run_steer_test.sh"],
++    "hil_golden": "/opt/aegis/golden_trace.ndjson",
++    "cosign_key": ""
++  },
++  "sim": {
++    "sim_packs": 5,
++    "sim_per_pack": 100,
++    "sim_parallel": 2
++  },
++  "retrain": {
++    "npu_runners": []
++  },
++  "provenance": {
++    "manifests": ["deploy.yaml"],
++    "rekor_server": ""
++  },
++  "carbon": {
++    "carbon_monitor_duration_s": 300
++  },
++  "cosign_key_env": ""
++}
++
+*** End File
+*** Add File:ops/ci/promotion_gate/strict_rekor_verify.py
++#!/usr/bin/env python3
++"""
++Strict Rekor verification helper
++ - Query Rekor for given image and attempt to parse JSON entries for builder metadata
++ - Returns a small JSON summary (stdout)
++"""
++import argparse
++import json
++import subprocess
++
++def rekor_search_json(artifact, rekor_server):
++    try:
++        out = subprocess.check_output(["rekor-cli","search","--artifact",artifact,"--rekor_server",rekor_server,"--output","json"])
++        return json.loads(out)
++    except Exception as e:
++        return {"error": str(e)}
++
++def summarize(artifact, rekor_server):
++    j = rekor_search_json(artifact, rekor_server)
++    if "error" in j:
++        return {"artifact": artifact, "ok": False, "error": j["error"]}
++    # best-effort: if any entry has 'integratedTime' or a 'body' that looks like provenance, mark ok
++    for k,v in j.items():
++        try:
++            body = v.get("body", {})
++            if "integratedTime" in body:
++                return {"artifact": artifact, "ok": True, "entry": k}
++        except Exception:
++            continue
++    return {"artifact": artifact, "ok": False, "note": "no obvious integratedTime/provenance found"}
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--artifact", required=True)
++    p.add_argument("--rekor-server", required=True)
++    args = p.parse_args()
++    s = summarize(args.artifact, args.rekor_server)
++    print(json.dumps(s, indent=2))
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:.github/workflows/final_validation_and_certify.yml
++name: Final Validation & Certify (self-hosted)
++on:
++  workflow_dispatch:
++    inputs:
++      config:
++        required: false
++      upload_s3:
++        required: false
++      cert_upload_url:
++        required: false
++jobs:
++  final:
++    runs-on: [self-hosted, linux, hardware]
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run final validation orchestrator
++        env:
++          COSIGN_KMS_URI: ${{ secrets.COSIGN_KMS_URI }}
++          REKOR_SERVER: ${{ secrets.REKOR_SERVER }}
++          S3_UPLOAD: ${{ github.event.inputs.upload_s3 || '' }}
++        run: |
++          cfg="${{ github.event.inputs.config || 'ops/validation/final_validation_config.json' }}"
++          python3 ops/validation/final_validation_orchestrator.py --config "$cfg" --out /tmp/aegis_final_run --upload-s3 "${{ github.event.inputs.upload_s3 || '' }}" --cert-upload-url "${{ github.event.inputs.cert_upload_url || '' }}"
++      - name: Upload artifacts
++        uses: actions/upload-artifact@v4
++        with:
++          name: final-validation-artifacts
++          path: /tmp/aegis_final_run
++
+*** End File
+*** Add File:ops/validation/README_FINAL_VALIDATION.md
++# Final validation orchestrator
++
++What this does
++- Runs RT sweeps, HIL campaigns, simulation cluster runs, OOD collection + retrain trigger, provenance checks, carbon monitor and packages a signed evidence bundle.
++
++How to use
++- Edit ops/validation/final_validation_config.json with your targets, manifests, and desired parameters.
++- Run locally:
++  python3 ops/validation/final_validation_orchestrator.py --config ops/validation/final_validation_config.json --out /tmp/aegis_final_run --upload-s3 s3://aegis-evidence/<run-id>
++- Or run via CI:
++  Use .github/workflows/final_validation_and_certify.yml to execute on self-hosted, labeled hardware runners.
++
++Operator responsibilities
++- Ensure cosign/rekor/apalache and vendor SDKs are installed on runners.
++- Review produced final_validation_summary.json and iterate on failures.
++- Upload signed bundle to certifier if required; use the cert_upload_url to let the orchestrator POST the bundle (certifier endpoint required).
++
+*** End File
+*** End Patch

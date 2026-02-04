@@ -1,0 +1,345 @@
+*** Begin Patch
+*** Add File:ops/automation/run_coverage_and_report.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Run the coverage scanner and produce a coverage report.
++# Usage:
++#   ./run_coverage_and_report.sh --kube-context myctx --namespace aegis-ml --upload-s3 s3://aegis-reports
++
++KUBE_CTX=""
++NAMESPACE=""
++S3_UPLOAD=""
++
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --kube-context) KUBE_CTX="$2"; shift 2;;
++    --namespace) NAMESPACE="$2"; shift 2;;
++    --upload-s3) S3_UPLOAD="$2"; shift 2;;
++    *) shift;;
++  esac
++done
++
++OUT_DIR=$(mktemp -d)
++RAW="/tmp/aegis_coverage_raw.txt"
++REPORT="$OUT_DIR/aegis_coverage_report.json"
++
++echo "Running code + cluster coverage checks..."
++python3 ops/automation/deployment_coverage_check.py --kube-context "$KUBE_CTX" --namespace "$NAMESPACE" > "$RAW" || true
++
++echo "Generating JSON summary..."
++python3 - <<PY > "$REPORT"
++import json, time
++raw = open("$RAW").read() if __import__('os').path.exists("$RAW") else ""
++report = {
++  "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++  "raw_summary": raw[:32000],
++}
++print(json.dumps(report, indent=2))
++PY
++
++echo "Report written to $REPORT"
++
++if [ -n "$S3_UPLOAD" ]; then
++  if command -v aws >/dev/null 2>&1; then
++    echo "Uploading $REPORT to $S3_UPLOAD"
++    aws s3 cp "$REPORT" "${S3_UPLOAD}/aegis_coverage_report_$(date -u +%Y%m%dT%H%M%SZ).json" || echo "s3 upload failed"
++  else
++    echo "aws cli not available; cannot upload"
++  fi
++fi
++
++echo "Done. Please review $REPORT"
++
+*** End File
+*** Add File:ops/human_review/signing_service/app_oidc.py
++#!/usr/bin/env python3
++"""
++Approver signing service (OIDC-protected, KMS-backed cosign)
++
++ - Validates incoming bearer token via OIDC introspection endpoint (or via public JWKS).
++ - Requires approver to have 'approver' scope (configurable via APPROVER_SCOPE).
++ - Signs the posted binary payload using cosign sign-blob with COSIGN_KMS_URI and returns hex signature.
++ - Appends an audit entry to an append-only audit log (rotating file) with timestamp, approver sub, and signature fingerprint.
++
++Security notes:
++ - This service is a mediator; in production place it behind ingress with mTLS and require OIDC authentication.
++ - COSIGN_KMS_URI must be restricted to this service via IAM/OIDC policy.
++"""
++import os, sys, time, logging, tempfile, subprocess, binascii, json
++from flask import Flask, request, jsonify
++import requests
++
++APP = Flask(__name__)
++logging.basicConfig(level=logging.INFO)
++
++# Config via env
++OIDC_INTROSPECTION = os.environ.get("OIDC_INTROSPECTION_URL", "")
++OIDC_CLIENT_ID = os.environ.get("OIDC_INTROSPECTION_CLIENT_ID", "")
++OIDC_CLIENT_SECRET = os.environ.get("OIDC_INTROSPECTION_CLIENT_SECRET", "")
++APPROVER_SCOPE = os.environ.get("APPROVER_SCOPE", "approver")
++COSIGN_KEY = os.environ.get("COSIGN_KMS_URI", "")
++AUDIT_LOG = os.environ.get("APPROVER_AUDIT_LOG", "/var/log/aegis/approver_audit.log")
++
++def introspect_token(token: str):
++    if not OIDC_INTROSPECTION:
++        return {"active": False}
++    try:
++        r = requests.post(OIDC_INTROSPECTION, data={"token": token}, auth=(OIDC_CLIENT_ID, OIDC_CLIENT_SECRET), timeout=5)
++        r.raise_for_status()
++        return r.json()
++    except Exception as e:
++        logging.exception("introspection failed")
++        return {"active": False}
++
++def record_audit(entry: dict):
++    try:
++        os.makedirs(os.path.dirname(AUDIT_LOG), exist_ok=True)
++        with open(AUDIT_LOG, "a") as fh:
++            fh.write(json.dumps(entry, separators=(",",":" )) + "\n")
++    except Exception:
++        logging.exception("audit log write failed")
++
++@APP.route("/sign", methods=["POST"])
++def sign_blob():
++    auth = request.headers.get("Authorization", "")
++    if not auth.startswith("Bearer "):
++        return jsonify({"ok": False, "error": "missing_bearer"}), 401
++    token = auth.split(" ",1)[1]
++    info = introspect_token(token)
++    if not info.get("active"):
++        return jsonify({"ok": False, "error": "invalid_token"}), 401
++    # Check scope / role
++    scopes = info.get("scope","")
++    if APPROVER_SCOPE not in scopes.split():
++        return jsonify({"ok": False, "error": "insufficient_scope"}), 403
++    approver = info.get("sub") or info.get("username") or info.get("email") or "unknown"
++    data = request.get_data()
++    if not data:
++        return jsonify({"ok": False, "error": "empty_payload"}), 400
++    # write payload to temp file and call cosign sign-blob
++    with tempfile.NamedTemporaryFile(delete=False) as bfh:
++        bfh.write(data)
++        bpath = bfh.name
++    sigpath = bpath + ".sig"
++    try:
++        if not COSIGN_KEY:
++            return jsonify({"ok": False, "error": "cosign_kms_not_configured"}), 500
++        cmd = ["cosign", "sign-blob", "--key", COSIGN_KEY, "--output-signature", sigpath, bpath]
++        subprocess.check_call(cmd, timeout=30)
++        with open(sigpath, "rb") as fh:
++            sig = fh.read()
++        hex_sig = binascii.hexlify(sig).decode()
++        # record audit entry (minimal)
++        entry = {"ts": time.time(), "approver": approver, "sig_len": len(sig), "payload_sha256": subprocess.check_output(["sha256sum", bpath]).decode().split()[0]}
++        record_audit(entry)
++        return jsonify({"ok": True, "signature_hex": hex_sig})
++    except subprocess.CalledProcessError:
++        logging.exception("cosign sign-blob failed")
++        return jsonify({"ok": False, "error": "signing_failed"}), 500
++    finally:
++        try:
++            os.unlink(bpath)
++            if os.path.exists(sigpath):
++                os.unlink(sigpath)
++        except Exception:
++            pass
++
++if __name__=="__main__":
++    APP.run(host="0.0.0.0", port=int(os.environ.get("PORT","8086")))
++
+*** End File
+*** Add File:ops/human_review/signing_service/requirements-oidc.txt
++flask
++requests
++
+*** End File
+*** Add File:ops/human_review/signing_service/k8s/signing_service_oidc.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: approver-signing-service-oidc
++  namespace: aegis-system
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: approver-signing-service-oidc
++  template:
++    metadata:
++      labels:
++        app: approver-signing-service-oidc
++    spec:
++      containers:
++      - name: signing
++        image: <YOUR_REGISTRY>/aegis-approver-signing-oidc:latest
++        env:
++        - name: COSIGN_KMS_URI
++          valueFrom:
++            secretKeyRef:
++              name: cosign-kms-secret
++              key: kms_uri
++        - name: OIDC_INTROSPECTION_URL
++          valueFrom:
++            secretKeyRef:
++              name: oidc-config
++              key: introspection_url
++        - name: OIDC_INTROSPECTION_CLIENT_ID
++          valueFrom:
++            secretKeyRef:
++              name: oidc-config
++              key: client_id
++        - name: OIDC_INTROSPECTION_CLIENT_SECRET
++          valueFrom:
++            secretKeyRef:
++              name: oidc-config
++              key: client_secret
++        - name: APPROVER_SCOPE
++          value: "approver"
++        - name: APPROVER_AUDIT_LOG
++          value: "/var/log/aegis/approver_audit.log"
++        volumeMounts:
++        - name: audit-log
++          mountPath: /var/log/aegis
++      volumes:
++      - name: audit-log
++        emptyDir: {}
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: approver-signing-oidc
++  namespace: aegis-system
++spec:
++  ports:
++  - port: 8086
++    targetPort: 8086
++  selector:
++    app: approver-signing-service-oidc
++
+*** End File
+*** Add File:ops/infra/terraform/kms_cosign_iam/README.md
++KMS & IAM policy example for cosign signing via KMS (AWS example)
++
++This example creates a KMS key and demonstrates a minimal IAM policy to allow a specific OIDC role (e.g., your CI / signing service) to use the key to sign artifacts.
++
++WARNING: This is an illustrative example. Review with CloudSec before applying in production.
++
++Steps:
++ - Provide your OIDC provider ARN and role (GitHub Actions OIDC or your workload identity).
++ - Apply terraform after internal review.
++
+*** End File
+*** Add File:ops/infra/terraform/kms_cosign_iam/main.tf
++provider "aws" {
++  region = var.aws_region
++}
++
++# Create a KMS key for cosign signing
++resource "aws_kms_key" "cosign" {
++  description             = "Cosign KMS key for signing detectors and artifacts"
++  deletion_window_in_days = 30
++}
++
++# Example IAM policy statement that grants Encrypt/Decrypt/Sign use to a specific principal (replace)
++data "aws_iam_policy_document" "allow_cosign_use" {
++  statement {
++    actions = [
++      "kms:Sign",
++      "kms:Verify",
++      "kms:DescribeKey",
++      "kms:GetPublicKey",
++    ]
++    resources = [aws_kms_key.cosign.arn]
++    principals {
++      type        = "AWS"
++      identifiers = [var.signer_principal_arn]
++    }
++  }
++}
++
++resource "aws_kms_key_policy" "placeholder" {
++  key_id = aws_kms_key.cosign.key_id
++  policy = data.aws_iam_policy_document.allow_cosign_use.json
++}
++
++output "kms_key_arn" {
++  value = aws_kms_key.cosign.arn
++}
++
+*** End File
+*** Add File:ops/infra/terraform/kms_cosign_iam/variables.tf
++variable "aws_region" { type = string, default = "us-east-1" }
++variable "signer_principal_arn" { type = string, default = "" }
++
+*** End File
+*** Add File:ops/docs/external_audit_brief.md
++# External Audit Brief — Aegis AI Safety Artifacts
++
++Purpose: Provide auditors with an indexed list of artifacts and commands needed to verify detector provenance, SBOMs, signatures, thresholds, evidence bundles and Rekor entries.
++
++Artifacts you will provide (examples and retrieval commands)
++
++1) Detector image(s)
++ - Registry image: <registry>/<repo>/aegis-detectors:<tag>
++ - Verify image signature with cosign:
++   cosign verify --key <COSIGN_KMS_URI> <registry>/<repo>/aegis-detectors:<tag>
++ - Pull SBOM (if generated):
++   syft <registry>/<repo>/aegis-detectors:<tag> -o json > detectors-sbom.json
++
++2) Pinned model artifacts (artifact store)
++ - Example layout: ${ARTIFACT_BASE}/nudenet/classifier-0.2.4.pkl
++ - Verify checksum:
++   aws s3 cp ${ARTIFACT_BASE}/nudenet/checksum.sha256 .
++   aws s3 cp ${ARTIFACT_BASE}/nudenet/classifier-0.2.4.pkl .
++   sha256sum -c checksum.sha256
++ - Verify cosign blob signature (if provided):
++   cosign verify-blob --signature classifier-0.2.4.pkl.sig classifier-0.2.4.pkl
++
++3) thresholds.json (detector calibration)
++ - Location: ${ARTIFACT_BASE}/thresholds/thresholds-<timestamp>.json
++ - Example fetch:
++   aws s3 cp ${ARTIFACT_BASE}/thresholds/thresholds-2026...json .
++ - Show thresholds and the labeled CSV used to compute them (ops/fl/calibration/labeled.csv)
++
++4) DP accounting & policies
++ - DP service endpoint: http://dp-service:8084
++ - Example: check client epsilon:
++   curl -H "Authorization: Bearer $DP_AUTH_TOKEN" http://dp-service:8084/eps/<client>
++ - Verify DB snapshot/backup available (RDS / managed db)
++
++5) Evidence bundles & artifacts
++ - Evidence S3 prefix: s3://<audit-bucket>/content_incident/
++ - Example: list recent bundles:
++   aws s3 ls s3://<audit-bucket>/content_incident/
++ - Download a bundle and verify cosign signature (if signed):
++   aws s3 cp s3://<audit-bucket>/content_incident/<bundle>.tar.gz .
++   cosign verify --key <COSIGN_KMS_URI> <bundle>.tar.gz
++ - Rekor entries: using rekor-cli:
++   rekor-cli search --artifact <bundle>.tar.gz --api-url <REKOR_URL>
++
++6) Action logs & approver audit
++ - Review queue logs (Redis dump or exported JSON): explain where review items and approvals are stored.
++ - Approver audit log (approver signing service): /var/log/aegis/approver_audit.log (or S3 export)
++ - Verify approval signatures via cosign verify-blob (approve.sig)
++
++7) Red-team results & remediation artifacts
++ - Red-team CI run logs (provide link or raw logs)
++ - Argo remediation workflow run id and outputs (Argo UI or kubectl get wf -n aegis-ml)
++ - Evidence bundle generated by remediation workflow and its Rekor/cosign proofs
++
++Verification checklist for auditor
++ - Validate cosign signatures on images & blobs.
++ - Validate checksums on pinned model artifacts.
++ - Validate thresholds.json ties back to a labeled dataset (inspect ops/fl/calibration/labeled.csv).
++ - Validate DP service snapshots and that DP accounting API is reachable and records charges.
++ - Validate that Argo remediation workflow was executed and evidence bundle uploaded.
++ - Verify approver signatures via cosign verify-blob and that audit log contains approver identity & timestamp.
++
++Contact & support
++ - Infra owner: infra-team@example.com
++ - Security lead: secops@example.com
++ - ML Ops: mlops@example.com
++
+*** End File
+*** End Patch

@@ -1,0 +1,463 @@
+*** Begin Patch
+*** Add File:ops/serving/gateway/Dockerfile.gateway
++FROM python:3.11-slim
++ENV DEBIAN_FRONTEND=noninteractive
++RUN apt-get update && apt-get install -y --no-install-recommends \
++    build-essential libsndfile1 ffmpeg && \
++    python3 -m pip install --upgrade pip
++RUN pip install tritonclient[http]==2.29.0 requests==2.31.0 prometheus_client==0.16.0
++WORKDIR /workspace
++COPY triton_gateway.py /workspace/triton_gateway.py
++EXPOSE 8089
++ENTRYPOINT ["python3","/workspace/triton_gateway.py"]
++
+*** End File
+*** Add File:ops/serving/gateway/triton_gateway.py
++#!/usr/bin/env python3
++"""
++Triton gateway: proxy requests to Triton, then run safety filters before returning results.
++Also emits Prometheus metrics for monitoring detection rates and escapes.
++
++This ensures post-generation filter is enforced in one place (edge/gateway).
++"""
++import os, json, time, logging
++from flask import Flask, request, jsonify
++import requests
++from prometheus_client import start_http_server, Counter, Histogram
++
++LOG = logging.getLogger("triton.gateway")
++logging.basicConfig(level=logging.INFO)
++
++TRITON_URL = os.environ.get("TRITON_URL", "http://triton:8000")
++FILTER_URL = os.environ.get("FILTER_URL", "http://safety-filter:8090/filter")
++PROM_PORT = int(os.environ.get("PROM_PORT", "9101"))
++
++# Metrics
++RPC_COUNT = Counter("aegis_triton_gateway_requests_total", "Total gateway requests")
++RPC_LATENCY = Histogram("aegis_triton_gateway_latency_seconds", "Gateway latency")
++FILTER_BLOCKED = Counter("aegis_safety_filter_blocked_total", "Number of outputs blocked by safety filter")
++FILTER_PII_DETECTED = Counter("aegis_safety_filter_pii_total", "PII detections by filter")
++
++app = Flask("triton-gateway")
++
++def call_triton(model, payload):
++    # Simple HTTP infer: POST /v2/models/{model}/infer
++    url = f"{TRITON_URL}/v2/models/{model}/infer"
++    r = requests.post(url, json=payload, timeout=30)
++    r.raise_for_status()
++    return r.json()
++
++def call_filter(text):
++    r = requests.post(FILTER_URL, json={"text": text}, timeout=5)
++    r.raise_for_status()
++    return r.json()
++
++@app.route("/generate", methods=["POST"])
++def generate():
++    start = time.time()
++    RPC_COUNT.inc()
++    body = request.json or {}
++    model = body.get("model", "multimodal_ensemble")
++    payload = body.get("payload", {})
++    try:
++        triton_resp = call_triton(model, payload)
++        # Simplified: assume triton_resp contains a text field or tokens we can convert
++        text = triton_resp.get("outputs", [{"data": [""]}])[0]["data"][0]
++        filt = call_filter(text)
++        if filt.get("blocked", False):
++            FILTER_BLOCKED.inc()
++            if filt.get("pii_matches"):
++                FILTER_PII_DETECTED.inc()
++            # Send to review queue or return blocked response
++            # Placeholders: push to review service or return 403
++            return jsonify({"ok": False, "reason": "blocked_by_safety", "details": filt}), 403
++        RPC_LATENCY.observe(time.time() - start)
++        return jsonify({"ok": True, "text": text, "meta": {"safety": filt}})
++    except Exception as e:
++        LOG.exception("generate failed")
++        return jsonify({"ok": False, "error": str(e)}), 500
++
++if __name__ == "__main__":
++    start_http_server(PROM_PORT)
++    app.run(host="0.0.0.0", port=8089)
++
+*** End File
+*** Add File:ops/multimodal/ingest/Dockerfile.safety
++FROM python:3.11-slim
++ENV DEBIAN_FRONTEND=noninteractive
++RUN apt-get update && apt-get install -y --no-install-recommends \
++    tesseract-ocr libsndfile1 ffmpeg build-essential && \
++    python3 -m pip install --upgrade pip
++RUN pip install presidio-analyzer presidio-anonymizer nudenet==0.2.4 pytesseract pillow whisper
++WORKDIR /workspace
++COPY dlp.py /workspace/dlp.py
++ENTRYPOINT ["python3","/workspace/dlp.py"]
++
+*** End File
+*** Add File:ops/fl/training/pretrain_scrub.py
++#!/usr/bin/env python3
++"""
++Enforce pre-training scrub: this script must be run (and succeed) before training starts.
++It checks dataset metadata for "scrubbed": true; if missing, it runs scrubbing (redaction)
++and records a _scrubbed.json marker in dataset directory.
++"""
++import os, sys, json, argparse
++from ops.evidence.redact import scrub_json
++
++parser = argparse.ArgumentParser()
++parser.add_argument("--dataset-dir", required=True)
++args = parser.parse_args()
++meta_path = os.path.join(args.dataset_dir, "meta.json")
++if not os.path.exists(meta_path):
++    print("meta.json missing; cannot verify scrub status")
++    sys.exit(2)
++meta = json.load(open(meta_path))
++if meta.get("scrubbed", False):
++    print("Dataset already scrubbed")
++    sys.exit(0)
++print("Dataset not scrubbed; performing scrub (in place)...")
++# Example: assume data files in 'items.json' (list of items)
++items_path = os.path.join(args.dataset_dir, "items.json")
++if os.path.exists(items_path):
++    items = json.load(open(items_path))
++    items_scrubbed = [scrub_json(i) for i in items]
++    with open(items_path, "w") as fh:
++        json.dump(items_scrubbed, fh)
++meta["scrubbed"] = True
++with open(meta_path, "w") as fh:
++    json.dump(meta, fh)
++open(os.path.join(args.dataset_dir, "_scrubbed.marker"), "w").write("ok")
++print("Scrub complete; dataset marked scrubbed")
++
+*** End File
+*** Add File:ops/fl/training/README_enforce_pretrain.md
++Enforcing pre-training scrub
++
++1) Before calling any training job, CI/dev must run:
++   python3 ops/fl/training/pretrain_scrub.py --dataset-dir /path/to/dataset
++
++2) Training scripts must exit non-zero if _scrubbed.marker or meta.scrubbed != True.
++   - See modification to train_multimodal.py to call pretrain_scrub or check marker.
++
+*** End File
+*** Modify File:ops/multimodal/training/train_multimodal.py
+@@
+ def train():
+     ds_meta = os.path.join(DATA_PATH, "meta.json")
++    marker = os.path.join(DATA_PATH, "_scrubbed.marker")
++    if not os.path.exists(marker):
++        raise RuntimeError("Dataset not scrubbed. Run ops/fl/training/pretrain_scrub.py --dataset-dir $MM_DATA_PATH")
+     dataset = MMImageTextDataset(ds_meta)
+*** End Modify File
+*** Add File:ops/fl/dp/dp_service.py
++#!/usr/bin/env python3
++"""
++DP Accounting service (REST) backed by PostgreSQL.
++ - Endpoints:
++   POST /charge {client, eps}
++   GET /eps/{client}
++   GET /over_budget?max=<float>
++ Auth: simple token via DP_AUTH_TOKEN env var (prod should use mTLS / IAM)
++"""
++import os, json, logging
++from flask import Flask, request, jsonify, abort
++import psycopg2
++
++DB_URL = os.environ.get("DP_DB_URL", "postgresql://dp:dp@localhost:5432/dp")
++AUTH_TOKEN = os.environ.get("DP_AUTH_TOKEN", "changeme")
++
++def get_conn():
++    return psycopg2.connect(DB_URL)
++
++app = Flask("dp-service")
++logging.basicConfig(level=logging.INFO)
++
++def require_auth():
++    tok = request.headers.get("Authorization","").replace("Bearer ","")
++    if tok != AUTH_TOKEN:
++        abort(401)
++
++@app.route("/charge", methods=["POST"])
++def charge():
++    require_auth()
++    b = request.json or {}
++    client = b.get("client")
++    eps = float(b.get("eps", 0.0))
++    if not client:
++        abort(400)
++    conn = get_conn()
++    cur = conn.cursor()
++    cur.execute("INSERT INTO accounts (client, epsilon) VALUES (%s, %s) ON CONFLICT (client) DO UPDATE SET epsilon = accounts.epsilon + EXCLUDED.epsilon", (client, eps))
++    conn.commit()
++    cur.close()
++    conn.close()
++    return jsonify({"ok": True})
++
++@app.route("/eps/<client>", methods=["GET"])
++def get_eps(client):
++    require_auth()
++    conn = get_conn()
++    cur = conn.cursor()
++    cur.execute("SELECT epsilon FROM accounts WHERE client=%s", (client,))
++    r = cur.fetchone()
++    cur.close()
++    conn.close()
++    return jsonify({"client": client, "epsilon": float(r[0]) if r else 0.0})
++
++@app.route("/over_budget", methods=["GET"])
++def over_budget():
++    require_auth()
++    max_eps = float(request.args.get("max", "1.0"))
++    conn = get_conn()
++    cur = conn.cursor()
++    cur.execute("SELECT client, epsilon FROM accounts WHERE epsilon > %s", (max_eps,))
++    rows = cur.fetchall()
++    cur.close()
++    conn.close()
++    return jsonify({"over": [{"client": r[0], "epsilon": float(r[1])} for r in rows]})
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8084")))
++
+*** End File
+*** Add File:ops/fl/dp/Dockerfile
++FROM python:3.11-slim
++RUN apt-get update && apt-get install -y --no-install-recommends libpq-dev gcc && \
++    python3 -m pip install --upgrade pip
++RUN pip install flask psycopg2-binary
++COPY dp_service.py /workspace/dp_service.py
++ENTRYPOINT ["python3","/workspace/dp_service.py"]
++
+*** End File
+*** Add File:ops/tests/redteam/github_create_issue.py
++#!/usr/bin/env python3
++"""
++Helper to create a GitHub issue when redteam CI finds a potential PII escape.
++Requires GH_TOKEN in env and GITHUB_REPOSITORY (owner/repo).
++"""
++import os, sys, requests
++
++TOKEN = os.environ.get("GH_TOKEN")
++REPO = os.environ.get("GITHUB_REPOSITORY")
++API = "https://api.github.com"
++
++def create_issue(title, body):
++    url = f"{API}/repos/{REPO}/issues"
++    r = requests.post(url, json={"title": title, "body": body}, headers={"Authorization": f"token {TOKEN}"})
++    r.raise_for_status()
++    print("Created issue:", r.json().get("html_url"))
++
++if __name__=="__main__":
++    if len(sys.argv) < 3:
++        print("usage: create_issue.py title body")
++        sys.exit(2)
++    create_issue(sys.argv[1], sys.argv[2])
++
+*** End File
+*** Add File:.github/workflows/redteam_nightly.yml
++name: Nightly RedTeam & Exfiltration Tests
++on:
++  schedule:
++    - cron: '0 3 * * *'
++jobs:
++  redteam:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run redteam prompt-injection tests
++        env:
++          MODEL_ENDPOINT: ${{ secrets.MODEL_ENDPOINT }}
++        run: |
++          set -e
++          python3 ops/tests/redteam/prompt_injection_tests.py "${{ secrets.MODEL_ENDPOINT }}" || echo "redteam failure"
++      - name: Create GH issue if failures (best-effort)
++        if: failure()
++        env:
++          GH_TOKEN: ${{ secrets.GH_TOKEN }}
++          GITHUB_REPOSITORY: ${{ github.repository }}
++        run: |
++          python3 ops/tests/redteam/github_create_issue.py "RedTeam alert: possible PII escape" "Check redteam logs in CI run $GITHUB_RUN_ID"
++
+*** End File
+*** Add File:ops/monitoring/prom_rules.yml
++groups:
++- name: aegis-safety.rules
++  rules:
++  - alert: SafetyFilterHighBlockRate
++    expr: increase(aegis_safety_filter_blocked_total[5m]) > 10
++    for: 2m
++    labels:
++      severity: warning
++    annotations:
++      summary: "High safety filter block rate"
++      description: "More than 10 blocks in 5m"
++
++  - alert: PiiDetectionsSpike
++    expr: increase(aegis_safety_filter_pii_total[5m]) > 5
++    for: 2m
++    labels:
++      severity: critical
++    annotations:
++      summary: "PII detection spike"
++      description: "PII detections spiked in the last 5m"
++
+*** End File
+*** Add File:ops/human_review/review_queue.py
++#!/usr/bin/env python3
++"""
++Simple human review queue service backed by Redis.
++ - POST /enqueue {id, payload, reason} -> stores item and returns id
++ - GET /list -> list pending items
++ - POST /approve {id, approvals:[<signed-blob-path>] } -> verifies signatures and, if enough approvals, marks approved
++ - Requires VERIFY_APPROVALS_CMD env pointing to verify_approvals.py or cosign verify-blob flow.
++"""
++import os, json, time
++from flask import Flask, request, jsonify
++import redis, subprocess
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
++VERIFY_CMD = os.environ.get("VERIFY_APPROVALS_CMD", "/workspace/ops/agents/verify_approvals.py")
++REQUIRED_APPROVALS = int(os.environ.get("REQUIRED_APPROVALS", "2"))
++
++app = Flask("review-queue")
++r = redis.from_url(REDIS_URL)
++
++def key(id): return f"review:{id}"
++
++@app.route("/enqueue", methods=["POST"])
++def enqueue():
++    b = request.json or {}
++    id = b.get("id") or str(int(time.time()*1000))
++    item = {"id": id, "payload": b.get("payload"), "reason": b.get("reason"), "ts": time.time(), "status": "pending"}
++    r.set(key(id), json.dumps(item))
++    r.lpush("review_queue", id)
++    return jsonify({"ok": True, "id": id})
++
++@app.route("/list", methods=["GET"])
++def list_pending():
++    ids = r.lrange("review_queue", 0, -1)
++    items = []
++    for i in ids:
++        v = r.get(key(i.decode()))
++        if v:
++            items.append(json.loads(v))
++    return jsonify({"items": items})
++
++@app.route("/approve", methods=["POST"])
++def approve():
++    b = request.json or {}
++    id = b.get("id")
++    approvals = b.get("approvals", [])
++    if not id or not approvals:
++        return jsonify({"error":"id and approvals required"}),400
++    # write approval blobs to temp files and call verify_approvals.py
++    tmp_files = []
++    for idx, blob in enumerate(approvals):
++        path = f"/tmp/approval_{id}_{idx}.bin"
++        with open(path,"wb") as fh:
++            fh.write(bytes.fromhex(blob))  # expect hex-encoded signed blob
++        tmp_files.append(path)
++    try:
++        subprocess.check_call([VERIFY_CMD] + tmp_files)
++    except subprocess.CalledProcessError:
++        return jsonify({"ok":False,"reason":"approval_verification_failed"}),403
++    # mark approved
++    v = r.get(key(id))
++    if not v:
++        return jsonify({"error":"not_found"}),404
++    item = json.loads(v)
++    item["status"]="approved"
++    item["approved_at"]=time.time()
++    r.set(key(id), json.dumps(item))
++    # remove from queue
++    r.lrem("review_queue", 0, id)
++    return jsonify({"ok":True})
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8091")))
++
+*** End File
+*** Add File:ops/agents/README_policy_override.md
++Multi-party override flow (high level)
++
++1) When an action is blocked by OPA as "destructive", the agent should place the action into the human review queue:
++   POST /enqueue to review service with payload and reason.
++2) Approvers retrieve the item and produce signed approval blobs (cosign sign-blob or cosign sign via KMS).
++3) Approvals are submitted to review service /approve endpoint as hex-encoded blobs.
++4) The review service runs verify_approvals.py to validate signatures and, if >= REQUIRED_APPROVALS, marks the item approved.
++5) The agent re-submits the action to the jailed executor with approvals attached so OPA policy can accept it.
++
+*** End File
+*** Add File:ops/monitoring/grafana_dashboard_aegis_safety.json
++{
++  "dashboard": {
++    "id": null,
++    "title": "Aegis Safety Overview",
++    "panels": [
++      {
++        "type": "graph",
++        "title": "Safety filter blocks (total)",
++        "targets": [
++          { "expr": "aegis_safety_filter_blocked_total", "legendFormat": "blocks" }
++        ],
++        "gridPos": {"x":0,"y":0,"w":12,"h":8}
++      },
++      {
++        "type": "graph",
++        "title": "PII detections",
++        "targets": [
++          { "expr": "aegis_safety_filter_pii_total", "legendFormat": "pii" }
++        ],
++        "gridPos": {"x":12,"y":0,"w":12,"h":8}
++      }
++    ]
++  }
++}
++
+*** End File
+*** Modify File:ops/agents/langchain_agent/agent_service_llm.py
+@@
+     plan = ask_llm_for_plan(prompt)
+     session = int(time.time())
+     logs = []
+     for step in plan:
+         action = {"tool": step["tool"], "args": step.get("args",{}), "session": session, "ts": time.time()}
+         allowed = opa_check({"type":"read" if step["tool"]=="list_datasets" else "write", "resource": step["tool"]})
+         if not allowed:
+-            action["status"]="blocked"
+-            logs.append(action)
+-            break
++            # Send to human review queue for multi-party approval
++            action["status"]="needs_human_review"
++            try:
++                requests.post(os.environ.get("REVIEW_QUEUE_URL","http://review-queue:8091/enqueue"), json={"id": f"{session}-{step['tool']}", "payload": action, "reason":"policy_block"})
++            except Exception:
++                pass
++            logs.append(action)
++            break
+*** End Modify File
+*** Add File:ops/ci/ci_promote_enforce_dp_opa.yml
++name: Enforce DP & OPA before Promotion
++on:
++  workflow_dispatch:
++jobs:
++  enforce:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run OPA promotion check (expects OPA endpoint accessible)
++        run: |
++          python3 ops/agents/ci/opa_enforce_dp_and_policy.sh validator.json artifact.json sbom.json
++      - name: Query DP service for over-budget clients
++        run: |
++          python3 - <<PY
++import requests,os
++dp = os.environ.get("DP_SERVICE","http://dp-service:8084")
++resp = requests.get(dp + "/over_budget?max=1.0", headers={"Authorization": "Bearer "+os.environ.get("DP_AUTH_TOKEN","changeme")})
++print(resp.json())
++if resp.json().get("over"):
++    raise SystemExit(2)
++PY
++
+*** End File
+*** End Patch

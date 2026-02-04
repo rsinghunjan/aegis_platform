@@ -1,0 +1,494 @@
+*** Begin Patch
+*** Add File:ops/carbon/README.md
++Carbon accounting & carbon-aware scheduling for Aegis
++
++This directory contains tooling to:
++- measure/estimate job energy (kWh) and convert to CO2e (kg)
++- query grid emission factors (ElectricityMap) with a static fallback
++- admission webhook to enforce per-project carbon budgets
++- a carbon-aware scheduler helper to pick lower-carbon regions/times
++- an auditor packager extension to include signed CO2e fields in PoA bundles
++- an autoscaler hook to recommend greener instance types
++
++All network APIs require secrets/API keys. Use environment variables:
++- ELECTRICITYMAP_API_KEY - ElectricityMap REST API key (optional)
++- REDIS_URL - budget + cache store (used by webhook)
++- COSIGN_KMS_URI / REKOR_SERVER - for signing auditor bundles
++
++Quick start:
++1. Deploy Redis and configure REDIS_URL.
++2. Add ElectricityMap API key or populate ops/carbon/convert/default_emissions.json.
++3. Hook job_carbon_exporter.py into training/PoA job post-run to record energy & CO2e.
++4. Deploy carbon_budget_webhook as an admission webhook (demo stub).
++5. Use carbon_audit_packager.py to include carbon fields in auditor bundles.
++
+*** End File
+*** Add File:ops/carbon/exporter/job_carbon_exporter.py
++#!/usr/bin/env python3
++"""
++Job carbon exporter
++ - Collects job metadata (start/end, instance type, region, gpu_hours)
++ - Optionally samples GPU power via nvidia-smi (if available) to compute energy_kWh
++ - Uses energy_to_co2.convert() to compute co2e_kg
++ - Emits a JSON artifact and optionally pushes Prometheus metrics to Pushgateway
++
++Usage (post-job):
++  python3 ops/carbon/exporter/job_carbon_exporter.py --job-id JOB123 --start 1670000000 --end 1670003000 --region us-west-2 --instance-type p4d.24xlarge --gpu-hours 4 --pushgateway http://pushgateway:9091
++"""
++import argparse, time, json, os, subprocess
++from datetime import datetime
++
++from ops.carbon.convert.energy_to_co2 import estimate_co2_for_job
++
++def sample_gpu_power(samples=5, interval_s=1):
++    """Try to sample GPU power via nvidia-smi. Returns avg Watts or None."""
++    powers = []
++    for _ in range(samples):
++        try:
++            out = subprocess.check_output(["nvidia-smi","--query-gpu=power.draw","--format=csv,noheader,nounits"], stderr=subprocess.DEVNULL)
++            val = float(out.decode().strip().splitlines()[0])
++            powers.append(val)
++        except Exception:
++            return None
++    return sum(powers)/len(powers) if powers else None
++
++def push_metric(pushgateway, job_id, metric, value):
++    try:
++        import requests
++        body = f"# TYPE {metric} gauge\n{metric}{{job_id=\"{job_id}\"}} {value}\n"
++        requests.post(f"{pushgateway}/metrics/job/aegis_carbon", data=body, timeout=5)
++    except Exception:
++        pass
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--job-id", required=True)
++    p.add_argument("--start", type=int, required=True)
++    p.add_argument("--end", type=int, required=True)
++    p.add_argument("--region", required=True)
++    p.add_argument("--instance-type", required=True)
++    p.add_argument("--gpu-hours", type=float, default=0.0)
++    p.add_argument("--pushgateway", default=os.environ.get("PUSHGATEWAY",""))
++    p.add_argument("--out", default=f"/tmp/carbon_job_{{}}.json")
++    args = p.parse_args()
++
++    runtime_hours = max(1e-6, (args.end - args.start) / 3600.0)
++
++    measured_power_w = sample_gpu_power()
++    # If measured_power_w available, use it. Else estimate from instance type + gpu_hours.
++    energy_kwh, co2e_kg, details = estimate_co2_for_job(
++        region=args.region,
++        instance_type=args.instance_type,
++        runtime_hours=runtime_hours,
++        gpu_hours=args.gpu_hours,
++        measured_power_w=measured_power_w
++    )
++
++    outpath = args.out.format(args.job_id)
++    payload = {
++        "job_id": args.job_id,
++        "start": args.start,
++        "end": args.end,
++        "runtime_hours": runtime_hours,
++        "instance_type": args.instance_type,
++        "region": args.region,
++        "gpu_hours": args.gpu_hours,
++        "measured_power_w": measured_power_w,
++        "energy_kwh": energy_kwh,
++        "co2e_kg": co2e_kg,
++        "details": details,
++        "generated_at": datetime.utcnow().isoformat() + "Z"
++    }
++    os.makedirs(os.path.dirname(outpath), exist_ok=True)
++    with open(outpath, "w") as fh:
++        json.dump(payload, fh, indent=2)
++    print("Wrote carbon artifact:", outpath)
++
++    if args.pushgateway:
++        push_metric(args.pushgateway, args.job_id, "aegis_job_energy_kwh", energy_kwh)
++        push_metric(args.pushgateway, args.job_id, "aegis_job_co2e_kg", co2e_kg)
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:ops/carbon/convert/energy_to_co2.py
++#!/usr/bin/env python3
++"""
++Energy to CO2 converter
++ - Primary: query ElectricityMap API for region/time emission factor (gCO2/kWh)
++ - Fallback: static JSON table (ops/carbon/convert/default_emissions.json)
++ - Estimate energy from measured power or instance typology
++"""
++import os, time, json, requests
++from datetime import datetime
++
++ELEC_API_KEY = os.environ.get("ELECTRICITYMAP_API_KEY","")
++FALLBACK = "ops/carbon/convert/default_emissions.json"
++PUE = float(os.environ.get("AEGIS_PUE", "1.2"))
++
++# Very small instance energy mapping (W avg) per-instance family (placeholder)
++INSTANCE_WATTS = {
++    "p4d.24xlarge": 2000 * 8,   # rough aggregated GPU card consumption
++    "a100": 400,                # per GPU nominal
++    "p4": 350,
++    "default": 300
++}
++
++def query_electricitymap(region, ts=None):
++    """Query ElectricityMap for average gCO2/kWh for the region at timestamp.
++    Returns grams CO2 per kWh or None.
++    """
++    if not ELEC_API_KEY:
++        return None
++    ts = ts or int(time.time())
++    # ElectricityMap API endpoint (example). Users must map their region code properly.
++    url = f"https://api.electricitymap.org/v3/carbon-intensity/history?zone={region}&start_at={int(ts)-3600}&end_at={int(ts)}"
++    headers = {"Accept": "application/json", "auth-token": ELEC_API_KEY}
++    try:
++        r = requests.get(url, headers=headers, timeout=5)
++        data = r.json()
++        # pick latest value
++        points = data.get("data", [])
++        if points:
++            return float(points[-1].get("carbonIntensity", 0.0))
++    except Exception:
++        return None
++    return None
++
++def fallback_emission_factor(region):
++    try:
++        j = json.load(open(FALLBACK))
++        return float(j.get(region, j.get("default", 400.0)))
++    except Exception:
++        return 400.0
++
++def estimate_energy_kwh(runtime_hours, measured_power_w=None, instance_type=None, gpu_hours=0.0):
++    """Estimate job energy in kWh.
++    - If measured_power_w provided, energy = measured_power_w * runtime_hours / 1000 * PUE
++    - Else estimate using instance_type avg watts * runtime_hours * PUE
++    """
++    if measured_power_w:
++        energy_kwh = (measured_power_w * runtime_hours) / 1000.0 * PUE
++        details = {"method":"measured_power"}
++        return energy_kwh, details
++    avg_w = INSTANCE_WATTS.get(instance_type, INSTANCE_WATTS["default"])
++    # crude estimate: average over number of GPUs implied by gpu_hours/runtime_hours
++    energy_kwh = (avg_w * runtime_hours) / 1000.0 * PUE
++    details = {"method":"instance_estimate","avg_w":avg_w}
++    return energy_kwh, details
++
++def energy_to_co2(energy_kwh, region, ts=None):
++    gf = query_electricitymap(region, ts)
++    if gf is None:
++        gf = fallback_emission_factor(region)
++    # gf is grams CO2 per kWh
++    co2e_kg = energy_kwh * gf / 1000.0
++    return co2e_kg, {"grid_gCO2_per_kWh": gf}
++
++def estimate_co2_for_job(region, instance_type, runtime_hours, gpu_hours=0.0, measured_power_w=None):
++    energy_kwh, e_det = estimate_energy_kwh(runtime_hours, measured_power_w=measured_power_w, instance_type=instance_type, gpu_hours=gpu_hours)
++    co2e_kg, cdet = energy_to_co2(energy_kwh, region)
++    details = {"energy_details": e_det, "co2_details": cdet}
++    return energy_kwh, co2e_kg, details
++
+*** End File
+*** Add File:ops/carbon/convert/default_emissions.json
++{
++  "us-west-2": 300,
++  "us-east-1": 350,
++  "eu-west-1": 230,
++  "ap-southeast-1": 600,
++  "default": 400
++}
++
+*** End File
+*** Add File:ops/carbon/webhook/carbon_budget_webhook.py
++#!/usr/bin/env python3
++"""
++Admission webhook (stub) that enforces per-namespace/project carbon budgets.
++ - Tracks budget consumption in Redis
++ - Estimates job CO2e using requested resources and an expected_duration annotation (hours)
++ - Rejects creation if budget would be exceeded
++
++This is a demo: in production deploy as TLS-enabled webhook and validate authenticity.
++"""
++import json, os, time
++from http.server import HTTPServer, BaseHTTPRequestHandler
++import redis
++from ops.carbon.convert.energy_to_co2 import estimate_co2_for_job
++
++REDIS_URL = os.environ.get("REDIS_URL","redis://redis:6379/0")
++r = redis.from_url(REDIS_URL)
++
++# budgets stored in Redis as "budget:{namespace}" -> float kgCO2 available
++DEFAULT_BUDGET_KG = float(os.environ.get("DEFAULT_CARBON_BUDGET_KG","100.0"))
++
++def get_budget(namespace):
++    v = r.get(f"budget:{namespace}")
++    if v is None:
++        r.set(f"budget:{namespace}", DEFAULT_BUDGET_KG)
++        return DEFAULT_BUDGET_KG
++    return float(v)
++
++def deduct_budget(namespace, kg):
++    # atomic decrement
++    key = f"budget:{namespace}"
++    pipe = r.pipeline()
++    pipe.get(key)
++    pipe.decrbyfloat(key, kg)
++    old, new = pipe.execute()
++    return float(new)
++
++class Handler(BaseHTTPRequestHandler):
++    def do_POST(self):
++        length = int(self.headers.get('Content-Length',0))
++        body = self.rfile.read(length)
++        req = json.loads(body)
++        # Expect admission review-like payload; simplified parsing:
++        namespace = req.get('request',{}).get('namespace','default')
++        obj = req.get('request',{}).get('object',{})
++        annotations = obj.get('metadata',{}).get('annotations',{})
++        expected_hours = float(annotations.get('aegis/expected_duration_hours', '1'))
++        region = annotations.get('aegis/region', 'us-west-2')
++        instance_type = obj.get('spec',{}).get('template',{}).get('spec',{}).get('containers',[{}])[0].get('resources',{}).get('limits',{}).get('nvidia.com/gpu', 0)
++        # coarse parse: instance_type annotation or fallback to default
++        instance_type_name = annotations.get('aegis/instance_type','p4d.24xlarge')
++        # estimate co2 for job
++        energy_kwh, co2e_kg, details = estimate_co2_for_job(region=region, instance_type=instance_type_name, runtime_hours=expected_hours, gpu_hours=float(instance_type))
++        budget = get_budget(namespace)
++        allowed = True
++        message = ""
++        if co2e_kg > budget:
++            allowed = False
++            message = f"budget_exceeded: required_kg={co2e_kg:.2f} budget_kg={budget:.2f}"
++        else:
++            # deduct
++            new_budget = deduct_budget(namespace, co2e_kg)
++            message = f"accepted: co2e_kg={co2e_kg:.2f}, remaining_budget={new_budget:.2f}"
++
++        resp = {"response":{"allowed": allowed, "status": {"message": message}}}
++        self.send_response(200)
++        self.end_headers()
++        self.wfile.write(json.dumps(resp).encode())
++
++if __name__=="__main__":
++    HTTPServer(('0.0.0.0', 8443), Handler).serve_forever()
++
+*** End File
+*** Add File:ops/carbon/scheduler/carbon_aware_scheduler.py
++#!/usr/bin/env python3
++"""
++Very small carbon-aware scheduler helper.
++Given a job manifest and candidate regions, picks the region with lowest current carbon intensity,
++then emits a Kubernetes job manifest with nodeSelector region=<chosen>.
++
++This is a helper - integrate into your batch submission pipeline or Argo workflows.
++"""
++import os, json, requests, time
++from ops.carbon.convert.energy_to_co2 import query_electricitymap, fallback_emission_factor
++
++def pick_region(candidate_regions):
++    best = None
++    best_val = float("inf")
++    for r in candidate_regions:
++        v = query_electricitymap(r)
++        if v is None:
++            v = fallback_emission_factor(r)
++        if v < best_val:
++            best_val = v
++            best = (r, v)
++    return best
++
++def inject_node_selector(job_manifest, region):
++    # job_manifest is a dict representing a Kubernetes Job
++    spec = job_manifest.setdefault("spec", {}).setdefault("template", {}).setdefault("spec", {})
++    spec.setdefault("nodeSelector", {})["region"] = region
++    return job_manifest
++
++if __name__=="__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--job-json", required=True)
++    p.add_argument("--candidates", required=True, help="comma separated region codes")
++    p.add_argument("--out", default="/tmp/carbon_job_manifest.json")
++    args = p.parse_args()
++    job = json.load(open(args.job_json))
++    candidates = args.candidates.split(",")
++    chosen, val = pick_region(candidates)
++    print("Chosen region:", chosen, "with gCO2/kWh:", val)
++    newjob = inject_node_selector(job, chosen)
++    with open(args.out, "w") as fh:
++        json.dump(newjob, fh, indent=2)
++    print("Wrote job manifest with nodeSelector to", args.out)
++
+*** End File
+*** Add File:ops/carbon/audit/carbon_audit_packager.py
++#!/usr/bin/env python3
++"""
++Extend auditor package to include carbon accounting artifacts and sign bundle.
++Produces manifest including CO2e totals for included job artifacts.
++"""
++import argparse, json, os, tarfile, tempfile, subprocess
++from datetime import datetime
++
++def build_bundle(artifacts, outpath, cosign_key=None, s3=None):
++    tmp = tempfile.mkdtemp()
++    manifest = {"generated_at": datetime.utcnow().isoformat()+"Z", "files": [], "total_co2e_kg": 0.0}
++    total = 0.0
++    for f in artifacts:
++        base = os.path.basename(f)
++        subprocess.check_call(["cp", f, tmp])
++        manifest["files"].append({"name": base, "path": f})
++        # try to read co2e from artifact if present
++        try:
++            j = json.load(open(f))
++            c = float(j.get("co2e_kg", 0.0))
++            total += c
++        except Exception:
++            pass
++    manifest["total_co2e_kg"] = total
++    mpath = os.path.join(tmp, "carbon_manifest.json")
++    with open(mpath, "w") as fh:
++        json.dump(manifest, fh, indent=2)
++    with tarfile.open(outpath, "w:gz") as tar:
++        tar.add(tmp, arcname="audit")
++    if cosign_key:
++        try:
++            subprocess.check_call(["cosign","sign","--key",cosign_key,outpath])
++        except Exception as e:
++            print("cosign signing failed:", e)
++    if s3:
++        try:
++            subprocess.check_call(["aws","s3","cp", outpath, os.path.join(s3, os.path.basename(outpath))])
++        except Exception as e:
++            print("s3 upload failed:", e)
++    return outpath
++
++if __name__=="__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--artifacts", required=True, help="comma-separated list of artifact paths (job carbon jsons)")
++    p.add_argument("--out", required=True)
++    p.add_argument("--cosign-key", default=os.environ.get("COSIGN_KMS_URI",""))
++    p.add_argument("--s3", default=os.environ.get("S3_UPLOAD",""))
++    args = p.parse_args()
++    arts = args.artifacts.split(",")
++    out = build_bundle(arts, args.out, cosign_key=args.cosign_key, s3=args.s3)
++    print("Wrote carbon auditor bundle:", out)
++
+*** End File
+*** Add File:ops/carbon/autoscaler/carbon_aware_autoscaler.py
++#!/usr/bin/env python3
++"""
++Autoscaler hook that scores instance types by estimated carbon per useful work.
++ - Input: candidate instance types, region, estimated job profile (gpu_hours)
++ - Output: ranking and suggested instance type
++This is a heuristic demonstration: in production integrate with cloud APIs and real energy benchmarks.
++"""
++import math
++from ops.carbon.convert.energy_to_co2 import fallback_emission_factor
++
++# sample efficiency metric: useful-work-per-watt baseline (higher is better)
++INSTANCE_EFFICIENCY = {
++    "p4d.24xlarge": 1.0,
++    "p3.16xlarge": 0.7,
++    "g4dn.xlarge": 0.2,
++    "default": 0.5
++}
++
++def score_instance(instance_type, region, runtime_hours, gpu_hours):
++    ef = fallback_emission_factor(region) / 1000.0  # kgCO2 per kWh -> tCO2? keep kg
++    # approximate watts
++    watts = 300 * (gpu_hours / max(1.0, runtime_hours)) if gpu_hours>0 else 300
++    energy_kwh = watts * runtime_hours / 1000.0
++    co2e = energy_kwh * ef * 1000.0  # kg
++    eff = INSTANCE_EFFICIENCY.get(instance_type, INSTANCE_EFFICIENCY["default"])
++    # score = co2e / eff (lower is better)
++    return co2e / eff
++
++def rank_instances(candidates, region, runtime_hours, gpu_hours):
++    scored = [(i, score_instance(i, region, runtime_hours, gpu_hours)) for i in candidates]
++    scored.sort(key=lambda x: x[1])
++    return scored
++
++if __name__=="__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--candidates", required=True, help="comma-separated instance types")
++    p.add_argument("--region", default="us-west-2")
++    p.add_argument("--runtime-hours", type=float, default=1.0)
++    p.add_argument("--gpu-hours", type=float, default=1.0)
++    args = p.parse_args()
++    candidates = args.candidates.split(",")
++    ranked = rank_instances(candidates, args.region, args.runtime_hours, args.gpu_hours)
++    for inst, score in ranked:
++        print(inst, score)
++
+*** End File
+*** Add File:ops/monitoring/grafana/carbon_dashboard.json
++{
++  "annotations": { "list": [] },
++  "editable": true,
++  "panels": [
++    {
++      "datasource": "Prometheus",
++      "title": "CO2e per Job (kg)",
++      "type": "timeseries",
++      "targets": [{ "expr": "aegis_job_co2e_kg", "refId": "A" }]
++    },
++    {
++      "datasource": "Prometheus",
++      "title": "Energy per Job (kWh)",
++      "type": "timeseries",
++      "targets": [{ "expr": "aegis_job_energy_kwh", "refId": "B" }]
++    },
++    {
++      "datasource": "Prometheus",
++      "title": "Cumulative CO2e (7d)",
++      "type": "timeseries",
++      "targets": [{ "expr": "sum_over_time(aegis_job_co2e_kg[7d])", "refId": "C" }]
++    }
++  ],
++  "schemaVersion": 32,
++  "title": "Aegis Carbon Dashboard",
++  "uid": "aegis-carbon-dashboard"
++}
++
+*** End File
+*** Add File:docs/runbooks/carbon_accounting_runbook.md
++# Carbon accounting runbook (Aegis)
++
++Prereqs:
++- REDIS_URL set for budget webhook
++- ELECTRICITYMAP_API_KEY set (optional) or default_emissions.json populated
++- PUSHGATEWAY configured for metrics ingestion (optional)
++- COSIGN_KMS_URI and S3_UPLOAD for signed audit bundles
++
++1) Instrument jobs to write carbon artifact
++ - After training/PoA jobs finish, call:
++   python3 ops/carbon/exporter/job_carbon_exporter.py --job-id JOB123 --start 1670000000 --end 1670003000 --region us-west-2 --instance-type p4d.24xlarge --gpu-hours 4 --pushgateway http://pushgateway:9091
++
++2) Create auditor carbon bundle
++ - Example:
++   python3 ops/carbon/audit/carbon_audit_packager.py --artifacts /tmp/carbon_job_JOB123.json --out /tmp/carbon_audit_JOB123.tar.gz --cosign-key "$COSIGN_KMS_URI" --s3 "$S3_UPLOAD"
++
++3) Deploy carbon budget webhook (demo)
++ - Run on a small host:
++   python3 ops/carbon/webhook/carbon_budget_webhook.py
++ - Configure K8s AdmissionWebhook to call it (TLS and auth required in prod)
++ - Set budgets in Redis: redis-cli SET budget:my-namespace 500.0
++
++4) Use carbon_aware_scheduler for batch submissions
++ - Example:
++   python3 ops/carbon/scheduler/carbon_aware_scheduler.py --job-json job.json --candidates us-west-2,us-east-1 --out job_region.json
++
++5) Autoscaler recommendation
++ - Test:
++   python3 ops/carbon/autoscaler/carbon_aware_autoscaler.py --candidates p4d.24xlarge,p3.16xlarge --region us-west-2 --runtime-hours 2 --gpu-hours 4
++
++6) Dashboards
++ - Import ops/monitoring/grafana/carbon_dashboard.json into Grafana
++ - Add alerts based on aegis_job_co2e_kg and cumulative budgets
++
+*** End File
+*** End Patch

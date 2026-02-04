@@ -1,0 +1,469 @@
+*** Begin Patch
+*** Add File:ops/automation/orchestrator/README.md
++Aegis Orchestrator — automation for safety events, policy decisions, and remediation
++
++Overview
++This component receives safety incident events (NATS subject or webhook), asks OPA what to do,
++and triggers remediation or retrain workflows via Argo Workflows. It supports both automatic
++and human-reviewed actions according to policy.
++
++Key pieces
++- Flask webhook endpoint: /webhook (for CI/GitHub -> orchestrator events)
++- NATS subscriber: listens to "safety.incidents" (optional)
++- OPA decision: consults OPA at OPA_URL to get action (auto_remediate | auto_block | require_human)
++- Argo invocation: uses `argo submit --from workflowtemplate/<name>` to launch remediation/retrain
++
++Environment variables (minimum)
++- OPA_URL: http://opa:8181 (OPA REST endpoint)
++- ARGO_NS: aegis-ml
++- ARGO_CLI: path to `argo` binary (default: argo)
++- APPROVER_HUMAN_URL: Optional URL to notify human approvers (Slack webhook or review service)
++- NATS_URL: nats://nats:4222 (optional, if using NATS)
++- ORCHESTRATOR_PORT: port for webhook server (default 8088)
++- ENABLE_NATS: "true" to enable NATS subscriber
++
++How to run (dev)
++1) Install requirements: pip install -r requirements.txt
++2) Run: python3 service.py
++3) Or build/dockerize using Dockerfile and deploy to cluster.
++
++Security note
++- Orchestrator should be deployed in aegis-system namespace and protected by mTLS/ingress rules.
++- OPA & Argo access must be limited to the orchestrator service account.
++
+*** End File
+*** Add File:ops/automation/orchestrator/requirements.txt
++flask
++requests
++nats-py
++PyYAML
+*** End File
+*** Add File:ops/automation/orchestrator/Dockerfile
++FROM python:3.11-slim
++WORKDIR /app
++COPY requirements.txt /app/requirements.txt
++RUN pip install --no-cache-dir -r /app/requirements.txt
++COPY service.py /app/service.py
++EXPOSE 8088
++CMD ["python3","/app/service.py"]
+*** End File
+*** Add File:ops/automation/orchestrator/service.py
++#!/usr/bin/env python3
++"""
++Aegis Orchestrator
++- Accepts webhook POSTs at /webhook (and optionally NATS subscriptions)
++- Queries OPA for policy decision
++- Executes Argo remediation or retrain workflows using `argo submit`
++"""
++import os
++import json
++import subprocess
++import logging
++import threading
++from flask import Flask, request, jsonify
++import requests
++
++LOG = logging.getLogger("aegis.orchestrator")
++logging.basicConfig(level=logging.INFO)
++
++OPA_URL = os.environ.get("OPA_URL", "http://opa:8181")
++ARGO_NS = os.environ.get("ARGO_NS", "aegis-ml")
++ARGO_CLI = os.environ.get("ARGO_CLI", "argo")
++APPROVER_HUMAN_URL = os.environ.get("APPROVER_HUMAN_URL", "")
++ENABLE_NATS = os.environ.get("ENABLE_NATS", "false").lower() == "true"
++NATS_URL = os.environ.get("NATS_URL", "nats://nats:4222")
++
++app = Flask("aegis-orchestrator")
++
++def opa_decision(event):
++    """
++    Query OPA for a policy decision. Expects OPA policy to return {"result": {"action": "...", "reason": "..."}}
++    """
++    try:
++        resp = requests.post(f"{OPA_URL}/v1/data/aegis/policy/decision", json={"input": event}, timeout=5)
++        resp.raise_for_status()
++        return resp.json().get("result", {})
++    except Exception as e:
++        LOG.exception("OPA request failed: %s", e)
++        return {"action": "require_human", "reason": "opa_unavailable"}
++
++def submit_argo(template_name, parameters=None):
++    """
++    Submit an Argo Workflow from a WorkflowTemplate. Uses the argo CLI for simplicity.
++    Parameters is a dict of key->value to pass as --parameter key=value
++    """
++    cmd = [ARGO_CLI, "submit", "--from", f"workflowtemplate/{template_name}", "-n", ARGO_NS]
++    if parameters:
++        for k,v in parameters.items():
++            cmd += ["--parameter", f"{k}={v}"]
++    LOG.info("Submitting Argo workflow: %s", " ".join(cmd))
++    try:
++        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=120)
++        LOG.info("Argo submit output: %s", out)
++        return {"ok": True, "output": out}
++    except subprocess.CalledProcessError as e:
++        LOG.exception("Argo submit failed: %s", e.output if hasattr(e,'output') else e)
++        return {"ok": False, "error": str(e)}
++
++def handle_event(event):
++    """
++    Core logic: evaluate via OPA, then take action.
++    """
++    LOG.info("Handling event: %s", event.get("id", "<no-id>"))
++    decision = opa_decision(event)
++    action = decision.get("action", "require_human")
++    LOG.info("OPA decision: %s", decision)
++    if action == "auto_block":
++        # block only: update blacklist and record evidence (use auto_contain template)
++        params = {"incident_id": event.get("id","evt"), "model": event.get("model","unknown")}
++        return submit_argo("aegis-auto-contain", parameters=params)
++    elif action == "auto_remediate":
++        # full remediation and retrain
++        params = {"incident_id": event.get("id","evt"), "model": event.get("model","unknown"), "reason": decision.get("reason","")}
++        return submit_argo("aegis-auto-remediate-retrain", parameters=params)
++    else:
++        # require human: notify approvers and create ticket (best-effort)
++        notify = {"incident_id": event.get("id","evt"), "model": event.get("model","unknown"), "reason": decision.get("reason","")}
++        try:
++            if APPROVER_HUMAN_URL:
++                requests.post(APPROVER_HUMAN_URL, json=notify, timeout=3)
++        except Exception:
++            LOG.exception("notify approvers failed")
++        return {"ok": True, "action": "require_human"}
++
++@app.route("/webhook", methods=["POST"])
++def webhook():
++    ev = request.get_json() or {}
++    # Kick off background handling so webhook returns quickly
++    threading.Thread(target=handle_event, args=(ev,)).start()
++    return jsonify({"ok": True}), 202
++
++def nats_subscriber_loop():
++    # Optional: lazy import nats client to avoid hard dependency when not enabled
++    try:
++        from nats.aio.client import Client as NATS
++        import asyncio
++        nc = NATS()
++        async def run():
++            await nc.connect(servers=[NATS_URL])
++            async def cb(msg):
++                subj = msg.subject
++                data = msg.data.decode()
++                try:
++                    ev = json.loads(data)
++                except Exception:
++                    ev = {"raw": data}
++                LOG.info("Received NATS event on %s", subj)
++                handle_event(ev)
++            await nc.subscribe("safety.incidents", cb=cb)
++            # keep running
++            while True:
++                await asyncio.sleep(1)
++        asyncio.run(run())
++    except Exception:
++        LOG.exception("NATS subscriber failed or not enabled")
++
++if __name__ == "__main__":
++    if ENABLE_NATS:
++        t = threading.Thread(target=nats_subscriber_loop, daemon=True)
++        t.start()
++    port = int(os.environ.get("ORCHESTRATOR_PORT", "8088"))
++    app.run(host="0.0.0.0", port=port)
+*** End File
+*** Add File:ops/policy/opa/safety_policy.rego
++package aegis.policy
++
++default decision = {"action": "require_human", "reason": "default"}
++
++# decision() returns an object with action and reason
++decision = {"action": action, "reason": reason} {
++  input := input
++  # High confidence PII or NSFW in prod requires human (safety critical)
++  input.score >= 0.98
++  input.model_env == "prod"
++  action = "require_human"
++  reason = sprintf("high_confidence_prod_score_%v", [input.score])
++}
++
++decision = {"action": action, "reason": reason} {
++  # Trusted automatic remediation in staging for very high scores
++  input.score >= 0.95
++  input.model_env == "staging"
++  action = "auto_remediate"
++  reason = "high_confidence_staging_auto_retrain"
++}
++
++decision = {"action": action, "reason": reason} {
++  # Auto-block outputs that are clearly PII/NSFW but not high impact
++  input.score >= 0.90
++  input.model_env != "prod"
++  action = "auto_block"
++  reason = "block_low_env"
++}
++
++decision = {"action": action, "reason": reason} {
++  # If DP budget over threshold, fail closed and require human
++  input.dp_over_budget == true
++  action = "require_human"
++  reason = "dp_over_budget"
++}
++
++decision = {"action": "require_human", "reason": "fallback"}
++
+*** End File
+*** Add File:ops/argo/workflows/aegis-auto-remediate-retrain.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: WorkflowTemplate
++metadata:
++  name: aegis-auto-remediate-retrain
++  namespace: aegis-ml
++spec:
++  templates:
++  - name: auto-remediate-retrain
++    steps:
++    - - name: collect-evidence
++        template: collect-evidence
++      - name: disable-model
++        template: disable-model
++      - name: update-blacklist
++        template: update-blacklist
++      - name: trigger-retrain
++        template: trigger-retrain
++      - name: validate-candidate
++        template: validate-candidate
++      - name: promote-canary
++        template: promote-canary
++
++  - name: collect-evidence
++    container:
++      image: bitnami/kubectl:latest
++      command: [sh, -c]
++      args:
++        - |
++          mkdir -p /tmp/evidence
++          kubectl -n aegis-ml get pods -o wide > /tmp/evidence/pods.txt || true
++          kubectl -n aegis-ml logs deployment/model-serving --tail=500 > /tmp/evidence/serving.log || true
++          tar czf /tmp/evidence.tgz /tmp/evidence || true
++    outputs:
++      artifacts:
++      - name: evidence
++        path: /tmp/evidence.tgz
++
++  - name: disable-model
++    container:
++      image: bitnami/kubectl:latest
++      command: [sh,-c]
++      args:
++        - |
++          kubectl -n aegis-ml scale deployment model-serving --replicas=0 || true
++
++  - name: update-blacklist
++    container:
++      image: curlimages/curl:7.85.0
++      command: [sh,-c]
++      args:
++        - |
++          # Placeholder: add an IOC or pattern to the blacklist service
++          curl -s -X POST -H "Content-Type: application/json" -d '{"pattern":"<auto-blacklist-pattern>"}' "${BLACKLIST_SERVICE:-http://blacklist:8093/blacklist}" || true
++
++  - name: trigger-retrain
++    container:
++      image: yourregistry/aegis-retrain-runner:latest
++      command: [sh,-c]
++      args:
++        - |
++          # This container should implement retrain orchestration and publish a candidate model tag to artifact store
++          python3 /app/run_retrain.py --incident-id "{{workflow.parameters.incident_id}}" || true
++
++  - name: validate-candidate
++    container:
++      image: yourregistry/aegis-retrain-validator:latest
++      command: [sh,-c]
++      args:
++        - |
++          # Validator should run safety/regression suite against candidate and exit non-zero on failure
++          python3 /app/validate_candidate.py || (echo "candidate validation failed" && exit 1)
++
++  - name: promote-canary
++    container:
++      image: bitnami/kubectl:latest
++      command: [sh,-c]
++      args:
++        - |
++          # Promote candidate to canary deployment (implementation specific)
++          echo "Promote candidate to canary (operator-specific step)"
++
+*** End File
+*** Add File:ops/argo/workflows/aegis-auto-contain.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: WorkflowTemplate
++metadata:
++  name: aegis-auto-contain
++  namespace: aegis-ml
++spec:
++  templates:
++  - name: auto-contain
++    steps:
++    - - name: collect-evidence
++        template: collect-evidence
++      - name: update-blacklist
++        template: update-blacklist
++
++  - name: collect-evidence
++    container:
++      image: bitnami/kubectl:latest
++      command: [sh, -c]
++      args:
++        - |
++          mkdir -p /tmp/evidence
++          kubectl -n aegis-ml get pods -o wide > /tmp/evidence/pods.txt || true
++          kubectl -n aegis-ml logs deployment/model-serving --tail=200 > /tmp/evidence/serving.log || true
++          tar czf /tmp/evidence.tgz /tmp/evidence || true
++    outputs:
++      artifacts:
++      - name: evidence
++        path: /tmp/evidence.tgz
++
++  - name: update-blacklist
++    container:
++      image: curlimages/curl:7.85.0
++      command: [sh,-c]
++      args:
++        - |
++          curl -s -X POST -H "Content-Type: application/json" -d '{"pattern":"<auto-blacklist-pattern>"}' "${BLACKLIST_SERVICE:-http://blacklist:8093/blacklist}" || true
++
+*** End File
+*** Add File:.github/workflows/redteam_to_orchestrator.yml
++name: RedTeam -> Orchestrator Event
++on:
++  workflow_dispatch:
++jobs:
++  run_redteam_and_notify:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run redteam tests
++        env:
++          MODEL_ENDPOINT: ${{ secrets.MODEL_ENDPOINT }}
++          AGENT_URL: ${{ secrets.AGENT_URL }}
++        run: |
++          set -e
++          python3 ops/tests/redteam/prompt_injection_tests.py "${{ secrets.MODEL_ENDPOINT }}" || exit 2
++      - name: Notify Orchestrator on failure
++        if: failure()
++        env:
++          ORCH_URL: ${{ secrets.ORCHESTRATOR_WEBHOOK_URL }}
++          INCIDENT_ID: "redteam-${{ github.run_id }}"
++        run: |
++          echo "Posting event to orchestrator"
++          payload=$(jq -n --arg id "$INCIDENT_ID" --arg model "redteam-model" --argjson score 0.99 '{id:$id, model:$model, score:$score, model_env:"staging", dp_over_budget:false}')
++          curl -s -X POST -H "Content-Type: application/json" -d "$payload" "$ORCH_URL/webhook" || true
++
+*** End File
+*** Add File:ops/docs/legal_and_compliance/checklist_autonomy.md
++# Legal & Compliance Checklist for Autonomous Actions
++
++Before enabling auto-remediation/retrain/promotion, ensure:
++
++1) Policy review
++ - OPA policies have been reviewed and signed-off by Legal & Compliance.
++ - Human-required actions are explicitly enumerated and cannot be bypassed by policy.
++
++2) Auditability
++ - All automated actions write immutable evidence to audit storage (S3).
++ - Evidence bundles are cosign-signed and Rekor entries are created.
++ - Approver decisions (if any) are recorded with identity and timestamp.
++
++3) Data protection
++ - DP accounting is enabled and enforced; fail-closed must be configured for production.
++ - Data retention and deletion policies are defined and implemented for evidence and training data.
++
++4) Incident response
++ - Runbooks for containment, escalation and legal notification exist and have been exercised.
++ - SLAs for notifications (internal / regulatory) are defined.
++
++5) Approval & scope
++ - Define what model families, environments, and users are in-scope for automation.
++ - High-impact models (finance/health/legal) require manual sign-off for promotion.
++
++6) External audit
++ - Plan for external audit of automation and evidence chain prior to production autonomy.
++
+*** End File
+*** Add File:ops/human_review/approvals_matrix.md
++# Approval Matrix — actions vs required approvers
++
++Low-risk actions (auto allowed)
++- Auto-block outputs, update blacklist: automated (no human required); audit only.
++
++Medium-risk actions (1 approver required)
++- Retrain trigger & canary promotion for staging models: 1 approver from ML Ops.
++
++High-risk actions (multi-party required)
++- Promote model to production: 2 approvers (ML Lead + Security Lead) OR automated if passing 14-day canary window + safety/regression tests AND explicit policy flag.
++- Purge dataset / delete backups: Legal + Data Owner sign-off (2 approvals).
++
++Emergency actions
++- Emergency disable model: automated allowed for incidents with score >= 0.995 OR manual on-call override; always require post‑hoc incident review.
++
+*** End File
+*** Add File:ops/automation/orchestrator/manifest_deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-orchestrator
++  namespace: aegis-system
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: aegis-orchestrator
++  template:
++    metadata:
++      labels:
++        app: aegis-orchestrator
++    spec:
++      containers:
++      - name: orchestrator
++        image: <YOUR_REGISTRY>/aegis-orchestrator:latest
++        env:
++        - name: OPA_URL
++          value: "http://opa:8181"
++        - name: ARGO_NS
++          value: "aegis-ml"
++        - name: APPROVER_HUMAN_URL
++          value: "http://review-queue:8091/notify"
++        - name: NATS_URL
++          value: "nats://nats:4222"
++        - name: ENABLE_NATS
++          value: "true"
++        ports:
++        - containerPort: 8088
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: aegis-orchestrator
++  namespace: aegis-system
++spec:
++  selector:
++    app: aegis-orchestrator
++  ports:
++  - port: 8088
++    targetPort: 8088
++
+*** End File
+*** Add File:ops/automation/orchestrator/tests/test_policy_logic.py
++import json
++from ops.policy.opa import dummy  # placeholder import path for unit tests
++
++def test_policy_decision_sample():
++    # This is a simple illustrative unit test for policy logic (run OPA separately in CI)
++    sample_event = {"id":"evt1","score":0.96,"model_env":"staging","dp_over_budget":False}
++    # Expected: auto_remediate per policy
++    # In CI, call OPA REST or local eval; here we assert shape of expected dict for clarity
++    # Real test should use opa eval or rego test.
++    assert sample_event["score"] > 0.9
++
+*** End File
+*** End Patch

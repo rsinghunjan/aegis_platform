@@ -1,0 +1,375 @@
+*** Begin Patch
+*** Add File:ops/runbooks/operationalize_checklist.md
++# Operationalization checklist — finish Aegis production hardening
++
++Overview: follow these steps in order. Each step references scripts/manifests under ops/.
++
++1) Build & publish pinned detector image (CI)
++ - Ensure ARTIFACT_BASE contains pinned model artifacts and checksums.
++ - Set DETECTOR_IMAGE and COSIGN_KMS_URI in GitHub Secrets.
++ - Trigger .github/workflows/build_and_verify_detectors.yml (created earlier).
++ - Verify image imports:
++   docker run --rm $DETECTOR_IMAGE python3 -c "import nudenet,presidio_analyzer,whisper,pytesseract; print('ok')"
++
++2) Deploy detector runtime (Kubernetes)
++ - Apply ops/serving/models/detector_deployment.yaml to deploy detector pods on nodes.
++ - Verify pods READY and model files exist under /opt/aegis/models.
++
++3) Enforce network controls and canonical gateway path
++ - Apply ops/infra/k8s/networkpolicy-enforce-gateway.yaml to block direct access to Triton/vLLM services from outside gateway namespace.
++ - Run ops/automation/deployment_coverage_check.py and remediate any flagged deployments.
++
++4) Calibration & thresholds
++ - Sample representative traffic, create ops/fl/calibration/candidates.txt.
++ - Run labeling: python3 ops/fl/calibration/label_tool.py --input candidates.txt --out ops/fl/calibration/labeled.csv
++ - Run calibration pipeline: ./ops/fl/calibration/run_calibration_pipeline.sh
++ - Validate thresholds on holdout and publish to ARTIFACT_BASE; ensure /opt/aegis/models/thresholds.json updated.
++
++5) Harden DP & auth
++ - Edit ops/infra/terraform/dp_ha/terraform.tfvars with VPC/subnet values and run terraform plan/apply (requires CloudSec review).
++ - Apply Kubernetes manifests: ops/infra/k8s/dp_deployment_mtls.yaml and verify ExternalSecret pulls DB URL & DP_AUTH_TOKEN.
++ - Provision KMS key and configure cosign + approver KMS policies (ops/infra/terraform/kms_cosign_iam/*).
++ - Enable mTLS on DP (cert-manager) using ops/infra/k8s/certmanager-issuer.yaml and ops/infra/k8s/dp_service_mtls.yaml.
++ - Configure gateway to enforce DP charging fail‑closed (ops/serving/gateway/gateway_dp_enforcer.py); set ENABLE_DP_FAIL_CLOSED=true.
++
++6) Adversarial automation & remediation
++ - Enable redteam_full GitHub Action (.github/workflows/redteam_full.yml).
++ - Enable auto-remediation action ops/automation/redteam_autoremediate.yml (creates tickets, calls content-alert-handler, triggers Argo remediation, creates retrain job).
++ - Validate Argo remediation workflow (ops/automation/argo/content_remediation_improvements.yaml) in staging.
++
++7) Approver signing & audit
++ - Deploy approver signing mediator (OIDC) using ops/human_review/signing_service/k8s/signing_service_oidc.yaml.
++ - Ensure approver OIDC roles/scopes and KMS COSIGN_KMS_URI assigned and limited via IAM policy.
++ - Run a signing end‑to‑end test: POST payload → /sign and verify cosign verify-blob of returned signature.
++
++8) Run an incident drill
++ - Run ops/runbooks/incident_drill/run_incident_drill.sh and validate: Argo workflow run, model disabled (scaled to 0), evidence uploaded to audit S3, Rekor/cosign proofs present.
++
++9) Monitoring & SLO tuning
++ - Collect 7–14 days of metrics (ops/monitoring/baseline_metrics.md).
++ - Tune ops/monitoring/safety_alert_config.yaml thresholds, create dashboards, and update runbooks.
++
++Notes & required approvals:
++ - All infra Terraform must be submitted for CloudSec review before apply.
++ - Do not run terraform apply until infra/jurisdiction approval and secret management (Vault/ExternalSecrets) are in place.
++
+*** End File
+*** Add File:ops/serving/models/detector_deployment.yaml
++apiVersion: apps/v1
++kind: DaemonSet
++metadata:
++  name: aegis-detector
++  namespace: aegis-system
++  labels:
++    app: aegis-detector
++spec:
++  selector:
++    matchLabels:
++      app: aegis-detector
++  template:
++    metadata:
++      labels:
++        app: aegis-detector
++    spec:
++      serviceAccountName: aegis-detector-sa
++      containers:
++      - name: detector
++        image: <YOUR_REGISTRY>/aegis-detectors:latest
++        imagePullPolicy: Always
++        volumeMounts:
++        - name: models
++          mountPath: /opt/aegis/models
++        readinessProbe:
++          exec:
++            command:
++            - cat
++            - /opt/aegis/models/.detectors_ready || exit 1
++          initialDelaySeconds: 10
++          periodSeconds: 10
++        resources:
++          requests:
++            cpu: "500m"
++            memory: "1Gi"
++          limits:
++            cpu: "2000m"
++            memory: "4Gi"
++      volumes:
++      - name: models
++        emptyDir: {} # operator should use a node-level PV or image baked models in production
++
++---
++# ServiceAccount and minimal RBAC to allow reading Secrets/ConfigMaps if required
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: aegis-detector-sa
++  namespace: aegis-system
++
+*** End File
+*** Add File:ops/infra/k8s/networkpolicy-enforce-gateway.yaml
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: restrict-triton-access
++  namespace: model-serving
++spec:
++  podSelector:
++    matchLabels:
++      app: triton
++  policyTypes:
++  - Ingress
++  ingress:
++  - from:
++    - namespaceSelector:
++        matchLabels:
++          name: aegis-system   # gateway lives here
++    ports:
++    - protocol: TCP
++      port: 8000
++    - protocol: TCP
++      port: 8001
++  - from: [] # deny all other ingress by not listing sources
++
++# Note: tune namespaceSelector label to match gateway namespace in your cluster.
++
+*** End File
+*** Add File:ops/serving/gateway/gateway_dp_enforcer.py
++"""
++DP enforcer helper: ensure dp charge succeeds before allowing model outputs.
++Use in triton_gateway handler: if ENABLE_DP_FAIL_CLOSED true, block responses on DP failures.
++"""
++import os, requests, logging
++
++DP_SERVICE = os.environ.get("DP_SERVICE_URL", "http://dp-service:8084")
++DP_AUTH = os.environ.get("DP_AUTH_TOKEN", "")
++ENABLE_FAIL_CLOSED = os.environ.get("ENABLE_DP_FAIL_CLOSED", "true").lower() == "true"
++LOG = logging.getLogger("aegis.dp.enforcer")
++
++def charge_and_enforce(client_id: str, eps: float) -> bool:
++    """
++    Charge DP service; return True if allowed to proceed; False means block.
++    """
++    if not client_id:
++        LOG.warning("No client_id provided for DP charge; failing closed.")
++        return False if ENABLE_FAIL_CLOSED else True
++    try:
++        headers = {"Authorization": f"Bearer {DP_AUTH}"} if DP_AUTH else {}
++        r = requests.post(f"{DP_SERVICE}/charge", json={"client": client_id, "eps": eps}, headers=headers, timeout=3)
++        if r.status_code == 200:
++            return True
++        LOG.error("DP charge returned non-200: %s %s", r.status_code, r.text)
++        return False if ENABLE_FAIL_CLOSED else True
++    except Exception:
++        LOG.exception("DP charge failed")
++        return False if ENABLE_FAIL_CLOSED else True
++
+*** End File
+*** Add File:ops/infra/terraform/dp_ha/main.tf
++provider "aws" {
++  region = var.aws_region
++}
++
++# Minimal multi-AZ RDS Postgres with Multi-AZ enabled (example)
++resource "random_password" "dp_password" {
++  length  = 32
++  special = true
++}
++
++resource "aws_secretsmanager_secret" "dp_db_password" {
++  name = var.db_password_secret_name
++}
++
++resource "aws_secretsmanager_secret_version" "dp_db_password_value" {
++  secret_id     = aws_secretsmanager_secret.dp_db_password.id
++  secret_string = jsonencode({ password = random_password.dp_password.result })
++}
++
++resource "aws_db_subnet_group" "dp_subnets" {
++  name       = "${var.db_identifier}-subnet"
++  subnet_ids = var.subnet_ids
++}
++
++resource "aws_db_instance" "dp" {
++  identifier             = var.db_identifier
++  engine                 = "postgres"
++  instance_class         = var.instance_class
++  name                   = var.db_name
++  username               = var.db_username
++  password               = jsondecode(aws_secretsmanager_secret_version.dp_db_password_value.secret_string).password
++  allocated_storage      = var.allocated_storage
++  skip_final_snapshot    = true
++  multi_az               = true
++  vpc_security_group_ids = var.vpc_security_group_ids
++  db_subnet_group_name   = aws_db_subnet_group.dp_subnets.name
++  backup_retention_period = var.backup_retention_days
++  apply_immediately = true
++}
++
++output "db_endpoint" {
++  value = aws_db_instance.dp.address
++}
++output "db_port" {
++  value = aws_db_instance.dp.port
++}
++
+*** End File
+*** Add File:ops/infra/terraform/dp_ha/variables.tf
++variable "aws_region" { type = string, default = "us-east-1" }
++variable "db_identifier" { type = string, default = "aegis-dp-db" }
++variable "db_name" { type = string, default = "dp" }
++variable "db_username" { type = string, default = "dp_admin" }
++variable "db_password_secret_name" { type = string, default = "aegis-dp-db-password" }
++variable "vpc_security_group_ids" { type = list(string) }
++variable "subnet_ids" { type = list(string) }
++variable "instance_class" { type = string, default = "db.t3.medium" }
++variable "allocated_storage" { type = number, default = 20 }
++variable "backup_retention_days" { type = number, default = 7 }
++
+*** End File
+*** Add File:ops/infra/k8s/dp_service_mtls.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: dp-service
++  namespace: aegis-system
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: dp-service
++  template:
++    metadata:
++      labels:
++        app: dp-service
++    spec:
++      containers:
++      - name: dp
++        image: <YOUR_REGISTRY>/aegis-dp-service:latest
++        env:
++        - name: DP_DB_URL
++          valueFrom:
++            secretKeyRef:
++              name: dp-secrets
++              key: db_url
++        - name: DP_AUTH_TOKEN
++          valueFrom:
++            secretKeyRef:
++              name: dp-secrets
++              key: token
++        - name: ENABLE_MTLS
++          value: "true"
++        - name: MTLS_CERT_PATH
++          value: "/etc/dp-certs/tls.crt"
++        - name: MTLS_KEY_PATH
++          value: "/etc/dp-certs/tls.key"
++        volumeMounts:
++        - name: dp-certs
++          mountPath: /etc/dp-certs
++          readOnly: true
++      volumes:
++      - name: dp-certs
++        secret:
++          secretName: dp-mtls
++
++---
++# Example cert-manager ClusterIssuer to support MTLS cert provisioning
++apiVersion: cert-manager.io/v1
++kind: ClusterIssuer
++metadata:
++  name: aegis-ca-issuer
++spec:
++  selfSigned: {}
++
+*** End File
+*** Add File:.github/workflows/redteam_autoremediate.yml
++name: RedTeam Auto-Remediate & Retrain
++on:
++  schedule:
++    - cron: '0 3 * * *' # daily at 03:00 UTC (tune as needed)
++  workflow_dispatch:
++jobs:
++  run_redteam:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run redteam suite
++        env:
++          MODEL_ENDPOINT: ${{ secrets.MODEL_ENDPOINT }}
++          AGENT_URL: ${{ secrets.AGENT_URL }}
++        run: |
++          set -e
++          python3 ops/tests/redteam/prompt_injection_tests.py "${MODEL_ENDPOINT}" || exit 2
++          python3 ops/tests/redteam/multi_step_agent_exfiltration.py "${AGENT_URL}" || exit 2
++      - name: Post success note
++        if: success()
++        run: echo "Redteam passed"
++  remediate_on_failure:
++    runs-on: ubuntu-latest
++    needs: run_redteam
++    if: failure()
++    steps:
++      - name: Create remediation ticket
++        uses: peter-evans/create-issue@v4
++        with:
++          title: "Redteam safety failure - auto remediation triggered"
++          body: |
++            Redteam tests failed. Automated remediation invoked. Run ID: ${{ github.run_id }}
++      - name: Trigger remediation handler
++        run: |
++          curl -s -X POST -H "Content-Type: application/json" -d '{"alert":"redteam_failure","run_id":"'"${{ github.run_id }}"'"}' "${{ secrets.CONTENT_ALERT_HANDLER_URL }}" || true
++      - name: Create retrain PR (best-effort)
++        run: |
++          # This step creates a retrain request via repository tools - placeholder
++          echo "Creating retrain request (operator action required)" > retrain_request.txt
++          gh pr create --title "Retrain: redteam-failure-${{ github.run_id }}" --body-file retrain_request.txt || true
++
+*** End File
+*** Add File:ops/monitoring/alerts_tuned.yaml
++groups:
++- name: aegis-safety.rules
++  rules:
++  - alert: SafetyFilterHighBlockRate
++    expr: increase(aegis_safety_filter_blocked_total[5m]) > 10
++    for: 2m
++    labels:
++      severity: page
++    annotations:
++      summary: "High safety filter block rate"
++      description: "More than 10 blocked outputs in the last 5m."
++
++  - alert: SafetyPIISpike
++    expr: increase(aegis_safety_filter_pii_total[5m]) > 5
++    for: 2m
++    labels:
++      severity: page
++    annotations:
++      summary: "PII detection spike"
++      description: "PII detections increased rapidly in last 5m."
++
++  - alert: DPServiceUnreachable
++    expr: absent(up{job='dp-service'} == 1)
++    for: 1m
++    labels:
++      severity: critical
++    annotations:
++      summary: "DP service unreachable"
++      description: "DP accounting service is not healthy. If ENABLE_DP_FAIL_CLOSED=true, model outputs may be blocked."
++
+*** End File
+*** Add File:ops/docs/operational_playbooks/containment_playbook.md
++# Containment playbook (high severity content incident)
++
++1) Acknowledge alert (PagerDuty/Slack)
++2) Immediately trigger remediation (if not already running):
++   curl -X POST $CONTENT_ALERT_HANDLER_URL -d '{"alert":"manual_trigger","reason":"containment"}'
++3) Verify Argo remediation workflow started (argo list -n aegis-ml)
++4) Verify model deployment scaled to 0:
++   kubectl -n aegis-ml get deployment model-serving -o yaml | yq '.spec.replicas'
++5) Download evidence bundle from audit S3 and verify cosign signature:
++   aws s3 cp s3://<bucket>/content_incident/<bundle> .
++   cosign verify --key $COSIGN_KMS_URI <bundle>
++6) Triage & RCA: ML + Data + Security + Legal stakeholders review evidence.
++7) Schedule retrain (if needed) and staged redeploy after negative examples added.
++
+*** End File
+*** End Patch

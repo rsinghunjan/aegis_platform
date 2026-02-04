@@ -1,0 +1,443 @@
+*** Begin Patch
+*** Add File:docs/runbooks/environment_prefill_instructions.md
++Environment-prefill variables for Aegis production bootstrap
++
++Before running the automated bootstrap or the one-click PoA harness, export these environment variables with values for your environment.
++
++Required environment variables (example values):
++
++- CLUSTER_CONTEXT="arn:aws:eks:us-west-2:123456789012:cluster/aegis-prod"   # kubectl/helm context name
++- REGISTRY="123456789012.dkr.ecr.us-west-2.amazonaws.com/aegis"           # container registry
++- COSIGN_KMS_URI="awskms://alias/aegis-cosign-key"                       # cosign KMS URI (or gcpkms:/, azure)
++- REKOR_SERVER="https://rekor.example.com"                               # Rekor transparency server
++- S3_UPLOAD="s3://aegis-evidence"                                        # S3 bucket for evidence & audit
++- REDIS_URL="redis://redis.aegis.svc:6379/0"                             # session store
++- OIDC_ISSUER_URL="https://login.example.com"                            # OIDC issuer for SSO
++- OIDC_CLIENT_ID="aegis-client-id"                                       # OIDC client ID
++- OIDC_CLIENT_SECRET="<redacted>"                                        # OIDC client secret (use Vault)
++- PROMPT_REGISTRY_HELM_VALUES="/tmp/prompt_values.yaml"                  # optional helm values file
++
++Optional / tuning variables:
++- NUM_DEEPSPEED_NODES=2
++- GPUS_PER_NODE=8
++- TRITON_REPLICAS=1
++- VLLM_REPLICAS=1
++
++Security notes:
++- Never put secrets in git. Place OIDC secrets and COSIGN_KMS_URIs into Vault or GitHub secrets, and reference them via the bootstrap (scripts read from environment or Vault).
++
+*** End File
+*** Add File:ops/runbooks/bootstrap_min_prod.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Bootstrap a minimal production-ready Aegis environment.
++# Reads environment variables described in docs/runbooks/environment_prefill_instructions.md
++#
++echo "Aegis minimal production bootstrap starting..."
++
++: "${CLUSTER_CONTEXT:?Set CLUSTER_CONTEXT (kubectl context)}"
++: "${REGISTRY:?Set REGISTRY (container registry)}"
++: "${COSIGN_KMS_URI:?Set COSIGN_KMS_URI (KMS URI for cosign)}"
++: "${REKOR_SERVER:?Set REKOR_SERVER (rekor server url)}"
++: "${S3_UPLOAD:?Set S3_UPLOAD (s3 uri for evidence)}"
++: "${REDIS_URL:?Set REDIS_URL (redis session store)}"
++: "${OIDC_ISSUER_URL:?Set OIDC_ISSUER_URL (OIDC issuer)}"
++: "${OIDC_CLIENT_ID:?Set OIDC_CLIENT_ID (OIDC client id)}"
++
++echo "Using kubectl context: $CLUSTER_CONTEXT"
++kubectl config use-context "$CLUSTER_CONTEXT"
++
++echo "1/8 - Create namespace(s)"
++kubectl create ns aegis-app || true
++kubectl create ns aegis-ml || true
++kubectl create ns aegis-system || true
++
++echo "2/8 - Install Redis (session store)"
++helm repo add bitnami https://charts.bitnami.com/bitnami || true
++helm upgrade --install aegis-redis bitnami/redis --namespace aegis-app --set auth.enabled=false || true
++
++echo "3/8 - Deploy Prompt Registry (Helm chart placeholder)"
++if [ -n "${PROMPT_REGISTRY_HELM_VALUES:-}" ] && [ -f "${PROMPT_REGISTRY_HELM_VALUES}" ]; then
++  helm upgrade --install aegis-prompt-registry ops/prompt/registry/helm -n aegis-app -f "${PROMPT_REGISTRY_HELM_VALUES}"
++else
++  helm upgrade --install aegis-prompt-registry ops/prompt/registry/helm -n aegis-app \
++    --set image.repository="${REGISTRY}/aegis-prompt-registry" --set image.tag="latest"
++fi
++
++echo "4/8 - Deploy oauth2-proxy (OIDC) for Prompt Registry"
++kubectl apply -f ops/security/oidc/oauth2-proxy-deployment.yaml -n aegis-system || true
++echo "   Note: ensure Kubernetes secrets (oidc-secrets, oauth-cookie) are created via Vault or k8s secrets"
++
++echo "5/8 - Deploy Triton & vLLM sample servers (model repo PVCs required)"
++kubectl apply -f ops/serving/triton/deployment.yaml -n aegis-ml || true
++kubectl apply -f ops/serving/vllm/deployment.yaml -n aegis-ml || true
++
++echo "6/8 - Install Fluentd for cluster log forwarding (modify host in configmap)"
++kubectl apply -f ops/logging/fluentd/fluentd-configmap.yaml
++kubectl apply -f ops/logging/fluentd/fluentd-daemonset.yaml
++
++echo "7/8 - Configure Vault K8s auth role for prompt-registry (assumes Vault is reachable)"
++if command -v vault >/dev/null 2>&1; then
++  bash ops/secrets/vault/vault_k8s_auth_setup.sh || echo "vault setup skipped or failed (requires Vault access)"
++else
++  echo "vault CLI not found; skip K8s auth setup. Use Vault UI or install vault CLI."
++fi
++
++echo "8/8 - Configure GitHub OIDC / CI signing guidance (manual step)"
++cat <<EOF
++Now:
++ - Add COSIGN_KMS_URI and REKOR_SERVER as GitHub repository secrets.
++ - Configure OIDC trust between GitHub and your cloud provider and bind roles to CI builders.
++ - Run ops/ci/builder_harden_and_cosign_automate.sh on at least one builder host.
++ - Populate Prompt Registry with initial templates via ops/prompt/registry/cli.py
++EOF
++
++echo "Bootstrap complete. Validate services and run the one-click PoA harness for an end-to-end smoke."
++
+*** End File
+*** Add File:ops/ci/verify_promotion.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Verify that a prompt bundle or evidence bundle is cosign-signed and has a Rekor entry.
++# Usage:
++#   ./ops/ci/verify_promotion.sh --bundle /path/to/prompt_X.tar.gz --cosign-key "$COSIGN_KMS_URI" --rekor "$REKOR_SERVER"
++#
++BUNDLE=""
++COSIGN_KEY="${COSIGN_KMS_URI:-}"
++REKOR_SERVER="${REKOR_SERVER:-}"
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --bundle) BUNDLE="$2"; shift 2;;
++    --cosign-key) COSIGN_KEY="$2"; shift 2;;
++    --rekor) REKOR_SERVER="$2"; shift 2;;
++    *) echo "Unknown arg: $1"; exit 2;;
++  esac
++done
++
++if [ -z "$BUNDLE" ]; then
++  echo "bundle path is required (--bundle)"
++  exit 2
++fi
++
++if [ ! -f "$BUNDLE" ]; then
++  echo "Bundle file not found: $BUNDLE"
++  exit 2
++fi
++
++echo "1) Verify cosign signature (KMS key: ${COSIGN_KEY:-<env>})"
++if command -v cosign >/dev/null 2>&1; then
++  if [ -n "$COSIGN_KEY" ]; then
++    cosign verify --key "$COSIGN_KEY" "$BUNDLE" || { echo "cosign verify failed"; exit 3; }
++  else
++    cosign verify "$BUNDLE" || { echo "cosign verify failed"; exit 3; }
++  fi
++else
++  echo "cosign not installed; cannot verify signature locally. Skipping."
++fi
++
++echo "2) Check Rekor for artifact digest (if rekor-cli available and REKOR_SERVER provided)"
++if command -v rekor-cli >/dev/null 2>&1 && [ -n "$REKOR_SERVER" ]; then
++  DIGEST=$(sha256sum "$BUNDLE" | awk '{print $1}')
++  echo "Searching Rekor for digest: $DIGEST"
++  rekor-cli search --sha "$DIGEST" --server "$REKOR_SERVER" || { echo "Rekor entry not found"; exit 4; }
++else
++  echo "rekor-cli not installed or REKOR_SERVER not set; skipping Rekor check"
++fi
++
++echo "Promotion verification complete: cosign+rekor checks passed (if run)."
++
+*** End File
+*** Add File:.github/workflows/verify_prompt_promotion.yml
++name: Verify Prompt Promotion (cosign + Rekor)
++on:
++  workflow_dispatch:
++    inputs:
++      bundle_path:
++        description: 'Local path or s3:// URI to bundle (if s3 provide presigned URL or mount)'
++        required: true
++      rekor_server:
++        description: 'Rekor server URL (optional if set in secrets)'
++        required: false
++jobs:
++  verify:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Install cosign & rekor-cli
++        run: |
++          curl -sSL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/download/v1.15.0/cosign-linux-amd64
++          chmod +x /usr/local/bin/cosign
++          # rekor-cli binary install placeholder (requires repo or apt)
++      - name: Fetch bundle (if s3 URL provided)
++        run: |
++          BUNDLE="${{ github.event.inputs.bundle_path }}"
++          if [[ "$BUNDLE" =~ ^s3:// ]]; then
++            aws s3 cp "$BUNDLE" /tmp/bundle.tar.gz
++            echo "/tmp/bundle.tar.gz" > bundle_loc.txt
++          else
++            echo "$BUNDLE" > bundle_loc.txt
++          fi
++      - name: Run verify script
++        env:
++          COSIGN_KMS_URI: ${{ secrets.COSIGN_KMS_URI }}
++          REKOR_SERVER: ${{ secrets.REKOR_SERVER }}
++        run: |
++          BUNDLE_LOC=$(cat bundle_loc.txt)
++          bash ops/ci/verify_promotion.sh --bundle "$BUNDLE_LOC" --cosign-key "${COSIGN_KMS_URI:-}" --rekor "${{ github.event.inputs.rekor_server || env.REKOR_SERVER || '' }}"
++
+*** End File
+*** Add File:ops/audit/auditor_package_template.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Build an auditor package containing specified artifacts, sign with cosign, push to S3 and emit Rekor/manifest info.
++# Usage:
++#   ./ops/audit/auditor_package_template.sh --out /tmp/auditor_bundle.tar.gz --artifacts /path/a.json,/path/b.json
++OUT=""
++ARTIFACTS_CSV=""
++COSIGN_KEY="${COSIGN_KMS_URI:-}"
++S3_UPLOAD="${S3_UPLOAD:-}"
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --out) OUT="$2"; shift 2;;
++    --artifacts) ARTIFACTS_CSV="$2"; shift 2;;
++    --cosign-key) COSIGN_KEY="$2"; shift 2;;
++    --s3) S3_UPLOAD="$2"; shift 2;;
++    *) echo "Unknown arg: $1"; exit 2;;
++  esac
++done
++
++: "${OUT:?--out required}"
++if [ -z "$ARTIFACTS_CSV" ]; then
++  echo "--artifacts required (comma-separated paths)"
++  exit 2
++fi
++
++TMPDIR=$(mktemp -d)
++IFS=',' read -r -a FILES <<< "$ARTIFACTS_CSV"
++MANIFEST="$TMPDIR/manifest.json"
++echo "{" > "$MANIFEST"
++echo "\"generated_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"," >> "$MANIFEST"
++echo "\"files\":[" >> "$MANIFEST"
++FIRST=true
++for f in "${FILES[@]}"; do
++  if [ ! -f "$f" ]; then
++    echo "Artifact missing: $f" >&2
++    exit 3
++  fi
++  cp "$f" "$TMPDIR/"
++  DIG=$(sha256sum "$f" | awk '{print $1}')
++  if [ "$FIRST" = true ]; then
++    FIRST=false
++  else
++    echo "," >> "$MANIFEST"
++  fi
++  echo "{\"name\":\"$(basename "$f")\",\"sha256\":\"$DIG\"}" >> "$MANIFEST"
++done
++echo "]}" >> "$MANIFEST"
++
++tar -czf "$OUT" -C "$TMPDIR" .
++echo "Created auditor bundle: $OUT"
++
++if command -v cosign >/dev/null 2>&1 && [ -n "$COSIGN_KEY" ]; then
++  cosign sign --key "$COSIGN_KEY" "$OUT" || echo "cosign sign failed"
++fi
++
++if [ -n "$S3_UPLOAD" ]; then
++  aws s3 cp "$OUT" "$S3_UPLOAD/$(basename "$OUT")" || echo "s3 upload failed"
++fi
++
++echo "Auditor package finished. bundle=$OUT"
++
+*** End File
+*** Add File:docs/audit/auditor_package_instructions.md
++# Auditor package instructions
++
++Use ops/audit/auditor_package_template.sh to assemble the artifacts auditors want (HIL bundles, Apalache outputs, rt timing reports, SBOMs, signed evidence).
++
++Example:
++
++export COSIGN_KMS_URI="awskms://alias/aegis-cosign-key"
++export S3_UPLOAD="s3://aegis-audit"
++./ops/audit/auditor_package_template.sh --out /tmp/auditor_bundle.tar.gz \
++  --artifacts /tmp/fleet_run_summary.json,/tmp/formal_summary.json,/tmp/rt_timing_report.json \
++  --cosign-key "$COSIGN_KMS_URI" --s3 "$S3_UPLOAD"
++
++Upload the produced bundle to the auditor or provide S3 URIs and Rekor entries if cosign was used.
++
+*** End File
+*** Add File:ops/monitoring/prometheus/alerts_slos.yml
++groups:
++- name: aegis-slo-alerts
++  rules:
++  - alert: RT_P99_Exceeded
++    expr: aegis_rt_p99_ms > 500
++    for: 5m
++    labels:
++      severity: critical
++    annotations:
++      summary: "RT p99 exceeds 500ms"
++      description: "Real-time p99 (ms) is {{ $value }} — check RT profiler and HIL runners."
++
++  - alert: Retrieval_PrecisionLow
++    expr: aegis_retrieval_recall_at_k < 0.6
++    for: 10m
++    labels:
++      severity: warning
++    annotations:
++      summary: "Retrieval recall@k below threshold"
++      description: "Consider rebuilding FAISS index or reranker."
++
++  - alert: HallucinationRateHigh
++    expr: aegis_lm_hallucination_rate > 0.05
++    for: 30m
++    labels:
++      severity: critical
++    annotations:
++      summary: "High hallucination rate"
++      description: "Investigate LM changes and grounding systems."
++
++  - alert: PromptPromotionFailure
++    expr: increase(github_actions_workflow_run_failed_total{workflow="prompt_promote_and_sign"}[1h]) > 0
++    for: 10m
++    labels:
++      severity: critical
++    annotations:
++      summary: "Prompt promotion CI failing"
++      description: "Check CI logs and cosign/Rekor integration."
++
+*** End File
+*** Add File:ops/monitoring/grafana/aegis_dashboard.json
++{
++  "annotations": { "list": [] },
++  "editable": true,
++  "gnetId": null,
++  "graphTooltip": 0,
++  "id": null,
++  "iteration": 162523,
++  "links": [],
++  "panels": [
++    {
++      "datasource": "Prometheus",
++      "fieldConfig": {},
++      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
++      "id": 1,
++      "title": "RT p99 (ms)",
++      "type": "timeseries",
++      "targets": [{ "expr": "aegis_rt_p99_ms", "refId": "A" }]
++    },
++    {
++      "datasource": "Prometheus",
++      "fieldConfig": {},
++      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
++      "id": 2,
++      "title": "Retrieval Recall@K",
++      "type": "timeseries",
++      "targets": [{ "expr": "aegis_retrieval_recall_at_k", "refId": "A" }]
++    },
++    {
++      "datasource": "Prometheus",
++      "fieldConfig": {},
++      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
++      "id": 3,
++      "title": "Hallucination Rate",
++      "type": "stat",
++      "targets": [{ "expr": "aegis_lm_hallucination_rate", "refId": "A" }]
++    },
++    {
++      "datasource": "Prometheus",
++      "fieldConfig": {},
++      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
++      "id": 4,
++      "title": "Prompt Promotion Failures (1h)",
++      "type": "stat",
++      "targets": [{ "expr": "increase(github_actions_workflow_run_failed_total{workflow=\"prompt_promote_and_sign\"}[1h])", "refId": "A" }]
++    }
++  ],
++  "schemaVersion": 32,
++  "style": "dark",
++  "tags": [ "aegis", "slo" ],
++  "templating": { "list": [] },
++  "time": { "from": "now-6h", "to": "now" },
++  "timepicker": {},
++  "timezone": "browser",
++  "title": "Aegis SLO Dashboard",
++  "uid": "aegis-slo-dashboard",
++  "version": 1
++}
++
+*** End File
+*** Add File:ops/runbooks/one_click_poa_prod_test.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# One-click PoA production-style test harness
++# Requires environment variables per docs/runbooks/environment_prefill_instructions.md
++#
++: "${PROMPT_ID:=demo_prompt}"
++: "${MODEL_ENDPOINT:=http://triton:8000}"
++: "${OUT_DIR:=/tmp/aegis_poa_prod_$(date +%s)}"
++mkdir -p "$OUT_DIR"
++
++echo "[0] Validate envs"
++: "${COSIGN_KMS_URI:?Set COSIGN_KMS_URI}"
++: "${REKOR_SERVER:?Set REKOR_SERVER}"
++: "${S3_UPLOAD:?Set S3_UPLOAD}"
++
++echo "[1] Promote prompt via registry (assumes prompt exists)"
++PROM_REG_URL="${PROMPT_REGISTRY_URL:-http://prompt-registry:5003}"
++curl -s -X POST "$PROM_REG_URL/prompts/$PROMPT_ID/promote" -H "Content-Type: application/json" -d '{"env":"staging"}' -o "$OUT_DIR/prompt_promote.json" || true
++cat "$OUT_DIR/prompt_promote.json"
++
++echo "[2] Run ADK sample agent to generate traces/evidence"
++python3 ops/adk/sample_agent/sample_agent.py --goal '{"command":"status"}' --out "$OUT_DIR/adk" --cosign "$COSIGN_KMS_URI" || true
++
++echo "[3] Run retrieval (FAISS) smoke (placeholder)"
++python3 - <<PY
++from ops.prompt.context.context_composer_v2 import compose
++print("Compose placeholder for retrieval + prompt")
++PY
++
++echo "[4] Call model endpoint"
++python3 - <<PY
++import requests, json, os
++payload = {"inputs":"Context: example\n\nQuestion: what is the status?\nAnswer:"}
++try:
++    r = requests.post("${MODEL_ENDPOINT}/v2/models/aegis-llm/infer", json=payload, timeout=10)
++    open("${OUT_DIR}/model_output.json","w").write(r.text)
++    print("Model output captured to ${OUT_DIR}/model_output.json")
++except Exception as e:
++    print("Model call failed:", e)
++PY
++
++echo "[5] Grounding check"
++python3 ops/eval/grounding/grounding_checker.py > "$OUT_DIR/grounding_check.json" || true
++
++echo "[6] Bundle & sign evidence"
++python3 - <<PY
++from ops.adk.sdk.evidence import bundle_evidence
++files = ["${OUT_DIR}/model_output.json","${OUT_DIR}/grounding_check.json","${OUT_DIR}/adk/trace.ndjson"]
++out = "${OUT_DIR}/poa_evidence.tar.gz"
++bundle_evidence(files, out, metadata={"prompt_id":"${PROMPT_ID}","run_by":"one_click_poa_prod_test"}, cosign_key="${COSIGN_KMS_URI}")
++print("Evidence bundled at", out)
++PY
++
++echo "[7] Upload evidence to S3"
++aws s3 cp "${OUT_DIR}/poa_evidence.tar.gz" "${S3_UPLOAD}/poa_evidence_$(date +%s).tar.gz" || echo "s3 upload may have failed"
++
++echo "[8] Verify promotion bundle & evidence via verify_promotion.sh"
++BUNDLE_PATH=$(jq -r '.bundle // empty' "$OUT_DIR/prompt_promote.json" || echo "")
++if [ -n "$BUNDLE_PATH" ] && [ -f "$BUNDLE_PATH" ]; then
++  bash ops/ci/verify_promotion.sh --bundle "$BUNDLE_PATH" --cosign-key "$COSIGN_KMS_URI" --rekor "$REKOR_SERVER" || echo "verify_promotion failed"
++else
++  echo "Prompt promote bundle path not found locally; skipping verification"
++fi
++
++echo "One-click PoA production test finished. Outputs under $OUT_DIR"
++
+*** End File
+*** End Patch

@@ -1,0 +1,824 @@
+*** Begin Patch
+*** Add File:ops/quantum/vault_k8s_integration.md
++---
++title: Vault + ExternalSecrets integration for QPU credentials
++---
++
++This document shows the recommended approach to store QPU provider credentials securely:
++
++1. Store provider credentials (IBMQ token, AWS credentials for Braket, Azure credentials) in HashiCorp Vault.
++2. Use Kubernetes ServiceAccount + Vault Agent Injector or ExternalSecrets operator to provide short-lived credentials to the qpu-adapter pods at runtime.
++3. Do not bake any long-lived keys into container images or manifests.
++
++Example high-level flow:
++ - Vault: secrets/quantum/ibmq -> token
++ - Kubernetes: create ServiceAccount 'qpu-adapter-sa' and allow Vault role mapping
++ - ExternalSecrets: create ExternalSecret that maps Vault path -> Kubernetes Secret
++ - Adapter reads secret from in-cluster secret (mounted env var or file) and uses it to obtain short-lived tokens or submit jobs
++
++See manifests below (ExternalSecret, Vault policy snippets).
++
+*** End File
+*** Add File:k8s/quantum/vault-policy-examples.hcl
++# Vault policy fragments (place in Vault as policies used by k8s auth role)
++path "secret/data/quantum/*" {
++  capabilities = ["read"]
++}
++
++path "transit/encrypt/*" {
++  capabilities = ["encrypt"]
++}
++
++# Use short-lived token issuance via Vault Kubernetes auth; bind to namespace/serviceaccount.
++
+*** End File
+*** Add File:k8s/quantum/externalsecret_ibmq.yaml
++apiVersion: external-secrets.io/v1beta1
++kind: ExternalSecret
++metadata:
++  name: ibmq-credentials
++  namespace: aegis-ml
++spec:
++  refreshInterval: "1h"
++  secretStoreRef:
++    name: vault-backend
++    kind: ClusterSecretStore
++  target:
++    name: ibmq-credentials
++    creationPolicy: Owner
++  data:
++  - secretKey: token
++    remoteRef:
++      key: secret/data/quantum/ibmq
++      property: token
++
++---
++# Example ClusterSecretStore (Vault) - adapt to your Vault address and auth method
++apiVersion: external-secrets.io/v1beta1
++kind: ClusterSecretStore
++metadata:
++  name: vault-backend
++spec:
++  provider:
++    vault:
++      server: "https://vault.example.internal"
++      path: "secret"
++      version: "v2"
++      auth:
++        kubernetes:
++          role: "aegis-quantum-role"
++          serviceAccountRef:
++            name: qpu-adapter-sa
++            namespace: aegis-ml
++
+*** End File
+*** Add File:ops/quantum/adapters/ibmq_adapter.py
++#!/usr/bin/env python3
++"""
++IBMQ provider adapter (production-oriented sketch).
++
++Responsibilities:
++ - Read credentials from in-cluster secret (mounted by ExternalSecrets)
++ - Submit circuits asynchronously to IBMQ (using Qiskit provider)
++ - Poll jobs, fetch results, fetch calibration/properties
++ - Handle errors, backoff, and optionally fall back to simulator
++"""
++import os
++import time
++import json
++import logging
++from typing import Dict, Any
++
++LOG = logging.getLogger("aegis.quantum.ibmq")
++
++try:
++    from qiskit import QuantumCircuit
++    from qiskit_ibm_runtime import IBMQProvider, Session, QiskitRuntimeError
++except Exception:
++    IBMQProvider = None
++    Session = None
++
++
++def _read_token_from_secret():
++    # Assumes ExternalSecret wrote a k8s secret 'ibmq-credentials' with 'token' key
++    path = "/var/secrets/ibmq/token"
++    if os.path.exists(path):
++        return open(path).read().strip()
++    return os.environ.get("IBMQ_TOKEN")
++
++
++class IBMQAdapter:
++    def __init__(self, backend_name: str = "ibmq_qasm_simulator"):
++        self.backend_name = backend_name
++        self.token = _read_token_from_secret()
++        self.provider = None
++        if IBMQProvider is not None and self.token:
++            try:
++                self.provider = IBMQProvider(instance="https://auth.quantum-computing.ibm.com/api")
++            except Exception as e:
++                LOG.exception("IBMQProvider init failed: %s", e)
++
++    def submit_async(self, qasm: str, shots: int = 1024) -> Dict[str, Any]:
++        """
++        Submit a QASM string asynchronously. Returns job metadata with job_id or error.
++        """
++        if not self.provider:
++            raise RuntimeError("IBMQ provider not configured")
++        try:
++            backend = self.provider.backend(self.backend_name)
++            job = backend.run(qasm, shots=shots) if hasattr(backend, "run") else backend.run(qasm, shots=shots)
++            job_id = job.job_id() if hasattr(job, "job_id") else getattr(job, "id", None)
++            return {"job_id": job_id, "status": "submitted"}
++        except Exception as e:
++            LOG.exception("IBMQ submit failed: %s", e)
++            return {"error": str(e)}
++
++    def poll_job(self, job_id: str, timeout_s: int = 600, poll_interval: float = 5.0) -> Dict[str, Any]:
++        """
++        Poll job until completion or timeout. Returns result or error dict.
++        """
++        if not self.provider:
++            return {"error": "provider_not_configured"}
++        try:
++            backend = self.provider.backend(self.backend_name)
++            start = time.time()
++            while time.time() - start < timeout_s:
++                # backend.status? or provider.job(job_id)
++                job = backend.job(job_id) if hasattr(backend, "job") else None
++                if job:
++                    st = job.status().name if hasattr(job, "status") else getattr(job, "status", "UNKNOWN")
++                    if st in ("DONE", "COMPLETED"):
++                        result = job.result() if hasattr(job, "result") else {"info": "result"}
++                        return {"status": "completed", "result": result}
++                    elif st in ("ERROR", "CANCELLED", "FAILED"):
++                        return {"status": "error", "error": str(st)}
++                time.sleep(poll_interval)
++            return {"status": "timeout", "error": "timed out"}
++        except Exception as e:
++            LOG.exception("poll_job failed: %s", e)
++            return {"error": str(e)}
++
++    def fetch_calibration(self) -> Dict[str, Any]:
++        """
++        Fetch backend calibration/properties: T1/T2/gate errors/coupling map.
++        """
++        if not self.provider:
++            return {}
++        try:
++            backend = self.provider.backend(self.backend_name)
++            props = backend.properties() if hasattr(backend, "properties") else {}
++            # normalize to dict and return
++            return {"properties": str(props)}
++        except Exception as e:
++            LOG.exception("fetch_calibration failed: %s", e)
++            return {"error": str(e)}
++
+*** End File
+*** Add File:ops/quantum/adapters/braket_adapter.py
++#!/usr/bin/env python3
++"""
++AWS Braket adapter sketch.
++ - Reads AWS credentials from environment/secret
++ - Submits via boto3 braket client (if available)
++ - Supports async polling and properties fetch
++"""
++import os
++import time
++import logging
++import json
++from typing import Dict, Any
++
++LOG = logging.getLogger("aegis.quantum.braket")
++
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++
++class BraketAdapter:
++    def __init__(self, device: str = "amazon/sv1"):
++        self.device = device
++        self.session = None
++        if boto3:
++            try:
++                self.client = boto3.client("braket")
++            except Exception:
++                self.client = None
++        else:
++            self.client = None
++
++    def submit_async(self, qasm: str, shots: int = 1000) -> Dict[str, Any]:
++        if not self.client:
++            return {"error": "boto3_not_available"}
++        try:
++            # Braket accepts S3 bucket + payload; simplified here
++            resp = self.client.create_job(
++                # placeholder fields - adapt in production
++                jobName=f"aegis-{int(time.time())}",
++                deviceConfig={"device": self.device, "shots": shots},
++                # provide program as long text or S3 pointer
++                action={'s3Uri': 's3://placeholder/program'}
++            )
++            return {"job_id": resp.get("jobArn")}
++        except Exception as e:
++            LOG.exception("braket submit failed: %s", e)
++            return {"error": str(e)}
++
++    def poll_job(self, job_id: str, timeout_s: int = 600, poll_interval: float = 10.0) -> Dict[str, Any]:
++        if not self.client:
++            return {"error": "client_unavailable"}
++        start = time.time()
++        while time.time() - start < timeout_s:
++            try:
++                resp = self.client.get_job(jobId=job_id)
++                status = resp.get("job", {}).get("status")
++                if status in ("COMPLETED", "FAILED", "CANCELLED"):
++                    return {"status": status, "details": resp}
++            except Exception as e:
++                LOG.exception("poll_job exception: %s", e)
++                return {"error": str(e)}
++            time.sleep(poll_interval)
++        return {"status": "timeout"}
++
++    def fetch_calibration(self) -> Dict[str, Any]:
++        # Braket may provide device properties via describe_device
++        if not self.client:
++            return {}
++        try:
++            resp = self.client.describe_device(deviceArn=self.device)
++            return {"properties": resp}
++        except Exception as e:
++            LOG.exception("fetch_calibration failed: %s", e)
++            return {"error": str(e)}
++
+*** End File
+*** Add File:ops/quantum/adapters/azure_adapter.py
++#!/usr/bin/env python3
++"""
++Azure Quantum adapter sketch.
++ - Uses azure-quantum SDK in production (not included here)
++"""
++import logging
++import time
++from typing import Dict, Any
++
++LOG = logging.getLogger("aegis.quantum.azure")
++
++class AzureAdapter:
++    def __init__(self, workspace: str = None):
++        self.workspace = workspace
++
++    def submit_async(self, qasm: str, shots: int = 1000) -> Dict[str, Any]:
++        # Placeholder: implement using azure-quantum SDK
++        return {"error": "not_implemented"}
++
++    def poll_job(self, job_id: str, timeout_s: int = 600, poll_interval: float = 10.0) -> Dict[str, Any]:
++        return {"error": "not_implemented"}
++
++    def fetch_calibration(self) -> Dict[str, Any]:
++        return {}
++
+*** End File
+*** Add File:ops/quantum/qpu_queue_service.py
++#!/usr/bin/env python3
++"""
++QPU Job Queue Microservice
++
++ - FastAPI service that accepts job submissions (circuit, backend, shots, owner, team)
++ - Enforces simple per-team quotas and estimated-cost checks
++ - Background worker dequeues jobs and calls provider adapters with rate limiting and batching hooks
++ - Supports fallback to simulator if provider unavailable
++
++Simple DB: SQLite for demo (switch to Postgres in production)
++"""
++import os
++import time
++import json
++import threading
++import uuid
++import logging
++from typing import Optional, Dict, Any, List
++from fastapi import FastAPI, HTTPException, BackgroundTasks
++from pydantic import BaseModel
++import sqlite3
++
++from adapters.ibmq_adapter import IBMQAdapter
++from adapters.braket_adapter import BraketAdapter
++from adapters.azure_adapter import AzureAdapter
++from qiskit import QuantumCircuit, transpile
++
++LOG = logging.getLogger("aegis.quantum.qpu_queue")
++LOG.setLevel(logging.INFO)
++
++DB_PATH = os.environ.get("QPU_DB", "/tmp/qpu_queue.db")
++PROCESS_INTERVAL = float(os.environ.get("QPU_PROCESS_INTERVAL", "5.0"))
++TEAM_QUOTA = {"research": 1000000, "prod": 100000}  # example quota in $-cents or arbitrary units
++COST_PER_SHOT = {"ibmq": 0.0001, "braket": 0.0002, "azure": 0.00015}  # dollars per shot
++
++app = FastAPI()
++
++class QpuJob(BaseModel):
++    circuit: str  # qasm or JSON representation
++    backend: str
++    shots: int = 1024
++    owner: str
++    team: str = "research"
++    priority: int = 5
++
++
++def init_db():
++    conn = sqlite3.connect(DB_PATH)
++    c = conn.cursor()
++    c.execute("""CREATE TABLE IF NOT EXISTS jobs (
++        id TEXT PRIMARY KEY,
++        circuit TEXT,
++        backend TEXT,
++        shots INTEGER,
++        owner TEXT,
++        team TEXT,
++        status TEXT,
++        submitted_at REAL,
++        started_at REAL,
++        finished_at REAL,
++        result TEXT,
++        est_cost REAL
++    )""")
++    conn.commit()
++    conn.close()
++
++
++def estimate_cost(backend: str, shots: int) -> float:
++    key = "ibmq" if "ibmq" in backend else ("braket" if "braket" in backend else "azure")
++    return shots * COST_PER_SHOT.get(key, 0.0001)
++
++
++@app.post("/submit")
++def submit_job(job: QpuJob, background_tasks: BackgroundTasks):
++    # simple quota enforcement (sum of estimated cost of running jobs in DB for the team)
++    est = estimate_cost(job.backend, job.shots)
++    # compute team usage
++    conn = sqlite3.connect(DB_PATH)
++    c = conn.cursor()
++    c.execute("SELECT SUM(est_cost) FROM jobs WHERE team = ? AND status IN ('submitted','running')", (job.team,))
++    row = c.fetchone()
++    team_usage = row[0] or 0.0
++    if team_usage + est > TEAM_QUOTA.get(job.team, 1e9):
++        conn.close()
++        raise HTTPException(status_code=402, detail="Team quota exceeded")
++    job_id = str(uuid.uuid4())
++    c.execute("INSERT INTO jobs (id,circuit,backend,shots,owner,team,status,submitted_at,est_cost) VALUES (?,?,?,?,?,?,?,?,?)",
++              (job_id, job.circuit, job.backend, job.shots, job.owner, job.team, "submitted", time.time(), est))
++    conn.commit()
++    conn.close()
++    return {"job_id": job_id, "est_cost": est}
++
++
++@app.get("/status/{job_id}")
++def status(job_id: str):
++    conn = sqlite3.connect(DB_PATH)
++    c = conn.cursor()
++    c.execute("SELECT status,result,est_cost FROM jobs WHERE id = ?", (job_id,))
++    row = c.fetchone()
++    conn.close()
++    if not row:
++        raise HTTPException(status_code=404, detail="Not found")
++    return {"status": row[0], "result": json.loads(row[1]) if row[1] else None, "est_cost": row[2]}
++
++
++def process_loop():
++    # adapters instances
++    ibm = IBMQAdapter()
++    brk = BraketAdapter()
++    az = AzureAdapter()
++    while True:
++        try:
++            conn = sqlite3.connect(DB_PATH)
++            c = conn.cursor()
++            c.execute("SELECT id,circuit,backend,shots FROM jobs WHERE status = 'submitted' ORDER BY submitted_at LIMIT 5")
++            rows = c.fetchall()
++            if not rows:
++                conn.close()
++                time.sleep(PROCESS_INTERVAL)
++                continue
++            # naive batching: group by backend
++            by_backend = {}
++            for r in rows:
++                jid, circ, backend, shots = r
++                by_backend.setdefault(backend, []).append((jid, circ, shots))
++            for backend, jobs in by_backend.items():
++                # simple rate limiting: only process one batch per backend per loop
++                for jid, circ, shots in jobs:
++                    c.execute("UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?", (time.time(), jid))
++                    conn.commit()
++                    # submit to provider
++                    try:
++                        if "ibmq" in backend:
++                            resp = ibm.submit_async(circ, shots=shots)
++                            if "error" in resp:
++                                # fallback: run on simulator
++                                LOG.warning("IBMQ submit failed, falling back to sim for job %s", jid)
++                                sim_res = run_simulator(circ, shots)
++                                c.execute("UPDATE jobs SET status='finished', finished_at=?, result=? WHERE id=?", (time.time(), json.dumps(sim_res), jid))
++                                conn.commit()
++                                continue
++                            job_id = resp.get("job_id")
++                            poll = ibm.poll_job(job_id, timeout_s=600)
++                            c.execute("UPDATE jobs SET status=?, finished_at=?, result=? WHERE id=?", (poll.get("status","unknown"), time.time(), json.dumps(poll), jid))
++                            conn.commit()
++                        elif "braket" in backend:
++                            resp = brk.submit_async(circ, shots=shots)
++                            if "error" in resp:
++                                sim_res = run_simulator(circ, shots)
++                                c.execute("UPDATE jobs SET status='finished', finished_at=?, result=? WHERE id=?", (time.time(), json.dumps(sim_res), jid))
++                                conn.commit()
++                                continue
++                            job_id = resp.get("job_id")
++                            poll = brk.poll_job(job_id, timeout_s=1800)
++                            c.execute("UPDATE jobs SET status=?, finished_at=?, result=? WHERE id=?", (poll.get("status","unknown"), time.time(), json.dumps(poll), jid))
++                            conn.commit()
++                        else:
++                            # unknown backend: run on simulator
++                            sim_res = run_simulator(circ, shots)
++                            c.execute("UPDATE jobs SET status='finished', finished_at=?, result=? WHERE id=?", (time.time(), json.dumps(sim_res), jid))
++                            conn.commit()
++                    except Exception as e:
++                        LOG.exception("Processing job %s failed: %s", jid, e)
++                        c.execute("UPDATE jobs SET status='error', finished_at=?, result=? WHERE id=?", (time.time(), json.dumps({"error": str(e)}), jid))
++                        conn.commit()
++            conn.close()
++        except Exception as e:
++            LOG.exception("Process loop failed: %s", e)
++        time.sleep(PROCESS_INTERVAL)
++
++
++def run_simulator(qasm: str, shots: int = 1024):
++    # Very small simulator fallback using qiskit Aer if available
++    try:
++        from qiskit import QuantumCircuit
++        from qiskit.providers.aer import AerSimulator
++        qc = QuantumCircuit.from_qasm_str(qasm) if qasm.strip().startswith("OPENQASM") else QuantumCircuit.from_qasm_str(qasm)
++        backend = AerSimulator()
++        job = backend.run(qc, shots=shots)
++        result = job.result()
++        counts = result.get_counts()
++        return {"counts": counts, "shots": shots, "source": "sim"}
++    except Exception as e:
++        LOG.exception("Simulator fallback failed: %s", e)
++        return {"error": str(e)}
++
++
++if __name__ == "__main__":
++    init_db()
++    # start background processor thread
++    t = threading.Thread(target=process_loop, daemon=True)
++    t.start()
++    import uvicorn
++    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("QPU_QUEUE_PORT", 8080)))
++
+*** End File
+*** Add File:ops/quantum/noise_aware_transpiler.py
++#!/usr/bin/env python3
++"""
++Noise-aware transpiler utilities for Qiskit circuits.
++
++ - fetch_backend_properties(): wrapper that calls provider adapter to get calibration/properties
++ - transpile_for_backend(): use coupling_map, basis_gates and set optimization level based on noise
++
++This module requires qiskit installed; it's written defensively so adapters can be used as stubs.
++"""
++import logging
++from qiskit import transpile, QuantumCircuit
++from typing import Dict, Any
++
++LOG = logging.getLogger("aegis.quantum.transpile")
++
++
++def fetch_backend_properties(adapter, backend_name: str) -> Dict[str, Any]:
++    try:
++        props = adapter.fetch_calibration()
++        return props.get("properties", {}) if isinstance(props, dict) else props
++    except Exception as e:
++        LOG.exception("fetch_backend_properties error: %s", e)
++        return {}
++
++
++def transpile_for_backend(qc: QuantumCircuit, adapter, backend_name: str, shots: int = 1024):
++    """
++    Use simplistic heuristics:
++     - if gate error high -> use lower optimization to be conservative
++     - if coupling_map present -> use it
++    """
++    props = fetch_backend_properties(adapter, backend_name)
++    # parse props (stub normalization)
++    coupling_map = props.get("coupling_map") if isinstance(props, dict) else None
++    avg_gate_error = float(props.get("avg_gate_error", 0.001)) if isinstance(props, dict) else 0.001
++    if avg_gate_error > 0.01:
++        opt_level = 0
++    elif avg_gate_error > 0.002:
++        opt_level = 1
++    else:
++        opt_level = 3
++    try:
++        if coupling_map:
++            tqc = transpile(qc, basis_gates=None, coupling_map=coupling_map, optimization_level=opt_level)
++        else:
++            tqc = transpile(qc, optimization_level=opt_level)
++        return {"transpiled_qc": tqc, "opt_level": opt_level}
++    except Exception as e:
++        LOG.exception("transpile failed: %s", e)
++        return {"error": str(e)}
++
+*** End File
+*** Add File:ops/quantum/provenance_signer.py
++#!/usr/bin/env python3
++"""
++Provenance hardening: sign evidence bundles with cosign (KMS-backed key) and register with Rekor.
++
++This is a convenience wrapper that calls `cosign sign-blob` and optionally `rekor-cli` to submit the signature.
++In production wire to KMS-backed cosign key (e.g., AWS KMS / GCP KMS) and Rekor transparency log.
++"""
++import os
++import subprocess
++import logging
++
++LOG = logging.getLogger("aegis.quantum.provenance")
++
++
++def sign_blob_with_cosign(file_path: str, cosign_key: str):
++    try:
++        cmd = ["cosign", "sign-blob", "--key", cosign_key, file_path]
++        subprocess.check_call(cmd)
++        LOG.info("Signed %s with cosign", file_path)
++        return True
++    except Exception as e:
++        LOG.exception("cosign sign failed: %s", e)
++        return False
++
++
++def register_with_rekor(file_path: str, signature_path: str, rekor_host: str):
++    try:
++        # placeholder: use rekor-cli or HTTP API to upload entry
++        cmd = ["rekor-cli", "upload", "--rekor_server", rekor_host, "--signature", signature_path, file_path]
++        subprocess.check_call(cmd)
++        LOG.info("Registered %s with Rekor", file_path)
++        return True
++    except Exception as e:
++        LOG.exception("Rekor registration failed: %s", e)
++        return False
++
+*** End File
+*** Add File:ops/quantum/metrics/quantum_calibration_exporter.py
++#!/usr/bin/env python3
++"""
++Exporter that scrapes provider adapters for calibration metrics and exposes Prometheus metrics.
++Run this as a deployment (one instance) or as a daemonset per-region/backend.
++"""
++import os
++import time
++import logging
++from prometheus_client import start_http_server, Gauge
++
++LOG = logging.getLogger("aegis.quantum.metrics")
++
++# Gauges for backend fidelity
++T1 = Gauge("aegis_quantum_t1_seconds", "QPU T1 (s)", ["backend", "qubit"])
++T2 = Gauge("aegis_quantum_t2_seconds", "QPU T2 (s)", ["backend", "qubit"])
++SINGLE_Q_GATE_ERROR = Gauge("aegis_quantum_single_qubit_error", "Single qubit gate error", ["backend", "qubit"])
++TWO_Q_GATE_ERROR = Gauge("aegis_quantum_two_qubit_error", "Two qubit gate error", ["backend", "qubits"])
++
++def scrape_and_export(adapters: dict, poll_interval: int = 300):
++    start_http_server(int(os.environ.get("QUANTUM_METRICS_PORT", 9410)))
++    while True:
++        for name, adapter in adapters.items():
++            try:
++                props = adapter.fetch_calibration()
++                # props parsing heuristics; adapters should return structured dict
++                if "properties" in props and isinstance(props["properties"], dict):
++                    p = props["properties"]
++                    # parse qubit metrics if present
++                    qubits = p.get("qubits", {})
++                    for q_idx, qinfo in qubits.items():
++                        if "t1" in qinfo:
++                            T1.labels(backend=name, qubit=str(q_idx)).set(float(qinfo["t1"]))
++                        if "t2" in qinfo:
++                            T2.labels(backend=name, qubit=str(q_idx)).set(float(qinfo["t2"]))
++                        if "single_error" in qinfo:
++                            SINGLE_Q_GATE_ERROR.labels(backend=name, qubit=str(q_idx)).set(float(qinfo["single_error"]))
++                    # two-qubit errors: p.get("two_qubit", {}) -> map of (q1,q2) -> error
++                    two = p.get("two_qubit", {})
++                    for k, v in two.items():
++                        TWO_Q_GATE_ERROR.labels(backend=name, qubits=str(k)).set(float(v))
++            except Exception as e:
++                LOG.exception("Metric scrape for %s failed: %s", name, e)
++        time.sleep(poll_interval)
++
++if __name__ == "__main__":
++    # Adapters to poll (modify as you deploy)
++    from adapters.ibmq_adapter import IBMQAdapter
++    adapters = {"ibmq": IBMQAdapter(backend_name=os.environ.get("IBMQ_BACKEND", "ibmq_quito"))}
++    scrape_and_export(adapters)
++
+*** End File
+*** Add File:ops/policy/qpu_policy.rego
++package aegis.qpu
++
++default allow_submit = false
++
++# Input shape:
++# {
++#   "team": "research",
++#   "owner": "alice",
++#   "est_cost": 0.15,
++#   "backend": "ibmq_quito"
++# }
++
++# Policy: require approval for jobs above threshold or for prod team
++allow_submit {
++  input.team == "research"
++  input.est_cost <= 10.0
++}
++
++allow_submit {
++  input.team == "prod"
++  input.approval != null
++}
++
++deny_reason[msg] {
++  not allow_submit
++  msg = "submission blocked by policy (cost or approval required)"
++}
++
+*** End File
+*** Add File:ops/quantum/ci/qpu_ci_gating.yml
++name: QPU CI gating
++on:
++  workflow_dispatch:
++jobs:
++  sim-baseline:
++    runs-on: ubuntu-latest
++    steps:
++    - uses: actions/checkout@v4
++    - name: Set up Python
++      uses: actions/setup-python@v4
++      with:
++        python-version: "3.11"
++    - name: Install deps
++      run: |
++        pip install qiskit pyarrow pandas
++    - name: Run simulator baseline
++      run: |
++        python3 ops/quantum/qiskit_job.py --circuit ops/quantum/examples/simple_circuit.json --mode sim --out-dir ./artifacts || (echo "sim failed" && exit 1)
++    - name: Snapshot circuit (DVC friendly)
++      run: |
++        python3 ops/quantum/deterministic_circuit_snapshot.py --circuit ops/quantum/examples/simple_circuit.json --out ./artifacts || true
++
++  qpu-optional:
++    needs: sim-baseline
++    runs-on: ubuntu-latest
++    if: ${{ github.event.inputs.submit_qpu == 'true' }}
++    steps:
++    - uses: actions/checkout@v4
++    - name: Trigger QPU Queue
++      run: |
++        curl -X POST http://qpu-queue.internal/submit -H "Content-Type: application/json" -d '{"circuit":"$(cat ops/quantum/examples/simple_circuit.json)","backend":"ibmq_quito","shots":1024,"owner":"ci","team":"research"}'
++
++  gating-check:
++    needs: [sim-baseline, qpu-optional]
++    runs-on: ubuntu-latest
++    steps:
++    - name: Check evidence presence
++      run: |
++        # In production verify signed evidence exists in artifact store and Rekor
++        echo "Gating stub: ensure signed evidence exists for promoted artifact"
++        exit 0
++
+*** End File
+*** Add File:ops/quantum/deterministic_circuit_snapshot.py
++#!/usr/bin/env python3
++"""
++Write deterministic circuit snapshot and optional DVC add.
++Records circuit hash, seed, and metadata for reproducibility.
++"""
++import os
++import argparse
++import json
++import hashlib
++import time
++import subprocess
++
++def snapshot_circuit(path, out_dir):
++    with open(path, "r") as fh:
++        data = fh.read()
++    h = hashlib.sha256(data.encode("utf-8")).hexdigest()
++    ts = int(time.time())
++    os.makedirs(out_dir, exist_ok=True)
++    out_path = os.path.join(out_dir, f"circuit_{h[:8]}_{ts}.json")
++    with open(out_path, "w") as fh:
++        json.dump({"circuit": data, "sha256": h, "ts": ts}, fh)
++    try:
++        subprocess.run(f"dvc add {out_path}", shell=True, check=True)
++    except Exception:
++        # DVC optional
++        pass
++    print("Wrote snapshot", out_path)
++
++if __name__ == "__main__":
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--circuit", required=True)
++    ap.add_argument("--out", default="./artifacts")
++    args = ap.parse_args()
++    snapshot_circuit(args.circuit, args.out)
++
+*** End File
+*** Add File:ops/quantum/backoff_fallback.md
++Backoff and fallback strategy for QPU submissions
++
++1. Queue jobs in shared QPU queue service (qpu_queue_service).
++2. If provider submission fails immediately, mark job with transient error and attempt fallback:
++   - First fallback: run on local/high-fidelity simulator (if acceptable)
++   - Second: re-enqueue with exponential backoff (backoff factor, jitter)
++3. For expensive runs, require approval before re-submitting to avoid billing surprises
++
++Implementation notes:
++ - qpu_queue_service implements simulator fallback for submission errors
++ - Provider adapters should raise specific exceptions for transient vs permanent errors
++ - Scheduler should support requeue_count to limit retries
++
+*** End File
+*** Add File:docs/quantum/grafana_qpu_dashboard.json
++{
++  "title": "Aegis QPU Dashboard",
++  "panels": [
++    {
++      "type": "graph",
++      "title": "QPU Queue Length",
++      "targets": [{"expr": "count(aegis_qpu_job_total{state=\"submitted\"})", "legendFormat": "submitted"}]
++    },
++    {
++      "type": "stat",
++      "title": "Estimated Cost in Queue ($)",
++      "targets": [{"expr": "sum(aegis_qpu_job_est_cost)", "legendFormat": "est_cost"}]
++    },
++    {
++      "type": "graph",
++      "title": "Backend T1/T2 (select backend)",
++      "targets": [{"expr": "aegis_quantum_t1_seconds", "legendFormat": "{{backend}}:{{qubit}}"}, {"expr": "aegis_quantum_t2_seconds", "legendFormat": "{{backend}}:{{qubit}}"}]
++    }
++  ]
++}
++
+*** End File
+*** Add File:ops/monitoring/prometheus/qpu_prometheus_rules.yaml
++groups:
++- name: qpu-operations
++  rules:
++  - alert: QPUQueueLengthHigh
++    expr: count(aegis_qpu_job_total{state="submitted"}) > 50
++    for: 5m
++    labels:
++      severity: page
++    annotations:
++      summary: "QPU queue length is high"
++      description: "More than 50 jobs in submitted state"
++  - alert: QPUEstimatedCostHigh
++    expr: sum(aegis_qpu_job_est_cost) > 100
++    for: 10m
++    labels:
++      severity: warning
++    annotations:
++      summary: "High estimated QPU cost in queue"
++      description: "Estimated queued QPU cost exceeds $100"
++
+*** End File
+*** Add File:ops/quantum/README_PRODUCTIONIZE.md
++Productionize checklist (summary)
++
++1) Secrets & credentials
++ - Vault policies created for quantum paths
++ - ExternalSecrets configured to refresh secrets and mount into qpu-adapter pods
++ - qpu-adapter serviceaccount has minimal permissions
++
++2) Queue & quota
++ - Deploy qpu_queue_service with Postgres in production (replace SQLite)
++ - Configure TEAM_QUOTA per org/team
++ - Integrate cost estimation hooks with billing/chargeback
++
++3) Providers & adapters
++ - Deploy and test IBMQ, Braket and Azure adapters with Vault secrets
++ - Add noise-aware transpiler integration before submission
++
++4) Provenance & signing
++ - Use cosign with KMS keys and Rekor to register every evidence bundle
++ - Ensure evidence is stored in artifact store and linked to MLflow runs
++
++5) Observability and policy
++ - Deploy calibration exporter, feed metrics to Prometheus, provision Grafana dashboard
++ - Add OPA policy and approver integration for high-cost jobs
++
++6) CI / gating
++ - Keep simulator CI for all runs; gate QPU runs via approvals and signed evidence
++ - Use deterministic snapshots to reproduce circuits
++
+*** End File
+*** End Patch

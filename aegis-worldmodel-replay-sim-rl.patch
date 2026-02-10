@@ -1,0 +1,678 @@
+*** Begin Patch
+*** Add File:ops/replay/replay_buffer_service.py
++#!/usr/bin/env python3
++"""
++Replay Buffer Microservice (Redis Streams based)
++
++- Accepts push of timestep/state/action/reward tuples for an episode.
++- Stores per-episode streams with bounded length (ring buffer semantics).
++- Exposes HTTP API to push events, fetch episodes, sample minibatches for training,
++  and export episodes to Parquet/TFRecord for offline training.
++
++Requires: redis, flask, pyarrow, pandas
++"""
++import os
++import time
++import json
++from flask import Flask, request, jsonify
++import redis
++import pandas as pd
++import pyarrow as pa
++import pyarrow.parquet as pq
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
++MAX_EPISODE_LEN = int(os.environ.get("MAX_EPISODE_LEN", "2000"))
++EXPORT_PATH = os.environ.get("EXPORT_PATH", "/tmp/episodes")
++
++r = redis.from_url(REDIS_URL, decode_responses=True)
++app = Flask(__name__)
++
++def episode_stream_key(run_id: str):
++    return f"aegis:replay:episode:{run_id}"
++
++@app.route("/push_event", methods=["POST"])
++def push_event():
++    """
++    JSON body:
++      {"run_id": "...", "t": 12, "state": {...}, "action": {...}, "reward": 0.0, "done": false}
++    """
++    body = request.get_json()
++    run_id = body["run_id"]
++    key = episode_stream_key(run_id)
++    # store as JSON string, use XADD with MAXLEN ~ MAX_EPISODE_LEN
++    r.xadd(key, {"payload": json.dumps(body)}, maxlen=MAX_EPISODE_LEN, approximate=True)
++    # set TTL to keep episodes for archival period if desired
++    r.expire(key, 60 * 60 * 24 * 7)  # 7 days default
++    return jsonify({"status": "ok"})
++
++@app.route("/get_episode/<run_id>", methods=["GET"])
++def get_episode(run_id):
++    key = episode_stream_key(run_id)
++    entries = r.xrange(key, count=MAX_EPISODE_LEN)
++    events = [json.loads(e[1]["payload"]) for e in entries]
++    return jsonify({"events": events})
++
++@app.route("/export_episode", methods=["POST"])
++def export_episode():
++    """
++    Export an episode to Parquet.
++    JSON body: {"run_id":"...","out":"<optional path>"}
++    """
++    body = request.get_json()
++    run_id = body["run_id"]
++    out = body.get("out") or f"{EXPORT_PATH}/{run_id}.parquet"
++    key = episode_stream_key(run_id)
++    entries = r.xrange(key)
++    if not entries:
++        return jsonify({"status": "not_found"}), 404
++    events = [json.loads(e[1]["payload"]) for e in entries]
++    # flatten events into DataFrame (simple approach)
++    rows = []
++    for ev in events:
++        row = {
++            "run_id": ev.get("run_id"),
++            "t": ev.get("t"),
++            "state": json.dumps(ev.get("state")),
++            "action": json.dumps(ev.get("action")),
++            "reward": ev.get("reward"),
++            "done": ev.get("done", False)
++        }
++        rows.append(row)
++    df = pd.DataFrame(rows)
++    os.makedirs(os.path.dirname(out), exist_ok=True)
++    table = pa.Table.from_pandas(df)
++    pq.write_table(table, out)
++    return jsonify({"status": "exported", "path": out})
++
++@app.route("/sample_batch", methods=["POST"])
++def sample_batch():
++    """
++    Sample a minibatch across episodes for training.
++    JSON body: {"batch_size": 64}
++    Returns a small JSON with sampled transitions (note: for large-scale training you should
++    stream directly from Redis into the learner to avoid copying).
++    """
++    body = request.get_json()
++    bsize = int(body.get("batch_size", 32))
++    # naive sample: pick random episode keys and sample a random event from each
++    keys = r.keys("aegis:replay:episode:*")
++    import random
++    samples = []
++    if not keys:
++        return jsonify({"samples": []})
++    for _ in range(bsize):
++        k = random.choice(keys)
++        entries = r.xrange(k)
++        if not entries:
++            continue
++        ev = json.loads(random.choice(entries)[1]["payload"])
++        samples.append(ev)
++    return jsonify({"samples": samples})
++
++if __name__ == "__main__":
++    os.makedirs(EXPORT_PATH, exist_ok=True)
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
++
+*** End File
+*** Add File:ops/sim/domain_randomizer.py
++#!/usr/bin/env python3
++"""
++Domain randomizer for PyBullet scenarios.
++
++Provides randomized params (friction, mass, lighting, camera jitter) for sim episodes.
++"""
++import random
++import json
++
++DEFAULT_BOUNDS = {
++    "mass_mul": [0.8, 1.2],
++    "friction_mul": [0.7, 1.3],
++    "camera_yaw_jitter": [-5.0, 5.0],
++    "light_intensity": [0.8, 1.2]
++}
++
++def sample_randomization(bounds: dict = None):
++    b = bounds or DEFAULT_BOUNDS
++    params = {}
++    for k, rng in b.items():
++        if isinstance(rng, list) and len(rng) == 2:
++            params[k] = random.uniform(rng[0], rng[1])
++        else:
++            params[k] = rng
++    return params
++
++def to_json(params):
++    return json.dumps(params)
++
++if __name__ == "__main__":
++    print(sample_randomization())
++
+*** End File
+*** Add File:ops/sim/pb_episode_recorder.py
++#!/usr/bin/env python3
++"""
++PyBullet episode recorder.
++
++Runs a parameterized episode with domain randomization, records timestep states,
++and writes a Parquet episode file + metadata (seed, randomization params).
++
++Usage:
++  python3 pb_episode_recorder.py --episodes 10 --out_dir /tmp/episodes
++"""
++import argparse
++import os
++import time
++import json
++import random
++import pybullet as p
++import pybullet_data
++from domain_randomizer import sample_randomization
++import pandas as pd
++import pyarrow as pa
++import pyarrow.parquet as pq
++
++def run_episode(env_seed, randomize_params, max_steps=200):
++    # Minimal PyBullet loop; replace with your env/robot control logic
++    physicsClient = p.connect(p.DIRECT)
++    p.setAdditionalSearchPath(pybullet_data.getDataPath())
++    p.resetSimulation()
++    p.setGravity(0, 0, -9.81)
++    plane = p.loadURDF("plane.urdf")
++    cube = p.loadURDF("r2d2.urdf", basePosition=[0,0,0.5])
++    # apply simple randomization (placeholder)
++    # e.g., scale visual light or randomize cube mass via changeDynamics
++    if "mass_mul" in randomize_params:
++        try:
++            p.changeDynamics(cube, -1, mass=1.0 * randomize_params["mass_mul"])
++        except Exception:
++            pass
++    data = []
++    for t in range(max_steps):
++        # simple policy: small random actions (replace with policy)
++        action = [random.uniform(-0.1,0.1) for _ in range(2)]
++        p.stepSimulation()
++        pos, orn = p.getBasePositionAndOrientation(cube)
++        # observation simplified
++        obs = {"pos": pos, "orn": orn}
++        row = {"t": t, "state": json.dumps(obs), "action": json.dumps(action), "reward": 0.0, "done": False}
++        data.append(row)
++    p.disconnect()
++    return data
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--episodes", type=int, default=1)
++    ap.add_argument("--out_dir", default="/tmp/episodes")
++    ap.add_argument("--max_steps", type=int, default=200)
++    ap.add_argument("--seed", type=int, default=None)
++    args = ap.parse_args()
++    os.makedirs(args.out_dir, exist_ok=True)
++    seed = args.seed or int(time.time())
++    random.seed(seed)
++    for i in range(args.episodes):
++        ep_seed = seed + i
++        random.seed(ep_seed)
++        rand_params = sample_randomization()
++        data = run_episode(ep_seed, rand_params, max_steps=args.max_steps)
++        df = pd.DataFrame(data)
++        basename = f"episode_{int(time.time())}_{i}.parquet"
++        out_path = os.path.join(args.out_dir, basename)
++        table = pa.Table.from_pandas(df)
++        pq.write_table(table, out_path)
++        meta = {"seed": ep_seed, "randomization": rand_params, "steps": len(data)}
++        with open(out_path + ".meta.json", "w") as fh:
++            json.dump(meta, fh)
++        print("Wrote", out_path)
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:ops/sim/sim_to_real_calibrator.py
++#!/usr/bin/env python3
++"""
++Simple sim->real calibration helper.
++
++Given directories of sim episodes and real episodes (Parquet), compute basic distribution
++statistics on selected sensors (e.g., position, orientation) and produce a balancing plan
++that can be used for domain randomization / dataset resampling.
++"""
++import os
++import json
++import numpy as np
++import pandas as pd
++from glob import glob
++
++def collect_stats(parquet_dir, field="state"):
++    files = glob(os.path.join(parquet_dir, "*.parquet"))
++    vals = []
++    for f in files:
++        df = pd.read_parquet(f)
++        # naive: parse JSON state, extract pos[0] as example
++        for s in df[field]:
++            try:
++                j = json.loads(s)
++                pos = j.get("pos", [0,0,0])
++                vals.append(pos[0])
++            except Exception:
++                continue
++    arr = np.array(vals)
++    return {"mean": float(np.mean(arr)), "std": float(np.std(arr)), "count": int(len(arr))}
++
++def build_balancing_plan(sim_dir, real_dir, out_path="balancing_plan.json"):
++    sim_stats = collect_stats(sim_dir)
++    real_stats = collect_stats(real_dir)
++    plan = {"sim": sim_stats, "real": real_stats, "advice": {}}
++    # simple advice: shift mean and widen randomization if mismatch
++    if abs(sim_stats["mean"] - real_stats["mean"]) > 0.1 * (abs(real_stats["mean"]) + 1e-6):
++        plan["advice"]["shift_mean"] = real_stats["mean"] - sim_stats["mean"]
++    if sim_stats["std"] < real_stats["std"]:
++        plan["advice"]["increase_randomization"] = True
++    with open(out_path, "w") as fh:
++        json.dump(plan, fh, indent=2)
++    print("Wrote balancing plan to", out_path)
++    return plan
++
++if __name__ == "__main__":
++    import argparse
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--sim-dir", required=True)
++    ap.add_argument("--real-dir", required=True)
++    ap.add_argument("--out", default="balancing_plan.json")
++    args = ap.parse_args()
++    build_balancing_plan(args.sim_dir, args.real_dir, args.out)
++
+*** End File
+*** Add File:k8s/edge/low_latency_inference.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: low-latency-inference
++  namespace: aegis-robotics
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: low-latency-inference
++  template:
++    metadata:
++      labels:
++        app: low-latency-inference
++    spec:
++      containers:
++      - name: model-runtime
++        image: "<YOUR_REGISTRY>/aegis-lowlatency-runtime:latest"
++        resources:
++          limits:
++            cpu: "2000m"
++            memory: "4Gi"
++        env:
++        - name: MODEL_PATH
++          value: "/models/agent_model.pt"
++        - name: MAX_LAT_MS
++          value: "50"
++        ports:
++        - containerPort: 9000
++      nodeSelector:
++        node-role.kubernetes.io=edge: "true"
++      priorityClassName: system-node-critical
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: low-latency-inference
++  namespace: aegis-robotics
++spec:
++  selector:
++    app: low-latency-inference
++  ports:
++  - port: 9000
++    targetPort: 9000
++
++# Notes:
++# - The runtime image should be a small, optimized runtime (TorchScript/ONNX/TensorRT) with
++#   a simple HTTP gRPC interface that responds within MAX_LAT_MS requirements.
++
+*** End File
+*** Add File:ops/planner/controller_interface.py
++#!/usr/bin/env python3
++"""
++Planner / Controller Interface stubs.
++
++Provides a safe wrapper that:
++ - Accepts a plan (list of actions).
++ - Verifies actions against a safety envelope.
++ - Interleaves model predictions with actuation via a controlled executor.
++
++Replace model.predict with your model serving call.
++"""
++import time
++import json
++
++def check_safety_envelope(action, envelope):
++    # envelope: {"max_vel": 1.0, "max_force": 10.0, ...}
++    # action: {"vel": 0.5, "force": 2.0}
++    if "vel" in action and action["vel"] > envelope.get("max_vel", 1.0):
++        return False, "vel_exceeds"
++    if "force" in action and action["force"] > envelope.get("max_force", 10.0):
++        return False, "force_exceeds"
++    return True, "ok"
++
++def execute_plan(plan, envelope, actuator_call):
++    """
++    plan: [{"step":0,"action":{...}}, ...]
++    actuator_call: callable(action) -> response
++    """
++    for step in plan:
++        action = step.get("action", {})
++        ok, reason = check_safety_envelope(action, envelope)
++        if not ok:
++            # block and log
++            raise RuntimeError(f"Action blocked: {reason}")
++        # execute via actuator_call (should call jailed executor / actuator adapter)
++        resp = actuator_call(action)
++        # simple feedback delay
++        time.sleep(0.01)
++    return True
++
++if __name__ == "__main__":
++    def fake_actuator(action):
++        print("Actuating", action)
++        return {"status":"ok"}
++    sample_plan = [{"step":0,"action":{"vel":0.5,"force":1.0}}, {"step":1,"action":{"vel":0.2,"force":0.0}}]
++    envelope = {"max_vel": 1.0, "max_force": 5.0}
++    execute_plan(sample_plan, envelope, fake_actuator)
++
+*** End File
+*** Add File:k8s/safety/e_stop_controller.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: e-stop-controller
++  namespace: aegis-robotics
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: e-stop-controller
++  template:
++    metadata:
++      labels:
++        app: e-stop-controller
++    spec:
++      containers:
++      - name: e-stop
++        image: "<YOUR_REGISTRY>/aegis-e-stop:latest"
++        ports:
++        - containerPort: 8088
++        env:
++        - name: WATCHDOG_TIMEOUT_S
++          value: "1"
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: e-stop-controller
++  namespace: aegis-robotics
++spec:
++  selector:
++    app: e-stop-controller
++  ports:
++  - port: 8088
++    targetPort: 8088
++
++# The e-stop service should expose an API that other services can query before acting
++# or subscribe to a topic indicating stop/resume events. It must be independent of model runtime.
++
+*** End File
+*** Add File:ops/rl/rllib_train.py
++#!/usr/bin/env python3
++"""
++Minimal RLlib training wrapper (PPO) that can consume episodes or replay buffer.
++Replace env with your custom Gym env that wraps the simulator or replay playback.
++"""
++import argparse
++import ray
++from ray import tune
++from ray.rllib.agents.ppo import PPOTrainer
++import os
++
++def train(config, stop):
++    ray.init(ignore_reinit_error=True)
++    tune.run("PPO", config=config, stop=stop)
++
++if __name__ == "__main__":
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--stop-iters", type=int, default=100)
++    args = ap.parse_args()
++    config = {
++        "env": "CartPole-v1",  # replace with your env
++        "num_workers": 2,
++        "framework": "torch",
++        "train_batch_size": 4000,
++    }
++    train(config, {"training_iteration": args.stop_iters})
++
+*** End File
+*** Add File:ops/rl/argo_rl_workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: WorkflowTemplate
++metadata:
++  name: rl-train-eval-register
++  namespace: aegis-ml
++spec:
++  templates:
++  - name: rl-train-eval
++    steps:
++    - - name: simulate-data
++        template: run-simulation
++    - - name: train
++        template: rllib-train
++    - - name: evaluate
++        template: eval
++    - - name: register
++        template: register-model
++
++  - name: run-simulation
++    container:
++      image: "<YOUR_REGISTRY>/aegis-sim-runner:latest"
++      command: ["/bin/sh","-c"]
++      args: ["python3 /app/pb_episode_recorder.py --episodes 50 --out_dir /work/episodes"]
++      volumeMounts:
++      - name: work
++        mountPath: /work
++
++  - name: rllib-train
++    container:
++      image: "<YOUR_REGISTRY>/aegis-rllib-train:latest"
++      command: ["/bin/sh","-c"]
++      args: ["python3 /app/rllib_train.py --stop-iters 100"]
++      volumeMounts:
++      - name: work
++        mountPath: /work
++
++  - name: eval
++    container:
++      image: "<YOUR_REGISTRY>/aegis-eval:latest"
++      command: ["/bin/sh","-c"]
++      args: ["python3 /app/evaluate_policy.py --episodes 20 --policy-path /work/checkpoint"]
++      volumeMounts:
++      - name: work
++        mountPath: /work
++
++  - name: register-model
++    container:
++      image: "<YOUR_REGISTRY>/aegis-register:latest"
++      command: ["/bin/sh","-c"]
++      args: ["python3 /app/register_model.py --path /work/checkpoint --model-name rl_candidate"]
++      volumeMounts:
++      - name: work
++        mountPath: /work
++
++  volumeClaimTemplates:
++  - metadata:
++      name: work
++    spec:
++      accessModes: ["ReadWriteOnce"]
++      resources:
++        requests:
++          storage: 50Gi
++
+*** End File
+*** Add File:ops/metrics/collector/episode_metrics_collector.py
++#!/usr/bin/env python3
++"""
++Episode-level metrics collector that exports Prometheus metrics for episodes:
++- episode_return, episode_length, safety_violations
++
++Exposes /metrics on port 9103 for scraping at high frequency.
++"""
++from prometheus_client import start_http_server, Gauge
++import time
++import random
++import argparse
++import json
++
++EPISODE_RETURN = Gauge("aegis_episode_return", "Return per episode", ["run_id"])
++EPISODE_LENGTH = Gauge("aegis_episode_length", "Length per episode", ["run_id"])
++SAFETY_VIOLATIONS = Gauge("aegis_episode_safety_violations", "Number of safety violations", ["run_id"])
++
++def publish_metrics(run_id, ret, length, violations):
++    EPISODE_RETURN.labels(run_id=run_id).set(ret)
++    EPISODE_LENGTH.labels(run_id=run_id).set(length)
++    SAFETY_VIOLATIONS.labels(run_id=run_id).set(violations)
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--port", type=int, default=9103)
++    args = ap.parse_args()
++    start_http_server(args.port)
++    # placeholder loop: in production feed from a queue or DB
++    while True:
++        run_id = str(int(time.time()))
++        publish_metrics(run_id, random.uniform(0,100), random.randint(10,200), random.randint(0,2))
++        time.sleep(1)
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:ops/experiment/deterministic_run.py
++#!/usr/bin/env python3
++"""
++Deterministic experiment runner.
++
++Sets seeds for Python, NumPy, Torch and the simulator, runs episodes, snapshots outputs,
++and writes a DVC stage example to record the dataset artifact.
++"""
++import os
++import argparse
++import random
++import numpy as np
++import json
++import subprocess
++
++def set_global_seed(seed):
++    random.seed(seed)
++    np.random.seed(seed)
++    try:
++        import torch
++        torch.manual_seed(seed)
++        if torch.cuda.is_available():
++            torch.cuda.manual_seed_all(seed)
++    except Exception:
++        pass
++
++def run_and_snapshot(seed, episodes_dir):
++    set_global_seed(seed)
++    # call the episode recorder
++    cmd = f"python3 ops/sim/pb_episode_recorder.py --episodes 1 --out_dir {episodes_dir} --seed {seed}"
++    subprocess.check_call(cmd, shell=True)
++    # write a manifest
++    manifest = {"seed": seed, "timestamp": int(__import__("time").time())}
++    out = os.path.join(episodes_dir, f"manifest_{seed}.json")
++    with open(out, "w") as fh:
++        json.dump(manifest, fh)
++    # example DVC add command (user must initialize dvc remote)
++    try:
++        subprocess.check_call(f"dvc add {episodes_dir}", shell=True)
++    except Exception:
++        print("dvc add failed or not installed; skip")
++    print("Wrote snapshot for seed", seed)
++
++if __name__ == "__main__":
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--seed", type=int, default=1234)
++    ap.add_argument("--out", default="/tmp/episodes_det")
++    args = ap.parse_args()
++    os.makedirs(args.out, exist_ok=True)
++    run_and_snapshot(args.seed, args.out)
++
+*** End File
+*** Add File:ops/telemetry/high_freq_exporter.py
++#!/usr/bin/env python3
++"""
++High-frequency telemetry exporter using prometheus_client HTTP server.
++Expose per-loop timing and control latency metrics; scrape interval should be configured low.
++"""
++from prometheus_client import start_http_server, Gauge, Summary
++import time
++import argparse
++import random
++
++CONTROL_LATENCY = Summary("aegis_control_loop_latency_ms", "Control loop latency in ms")
++CONTROL_STEP = Gauge("aegis_control_step", "Step counter", ["run_id"])
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--port", type=int, default=9200)
++    args = ap.parse_args()
++    start_http_server(args.port)
++    run_id = str(int(time.time()))
++    step = 0
++    while True:
++        with CONTROL_LATENCY.time():
++            # simulated control work
++            t0 = time.time()
++            time.sleep(random.uniform(0.001, 0.01))  # 1-10ms
++            latency_ms = (time.time() - t0) * 1000.0
++        CONTROL_STEP.labels(run_id=run_id).set(step)
++        step += 1
++        # sleep a short while to simulate loop frequency (e.g., 100Hz -> 0.01s)
++        time.sleep(0.01)
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:docs/worldmodel/README_WORLD_MODEL.md
++# World-Model & HIL / Replay Buffer Scaffold
++
++This patch adds components to support world-model workflows:
++
++- Replay buffer microservice (Redis Streams) with HTTP API: ops/replay/replay_buffer_service.py
++- PyBullet episode recorder with domain randomization: ops/sim/pb_episode_recorder.py + domain_randomizer.py
++- Sim->Real calibrator to compute distribution mismatches and balancing advice: ops/sim/sim_to_real_calibrator.py
++- Low-latency inference pod manifest for edge/robot runtimes: k8s/edge/low_latency_inference.yaml
++- Planner/controller interface with safety envelope checks: ops/planner/controller_interface.py
++- E‑stop controller manifest (independent safety controller): k8s/safety/e_stop_controller.yaml
++- RL training wrappers & Argo WorkflowTemplate for RL experiments: ops/rl/rllib_train.py + ops/rl/argo_rl_workflow.yaml
++- Episode metrics collector and high-frequency telemetry exporter for control loops: ops/metrics/collector/episode_metrics_collector.py and ops/telemetry/high_freq_exporter.py
++- Deterministic experiment runner to seed and snapshot episodes (DVC friendly): ops/experiment/deterministic_run.py
++
++Usage guidance:
++- Start replay_buffer_service and point PB recorder or sim-runner to push events to it.
++- Use deterministic_run to produce reproducible episodes (DVC snapshots).
++- Run Argo RL workflow to simulate, train (RLlib), evaluate and register candidate policies.
++- Ensure e-stop controller is independent of model runtime and attached to actuators in real deployments.
++- Scrape the high-frequency telemetry endpoints at appropriate scrape interval (e.g., 10-50Hz) or use dedicated telemetry pipeline for sub-100ms workloads.
++
++Safety & operational notes:
++- Keep E‑stop and safety controller in separate failure domain (different node or even out-of-cluster) where possible.
++- Do not run real actuators unless HIL tests and approvals passed.
++- Use domain_randomizer and sim_to_real_calibrator iteratively until sim statistics match real world within tolerance.
++
+*** End File
+*** End Patch

@@ -1,0 +1,494 @@
+*** Begin Patch
+*** Add File:ops/carbon/requirements.txt
++codecarbon
++mlflow
++requests
++prometheus-client
++pynvml
++psutil
++
+*** End File
+*** Add File:ops/carbon/codecarbon_wrapper.py
++#!/usr/bin/env python3
++"""
++CodeCarbon + MLflow wrapper for training and inference jobs.
++
++Usage:
++  python3 codecarbon_wrapper.py --mode train --entrypoint "python train.py --epochs 10" \
++      --project myproject --run-name run1 --out-dir /tmp/carbon
++
++This script:
++ - Runs a subprocess (training or inference) while measuring emissions via CodeCarbon
++ - Emits job-level kWh and estimated CO2e to stdout and (optionally) to MLflow
++ - Writes a small JSON evidence file with energy & CO2 metadata for the run
++ - Returns subprocess exit code
++
++Notes:
++ - Requires CodeCarbon installed (see requirements.txt)
++ - For accurate GPU power telemetry use the gpu_power_exporter (pynvml) or DCGM exporter; CodeCarbon otherwise uses CPU/GPU heuristics.
++"""
++import os
++import json
++import time
++import shlex
++import subprocess
++import argparse
++from pathlib import Path
++
++try:
++    from codecarbon import EmissionsTracker
++except Exception:
++    EmissionsTracker = None
++
++try:
++    import mlflow
++except Exception:
++    mlflow = None
++
++OUT_DIR_DEFAULT = Path(os.environ.get("CARBON_OUT_DIR", "/tmp/aegis_carbon"))
++OUT_DIR_DEFAULT.mkdir(parents=True, exist_ok=True)
++
++
++def run_and_track(command: str, project: str = "aegis", run_name: str = None, mlflow_uri: str = None):
++    run_id = f"{int(time.time())}"
++    # configure CodeCarbon tracker
++    if EmissionsTracker is None:
++        print("Warning: codecarbon not installed; skipping emissions tracking.")
++        start_time = time.time()
++        proc = subprocess.run(shlex.split(command))
++        duration = time.time() - start_time
++        metadata = {"duration_s": duration, "energy_kwh": None, "co2_kg": None, "exit_code": proc.returncode}
++        out = OUT_DIR_DEFAULT / f"carbon_{run_id}.json"
++        with open(out, "w") as fh:
++            json.dump(metadata, fh, indent=2)
++        return proc.returncode
++
++    tracker = EmissionsTracker(project_name=project, save_to_file=False)
++    tracker.start()
++    start = time.time()
++    proc = subprocess.run(shlex.split(command))
++    duration = time.time() - start
++    emissions = tracker.stop()  # returns grams CO2
++    co2_kg = emissions / 1000.0 if emissions is not None else None
++
++    # CodeCarbon does not directly return energy kWh, approximate if possible (some backends may provide)
++    # We prefer to read GPU energy via gpu_power_exporter external metric; here we store what CodeCarbon provides.
++    metadata = {
++        "project": project,
++        "run_name": run_name,
++        "command": command,
++        "duration_s": duration,
++        "co2_kg": co2_kg,
++        "exit_code": proc.returncode,
++        "timestamp": int(time.time())
++    }
++    out = OUT_DIR_DEFAULT / f"carbon_{run_id}.json"
++    with open(out, "w") as fh:
++        json.dump(metadata, fh, indent=2)
++
++    # optionally log to MLflow
++    if mlflow is not None and mlflow_uri:
++        try:
++            mlflow.set_tracking_uri(mlflow_uri)
++            with mlflow.start_run(run_name=run_name or run_id):
++                if metadata["co2_kg"] is not None:
++                    mlflow.log_metric("co2_kg", metadata["co2_kg"])
++                mlflow.log_metric("duration_s", metadata["duration_s"])
++                mlflow.log_artifact(str(out), artifact_path="carbon")
++        except Exception as e:
++            print("MLflow logging failed:", e)
++
++    print("Carbon metadata written to", out)
++    return proc.returncode
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--mode", choices=["train", "infer"], default="train")
++    ap.add_argument("--entrypoint", required=True, help="Subprocess command to run")
++    ap.add_argument("--project", default="aegis")
++    ap.add_argument("--run-name", default=None)
++    ap.add_argument("--mlflow-uri", default=os.environ.get("MLFLOW_TRACKING_URI", ""))
++    args = ap.parse_args()
++    rc = run_and_track(args.entrypoint, project=args.project, run_name=args.run_name, mlflow_uri=args.mlflow_uri or None)
++    raise SystemExit(rc)
++
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:ops/monitoring/gpu_power_exporter.py
++#!/usr/bin/env python3
++"""
++GPU Power Exporter for Prometheus
++
++Attempts to read NVIDIA GPU power usage via pynvml. If not available, optionally falls back to
++reading a Prometheus DCGM exporter URL (configured by env var DCGM_PROM_URL).
++
++Exposes:
++ - aegis_gpu_power_watts{gpu_index}
++ - aegis_gpu_power_limit_watts{gpu_index}
++ - aegis_gpu_power_total_wh{gpu_index} (integrated over time by process)
++
++Usage:
++  python3 gpu_power_exporter.py --port 9450 --poll-interval 5
++
++Notes:
++ - This exporter is best-run on GPU nodes (DaemonSet) and scraped by Prometheus.
++ - Requires permissions to access /dev/nvidia* and NVML available.
++"""
++import os
++import time
++import argparse
++import threading
++from prometheus_client import start_http_server, Gauge, Counter
++
++USE_DCGM_FALLBACK = bool(os.environ.get("DCGM_PROM_URL"))
++DCGM_PROM_URL = os.environ.get("DCGM_PROM_URL", "http://localhost:9400/metrics")
++
++try:
++    import pynvml
++    PYNVML_AVAILABLE = True
++except Exception:
++    PYNVML_AVAILABLE = False
++
++POWER_WATTS = Gauge("aegis_gpu_power_watts", "Instantaneous GPU power draw (W)", ["gpu_index"])
++POWER_LIMIT = Gauge("aegis_gpu_power_limit_watts", "GPU power limit (W)", ["gpu_index"])
++ENERGY_WH = Counter("aegis_gpu_energy_wh_total", "Accumulated GPU energy (Wh) observed by exporter", ["gpu_index"])
++
++def read_nvml():
++    pynvml.nvmlInit()
++    device_count = pynvml.nvmlDeviceGetCount()
++    readings = []
++    for i in range(device_count):
++        h = pynvml.nvmlDeviceGetHandleByIndex(i)
++        try:
++            power = pynvml.nvmlDeviceGetPowerUsage(h) / 1000.0  # mW -> W
++        except Exception:
++            power = 0.0
++        try:
++            power_limit = pynvml.nvmlDeviceGetPowerManagementLimit(h) / 1000.0
++        except Exception:
++            power_limit = 0.0
++        readings.append((i, power, power_limit))
++    return readings
++
++def exporter_loop(poll_interval=5.0):
++    last_time = time.time()
++    last_power = {}
++    while True:
++        now = time.time()
++        elapsed = now - last_time
++        last_time = now
++        readings = []
++        if PYNVML_AVAILABLE:
++            try:
++                readings = read_nvml()
++            except Exception as e:
++                print("NVML read failed:", e)
++                readings = []
++        if not readings and USE_DCGM_FALLBACK:
++            # Basic fallback: parse DCGM Prometheus endpoint (simple pass)
++            try:
++                import requests
++                r = requests.get(DCGM_PROM_URL, timeout=3)
++                text = r.text
++                # crude parse: look for nvidia_gpu_power_draw{gpu="i"} value
++                for line in text.splitlines():
++                    if "nvidia_gpu_power_draw" in line and "gpu=" in line:
++                        # example: nvidia_gpu_power_draw{gpu="0", ...} 123.45
++                        try:
++                            parts = line.split()
++                            value = float(parts[-1])
++                            # extract gpu index
++                            idx = 0
++                            i = line.find('gpu="')
++                            if i != -1:
++                                j = line.find('"', i+5)
++                                idx = int(line[i+5:j])
++                            readings.append((idx, value, 0.0))
++                        except Exception:
++                            continue
++            except Exception as e:
++                print("DCGM fallback failed:", e)
++        # publish readings
++        for idx, power, limit in readings:
++            POWER_WATTS.labels(gpu_index=str(idx)).set(power)
++            POWER_LIMIT.labels(gpu_index=str(idx)).set(limit)
++            # accumulate Wh: power(W) * elapsed(s) / 3600 = Wh
++            ENERGY_WH.labels(gpu_index=str(idx)).inc(power * (elapsed / 3600.0))
++        time.sleep(poll_interval)
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--port", type=int, default=9450)
++    ap.add_argument("--poll-interval", type=float, default=5.0)
++    args = ap.parse_args()
++    start_http_server(args.port)
++    print("Starting GPU power exporter on port", args.port, "NVML available:", PYNVML_AVAILABLE)
++    exporter_loop(poll_interval=args.poll_interval)
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:ops/monitoring/prometheus/carbon_prometheus_rules.yaml
++groups:
++- name: carbon-accounting
++  rules:
++  - record: job:kwh_total:sum
++    expr: sum by (job) (increase(aegis_gpu_energy_wh_total[1h])) / 1000
++    # produces kWh per job aggregated over last hour (if job label exported)
++  - record: job:co2_kg_estimate:sum
++    expr: job:kwh_total:sum * avg_over_time(carbon_grid_intensity_gco2_per_kwh[1h]) / 1000
++  - alert: CarbonSpike
++    expr: increase(aegis_gpu_energy_wh_total[1h]) > 10000
++    for: 10m
++    labels:
++      severity: warning
++    annotations:
++      summary: "Large energy consumption spike detected"
++      description: "Energy usage increased significantly in the last hour."
++
+*** End File
+*** Add File:ops/monitoring/prometheus/carbon_metrics_scrape.md
++## Carbon metrics and grid intensity
++
++This explains sources for the `carbon_grid_intensity_gco2_per_kwh` metric referenced in rules:
++
++- Option A: Use Microsoft Carbon Aware SDK / adapter to publish a `carbon_grid_intensity_gco2_per_kwh` gauge per region into Prometheus.
++- Option B: Use ElectricityMap API to push grid intensity into Prometheus via a simple exporter (not included here).
++- For now, you can set a static gauge via `promtool` or pushgateway for testing.
++
++Example Prometheus query to compute CO2e for a job:
++
++  sum(increase(aegis_gpu_energy_wh_total{job="train-job-123"}[1h])) / 1000
++    * avg_over_time(carbon_grid_intensity_gco2_per_kwh[1h]) / 1000
++
++This gives metric in metric tons (tonnes) if grid intensity in gCO2/kWh; adjust conversions as needed.
++
+*** End File
+*** Add File:docs/carbon/grafana_dashboard.json
++{
++  "annotations": {"list": []},
++  "panels": [
++    {
++      "type": "graph",
++      "title": "GPU Power (W) per GPU",
++      "targets": [
++        {"expr": "aegis_gpu_power_watts", "legendFormat": "gpu {{gpu_index}}"}
++      ],
++      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0}
++    },
++    {
++      "type": "graph",
++      "title": "Accumulated GPU Energy (Wh) (last 1h)",
++      "targets": [
++        {"expr": "increase(aegis_gpu_energy_wh_total[1h])", "legendFormat": "gpu {{gpu_index}}"}
++      ],
++      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
++    },
++    {
++      "type": "stat",
++      "title": "Estimated CO2e per job (kg)",
++      "targets": [
++        {"expr": "job:kwh_total:sum * avg_over_time(carbon_grid_intensity_gco2_per_kwh[1h])", "legendFormat": "{{job}}"}
++      ],
++      "gridPos": {"h": 4, "w": 12, "x": 0, "y": 16}
++    },
++    {
++      "type": "table",
++      "title": "Recent Carbon Evidence Files",
++      "targets": [],
++      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
++      "options": {"showHeader": true}
++    }
++  ],
++  "schemaVersion": 16,
++  "title": "Aegis Carbon Dashboard",
++  "version": 1
++}
++
+*** End File
+*** Add File:ops/scheduler/carbon_aware_runner.py
++#!/usr/bin/env python3
++"""
++Carbon-aware runner for Argo / batch jobs.
++
++Behavior:
++ - Query a carbon intensity API (ElectricityMap or Carbon Aware)
++ - If current intensity <= threshold, run the target command immediately
++ - Otherwise, wait/poll until intensity drops below threshold or until max_wait_s exceeded
++ - Write a small JSON file indicating scheduling decision and measured intensity
++
++Usage (as an entrypoint in an Argo job container):
++  python3 carbon_aware_runner.py --command "python train.py" --threshold 200 --max-wait 7200
++
++Notes:
++ - For production use, integrate with your cluster scheduler to prefer low-carbon regions rather than simple delay.
++ - ElectricityMap requires API key; set ELECTRICITYMAP_API_KEY env var or use CARBON_AWARE_URL for local adapter.
++"""
++import os
++import time
++import json
++import argparse
++import subprocess
++import requests
++from pathlib import Path
++
++DEFAULT_CHECK_URL = os.environ.get("CARBON_AWARE_URL", "https://api.carbonintensity.org.uk/intensity")  # placeholder
++ELECTRICITYMAP_URL = "https://api.electricitymap.org/v3/co2-intensity"  # requires key
++
++OUT_DIR = Path(os.environ.get("CARBON_RUNNER_OUT", "/tmp/carbon_runner"))
++OUT_DIR.mkdir(parents=True, exist_ok=True)
++
++def get_intensity_via_carbonaware():
++    # Tries the placeholder Carbon Intensity API (UK) then ElectricityMap if key present
++    try:
++        r = requests.get(DEFAULT_CHECK_URL, timeout=5)
++        if r.status_code == 200:
++            payload = r.json()
++            # UK carbonintensity returns data[0].intensity.forecast (gCO2/kWh)
++            if "data" in payload and isinstance(payload["data"], list):
++                val = payload["data"][0].get("intensity", {}).get("forecast", None)
++                if val is not None:
++                    return float(val)
++    except Exception:
++        pass
++    # fallback to ElectricityMap if key provided
++    key = os.environ.get("ELECTRICITYMAP_API_KEY")
++    if key:
++        try:
++            r = requests.get(ELECTRICITYMAP_URL, params={}, headers={"Authorization": f"Bearer {key}"}, timeout=5)
++            if r.status_code == 200:
++                payload = r.json()
++                # electricitymap v3 shape varies; try to find a numeric intensity value
++                if "data" in payload and "carbonIntensity" in payload["data"]:
++                    return float(payload["data"]["carbonIntensity"])
++        except Exception:
++            pass
++    return None
++
++def run_command(command):
++    t0 = time.time()
++    proc = subprocess.run(command, shell=True)
++    duration = time.time() - t0
++    return proc.returncode, duration
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--command", required=True, help="Shell command to run")
++    ap.add_argument("--threshold", type=float, default=250.0, help="gCO2/kWh threshold to allow run")
++    ap.add_argument("--poll-interval", type=int, default=300, help="Seconds between intensity polls")
++    ap.add_argument("--max-wait", type=int, default=3600, help="Max seconds to wait before running anyway")
++    args = ap.parse_args()
++
++    start_wait = time.time()
++    measured = None
++    while True:
++        intensity = get_intensity_via_carbonaware()
++        measured = intensity
++        now = time.time()
++        waited = now - start_wait
++        if intensity is not None and intensity <= args.threshold:
++            decision = "run_now"
++            rc, duration = run_command(args.command)
++            break
++        if waited >= args.max_wait:
++            decision = "run_after_wait"
++            rc, duration = run_command(args.command)
++            break
++        # else wait
++        time.sleep(args.poll_interval)
++
++    out = {
++        "decision": decision,
++        "measured_intensity_gco2_per_kwh": measured,
++        "threshold": args.threshold,
++        "waited_s": waited,
++        "exit_code": rc,
++        "duration_s": duration
++    }
++    outpath = OUT_DIR / f"carbon_schedule_{int(time.time())}.json"
++    with open(outpath, "w") as fh:
++        json.dump(out, fh, indent=2)
++    print("Wrote scheduling decision to", outpath)
++    raise SystemExit(rc)
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:k8s/scheduler/carbon-aware-cronjob.yaml
++apiVersion: batch/v1beta1
++kind: CronJob
++metadata:
++  name: carbon-aware-batch-job
++  namespace: aegis-jobs
++spec:
++  schedule: "0 * * * *"  # hourly attempt in this example; the runner will wait for low-carbon window
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          containers:
++          - name: carbon-runner
++            image: "<YOUR_REGISTRY>/aegis-carbon-runner:latest"
++            command: ["python3", "/app/carbon_aware_runner.py"]
++            args:
++            - "--command"
++            - "python /work/train.py --epochs 10"
++            - "--threshold"
++            - "200"
++            - "--max-wait"
++            - "7200"
++            env:
++            - name: ELECTRICITYMAP_API_KEY
++              valueFrom:
++                secretKeyRef:
++                  name: electricitymap-key
++                  key: api_key
++            volumeMounts:
++            - name: work
++              mountPath: /work
++          restartPolicy: OnFailure
++          volumes:
++          - name: work
++            persistentVolumeClaim:
++              claimName: carbon-work-pvc
++
+*** End File
+*** Add File:ops/carbon/README_CARBON_INTEGRATION.md
++# Aegis Carbon Awareness Integration
++
++This patch provides:
++- CodeCarbon wrapper for training/inference (ops/carbon/codecarbon_wrapper.py)
++- GPU power exporter using NVML (ops/monitoring/gpu_power_exporter.py)
++- Prometheus recording rules for carbon accounting (ops/monitoring/prometheus/carbon_prometheus_rules.yaml)
++- Grafana dashboard JSON (docs/carbon/grafana_dashboard.json)
++- Carbon-aware runner to delay batch jobs until low-grid-carbon windows (ops/scheduler/carbon_aware_runner.py)
++- CronJob example to schedule carbon-aware batch jobs (k8s/scheduler/carbon-aware-cronjob.yaml)
++
++Quick start:
++1. Install dependencies in a virtualenv or your container:
++   pip install -r ops/carbon/requirements.txt
++
++2. Deploy GPU power exporter on GPU nodes (DaemonSet recommended):
++   python3 ops/monitoring/gpu_power_exporter.py --port 9450
++
++3. Scrape exporter endpoint from Prometheus and import `carbon_prometheus_rules.yaml` into Prometheus.
++
++4. Start training with carbon tracking:
++   python3 ops/carbon/codecarbon_wrapper.py --entrypoint "python train.py" --project myproj --run-name r1 --mlflow-uri http://mlflow:5000
++
++5. For batch jobs, use the carbon-aware runner as an Argo/cron job entrypoint so runs occur in low-carbon windows:
++   Use k8s/scheduler/carbon-aware-cronjob.yaml as an example.
++
++Notes & caveats:
++- ElectricityMap / Carbon Aware API keys are required for real-time grid intensity. You can set ELECTRICITYMAP_API_KEY or configure CARBON_AWARE_URL to a local adapter.
++- For accurate energy accounting, prefer direct power telemetry (NVML/DCGM). CodeCarbon provides estimates when direct telemetry is unavailable.
++- Integrate MLflow to store per-run energy/CO2 metrics and visualize in Grafana.
++
+*** End File
+*** End Patch

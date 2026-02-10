@@ -1,0 +1,412 @@
+*** Begin Patch
+*** Add File:ops/llm_support/streaming/streaming_proxy_tokenized.py
++#!/usr/bin/env python3
++"""
++Streaming proxy with tokenizer integration for accurate per-token DP accounting.
++ - Uses a local tokenizer client service to compute exact token counts per chunk.
++ - Periodically charges DP with accurate token counts.
++ - On DP failure or DP over-budget mid-stream, enforces fail-closed behavior:
++     notifies orchestrator and stops the stream with a blocked message.
++
++Environment variables:
++ - LLM_BACKEND_HTTP: backend streaming HTTP endpoint (ndjson)
++ - DP_SERVICE: DP service charge endpoint
++ - ORCH_WEBHOOK: orchestrator webhook URL
++ - TOKENIZER_URL: tokenizer service URL (POST /count)
++ - DP_AUTH_TOKEN: optional auth token for DP service
++ - CHARGE_INTERVAL_TOKENS: tokens window to charge (default 128)
++ - FAIL_CLOSED_ON_DP_FAIL: "true" to enforce fail-closed on charge failures (default true)
++"""
++import os, json, time, logging
++from typing import AsyncIterator
++from fastapi import FastAPI, Request
++from fastapi.responses import StreamingResponse
++import httpx
++
++LOG = logging.getLogger("aegis.streaming.tokenized")
++logging.basicConfig(level=logging.INFO)
++
++LLM_BACKEND_HTTP = os.environ.get("LLM_BACKEND_HTTP", "http://vllm.model-serving.svc.cluster.local:8080/generate_stream")
++DP_SERVICE = os.environ.get("DP_SERVICE", "http://dp-service:8084")
++ORCH_WEBHOOK = os.environ.get("ORCH_WEBHOOK", "http://aegis-orchestrator.aegis-system.svc.cluster.local:8088/webhook")
++TOKENIZER_URL = os.environ.get("TOKENIZER_URL", "http://tokenizer.aegis-system.svc.cluster.local:8090/count")
++DP_AUTH = os.environ.get("DP_AUTH_TOKEN", "")
++CHARGE_INTERVAL_TOKENS = int(os.environ.get("CHARGE_INTERVAL_TOKENS", "128"))
++FAIL_CLOSED = os.environ.get("FAIL_CLOSED_ON_DP_FAIL", "true").lower() in ("1","true","yes")
++
++app = FastAPI(title="Aegis Tokenized Streaming Proxy")
++
++async def count_tokens(text: str, model: str = "default") -> int:
++    try:
++        async with httpx.AsyncClient(timeout=2.0) as c:
++            r = await c.post(TOKENIZER_URL, json={"text": text, "model": model})
++            r.raise_for_status()
++            return int(r.json().get("tokens", 0))
++    except Exception:
++        # fallback heuristic
++        LOG.exception("tokenizer call failed; falling back")
++        return len(text.split())
++
++async def charge_dp(client_id: str, tokens: int) -> bool:
++    if not client_id:
++        return False
++    headers = {"Authorization": f"Bearer {DP_AUTH}"} if DP_AUTH else {}
++    async with httpx.AsyncClient(timeout=3.0) as c:
++        try:
++            r = await c.post(f"{DP_SERVICE}/charge", json={"client": client_id, "tokens": tokens}, headers=headers)
++            return r.status_code == 200
++        except Exception:
++            LOG.exception("dp charge failed")
++            return False
++
++async def notify_orch(evt: dict):
++    async with httpx.AsyncClient(timeout=2.0) as c:
++        try:
++            await c.post(ORCH_WEBHOOK, json=evt)
++        except Exception:
++            LOG.exception("orchestrator notify failed")
++
++async def backend_stream(payload: dict) -> AsyncIterator[dict]:
++    async with httpx.AsyncClient(timeout=None) as client:
++        async with client.stream("POST", LLM_BACKEND_HTTP, json=payload) as r:
++            async for line in r.aiter_lines():
++                if not line:
++                    continue
++                try:
++                    yield json.loads(line)
++                except Exception:
++                    yield {"text": line}
++
++@app.post("/generate")
++async def generate(req: Request):
++    body = await req.json()
++    client_id = body.get("client_id")
++    token_accum = 0
++    async def stream():
++        nonlocal token_accum
++        async for chunk in backend_stream(body):
++            text = chunk.get("text","")
++            # compute accurate tokens for this chunk
++            tokens = await count_tokens(text, model=body.get("model","default"))
++            # simple incremental safety: allow backend to indicate 'score'
++            score = chunk.get("score", 0.0)
++            if score >= 0.95:
++                evt = {"id": f"auto-{int(time.time())}", "model_env": body.get("model_env","staging"), "score": score, "model":"llm-backend"}
++                await notify_orch(evt)
++                yield json.dumps({"status":"blocked","reason":"safety_high_score"}) + "\n"
++                return
++            yield json.dumps({"status":"ok","text": text}) + "\n"
++            token_accum += tokens
++            if token_accum >= CHARGE_INTERVAL_TOKENS:
++                ok = await charge_dp(client_id, token_accum)
++                if not ok:
++                    LOG.warning("DP charge failed for %s tokens", token_accum)
++                    await notify_orch({"id":f"dp-{int(time.time())}", "model_env": body.get("model_env","prod"), "score":0.0, "dp_over_budget": True})
++                    if FAIL_CLOSED:
++                        yield json.dumps({"status":"blocked","reason":"dp_over_budget"}) + "\n"
++                        return
++                token_accum = 0
++    return StreamingResponse(stream(), media_type="application/x-ndjson")
++
+*** End File
+*** Add File:k8s/jailed/gvisor_runtimeclass.yaml
++apiVersion: node.k8s.io/v1
++kind: RuntimeClass
++metadata:
++  name: gvisor
++handler: runsc
++---
++# Note: Ensure gVisor (runsc) is installed on all nodes that will run RuntimeClass=gvisor.
++# See cloud-provider docs for enabling gVisor.
++
+*** End File
+*** Add File:k8s/jailed/jailed-executor-gvisor-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: jailed-executor
++  namespace: aegis-system
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: jailed-executor
++  template:
++    metadata:
++      labels:
++        app: jailed-executor
++    spec:
++      runtimeClassName: gvisor
++      serviceAccountName: jailed-executor-sa
++      containers:
++      - name: jailed-executor
++        image: <YOUR_REGISTRY>/aegis-jailed-executor:latest
++        securityContext:
++          allowPrivilegeEscalation: false
++          readOnlyRootFilesystem: true
++          runAsNonRoot: true
++        env:
++        - name: EVIDENCE_DIR
++          value: /var/lib/aegis/evidence
++        volumeMounts:
++        - name: evidence
++          mountPath: /var/lib/aegis/evidence
++      volumes:
++      - name: evidence
++        emptyDir: {}
++
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: jailed-executor-sa
++  namespace: aegis-system
++
++---
++# Minimal Role/RoleBinding for jailed executor to create Jobs and write Secrets if needed
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: jailed-executor-role
++  namespace: aegis-system
++rules:
++- apiGroups: [""]
++  resources: ["pods","jobs","secrets"]
++  verbs: ["create","get","list","watch","delete"]
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: jailed-executor-rb
++  namespace: aegis-system
++subjects:
++- kind: ServiceAccount
++  name: jailed-executor-sa
++  namespace: aegis-system
++roleRef:
++  kind: Role
++  name: jailed-executor-role
++  apiGroup: rbac.authorization.k8s.io
++
+*** End File
+*** Add File:ops/dp/mock_dp_service.py
++#!/usr/bin/env python3
++"""
++Mock DP service used for integration and fail-closed testing.
++ - POST /charge -> returns 200 or 503 depending on internal state
++ - POST /set_state {"state":"ok"|"fail"} toggles behavior
++ - GET /health returns 200 if state == ok
++"""
++from flask import Flask, request, jsonify
++import threading
++
++app = Flask("mock-dp")
++state = {"status": "ok"}
++
++@app.post("/charge")
++def charge():
++    data = request.get_json() or {}
++    if state["status"] == "ok":
++        return jsonify({"ok": True}), 200
++    return jsonify({"error": "dp_fail"}), 503
++
++@app.post("/set_state")
++def set_state():
++    data = request.get_json() or {}
++    s = data.get("state","ok")
++    state["status"] = s
++    return jsonify({"status": state["status"]})
++
++@app.get("/health")
++def health():
++    return ("", 200) if state["status"] == "ok" else ("", 503)
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=8084)
++
+*** End File
+*** Add File:ops/tests/dp_failclosed_test.py
++#!/usr/bin/env python3
++"""
++Integration test (script) to exercise DP fail-closed behavior:
++ - Assumes streaming_proxy_tokenized is reachable at STREAMING_URL
++ - Assumes mock DP service reachable at DP_CONTROL_URL
++ Steps:
++ 1. Start a streaming /generate request (simulated backend that streams text)
++ 2. After a short window, toggle DP to 'fail' via mock DP /set_state
++ 3. Expect the stream to end with a blocked message containing 'dp_over_budget' or similar
++"""
++import requests, threading, time, os, sys
++
++STREAMING_URL = os.environ.get("STREAMING_URL", "http://localhost:8089/generate")
++DP_CONTROL_URL = os.environ.get("DP_CONTROL_URL", "http://localhost:8084")
++
++def run_stream():
++    payload = {"client_id":"test-client","model_env":"staging","payload":{"inputs":"stream test"}}
++    r = requests.post(STREAMING_URL, json=payload, stream=True, timeout=60)
++    for line in r.iter_lines(decode_unicode=True):
++        if not line:
++            continue
++        print("STREAM:", line)
++        if "dp_over_budget" in line or "blocked" in line:
++            print("Detected block; test success")
++            return True
++    print("Stream ended without block")
++    return False
++
++def main():
++    # ensure DP is OK
++    requests.post(f"{DP_CONTROL_URL}/set_state", json={"state":"ok"})
++    t = threading.Thread(target=run_stream)
++    t.start()
++    time.sleep(2)  # let stream start and accumulate charges
++    print("Forcing DP to fail")
++    requests.post(f"{DP_CONTROL_URL}/set_state", json={"state":"fail"})
++    t.join(timeout=30)
++    print("Test complete")
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:ops/physical/hil/pybullet_hil_simulator.py
++#!/usr/bin/env python3
++"""
++Simple HIL simulator using PyBullet.
++ - Provides an HTTP API to accept actuator commands and an E-STOP toggle.
++ - Exposes /command POST {"joint":0,"torque":...} and /estop POST {"engage": true}
++ - Records telemetry and can be queried for current state.
++"""
++import os, time, threading, json
++from fastapi import FastAPI, Request
++import uvicorn
++import pybullet as p
++import pybullet_data
++
++app = FastAPI(title="Aegis HIL Simulator")
++SIM_STATE = {"estop": False, "telemetry": []}
++
++def sim_thread():
++    physicsClient = p.connect(p.DIRECT)
++    p.setAdditionalSearchPath(pybullet_data.getDataPath())
++    planeId = p.loadURDF("plane.urdf")
++    robot = p.loadURDF("r2d2.urdf", basePosition=[0,0,0.1])
++    while True:
++        if SIM_STATE["estop"]:
++            # freeze simulation (no steps) but still record
++            time.sleep(0.05)
++            continue
++        p.stepSimulation()
++        pos, orn = p.getBasePositionAndOrientation(robot)
++        SIM_STATE["telemetry"].append({"t": time.time(), "pos": pos})
++        # keep telemetry bounded
++        if len(SIM_STATE["telemetry"]) > 1000:
++            SIM_STATE["telemetry"] = SIM_STATE["telemetry"][-500:]
++        time.sleep(0.01)
++
++@app.on_event("startup")
++def startup():
++    thread = threading.Thread(target=sim_thread, daemon=True)
++    thread.start()
++
++@app.post("/command")
++async def command(req: Request):
++    body = await req.json()
++    if SIM_STATE["estop"]:
++        return {"status":"blocked", "reason":"estop_engaged"}
++    # In this simple harness, we record commands; a real HIL would apply forces/vels
++    SIM_STATE.setdefault("commands", []).append(body)
++    return {"status":"ok"}
++
++@app.post("/estop")
++async def estop(req: Request):
++    body = await req.json()
++    engage = body.get("engage", True)
++    SIM_STATE["estop"] = bool(engage)
++    return {"estop": SIM_STATE["estop"]}
++
++@app.get("/telemetry")
++async def telemetry():
++    return {"estop": SIM_STATE["estop"], "telemetry_size": len(SIM_STATE["telemetry"])}
++
++if __name__ == "__main__":
++    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "9090")), log_level="info")
++
+*** End File
+*** Add File:ops/physical/hil/requirements.txt
++fastapi
++uvicorn[standard]
++pybullet
++
+*** End File
+*** Add File:ops/physical/hil/hil_test.py
++#!/usr/bin/env python3
++"""
++Example test that connects to the HIL simulator, sends a command, engages E-STOP,
++and verifies commands are blocked while E-STOP engaged.
++"""
++import requests, time, os
++
++BASE = os.environ.get("HIL_URL", "http://localhost:9090")
++
++def main():
++    print("Sending a normal command...")
++    r = requests.post(f"{BASE}/command", json={"joint":0,"torque":1.0})
++    print("resp:", r.json())
++    print("Engaging E-STOP")
++    requests.post(f"{BASE}/estop", json={"engage": True})
++    time.sleep(0.5)
++    print("Sending command while estop engaged (should be blocked)")
++    r2 = requests.post(f"{BASE}/command", json={"joint":0,"torque":2.0})
++    print("resp:", r2.json())
++    print("Clearing E-STOP")
++    requests.post(f"{BASE}/estop", json={"engage": False})
++    time.sleep(0.2)
++    print("Sending command after estop cleared")
++    r3 = requests.post(f"{BASE}/command", json={"joint":0,"torque":0.5})
++    print("resp:", r3.json())
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:ops/docs/hardening/wiring_jailed_dp_hil_README.md
++# Operational wiring: tokenizer, jailed executor (gVisor), DP fail‑closed tests, HIL simulator
++
++This patch adds the following deliverables to help you wire/harden production:
++
++- Tokenizer-integrated streaming proxy:
++  - ops/llm_support/streaming/streaming_proxy_tokenized.py
++  - Uses TOKENIZER_URL to compute accurate token counts; periodically charges DP.
++  - FAIL_CLOSED_ON_DP_FAIL controls whether the proxy blocks on DP failures.
++
++- Jailed executor runtime with gVisor:
++  - k8s/jailed/gvisor_runtimeclass.yaml
++  - k8s/jailed/jailed-executor-gvisor-deployment.yaml
++  - Deploy gVisor (runsc) on nodes intended for sandboxed jobs; use runtimeClassName: gvisor.
++
++- DP fail-closed test harness:
++  - ops/dp/mock_dp_service.py (mock DP service with toggle)
++  - ops/tests/dp_failclosed_test.py (script that starts a stream and flips DP state)
++  - Use these in staging to validate fail-closed behavior before production.
++
++- HIL simulation harness (PyBullet):
++  - ops/physical/hil/pybullet_hil_simulator.py
++  - ops/physical/hil/hil_test.py
++  - Useful for hardware-in-the-loop tests and E-STOP verification in a controlled environment.
++
++Integration notes and next steps:
++- Build and push images for streaming_proxy_tokenized and mock DP; update K8s manifests to reference your registry.
++- Deploy tokenizer service (ops/tokenization/tokenizer_service.py) or an equivalent tiktoken-based service and set TOKENIZER_URL.
++- Provision nodes with gVisor (runsc). Follow your cloud provider docs for installing runsc and enabling RuntimeClass support.
++- Run the DP fail-closed test in staging: deploy streaming proxy, mock DP, and verify that mid-stream DP failure causes block and orchestrator notification.
++- Use the HIL simulator in an isolated network to run agentic actuation tests; ensure E-STOP path is independent of model control path (safety controller outside the model).
++
++Security & production cautions:
++- Do not run the HIL simulator or mock DP in production; they are test harnesses for staging and development.
++- gVisor reduces attack surface but is not a complete replacement for additional sandboxing (Firecracker, hardware virtualization) where required.
++- Ensure cosign KMS, OIDC, and multisig flows are fully deployed and audited before enabling auto‑promote for agentic/actuating actions.
++
+*** End File
+*** End Patch

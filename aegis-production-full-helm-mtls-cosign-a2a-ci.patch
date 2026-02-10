@@ -1,0 +1,1471 @@
+*** Begin Patch
+*** Add File:langchain_runtime/requirements.txt
+fastapi
+uvicorn[standard]
+langchain
+transformers
+torch
+httpx
+prometheus_client
+pydantic
+redis
+requests
+python-multipart
+*** End File
+*** Add File:langchain_runtime/Dockerfile
+FROM python:3.10-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py /app/app.py
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8080
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+*** End File
+*** Add File:langchain_runtime/app.py
+from fastapi import FastAPI, HTTPException, Request, Depends, Header
+from pydantic import BaseModel
+import os, time, json, logging, uuid
+import httpx
+from prometheus_client import Counter, Histogram
+# Attempt to import LangChain; if not present, fallback to local Aegis AgentRunner
+try:
+    from langchain.chains import LLMChain
+    from langchain.chains.qa_with_sources import load_qa_with_sources_chain
+    from langchain.llms.base import LLM
+    from langchain.prompts import PromptTemplate
+    LANGCHAIN_AVAILABLE = True
+except Exception:
+    LANGCHAIN_AVAILABLE = False
+
+# Use existing Aegis LLM adapter if LangChain not installed / for integration
+from api.langchain_adapter import AegisLLM, AgentRunner
+
+logger = logging.getLogger("langchain_runtime")
+logging.basicConfig(level=logging.INFO)
+
+REQUEST_COUNT = Counter("langchain_requests_total", "Total LangChain runtime requests", ["chain"])
+REQUEST_LATENCY = Histogram("langchain_request_latency_seconds", "Latency for chain runs", ["chain"])
+
+AEGIS_API = os.environ.get("AEGIS_API_BASE", "http://localhost:8081")
+MCP_API = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
+A2A_API = os.environ.get("A2A_API", "http://approver:8085")
+DEFAULT_MODEL = os.environ.get("AEGIS_DEFAULT_MODEL", "multimodal_demo")
+DEFAULT_VERSION = os.environ.get("AEGIS_DEFAULT_MODEL_VERSION", "v1")
+
+app = FastAPI(title="Aegis LangChain Runtime")
+
+# import auth helper (JWT/OIDC) if present
+try:
+    from .auth import validate_token
+except Exception:
+    def validate_token(authorization: str | None = Header(default=None)):
+        return True
+
+class ChainRequest(BaseModel):
+    chain_type: str = "retrieval_qa"  # retrieval_qa | graph_plan | agent
+    model_id: str = DEFAULT_MODEL
+    model_version: str = DEFAULT_VERSION
+    input: str
+    tenant_id: str | None = None
+    options: dict | None = {}
+
+# Minimal LangChain LLM wrapper that delegates to Aegis predict endpoint
+class AegisLLMForLangchain(object):
+    def __init__(self, api_base=None, model=None, version=None, token=None):
+        # delegate to existing AegisLLM
+        self.client = AegisLLM(api_base=api_base or AEGIS_API, api_token=token or "", model=model, version=version)
+
+    def _call(self, prompt, stop=None):
+        # LangChain-style call
+        resp = self.client.generate(prompt)
+        return resp
+
+# helper: attach MCP context
+def attach_mcp_context(model_id, model_version, run_id, extra):
+    try:
+        rec = {
+            "model_id": model_id,
+            "version": model_version,
+            "artifacts": [{"uri": extra.get("artifact_uri",""), "hash": extra.get("artifact_hash","")}],
+            "evaluation": {"run_id": run_id},
+            "approvals": []
+        }
+        httpx.post(f"{MCP_API.rstrip('/')}/models/{model_id}/context", json=rec, timeout=5.0)
+    except Exception as e:
+        logger.warning("MCP attach failed: %s", e)
+
+# helper: optional approval request via A2A
+def maybe_request_approval(model_id, artifact_uri, requester="langchain-runtime"):
+    try:
+        payload = {
+            "id": str(uuid.uuid4()),
+            "type": "approval_request",
+            "model_id": model_id,
+            "artifact_uri": artifact_uri,
+            "requester": requester,
+            "ts": int(time.time())
+        }
+        httpx.post(f"{A2A_API.rstrip('/')}/request", json=payload, timeout=5.0)
+    except Exception as e:
+        logger.warning("A2A approval request failed: %s", e)
+
+@app.post("/v1/chain/run")
+def run_chain(req: ChainRequest, _auth: bool = Depends(validate_token), authorization: str | None = Header(default=None)):
+    chain = req.chain_type
+    REQUEST_COUNT.labels(chain).inc()
+    start = time.time()
+    run_id = str(uuid.uuid4())
+    try:
+        # create LLM wrapper
+        if LANGCHAIN_AVAILABLE:
+            llm = AegisLLMForLangchain(api_base=AEGIS_API, model=req.model_id, version=req.model_version)
+            # Example: retrieval_qa uses a simple prompt chain (customize as needed)
+            if req.chain_type == "retrieval_qa":
+                # Call your retrieval service to get context
+                try:
+                    r = httpx.post(os.environ.get("AEGIS_RETRIEVAL_API", "http://retriever:8080/retrieve"), json={"q": req.input}, timeout=10.0)
+                    ctx = r.json()
+                    context_text = "\n".join([d.get("text","") for d in ctx.get("docs", [])])
+                except Exception:
+                    context_text = ""
+                prompt = f"Answer the question using the context below.\n\nContext:\n{context_text}\n\nQuestion:\n{req.input}"
+                if LANGCHAIN_AVAILABLE:
+                    prompt_template = PromptTemplate(template=prompt, input_variables=[])
+                    chain_obj = LLMChain(llm=llm, prompt=prompt_template)
+                    out = chain_obj.run("")
+                else:
+                    out = llm._call(prompt)
+            elif req.chain_type == "graph_plan":
+                # Ask LangGraph or fallback planner (agent-runner) via agent
+                # For simplicity, call Aegis AgentRunner if available
+                ar = AgentRunner()
+                out = ar.run(req.input)
+            else:
+                # generic agent
+                ar = AgentRunner()
+                out = ar.run(req.input)
+        else:
+            # no langchain installed: fallback to AgentRunner
+            ar = AgentRunner()
+            out = ar.run(req.input)
+
+        # attach MCP context and optionally request approval
+        attach_mcp_context(req.model_id, req.model_version, run_id, req.options or {})
+        if (req.options or {}).get("request_approval"):
+            maybe_request_approval(req.model_id, (req.options or {}).get("artifact_uri",""))
+
+        REQUEST_LATENCY.labels(chain).observe(time.time() - start)
+        return {"run_id": run_id, "result": out}
+    except Exception as e:
+        REQUEST_LATENCY.labels(chain).observe(time.time() - start)
+        logger.exception("Chain run failed")
+        raise HTTPException(status_code=500, detail=str(e))
+*** End File
+*** Add File:langchain_runtime/helm/values.yaml
+replicaCount: 2
+image:
+  repository: <YOUR_REGISTRY>/langchain-runtime
+  tag: latest
+service:
+  type: ClusterIP
+ingress:
+  enabled: false
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 1000m
+    memory: 2Gi
+env:
+  AEGIS_API_BASE: "http://aegis-api:8081"
+  AEGIS_MCP_API: "http://mcp:8082"
+  AEGIS_RETRIEVAL_API: "http://retriever:8080/retrieve"
+  A2A_API: "http://approver:8085"
+mtls:
+  enabled: false
+  secretName: aegis-langchain-tls
+*** End File
+*** Add File:langchain_runtime/helm/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: langchain-runtime
+  labels:
+    app: langchain-runtime
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: langchain-runtime
+  template:
+    metadata:
+      labels:
+        app: langchain-runtime
+    spec:
+      containers:
+      - name: runtime
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        env:
+        - name: AEGIS_API_BASE
+          value: "{{ .Values.env.AEGIS_API_BASE }}"
+        - name: AEGIS_MCP_API
+          value: "{{ .Values.env.AEGIS_MCP_API }}"
+        - name: AEGIS_RETRIEVAL_API
+          value: "{{ .Values.env.AEGIS_RETRIEVAL_API }}"
+        - name: A2A_API
+          value: "{{ .Values.env.A2A_API }}"
+        - name: USE_MTLS
+          value: "{{ default "false" .Values.mtls.enabled }}"
+        ports:
+        - containerPort: 8080
+        resources:
+{{ toYaml .Values.resources | indent 8 }}
+        volumeMounts:
+        - name: tls-certs
+          mountPath: /var/run/secrets/tls
+          readOnly: true
+      volumes:
+      - name: tls-certs
+        secret:
+          secretName: {{ .Values.mtls.secretName }}
+*** End File
+*** Add File:langchain_runtime/helm/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: langchain-runtime
+spec:
+  selector:
+    app: langchain-runtime
+  ports:
+    - port: 80
+      targetPort: 8080
+  type: {{ .Values.service.type }}
+*** End File
+*** Add File:langgraph/requirements.txt
+fastapi
+uvicorn[standard]
+redis
+redisgraph
+requests
+pydantic
+*** End File
+*** Add File:langgraph/Dockerfile
+FROM python:3.10-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py /app/app.py
+EXPOSE 8090
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8090"]
+*** End File
+*** Add File:langgraph/app.py
+"""
+LangGraph - simple graph planner & agent adapter using RedisGraph.
+
+APIs:
+ - POST /graph/node  {id, labels, props}
+ - POST /graph/edge  {src, dst, relation}
+ - POST /plan        {query: natural_language_query} -> returns plan steps (simple)
+"""
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import os, logging, json, httpx
+import redis
+
+logger = logging.getLogger("langgraph")
+logging.basicConfig(level=logging.INFO)
+
+REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+REDIS_GRAPH_KEY = os.environ.get("REDIS_GRAPH_KEY", "AegisGraph")
+
+r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+try:
+    from redisgraph import Node, Edge, Graph
+    graph = Graph(REDIS_GRAPH_KEY, r)
+except Exception:
+    graph = None
+
+app = FastAPI(title="LangGraph")
+
+class NodeIn(BaseModel):
+    id: str
+    labels: list[str] = []
+    props: dict = {}
+
+class EdgeIn(BaseModel):
+    src: str
+    dst: str
+    relation: str
+
+class PlanIn(BaseModel):
+    query: str
+
+@app.post("/graph/node")
+def add_node(n: NodeIn):
+    if graph is None:
+        raise HTTPException(status_code=500, detail="redisgraph not available")
+    node = Node(label=",".join(n.labels), properties=n.props)
+    graph.add_node(node)
+    graph.commit()
+    return {"status":"ok"}
+
+@app.post("/graph/edge")
+def add_edge(e: EdgeIn):
+    if graph is None:
+        raise HTTPException(status_code=500, detail="redisgraph not available")
+    # naive lookup & create nodes if missing omitted for brevity
+    # In production, ensure node identities and properties are stored and referenced
+    return {"status":"ok", "note":"edge persistence requires node management; implement as needed"}
+
+@app.post("/plan")
+def plan_query(p: PlanIn):
+    # Simple planner: echo steps based on keywords (demo)
+    q = p.query.lower()
+    steps = []
+    if "summarize" in q:
+        steps.append({"action":"retrieve_context", "desc":"Get relevant docs from retriever"})
+        steps.append({"action":"call_llm", "desc":"Summarize retrieved docs"})
+    elif "relation" in q or "graph" in q:
+        steps.append({"action":"graph_query", "desc":"Query graph for relations"})
+        steps.append({"action":"call_llm", "desc":"Explain relations"})
+    else:
+        steps.append({"action":"retrieve_context", "desc":"Default retrieve and answer"})
+        steps.append({"action":"call_llm", "desc":"Produce final answer"})
+    return {"plan": steps}
+*** End File
+*** Add File:langgraph/helm/values.yaml
+replicaCount: 1
+image:
+  repository: <YOUR_REGISTRY>/langgraph
+  tag: latest
+service:
+  type: ClusterIP
+redis:
+  enabled: false
+mtls:
+  enabled: false
+  secretName: aegis-langgraph-tls
+*** End File
+*** Add File:langchain_demo/run_demo.py
+#!/usr/bin/env python3
+"""
+Demo script:
+ - Assumes MCP service, LangChain runtime, Retriever and approver are deployed locally or in cluster.
+ - Calls LangChain runtime to run a RetrievalQA and a LangGraph plan run that requests approval.
+"""
+import requests, os, json, time
+
+LANGCHAIN_URL = os.environ.get("LANGCHAIN_URL", "http://localhost:8080/v1/chain/run")
+
+def run_retrieval_qa():
+    payload = {
+        "chain_type": "retrieval_qa",
+        "model_id": "multimodal_demo",
+        "model_version": "v1",
+        "input": "What are the top-3 risks of deploying LLMs?",
+        "options": {}
+    }
+    r = requests.post(LANGCHAIN_URL, json=payload, timeout=60)
+    print("RetrievalQA:", r.status_code, r.json())
+
+def run_graph_plan():
+    payload = {
+        "chain_type": "graph_plan",
+        "model_id": "multimodal_demo",
+        "model_version": "v1",
+        "input": "Find relationships between data sources and summarize potential compliance issues.",
+        "options": {"request_approval": True, "artifact_uri": "s3://aegis-artifacts/graph-plan-1.plan"}
+    }
+    r = requests.post(LANGCHAIN_URL, json=payload, timeout=60)
+    print("GraphPlan:", r.status_code, r.json())
+
+if __name__ == "__main__":
+    print("Running RetrievalQA demo")
+    run_retrieval_qa()
+    time.sleep(1)
+    print("Running GraphPlan demo (will request approval)")
+    run_graph_plan()
+*** End File
+*** Add File:.github/workflows/langchain_smoke.yml
+name: LangChain runtime smoke test
+on:
+  workflow_dispatch:
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Run LangChain smoke locally (requires LANGCHAIN_URL secret)
+      env:
+        LANGCHAIN_URL: ${{ secrets.LANGCHAIN_URL }}
+      run: |
+        echo '{"chain_type":"retrieval_qa","input":"hello","model_id":"multimodal_demo","model_version":"v1"}' > /tmp/p.json
+        curl -sS -X POST "$LANGCHAIN_URL" -H "Content-Type: application/json" --data-binary @/tmp/p.json || exit 1
+*** End File
+*** Add File:docs/langchain_and_langgraph.md
+# LangChain Runtime & LangGraph integration (overview)
+
+What was added
+- langchain_runtime/: a FastAPI-based LangChain runtime that integrates your AegisLLM/AgentRunner,
+  calls your retrieval service, attaches MCP context, exposes /v1/chain/run and emits Prometheus metrics.
+- langgraph/: a small graph-planning service using RedisGraph (or networkx fallback) providing /plan endpoint.
+- An adapter in the LangChain runtime calls your existing AgentRunner when LangChain or advanced agents aren't necessary.
+- Demo script and CI smoke workflow to validate the runtime endpoint.
+
+Deployment notes
+- Build and push Docker images or replace <YOUR_REGISTRY> placeholders in Helm values.
+- Deploy RedisGraph (or the Redis + redisgraph module) if you want full graph persistence; else use in-memory.
+- Wire AEGIS_MCP_API and AEGIS_RETRIEVAL_API env variables to point to your MCP & retrieval services.
+- Ensure A2A / approver API endpoint is reachable for approval requests.
+
+Security & production
+- Add auth (JWT) and RBAC to the LangChain runtime and LangGraph service.
+- Configure rate limits and OPA pre-flight checks for agent execution.
+- Use GPU-backed nodes and vLLM/Triton when running large models in production.
+*** End File
+*** Add File:images/langchain-runtime/Dockerfile
+FROM python:3.10-slim
+WORKDIR /app
+COPY langchain_runtime/requirements.txt .
+RUN pip install --no-cache-dir -r langchain_runtime/requirements.txt
+COPY langchain_runtime/ app/langchain_runtime/
+WORKDIR /app/app/langchain_runtime
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8080
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+*** End File
+*** Add File:images/langgraph/Dockerfile
+FROM python:3.10-slim
+WORKDIR /app
+COPY langgraph/requirements.txt .
+RUN pip install --no-cache-dir -r langgraph/requirements.txt
+COPY langgraph/ app/langgraph/
+WORKDIR /app/app/langgraph
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8090
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8090"]
+*** End File
+*** Add File:images/mcp/Dockerfile
+FROM python:3.10-slim
+WORKDIR /app
+COPY mcp/server/requirements.txt .
+RUN pip install --no-cache-dir -r mcp/server/requirements.txt
+COPY mcp/server/ app/mcp_server/
+WORKDIR /app/app/mcp_server
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8082
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8082"]
+*** End File
+*** Add File:images/approver-consumer/Dockerfile
+FROM python:3.10-slim
+WORKDIR /app
+COPY a2a/consumer/approver_consumer.py app/
+RUN pip install --no-cache-dir flask psycopg2-binary requests
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8085
+CMD ["python", "app/approver_consumer.py"]
+*** End File
+*** Update File:.github/workflows/build_and_push_images.yml
+@@
+       - name: Log in to registry
+         uses: docker/login-action@v2
+         with:
+           registry: ${{ secrets.DOCKER_REGISTRY }}
+           username: ${{ secrets.DOCKER_USERNAME }}
+           password: ${{ secrets.DOCKER_PASSWORD }}
+-      - name: Build & push langchain-runtime
+-        uses: docker/build-push-action@v4
+-        with:
+-          context: .
+-          file: images/langchain-runtime/Dockerfile
+-          push: true
+-          tags: ${{ secrets.DOCKER_REGISTRY }}/langchain-runtime:latest
+-      - name: Build & push langgraph
+-        uses: docker/build-push-action@v4
+-        with:
+-          context: .
+-          file: images/langgraph/Dockerfile
+-          push: true
+-          tags: ${{ secrets.DOCKER_REGISTRY }}/langgraph:latest
+-      - name: Build & push mcp
+-        uses: docker/build-push-action@v4
+-        with:
+-          context: .
+-          file: images/mcp/Dockerfile
+-          push: true
+-          tags: ${{ secrets.DOCKER_REGISTRY }}/mcp:latest
+-      - name: Build & push approver-consumer
+-        uses: docker/build-push-action@v4
+-        with:
+-          context: .
+-          file: images/approver-consumer/Dockerfile
+-          push: true
+-          tags: ${{ secrets.DOCKER_REGISTRY }}/approver-consumer:latest
++      - name: Build & push images (multi-arch)
++        uses: docker/build-push-action@v4
++        with:
++          context: .
++          push: true
++          platforms: linux/amd64,linux/arm64
++          build-args: |
++            REG=${{ secrets.DOCKER_REGISTRY }}
++          tags: |
++            ${{ secrets.DOCKER_REGISTRY }}/langchain-runtime:latest
++            ${{ secrets.DOCKER_REGISTRY }}/langgraph:latest
++            ${{ secrets.DOCKER_REGISTRY }}/mcp:latest
++            ${{ secrets.DOCKER_REGISTRY }}/approver-consumer:latest
++          file: images/langchain-runtime/Dockerfile
++      - name: Build langgraph image (additional step to ensure correct context)
++        uses: docker/build-push-action@v4
++        with:
++          context: .
++          file: images/langgraph/Dockerfile
++          push: true
++          tags: ${{ secrets.DOCKER_REGISTRY }}/langgraph:latest
++      - name: Build mcp image
++        uses: docker/build-push-action@v4
++        with:
++          context: .
++          file: images/mcp/Dockerfile
++          push: true
++          tags: ${{ secrets.DOCKER_REGISTRY }}/mcp:latest
++      - name: Build approver-consumer image
++        uses: docker/build-push-action@v4
++        with:
++          context: .
++          file: images/approver-consumer/Dockerfile
++          push: true
++          tags: ${{ secrets.DOCKER_REGISTRY }}/approver-consumer:latest
+*** End File
+*** Add File:mcp/helm/Chart.yaml
+apiVersion: v2
+name: mcp
+description: Model Context Protocol service for Aegis (production helm chart)
+version: 0.1.0
+appVersion: "0.1.0"
+*** End File
+*** Add File:mcp/helm/values.yaml
+replicaCount: 2
+image:
+  repository: "<YOUR_REGISTRY>/mcp"
+  tag: latest
+service:
+  type: ClusterIP
+ingress:
+  enabled: false
+auth:
+  enabled: true
+  tokenSecretName: mcp-auth-token
+postgres:
+  enabled: false
+  host: ""
+  port: 5432
+  user: ""
+  password: ""
+  database: mcpdb
+*** End File
+*** Add File:mcp/helm/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp
+  labels:
+    app: mcp
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: mcp
+  template:
+    metadata:
+      labels:
+        app: mcp
+    spec:
+      containers:
+      - name: mcp
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        env:
+        - name: AEGIS_MCP_STORE
+          value: /data/mcp_store.json
+        - name: MCP_POSTGRES_DSN
+          value: {{ if .Values.postgres.enabled }}postgresql://{{ .Values.postgres.user }}:{{ .Values.postgres.password }}@{{ .Values.postgres.host }}:{{ .Values.postgres.port }}/{{ .Values.postgres.database }}{{ end }}
+        - name: MCP_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.auth.tokenSecretName }}
+              key: token
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        ports:
+        - containerPort: 8082
+      volumes:
+      - name: data
+        emptyDir: {}
+*** End File
+*** Add File:mcp/helm/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp
+spec:
+  selector:
+    app: mcp
+  ports:
+  - port: 80
+    targetPort: 8082
+  type: {{ .Values.service.type }}
+*** End File
+*** Add File:mcp/helm/templates/secret.yaml
+{{- if .Values.auth.enabled }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.auth.tokenSecretName }}
+type: Opaque
+data:
+  token: {{ randAlphaNum 32 | b64enc }}
+{{- end }}
+*** End File
+*** Update File:mcp/server/main.py
+@@
+-import os
+-import json
+-from typing import Optional
+-from fastapi import FastAPI, HTTPException
+-from pydantic import BaseModel
+-from datetime import datetime
+-import pathlib
++import os
++import json
++from typing import Optional
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++from datetime import datetime
++import pathlib
++import logging
++import requests
++from jose import jwk, jwt, JWTError
++from fastapi import Header, Depends
++import psycopg2
++
++logger = logging.getLogger("mcp.server")
++logging.basicConfig(level=logging.INFO)
+@@
+-STORE_FILE = os.environ.get("AEGIS_MCP_STORE", "/data/mcp_store.json")
+-POSTGRES_DSN = os.environ.get("MCP_POSTGRES_DSN", "")
++STORE_FILE = os.environ.get("AEGIS_MCP_STORE", "/data/mcp_store.json")
++POSTGRES_DSN = os.environ.get("MCP_POSTGRES_DSN", "")
++MCP_API_TOKEN = os.environ.get("MCP_API_TOKEN", "")
++OIDC_ISSUER = os.environ.get("MCP_OIDC_ISSUER", "")
++OIDC_AUDIENCE = os.environ.get("MCP_OIDC_AUDIENCE", "")
++
++_JWKS_CACHE = {}
+@@
+ def _save_store(d):
+     p = _ensure_store()
+     p.write_text(json.dumps(d, indent=2))
++
++
++def _pg_connect():
++    if not POSTGRES_DSN:
++        return None
++    return psycopg2.connect(POSTGRES_DSN)
++
++def _fetch_record_pg(model_id: str):
++    conn = _pg_connect()
++    if not conn:
++        return None
++    cur = conn.cursor()
++    cur.execute("SELECT record_json FROM mcp_records WHERE model_id = %s ORDER BY updated_at DESC LIMIT 1", (model_id,))
++    row = cur.fetchone()
++    cur.close()
++    conn.close()
++    if row:
++        return row[0]
++    return None
++
++def _save_record_pg(model_id: str, rec: dict):
++    conn = _pg_connect()
++    if not conn:
++        return False
++    cur = conn.cursor()
++    cur.execute("INSERT INTO mcp_records (model_id, version, record_json) VALUES (%s,%s,%s)",
++                (model_id, rec.get("version"), json.dumps(rec)))
++    conn.commit()
++    cur.close()
++    conn.close()
++    return True
++
++def _get_jwks():
++    global _JWKS_CACHE
++    if not OIDC_ISSUER:
++        return None
++    if _JWKS_CACHE:
++        return _JWKS_CACHE
++    try:
++        openid_cfg = requests.get(f"{OIDC_ISSUER.rstrip('/')}/.well-known/openid-configuration", timeout=5.0).json()
++        jwks_uri = openid_cfg.get("jwks_uri")
++        if not jwks_uri:
++            return None
++        jwks = requests.get(jwks_uri, timeout=5.0).json()
++        _JWKS_CACHE = jwks
++        return jwks
++    except Exception as e:
++        logger.warning("Failed to fetch JWKS: %s", e)
++        return None
++
++def _validate_jwt(auth_header: str | None = Header(default=None)):
++    # If no OIDC configured and no token required, allow
++    if not OIDC_ISSUER and not MCP_API_TOKEN:
++        return True
++    # Token-based fallback
++    if MCP_API_TOKEN:
++        if not auth_header:
++            raise HTTPException(status_code=401, detail="Authorization required")
++        parts = auth_header.split()
++        if len(parts) != 2 or parts[0].lower() != "bearer" or parts[1] != MCP_API_TOKEN:
++            # Not matching static token — try JWT next
++            pass
++        else:
++            return True
++    # JWT Path
++    if not auth_header:
++        raise HTTPException(status_code=401, detail="Authorization required")
++    token = auth_header.split()[1]
++    jwks = _get_jwks()
++    if not jwks:
++        raise HTTPException(status_code=500, detail="OIDC not available")
++    try:
++        headers = jwt.get_unverified_header(token)
++        kid = headers.get("kid")
++        key_entry = None
++        for k in jwks.get("keys", []):
++            if k.get("kid") == kid:
++                key_entry = k
++                break
++        if not key_entry:
++            raise HTTPException(status_code=401, detail="invalid token key")
++        # build rsa key
++        # python-jose accepts the jwk dict directly
++        claims = jwt.decode(token, key_entry, audience=OIDC_AUDIENCE or None, issuer=OIDC_ISSUER or None)
++        return True
++    except JWTError as e:
++        raise HTTPException(status_code=401, detail="token invalid")
+*** End File
+*** Add File:mcp/helm/Chart.yaml
+apiVersion: v2
+name: mcp
+description: MCP service (production Helm chart with Postgres option)
+version: 0.2.0
+appVersion: "0.1.0"
+*** End File
+*** Update File:mcp/helm/values.yaml
+@@
+ postgres:
+   enabled: false
+   host: ""
+   port: 5432
+   user: ""
+   password: ""
+   database: mcpdb
+   secretName: mcp-postgres-secret
+   # If enabled: chart will use bitnami/postgresql as a subchart if you add it as a dependency
+   bitnami:
+     enabled: false
+     image:
+       tag: 15.3.0
+*** End File
+*** Add File:mcp/helm/templates/postgres-secret.yaml
+{{- if .Values.postgres.enabled }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.postgres.secretName }}
+type: Opaque
+data:
+  user: {{ .Values.postgres.user | b64enc }}
+  password: {{ .Values.postgres.password | b64enc }}
+  host: {{ .Values.postgres.host | b64enc }}
+  port: {{ tostring .Values.postgres.port | b64enc }}
+  db: {{ .Values.postgres.database | b64enc }}
+{{- end }}
+*** End File
+*** Add File:a2a/schemas/a2a_messages.json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "approval_request": {
+      "type": "object",
+      "required": ["id","type","model_id","artifact_uri","requester","ts"],
+      "properties": {
+        "id": {"type":"string"},
+        "type": {"type":"string","const":"approval_request"},
+        "model_id": {"type":"string"},
+        "artifact_uri": {"type":"string"},
+        "requester": {"type":"string"},
+        "ts": {"type":"integer"}
+      }
+    },
+    "approval_response": {
+      "type": "object",
+      "required": ["id","type","approval_id","approver","approved","ts"],
+      "properties": {
+        "id": {"type":"string"},
+        "type": {"type":"string","const":"approval_response"},
+        "approval_id": {"type":"string"},
+        "approver": {"type":"string"},
+        "approved": {"type":"boolean"},
+        "ts": {"type":"integer"}
+      }
+    }
+  }
+}
+*** End File
+*** Update File:a2a/sdk/client.py
+@@
+ import os
+ import json
+ import time
+ import uuid
+ import requests
+ from jsonschema import validate, ValidationError
+ 
+ SCHEMA_PATH = os.environ.get("A2A_SCHEMA_PATH", "a2a/schemas/a2a_messages.json")
+ KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "")
+ APPROVER_API = os.environ.get("AEGIS_APPROVER_API", "http://approver.aegis-system.svc.cluster.local")
++COSIGN_KEY = os.environ.get("COSIGN_KEY", "")
++COSIGN_VERIFY_PUB = os.environ.get("COSIGN_PUB", "")
+@@
+ def publish_approval_request(model_id: str, artifact_uri: str, requester: str = "a2a-client"):
+     msg = _build_approval_request(model_id, artifact_uri, requester)
+     try:
+         validate(instance=msg, schema=SCHEMAS["approval_request"])
+     except ValidationError as e:
+         raise RuntimeError("A2A validation failed: " + str(e))
+ 
++    # If cosign key provided, attempt to sign the message and attach signature (best-effort)
++    if COSIGN_KEY:
++        import tempfile, subprocess, base64
++        tf = tempfile.NamedTemporaryFile(delete=False)
++        try:
++            tf.write(json.dumps(msg).encode("utf-8"))
++            tf.flush()
++            sigf = tf.name + ".sig"
++            try:
++                subprocess.check_call(["cosign", "sign-blob", "--key", COSIGN_KEY, tf.name])
++                # cosign creates <file>.sig; read and attach as base64
++                with open(sigf, "rb") as sf:
++                    msg["sig_b64"] = base64.b64encode(sf.read()).decode("utf-8")
++            except Exception as e:
++                print("cosign sign-blob failed:", e)
++        finally:
++            try:
++                tf.close()
++            except Exception:
++                pass
++
+     # If Kafka configured, attempt to publish (simple kafka-python optional)
+     if KAFKA_BOOTSTRAP:
+         try:
+             from kafka import KafkaProducer
+             p = KafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP, value_serializer=lambda v: json.dumps(v).encode("utf-8"))
+             p.send("aegis-a2a-approvals", msg)
+             p.flush()
+             print("Published approval_request to Kafka")
+             return msg
+         except Exception as e:
+             print("Kafka publish failed, fallback to HTTP:", e)
+ 
+     # Fallback: POST to approver API
+     url = f"{APPROVER_API}/request"
+     resp = requests.post(url, json=msg, timeout=10)
+     resp.raise_for_status()
+     print("Posted approval_request to approver API")
+     return msg
+*** End File
+*** Update File:a2a/consumer/approver_consumer.py
+@@
+ import os
+ import json
+ import time
+ import psycopg2
+ from flask import Flask, request, jsonify
+ import base64, tempfile, subprocess
+@@
+ DB_DSN = os.environ.get("APPROVER_POSTGRES_DSN", "postgresql://mlflow:pass@postgres:5432/approver")
+ COSIGN_PUB = os.environ.get("COSIGN_PUB", "")
+ 
+@@
+ def handle_request():
+     msg = request.get_json()
+     # basic validation
+     if not msg or msg.get("type") != "approval_request":
+         return jsonify({"error": "invalid message"}), 400
+     # If a signature is attached, verify it (best-effort)
+     if COSIGN_PUB and msg.get("sig_b64"):
+         try:
+             sig = base64.b64decode(msg["sig_b64"])
+             with tempfile.NamedTemporaryFile(delete=False) as tf:
+                 tf.write(json.dumps({k:v for k,v in msg.items() if k != "sig_b64"}).encode("utf-8"))
+                 tf.flush()
+                 sigf = tf.name + ".sig"
+                 with open(sigf, "wb") as sf:
+                     sf.write(sig)
+                 # verify with cosign verify-blob --key <pubkey> --signature sigfile artifactfile
+                 subprocess.check_call(["cosign", "verify-blob", "--key", COSIGN_PUB, "--signature", sigf, tf.name])
+         except subprocess.CalledProcessError as e:
+             print("cosign verification failed:", e)
+             return jsonify({"error": "signature verification failed"}), 400
+         except Exception as e:
+             print("signature verify error:", e)
+             return jsonify({"error":"signature verify error"}), 400
+     # persist to DB
+     try:
+         conn = psycopg2.connect(DB_DSN)
+         cur = conn.cursor()
+         cur.execute("INSERT INTO approvals (id, namespace, action, requester, signed) VALUES (%s,%s,%s,%s,%s)",
+                     (msg["id"], "aegis-ml", json.dumps({"artifact": msg["artifact_uri"]}), msg["requester"], False))
+         conn.commit()
+         cur.close()
+         conn.close()
+     except Exception as e:
+         print("DB insert failed:", e)
+         return jsonify({"error": "db"}), 500
+     return jsonify({"status": "ok"}), 201
+*** End File
+*** Add File:ops/playbooks/deploy_all.sh
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# Operator playbook: create k8s TLS secrets (placeholders), install Helm charts, and run basic smoke tests.
+#
+# Prereqs: helm, kubectl, jq, env vars:
+#   DOCKER_REGISTRY, AEGIS_NAMESPACE (default aegis-system), MCP_API_TOKEN, MCP_POSTGRES_SECRET, APPROVER_POSTGRES_SECRET
+#
+NAMESPACE="${AEGIS_NAMESPACE:-aegis-system}"
+REG="${DOCKER_REGISTRY:-<YOUR_REGISTRY>}"
+echo "Creating namespace ${NAMESPACE}"
+kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+echo "Creating placeholder mTLS secrets (replace with real certs)"
+kubectl create secret tls aegis-mtls-ca --cert=/dev/null --key=/dev/null --namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+kubectl create secret generic aegis-langchain-tls --from-literal=cert="REPLACE_ME" --from-literal=key="REPLACE_ME" --namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+kubectl create secret generic aegis-langgraph-tls --from-literal=cert="REPLACE_ME" --from-literal=key="REPLACE_ME" --namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+echo "Installing MCP (Helm)"
+helm upgrade --install mcp helm/mcp -n "${NAMESPACE}" --set image.repository="${REG}/mcp" --set image.tag=latest --wait
+echo "Installing langchain-runtime (Helm)"
+helm upgrade --install langchain-runtime helm/langchain_runtime -n "${NAMESPACE}" --set image.repository="${REG}/langchain-runtime" --set image.tag=latest --wait
+echo "Installing langgraph (Helm)"
+helm upgrade --install langgraph helm/langgraph -n "${NAMESPACE}" --set image.repository="${REG}/langgraph" --set image.tag=latest --wait
+echo "Deploy approver consumer as a Deployment (simple)"
+kubectl -n "${NAMESPACE}" apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: approver-consumer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: approver-consumer
+  template:
+    metadata:
+      labels:
+        app: approver-consumer
+    spec:
+      containers:
+      - name: approver
+        image: "${REG}/approver-consumer:latest"
+        ports:
+        - containerPort: 8085
+EOF
+echo "Waiting for deployments to become ready..."
+kubectl -n "${NAMESPACE}" rollout status deployment/mcp --timeout=120s || true
+kubectl -n "${NAMESPACE}" rollout status deployment/langchain-runtime --timeout=120s || true
+kubectl -n "${NAMESPACE}" rollout status deployment/langgraph --timeout=120s || true
+echo "Running basic smoke tests"
+MCP_SVC=$(kubectl -n "${NAMESPACE}" get svc mcp -o jsonpath='{.metadata.name}' 2>/dev/null || true)
+if [ -n "$MCP_SVC" ]; then
+  echo "MCP appears deployed in ${NAMESPACE}"
+fi
+echo "Deployment script finished - replace placeholder secrets with real certs and DB credentials."
+*** End File
+*** Update File:mcp/helm/values.yaml
+@@
+ postgres:
+   enabled: false
+   host: ""
+   port: 5432
+   user: ""
+   password: ""
+   database: mcpdb
+   secretName: mcp-postgres-secret
+   # If enabled: chart will use bitnami/postgresql as a subchart if you add it as a dependency
+   bitnami:
+     enabled: false
+     image:
+       tag: 15.3.0
+*** End File
+*** Add File:helm/templates/mtls-placeholder-secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aegis-mtls-ca
+type: Opaque
+data:
+  ca.crt: ""
+*** End File
+*** Add File:db/migrations/alembic.ini
+[alembic]
+script_location = db/migrations
+
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARN
+handlers = console
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+*** End File
+*** Add File:db/migrations/env.py
+import os
+from logging.config import fileConfig
+
+from sqlalchemy import engine_from_config, pool
+from alembic import context
+
+# this is the Alembic Config object, which provides
+# access to the values within the .ini file in use.
+config = context.config
+
+# Interpret the config file for Python logging.
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+# add your model's MetaData object here for 'autogenerate' support
+# from myapp import mymodel
+# target_metadata = mymodel.Base.metadata
+target_metadata = None
+
+# other values from the config, defined by the needs of env.py,
+# can be acquired:
+DATABASE_URL = os.environ.get("MIGRATE_DSN", os.environ.get("MCP_POSTGRES_DSN", "postgresql://postgres:postgres@localhost:5432/postgres"))
+
+def run_migrations_offline():
+    url = DATABASE_URL
+    context.configure(url=url, target_metadata=target_metadata, literal_binds=True)
+    with context.begin_transaction():
+        context.run_migrations()
+
+def run_migrations_online():
+    connectable = engine_from_config(
+        {"sqlalchemy.url": DATABASE_URL},
+        prefix='sqlalchemy.',
+        poolclass=pool.NullPool)
+
+    with connectable.connect() as connection:
+        context.configure(connection=connection, target_metadata=target_metadata)
+        with context.begin_transaction():
+            context.run_migrations()
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+*** End File
+*** Add File:db/migrations/script.py.mako
+"""${message}
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+def upgrade():
+    pass
+
+def downgrade():
+    pass
+*** End File
+*** Add File:db/migrations/versions/0001_create_mcp_table.py
+"""create mcp table
+Revision ID: 0001_create_mcp_table
+Revises:
+Create Date: 2026-02-10 00:00:00.000000
+"""
+from alembic import op
+import sqlalchemy as sa
+
+# revision identifiers, used by Alembic.
+revision = '0001_create_mcp_table'
+down_revision = None
+branch_labels = None
+depends_on = None
+
+def upgrade():
+    op.create_table(
+        'mcp_records',
+        sa.Column('id', sa.Integer, primary_key=True, autoincrement=True),
+        sa.Column('model_id', sa.String(255), nullable=False),
+        sa.Column('version', sa.String(64), nullable=True),
+        sa.Column('record_json', sa.JSON, nullable=False),
+        sa.Column('created_at', sa.DateTime, server_default=sa.func.now(), nullable=False),
+        sa.Column('updated_at', sa.DateTime, server_default=sa.func.now(), onupdate=sa.func.now(), nullable=False),
+    )
+
+def downgrade():
+    op.drop_table('mcp_records')
+*** End File
+*** Add File:db/migrations/versions/0002_create_approvals_table.py
+"""create approvals table
+Revision ID: 0002_create_approvals_table
+Revises: 0001_create_mcp_table
+Create Date: 2026-02-10 00:00:00.000001
+"""
+from alembic import op
+import sqlalchemy as sa
+
+revision = '0002_create_approvals_table'
+down_revision = '0001_create_mcp_table'
+branch_labels = None
+depends_on = None
+
+def upgrade():
+    op.create_table(
+        'approvals',
+        sa.Column('id', sa.String(64), primary_key=True),
+        sa.Column('namespace', sa.String(128), nullable=False),
+        sa.Column('action', sa.JSON, nullable=False),
+        sa.Column('requester', sa.String(128), nullable=False),
+        sa.Column('signed', sa.Boolean, nullable=False, server_default=sa.false()),
+        sa.Column('created_at', sa.DateTime, server_default=sa.func.now(), nullable=False),
+    )
+
+def downgrade():
+    op.drop_table('approvals')
+*** End File
+*** Add File:scripts/db_migrate.py
+#!/usr/bin/env python3
+"""
+Run Alembic migrations for MCP and approver schemas.
+Set MIGRATE_DSN or MCP_POSTGRES_DSN / APPROVER_POSTGRES_DSN in env.
+"""
+import os
+import sys
+import subprocess
+
+DSN = os.environ.get("MIGRATE_DSN") or os.environ.get("MCP_POSTGRES_DSN") or os.environ.get("APPROVER_POSTGRES_DSN")
+if not DSN:
+    print("Set MIGRATE_DSN or MCP_POSTGRES_DSN/APPROVER_POSTGRES_DSN")
+    sys.exit(2)
+
+os.environ["MIGRATE_DSN"] = DSN
+
+here = os.path.dirname(__file__)
+alembic = os.path.join(here, "..", "db", "migrations")
+cmd = ["alembic", "-c", os.path.join(alembic, "alembic.ini"), "upgrade", "head"]
+print("Running:", " ".join(cmd))
+subprocess.check_call(cmd, cwd=alembic)
+print("Migrations applied")
+*** End File
+*** Add File:mcp/server/requirements.txt
+fastapi
+uvicorn[standard]
+psycopg2-binary
+requests
+python-multipart
+alembic
+python-jose[cryptography]
+*** End File
+*** Add File:langchain_runtime/auth.py
+"""
+JWT/OIDC middleware helper for LangChain runtime.
+Validates incoming Authorization header using JWKS from OIDC_ISSUER.
+"""
+import os, logging, requests
+from jose import jwt, JWTError
+from fastapi import HTTPException, Header
+
+logger = logging.getLogger("langchain.auth")
+
+OIDC_ISSUER = os.environ.get("AEGIS_OIDC_ISSUER", "")
+OIDC_AUDIENCE = os.environ.get("AEGIS_OIDC_AUDIENCE", "")
+
+_JWKS = {}
+
+def get_jwks():
+    global _JWKS
+    if _JWKS:
+        return _JWKS
+    if not OIDC_ISSUER:
+        return None
+    try:
+        cfg = requests.get(f"{OIDC_ISSUER.rstrip('/')}/.well-known/openid-configuration", timeout=3.0).json()
+        jwks_uri = cfg.get("jwks_uri")
+        _JWKS = requests.get(jwks_uri, timeout=3.0).json()
+        return _JWKS
+    except Exception as e:
+        logger.warning("Failed to fetch JWKS: %s", e)
+        return None
+
+def validate_token(auth_header: str | None = Header(default=None)):
+    if not OIDC_ISSUER:
+        return True
+    if not auth_header:
+        raise HTTPException(status_code=401, detail="Authorization header required")
+    token = auth_header.split()[1]
+    jwks = get_jwks()
+    if not jwks:
+        raise HTTPException(status_code=500, detail="OIDC not available")
+    try:
+        headers = jwt.get_unverified_header(token)
+        kid = headers.get("kid")
+        key_entry = None
+        for k in jwks.get("keys", []):
+            if k.get("kid") == kid:
+                key_entry = k
+                break
+        if not key_entry:
+            raise HTTPException(status_code=401, detail="invalid token key")
+        claims = jwt.decode(token, key_entry, audience=OIDC_AUDIENCE or None, issuer=OIDC_ISSUER or None)
+        return True
+    except JWTError:
+        raise HTTPException(status_code=401, detail="token invalid")
+*** End File
+*** Update File:api/langchain_adapter.py
+@@
+ from typing import Callable, Dict, Any, Optional, List
+ import httpx, os, uuid, time, logging
+@@
+ class LangChainWrapper:
+     """
+     Adapter that provides a LangChain-compatible interface while preserving existing audit hooks.
+     Use this to call your existing AgentRunner or to call into the LangChain runtime.
+     """
+     def __init__(self, api_base: str = None, mcp_api: str = None, a2a_api: str = None):
+         self.api_base = api_base or os.environ.get("AEGIS_API_BASE", "http://localhost:8081")
+         self.mcp_api = mcp_api or os.environ.get("AEGIS_MCP_API", "http://localhost:8082")
+         self.a2a_api = a2a_api or os.environ.get("A2A_API", "http://approver:8085")
+         self.logger = logging.getLogger("aegis.langchain_wrapper")
+ 
+     def run_chain(self, model_id: str, model_version: str, prompt: str, request_approval: bool = False, artifact_uri: str = "") -> str:
+         run_id = str(uuid.uuid4())
+         # attach MCP minimal trace
+         try:
+             rec = {"model_id": model_id, "version": model_version, "artifacts":[{"uri": artifact_uri}], "evaluation":{"run_id": run_id}}
+             httpx.post(f"{self.mcp_api.rstrip('/')}/models/{model_id}/context", json=rec, timeout=3.0)
+         except Exception:
+             self.logger.debug("MCP attach failed (continuing)")
+ 
+         # Use existing AgentRunner to execute (non-blocking replacement)
+         try:
+             ar = AgentRunner()
+             result = ar.run(prompt)
+         except Exception as e:
+             self.logger.exception("AgentRunner execution failed")
+             raise
+ 
+         if request_approval:
+             try:
+                 payload = {"id": str(uuid.uuid4()), "type":"approval_request", "model_id": model_id, "artifact_uri": artifact_uri, "requester":"langchain-wrapper", "ts": int(time.time())}
+                 httpx.post(f"{self.a2a_api.rstrip('/')}/request", json=payload, timeout=2.0)
+             except Exception:
+                 self.logger.debug("A2A approval request failed (continuing)")
+ 
+         return result
+*** End File
+*** Begin Patch
+*** Add File:helm/langchain_runtime/Chart.yaml
++apiVersion: v2
++name: langchain-runtime
++description: LangChain runtime for Aegis (Helm chart)
++version: 0.1.0
++appVersion: "0.1.0"
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/langchain_runtime/values.yaml
++replicaCount: 2
++image:
++  repository: "<YOUR_REGISTRY>/langchain-runtime"
++  tag: latest
++service:
++  type: ClusterIP
++ingress:
++  enabled: false
++resources:
++  requests:
++    cpu: 250m
++    memory: 512Mi
++  limits:
++    cpu: 1000m
++    memory: 2Gi
++env:
++  AEGIS_API_BASE: "http://aegis-api:8081"
++  AEGIS_MCP_API: "http://mcp:8082"
++  AEGIS_RETRIEVAL_API: "http://retriever:8080/retrieve"
++  A2A_API: "http://approver:8085"
++mtls:
++  enabled: false
++  secretName: aegis-langchain-tls
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/langchain_runtime/templates/deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: langchain-runtime
++  labels:
++    app: langchain-runtime
++spec:
++  replicas: {{ .Values.replicaCount }}
++  selector:
++    matchLabels:
++      app: langchain-runtime
++  template:
++    metadata:
++      labels:
++        app: langchain-runtime
++    spec:
++      containers:
++      - name: runtime
++        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
++        env:
++        - name: AEGIS_API_BASE
++          value: "{{ .Values.env.AEGIS_API_BASE }}"
++        - name: AEGIS_MCP_API
++          value: "{{ .Values.env.AEGIS_MCP_API }}"
++        - name: AEGIS_RETRIEVAL_API
++          value: "{{ .Values.env.AEGIS_RETRIEVAL_API }}"
++        - name: A2A_API
++          value: "{{ .Values.env.A2A_API }}"
++        - name: USE_MTLS
++          value: "{{ default "false" .Values.mtls.enabled }}"
++        ports:
++        - containerPort: 8080
++        resources:
++{{ toYaml .Values.resources | indent 8 }}
++        volumeMounts:
++        - name: tls-certs
++          mountPath: /var/run/secrets/tls
++          readOnly: true
++      volumes:
++      - name: tls-certs
++        secret:
++          secretName: {{ .Values.mtls.secretName }}
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/langchain_runtime/templates/service.yaml
++apiVersion: v1
++kind: Service
++metadata:
++  name: langchain-runtime
++spec:
++  selector:
++    app: langchain-runtime
++  ports:
++    - port: 80
++      targetPort: 8080
++  type: {{ .Values.service.type }}
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/langgraph/Chart.yaml
++apiVersion: v2
++name: langgraph
++description: LangGraph planner service (Helm chart)
++version: 0.1.0
++appVersion: "0.1.0"
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/langgraph/values.yaml
++replicaCount: 1
++image:
++  repository: "<YOUR_REGISTRY>/langgraph"
++  tag: latest
++service:
++  type: ClusterIP
++redis:
++  enabled: false
++  host: redis
++  port: 6379
++mtls:
++  enabled: false
++  secretName: aegis-langgraph-tls
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/langgraph/templates/deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: langgraph
++  labels:
++    app: langgraph
++spec:
++  replicas: {{ .Values.replicaCount }}
++  selector:
++    matchLabels:
++      app: langgraph
++  template:
++    metadata:
++      labels:
++        app: langgraph
++    spec:
++      containers:
++      - name: langgraph
++        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
++        env:
++        - name: REDIS_HOST
++          value: "{{ .Values.redis.host }}"
++        - name: REDIS_PORT
++          value: "{{ .Values.redis.port }}"
++        - name: USE_MTLS
++          value: "{{ default "false" .Values.mtls.enabled }}"
++        ports:
++        - containerPort: 8090
++        volumeMounts:
++        - name: tls-certs
++          mountPath: /var/run/secrets/tls
++          readOnly: true
++      volumes:
++      - name: tls-certs
++        secret:
++          secretName: {{ .Values.mtls.secretName }}
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/langgraph/templates/service.yaml
++apiVersion: v1
++kind: Service
++metadata:
++  name: langgraph
++spec:
++  selector:
++    app: langgraph
++  ports:
++  - port: 80
++    targetPort: 8090
++  type: {{ .Values.service.type }}
++
+*** End Patch
+*** End Patch

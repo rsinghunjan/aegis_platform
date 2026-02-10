@@ -1,0 +1,538 @@
+*** Begin Patch
+*** Add File:k8s/redis/redis-cluster.yaml
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: aegis-system
++
++---
++# Simple Redis StatefulSet (3 replicas) suitable for staging / small prod.
++# For production, prefer a managed Redis (Elasticache / Memorystore / Azure Cache) or Redis Operator.
++apiVersion: apps/v1
++kind: StatefulSet
++metadata:
++  name: aegis-redis
++  namespace: aegis-system
++spec:
++  serviceName: "aegis-redis"
++  replicas: 3
++  selector:
++    matchLabels:
++      app: aegis-redis
++  template:
++    metadata:
++      labels:
++        app: aegis-redis
++    spec:
++      containers:
++      - name: redis
++        image: redis:7.0
++        args: ["redis-server", "--appendonly", "yes", "--save", "900 1", "--save", "300 10"]
++        ports:
++        - containerPort: 6379
++        resources:
++          requests:
++            cpu: "100m"
++            memory: "256Mi"
++        volumeMounts:
++        - name: redis-data
++          mountPath: /data
++  volumeClaimTemplates:
++  - metadata:
++      name: redis-data
++    spec:
++      accessModes: ["ReadWriteOnce"]
++      resources:
++        requests:
++          storage: 10Gi
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: aegis-redis
++  namespace: aegis-system
++spec:
++  clusterIP: None
++  selector:
++    app: aegis-redis
++  ports:
++  - port: 6379
++    targetPort: 6379
++
+*** End File
+*** Add File:ops/retrain/retrain_guard_redis.py
++#!/usr/bin/env python3
++"""
++Retrain guard using Redis for HA counters and cooldowns.
++
++Behavior:
++ - Uses a Redis sorted set per "project" to store timestamps of retrain events.
++ - Atomic Lua script checks cooldown and daily rate limit and records the new event when allowed.
++ - Requires: REDIS_URL environment variable (e.g., redis://aegis-redis:6379/0)
++ - Falls back to file-backed behavior only if Redis is unavailable (logged).
++
++Inputs:
++ - dataset_meta: dict with sensitivity, curated_examples_path, approvals (list of sigs)
++ - requestor: string identity
++
++Return:
++ - JSON: {"allowed": bool, "reason": "..."}
++"""
++import os
++import json
++import time
++import logging
++import redis
++import subprocess
++
++LOG = logging.getLogger("aegis.retrain.guard.redis")
++logging.basicConfig(level=logging.INFO)
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
++MULTISIG_CMD = os.environ.get("MULTISIG_VERIFY_CMD", "/app/multisig_verify.py")
++MULTISIG_THRESHOLD = int(os.environ.get("MULTISIG_THRESHOLD", "2"))
++COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "3600"))
++MAX_PER_24H = int(os.environ.get("MAX_RETRAINS_PER_24H", "3"))
++
++# Lua script: atomically check last timestamp and count in 24h window, then add new timestamp if allowed.
++LUA_CHECK_AND_ADD = r"""
++local key = KEYS[1]
++local now = tonumber(ARGV[1])
++local cooldown = tonumber(ARGV[2])
++local cutoff = tonumber(ARGV[3])
++local max24 = tonumber(ARGV[4])
++
++-- remove old entries < cutoff (defensive)
++redis.call("ZREMRANGEBYSCORE", key, 0, cutoff - 86400)
++
++local last = redis.call("ZREVRANGE", key, 0, 0, "WITHSCORES")
++if #last > 0 then
++  local last_ts = tonumber(last[2])
++  if now - last_ts < cooldown then
++    return cjson.encode({allowed=false, reason="cooldown_active", last=last_ts})
++  end
++end
++
++local count = redis.call("ZCOUNT", key, cutoff, now)
++if count >= max24 then
++  return cjson.encode({allowed=false, reason="rate_limit_exceeded", count=count})
++end
++
++redis.call("ZADD", key, now, tostring(now) .. ":" .. ARGV[5])
++redis.call("EXPIRE", key, 3600*48)
++return cjson.encode({allowed=true})
++"""
++
++def get_redis():
++    try:
++        return redis.from_url(REDIS_URL, decode_responses=True)
++    except Exception:
++        LOG.exception("Failed to connect to Redis")
++        return None
++
++def verify_multisig(approvals):
++    if not approvals or len(approvals) < MULTISIG_THRESHOLD:
++        return False
++    try:
++        args = [MULTISIG_CMD, "--threshold", str(MULTISIG_THRESHOLD)] + [f"--sig={s}" for s in approvals]
++        LOG.info("Calling multisig verifier: %s", args)
++        subprocess.check_call(args)
++        return True
++    except Exception:
++        LOG.exception("Multisig verification failed")
++        return False
++
++def retrain_allowed_redis(dataset_meta, requestor):
++    """
++    dataset_meta: dict with keys sensitivity, curated_examples_path, approvals (list)
++    Returns: (allowed: bool, reason: str)
++    """
++    r = get_redis()
++    if r is None:
++        LOG.warning("Redis unavailable; falling back to conservative deny")
++        return False, "redis_unavailable"
++
++    now = int(time.time())
++    cutoff = now - 24*3600
++    key = f"aegis:retrain:{dataset_meta.get('dataset_id','default')}:history"
++    try:
++        res = r.eval(LUA_CHECK_AND_ADD, 1, key, now, COOLDOWN_SECONDS, cutoff, MAX_PER_24H, requestor)
++        out = json.loads(res)
++        if not out.get("allowed", False):
++            return False, out.get("reason", "denied")
++    except Exception:
++        LOG.exception("Redis eval failed")
++        return False, "redis_error"
++
++    # If dataset sensitive, require multisig approvals
++    if dataset_meta.get("sensitivity") == "high":
++        if not verify_multisig(dataset_meta.get("approvals", [])):
++            return False, "multisig_required_or_failed"
++
++    # curated examples must be present
++    if not dataset_meta.get("curated_examples_path"):
++        return False, "no_curated_examples"
++
++    return True, "allowed"
++
++def main():
++    import argparse
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--dataset-meta", required=True)
++    ap.add_argument("--requestor", required=True)
++    args = ap.parse_args()
++    try:
++        if os.path.exists(args.dataset_meta):
++            ds = json.load(open(args.dataset_meta))
++        else:
++            ds = json.loads(args.dataset_meta)
++    except Exception:
++        LOG.exception("Failed to load dataset meta")
++        print(json.dumps({"allowed": False, "reason": "bad_dataset_meta"}))
++        return 2
++    allowed, reason = retrain_allowed_redis(ds, args.requestor)
++    print(json.dumps({"allowed": allowed, "reason": reason}))
++    return 0 if allowed else 1
++
++if __name__ == "__main__":
++    raise SystemExit(main())
++
+*** End File
+*** Add File:ops/retrain/retrain_guard_dynamo.py
++#!/usr/bin/env python3
++"""
++DynamoDB-backed retrain guard (alternative to Redis).
++ - Uses a DynamoDB table to store retrain events (PK: dataset_id, SK: ts#requestor)
++ - Requires AWS credentials and table name in environment:DYNAMO_TABLE
++ - This is a simple implementation; for production use conditional writes or transactional API for atomicity.
++"""
++import os
++import json
++import time
++import logging
++import boto3
++from botocore.exceptions import ClientError
++import subprocess
++
++LOG = logging.getLogger("aegis.retrain.guard.dynamo")
++logging.basicConfig(level=logging.INFO)
++
++DYNAMO_TABLE = os.environ.get("DYNAMO_TABLE")
++MULTISIG_CMD = os.environ.get("MULTISIG_VERIFY_CMD", "/app/multisig_verify.py")
++MULTISIG_THRESHOLD = int(os.environ.get("MULTISIG_THRESHOLD", "2"))
++COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "3600"))
++MAX_PER_24H = int(os.environ.get("MAX_RETRAINS_PER_24H", "3"))
++
++def verify_multisig(approvals):
++    if not approvals or len(approvals) < MULTISIG_THRESHOLD:
++        return False
++    try:
++        args = [MULTISIG_CMD, "--threshold", str(MULTISIG_THRESHOLD)] + [f"--sig={s}" for s in approvals]
++        subprocess.check_call(args)
++        return True
++    except Exception:
++        LOG.exception("Multisig verification failed")
++        return False
++
++def retrain_allowed_dynamo(dataset_meta, requestor):
++    if not DYNAMO_TABLE:
++        LOG.error("DYNAMO_TABLE not set")
++        return False, "no_table"
++    dynamo = boto3.resource("dynamodb")
++    table = dynamo.Table(DYNAMO_TABLE)
++    now = int(time.time())
++    cutoff = now - 24*3600
++    dataset_id = dataset_meta.get("dataset_id", "default")
++    # Query recent events (inefficient for large tables; add GSI for timestamp)
++    try:
++        resp = table.query(KeyConditionExpression="dataset_id = :d and begins_with(event_ts, :p)", ExpressionAttributeValues={":d": dataset_id, ":p": ""}, Limit=1000)
++        items = resp.get("Items", [])
++    except ClientError:
++        LOG.exception("dynamo query failed")
++        return False, "dynamo_error"
++
++    last_ts = max((int(i.get("ts",0)) for i in items), default=0)
++    if last_ts and now - last_ts < COOLDOWN_SECONDS:
++        return False, "cooldown_active"
++    recent_count = sum(1 for i in items if int(i.get("ts",0)) >= cutoff)
++    if recent_count >= MAX_PER_24H:
++        return False, "rate_limit_exceeded"
++
++    if dataset_meta.get("sensitivity") == "high":
++        if not verify_multisig(dataset_meta.get("approvals", [])):
++            return False, "multisig_required_or_failed"
++
++    if not dataset_meta.get("curated_examples_path"):
++        return False, "no_curated_examples"
++
++    # record event
++    try:
++        table.put_item(Item={"dataset_id": dataset_id, "event_ts": f"{now}#{requestor}", "ts": now, "requestor": requestor})
++    except ClientError:
++        LOG.exception("dynamo put failed")
++    return True, "allowed"
++
+*** End File
+*** Add File:k8s/retrain/retrain-guard-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: retrain-guard
++  namespace: aegis-system
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: retrain-guard
++  template:
++    metadata:
++      labels:
++        app: retrain-guard
++    spec:
++      containers:
++      - name: retrain-guard
++        image: "<YOUR_REGISTRY>/aegis-retrain-guard:latest"
++        env:
++        - name: REDIS_URL
++          value: "redis://aegis-redis:6379/0"
++        - name: MULTISIG_VERIFY_CMD
++          value: "/app/multisig_verify.py"
++        - name: MULTISIG_THRESHOLD
++          value: "2"
++        - name: COOLDOWN_SECONDS
++          value: "3600"
++        - name: MAX_RETRAINS_PER_24H
++          value: "3"
++        ports:
++        - containerPort: 8083
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: retrain-guard
++  namespace: aegis-system
++spec:
++  ports:
++  - port: 8083
++  selector:
++    app: retrain-guard
++
+*** End File
+*** Add File:k8s/detectors/daemonset.yaml
++apiVersion: apps/v1
++kind: DaemonSet
++metadata:
++  name: aegis-detectors
++  namespace: aegis-system
++spec:
++  selector:
++    matchLabels:
++      app: aegis-detectors
++  template:
++    metadata:
++      labels:
++        app: aegis-detectors
++    spec:
++      containers:
++      - name: detectors
++        image: "<YOUR_REGISTRY>/aegis-detectors:latest"
++        imagePullPolicy: IfNotPresent
++        env:
++        - name: THRESHOLDS_PATH
++          value: "/etc/detectors/thresholds.json"
++        volumeMounts:
++        - name: thresholds
++          mountPath: /etc/detectors
++      volumes:
++      - name: thresholds
++        configMap:
++          name: detectors-thresholds
++      tolerations:
++      - operator: "Exists"
++
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: detectors-thresholds
++  namespace: aegis-system
++data:
++  thresholds.json: |
++    {
++      "pii_detector": 0.9,
++      "nsfw_detector": 0.85,
++      "ocr_confidence": 0.7
++    }
++
+*** End File
+*** Add File:ops/detectors/calibrate_job.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: detectors-calibration
++  namespace: aegis-system
++spec:
++  template:
++    spec:
++      containers:
++      - name: calibrate
++        image: "<YOUR_REGISTRY>/aegis-detector-calibrator:latest"
++        command: ["python3", "/app/calibrate.py", "--output", "/out/thresholds.json"]
++        volumeMounts:
++        - name: out
++          mountPath: /out
++      restartPolicy: Never
++      volumes:
++      - name: out
++        emptyDir: {}
++  backoffLimit: 0
++
+*** End File
+*** Add File:k8s/gpu/node-local-cache-daemonset.yaml
++apiVersion: apps/v1
++kind: DaemonSet
++metadata:
++  name: node-local-model-cache
++  namespace: aegis-system
++spec:
++  selector:
++    matchLabels:
++      app: node-local-model-cache
++  template:
++    metadata:
++      labels:
++        app: node-local-model-cache
++    spec:
++      nodeSelector:
++        beta.kubernetes.io/instance-type: "gpu"
++      containers:
++      - name: cacher
++        image: "<YOUR_REGISTRY>/aegis-cache-warm:latest"
++        env:
++        - name: MODEL_SOURCE_URL
++          value: "s3://aegis-models"
++        - name: CACHE_PATH
++          value: "/var/local/models"
++        volumeMounts:
++        - name: cache
++          mountPath: /var/local/models
++      volumes:
++      - name: cache
++        hostPath:
++          path: /var/local/models
++          type: DirectoryOrCreate
++      tolerations:
++      - operator: "Exists"
++
+*** End File
+*** Add File:docs/gpu/README_nodepool_nvme.md
++# GPU Node Pools & NVMe Cache (example guidance)
++
++This document provides example commands and guidance for provisioning GPU node pools with local NVMe caching.
++
++GKE example (gcloud):
++1. Create GPU node pool:
++   gcloud container node-pools create gpu-pool \
++     --cluster=my-cluster --zone=us-central1-a \
++     --accelerator type=nvidia-tesla-a100,count=1 \
++     --machine-type=n1-standard-16 \
++     --num-nodes=2 \
++     --disk-type=local-ssd \
++     --local-ssd-count=1
++
++2. Label the pool nodes:
++   kubectl label nodes <node-name> node-role.kubernetes.io/gpu=true
++
++EKS / AKS: create equivalent nodegroups with GPU instance types and attach instance store or fast disks for caching.
++
++Recommendations:
++- Use nodeSelector in model-serving pods: nodeSelector: {"node-role.kubernetes.io/gpu":"true"}
++- Mount hostPath (/var/local/models) or use a CSI driver for node-local SSDs for model cache.
++- Deploy node-local cache DaemonSet (k8s/gpu/node-local-cache-daemonset.yaml) to prefetch candidate model shards.
++
+*** End File
+*** Add File:k8s/approver/approver-deployment-prod.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: approver-signing
++  namespace: aegis-system
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: approver-signing
++  template:
++    metadata:
++      labels:
++        app: approver-signing
++    spec:
++      serviceAccountName: approver-sa
++      containers:
++      - name: approver
++        image: "<YOUR_REGISTRY>/aegis-approver-signing:latest"
++        env:
++        - name: COSIGN_KMS_URI
++          valueFrom:
++            secretKeyRef:
++              name: approver-secrets
++              key: cosign_kms_uri
++        - name: OIDC_INTROSPECTION_URL
++          valueFrom:
++            secretKeyRef:
++              name: approver-secrets
++              key: oidc_introspection
++        - name: OIDC_CLIENT_ID
++          valueFrom:
++            secretKeyRef:
++              name: approver-secrets
++              key: oidc_client_id
++        - name: OIDC_CLIENT_SECRET
++          valueFrom:
++            secretKeyRef:
++              name: approver-secrets
++              key: oidc_client_secret
++        ports:
++        - containerPort: 8080
++
++---
++apiVersion: v1
++kind: Secret
++metadata:
++  name: approver-secrets
++  namespace: aegis-system
++type: Opaque
++stringData:
++  cosign_kms_uri: "<AWKMS_URI_OR_SIMILAR>"
++  oidc_introspection: "<OIDC_INTROSPECTION_URL>"
++  oidc_client_id: "<OIDC_CLIENT_ID>"
++  oidc_client_secret: "<OIDC_CLIENT_SECRET>"
++
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: approver-sa
++  namespace: aegis-system
++
+*** End File
+*** Add File:ops/retrain/README_redis_dynamo.md
++# Retrain Guard: Redis & Dynamo Backends
++
++This directory adds Redis- and Dynamo-backed retrain guard implementations to replace the file-backed state.
++
++Files:
++- retrain_guard_redis.py : uses Redis sorted sets + Lua script for atomic cooldown and rate checks.
++- retrain_guard_dynamo.py : alternative DynamoDB implementation (simpler).
++- retrain-guard-deployment.yaml : k8s deployment referencing REDIS_URL.
++
++Operational notes:
++- Set REDIS_URL in deployment env to point to your Redis cluster/service.
++- MULTISIG_VERIFY_CMD should be available in the container image or mounted.
++- For high throughput, use Redis managed service or cluster and ensure network & auth (TLS) are configured.
++- Ensure retrain-guard is called by the orchestrator prior to submitting Argo retrain workflows.
++
+*** End File
+*** End Patch

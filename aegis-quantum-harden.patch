@@ -1,0 +1,387 @@
+*** Begin Patch
+*** Add File:ops/quantum/README_QUANTUM.md
++# Aegis Quantum Domain Hardening
++
++This directory contains scaffolding to harden the quantum domain in Aegis:
++
++- A reproducible container image Dockerfile for quantum workloads (Qiskit / Cirq / PennyLane).
++- A simulator job wrapper and an optional QPU submission helper (IBMQ / Braket stub).
++- Provenance/evidence bundler for quantum runs, with cosign signing helper.
++- An Argo WorkflowTemplate for hybrid sim→QPU workflows.
++- CI workflow to test circuit submissions on a simulator and build/sign artifacts.
++- Metrics exporter for quantum job queue/latency (Prometheus).
++
++Key recommended production practices:
++- Use a dedicated KMS-backed cosign key to sign all quantum artifacts and recorded results.
++- Keep QPU credentials in Vault / ExternalSecrets and never bake into images.
++- Prefer simulator-based CI; real QPU calls should be gated with approvals and cost accounting.
++- Record full provenance for every QPU job (circuit, backend, shots, job id, result, timestamp) and store signed evidence.
++- Rate-limit and queue QPU submissions to avoid unexpected costs; expose cost metrics.
++
++Quickstart (dev):
++1. Build the quantum runner image: docker build -t aegis-quantum-runner:local .
++2. Run a simulator test: python3 ops/quantum/qiskit_job.py --circuit examples/simple_circuit.json --mode=sim
++3. Use Argo (ops/k8s/quantum-workflow.yaml) to run simulated workflows.
++
+*** End File
+*** Add File:ops/quantum/Dockerfile
++FROM python:3.11-slim
++LABEL maintainer="aegis-platform@example.com"
++
++ENV DEBIAN_FRONTEND=noninteractive
++RUN apt-get update && apt-get install -y --no-install-recommends \
++    build-essential git curl && \
++    rm -rf /var/lib/apt/lists/*
++
++RUN pip install --no-cache-dir qiskit==0.50.* qiskit-ibmq-provider requests pyarrow pandas prometheus-client cosign==1.0.0 || true
++
++WORKDIR /app
++COPY qiskit_job.py ops/quantum/qiskit_job.py
++COPY quantum_provenance.py ops/quantum/quantum_provenance.py
++COPY ibmq_integration_stub.py ops/quantum/ibmq_integration_stub.py
++COPY metrics_exporter.py ops/quantum/metrics_exporter.py
++ENTRYPOINT ["python3", "/app/qiskit_job.py"]
++
+*** End File
+*** Add File:ops/quantum/qiskit_job.py
++#!/usr/bin/env python3
++"""
++Quantum job runner (Qiskit-focused).
++
++Modes:
++ - sim : run on local Aer simulator
++ - qpu : submit to an external QPU provider (IBMQ/Braket) via a provider stub (requires credentials)
++
++Behavior:
++ - Loads a circuit description (JSON or OpenQASM) and runs it.
++ - Records provenance and signs evidence (if COSIGN_KEY set).
++ - Emits lightweight Prometheus metrics via metrics_exporter.
++"""
++import os
++import json
++import time
++import argparse
++import uuid
++from pathlib import Path
++from quantum_provenance import bundle_provenance
++from metrics_exporter import QuantumMetrics
++
++MODE_SIM = "sim"
++MODE_QPU = "qpu"
++
++def load_circuit_from_json(path):
++    with open(path, "r") as fh:
++        payload = json.load(fh)
++    return payload
++
++def run_on_sim(circuit_json, shots=1024):
++    # Minimal qiskit Aer run; import inside to keep module import optional
++    from qiskit import QuantumCircuit, transpile
++    from qiskit.providers.aer import AerSimulator
++    qc = QuantumCircuit.from_qasm_str(circuit_json.get("qasm", "")) if circuit_json.get("qasm") else QuantumCircuit.from_dict(circuit_json)
++    backend = AerSimulator()
++    tqc = transpile(qc, backend)
++    job = backend.run(tqc, shots=shots)
++    result = job.result()
++    counts = result.get_counts()
++    return {"counts": counts, "shots": shots}
++
++def submit_to_qpu(circuit_json, provider_stub, shots=1024):
++    # provider_stub is an object implementing submit(circuit_qasm, shots) -> dict
++    qasm = circuit_json.get("qasm")
++    if not qasm:
++        raise RuntimeError("QASM required for QPU submission in this stub")
++    job_info = provider_stub.submit(qasm, shots)
++    return job_info
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--circuit", required=True, help="Path to circuit JSON or QASM")
++    ap.add_argument("--mode", choices=[MODE_SIM, MODE_QPU], default=MODE_SIM)
++    ap.add_argument("--shots", type=int, default=1024)
++    ap.add_argument("--out-dir", default="/tmp/quantum_results")
++    args = ap.parse_args()
++
++    Path(args.out_dir).mkdir(parents=True, exist_ok=True)
++    if args.circuit.endswith(".json"):
++        circ = load_circuit_from_json(args.circuit)
++    else:
++        # read QASM
++        circ = {"qasm": open(args.circuit).read()}
++
++    run_id = str(uuid.uuid4())
++    metrics = QuantumMetrics()
++    start = time.time()
++    try:
++        if args.mode == MODE_SIM:
++            res = run_on_sim(circ, shots=args.shots)
++            status = "ok"
++        else:
++            # attempt to load provider stub
++            from ibmq_integration_stub import IBMQProviderStub
++            stub = IBMQProviderStub()
++            res = submit_to_qpu(circ, stub, shots=args.shots)
++            status = "submitted"
++    except Exception as e:
++        res = {"error": str(e)}
++        status = "error"
++    duration = time.time() - start
++
++    # Provenance and evidence bundling (signed if COSIGN_KEY)
++    meta = {
++        "run_id": run_id,
++        "mode": args.mode,
++        "shots": args.shots,
++        "status": status,
++        "duration_s": duration,
++    }
++    ev_path = bundle_provenance(meta, circ, res, out_dir=args.out_dir)
++    metrics.record_job(status, duration)
++    print("Result:", res)
++    print("Evidence:", ev_path)
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:ops/quantum/quantum_provenance.py
++#!/usr/bin/env python3
++"""
++Provenance bundler for quantum runs.
++
++Creates a JSON bundle with metadata, circuit, results and environment info.
++Optionally signs the bundle with cosign if COSIGN_KEY env var is present.
++"""
++import os
++import json
++import time
++import socket
++import subprocess
++from pathlib import Path
++
++OUT_DIR_DEFAULT = os.environ.get("QUANTUM_EVIDENCE_DIR", "/tmp/quantum_evidence")
++Path(OUT_DIR_DEFAULT).mkdir(parents=True, exist_ok=True)
++
++def bundle_provenance(metadata: dict, circuit: dict, result: dict, out_dir: str = None):
++    out_dir = out_dir or OUT_DIR_DEFAULT
++    Path(out_dir).mkdir(parents=True, exist_ok=True)
++    ts = int(time.time())
++    host = socket.gethostname()
++    bundle = {
++        "metadata": metadata,
++        "circuit": circuit,
++        "result": result,
++        "env": {
++            "host": host,
++            "ts": ts,
++        }
++    }
++    fname = os.path.join(out_dir, f"quantum_run_{metadata.get('run_id','run')}_{ts}.json")
++    with open(fname, "w") as fh:
++        json.dump(bundle, fh, indent=2)
++    # optionally sign
++    cosign_key = os.environ.get("COSIGN_KEY")
++    if cosign_key:
++        try:
++            subprocess.run(["cosign", "sign-blob", "--key", cosign_key, fname], check=True)
++        except Exception:
++            # non-fatal; signing failures logged but do not block result recording
++            print("Warning: cosign sign-blob failed")
++    return fname
++
+*** End File
+*** Add File:ops/quantum/ibmq_integration_stub.py
++#!/usr/bin/env python3
++"""
++IBMQ / QPU provider integration stub.
++
++This is a safe stub that demonstrates the shape of an integration.
++In production replace with a secure implementation that reads credentials from Vault
++and submits via qiskit.providers.ibmq or cloud provider SDK (AWS Braket / Azure Quantum).
++"""
++import os
++import time
++import uuid
++
++class IBMQProviderStub:
++    def __init__(self):
++        self.backend = os.environ.get("IBMQ_BACKEND", "ibmq_qasm_simulator")
++
++    def submit(self, qasm_str: str, shots: int = 1024):
++        # placeholder: in real integration use IBMQ.load_account() and provider.get_backend(...)
++        print("Stub submit to backend", self.backend)
++        # emulate async job id and delayed result
++        job_id = f"stub-{uuid.uuid4()}"
++        time.sleep(0.5)
++        # emulate a result shape similar to Qiskit
++        result = {"job_id": job_id, "status": "COMPLETED", "counts": {"00": shots//2, "11": shots//2}}
++        return result
++
+*** End File
+*** Add File:ops/quantum/metrics_exporter.py
++#!/usr/bin/env python3
++"""
++Simple Prometheus metrics helper for quantum jobs.
++
++Expose:
++ - aegis_quantum_jobs_total{status}
++ - aegis_quantum_job_duration_seconds (summary)
++"""
++from prometheus_client import Counter, Summary, start_http_server
++import threading
++import time
++
++JOBS = Counter("aegis_quantum_jobs_total", "Quantum jobs total", ["status"])
++DURATION = Summary("aegis_quantum_job_duration_seconds", "Quantum job durations")
++
++class QuantumMetrics:
++    def __init__(self, port=9400):
++        # Start exporter in background if not already running
++        t = threading.Thread(target=start_http_server, args=(port,), daemon=True)
++        t.start()
++
++    def record_job(self, status: str, duration_s: float):
++        JOBS.labels(status=status).inc()
++        DURATION.observe(duration_s)
++
+*** End File
+*** Add File:k8s/quantum/quantum-workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: WorkflowTemplate
++metadata:
++  name: quantum-sim-qpu-workflow
++  namespace: aegis-ml
++spec:
++  entrypoint: sim-then-optional-qpu
++  templates:
++  - name: sim-then-optional-qpu
++    steps:
++    - - name: run-sim
++        template: run-simulator
++    - - name: maybe-qpu
++        template: submit-qpu
++        when: "{{workflow.parameters.submit_qpu}} == true"
++  - name: run-simulator
++    container:
++      image: "<YOUR_REGISTRY>/aegis-quantum-runner:latest"
++      command: ["python3", "/app/qiskit_job.py"]
++      args: ["--circuit", "/work/circuit.json", "--mode", "sim", "--out-dir", "/work/out"]
++      volumeMounts:
++      - name: work
++        mountPath: /work
++  - name: submit-qpu
++    container:
++      image: "<YOUR_REGISTRY>/aegis-quantum-runner:latest"
++      command: ["python3", "/app/qiskit_job.py"]
++      args: ["--circuit", "/work/circuit.json", "--mode", "qpu", "--out-dir", "/work/out"]
++      volumeMounts:
++      - name: work
++        mountPath: /work
++  volumes:
++  - name: work
++    persistentVolumeClaim:
++      claimName: quantum-work-pvc
++  arguments:
++    parameters:
++    - name: submit_qpu
++      value: "false"
++
++---
++# PVC (example) - replace with appropriate storage class
++apiVersion: v1
++kind: PersistentVolumeClaim
++metadata:
++  name: quantum-work-pvc
++  namespace: aegis-ml
++spec:
++  accessModes:
++    - ReadWriteOnce
++  resources:
++    requests:
++      storage: 10Gi
++
+*** End File
+*** Add File:.github/workflows/quantum_ci.yml
++name: Quantum CI (sim-only)
++on:
++  workflow_dispatch:
++  push:
++    paths:
++      - 'ops/quantum/**'
++jobs:
++  build-and-test:
++    runs-on: ubuntu-latest
++    steps:
++    - uses: actions/checkout@v4
++    - name: Set up Python
++      uses: actions/setup-python@v4
++      with:
++        python-version: "3.11"
++    - name: Install deps
++      run: |
++        pip install -r <(echo "qiskit\npyarrow\npandas\nprometheus-client")
++    - name: Run simulator smoke test
++      run: |
++        python3 ops/quantum/qiskit_job.py --circuit ops/quantum/examples/simple_circuit.json --mode sim --out-dir ./artifacts || (echo "sim failed" && exit 1)
++    - name: Build Docker image (optional)
++      run: |
++        docker build -t aegis-quantum-runner:ci -f ops/quantum/Dockerfile .
++    - name: Package evidence artifact
++      run: |
++        tar czf artifacts/quantum_ci_artifacts.tgz ./artifacts || true
++
+*** End File
+*** Add File:ops/quantum/examples/simple_circuit.json
++{
++  "qasm": "OPENQASM 2.0; include \"qelib1.inc\"; qreg q[2]; creg c[2]; h q[0]; cx q[0],q[1]; measure q -> c;"
++}
++
+*** End File
+*** Add File:ops/quantum/cosign_sign_qartifact.sh
++#!/usr/bin/env bash
++set -euo pipefail
++if [ -z "${COSIGN_KEY:-}" ]; then
++  echo "COSIGN_KEY not set. Set to KMS URI or path to key."
++  exit 1
++fi
++if [ "$#" -lt 1 ]; then
++  echo "Usage: $0 <file>"
++  exit 2
++fi
++FILE="$1"
++cosign sign-blob --key "${COSIGN_KEY}" "$FILE"
++echo "Signed $FILE"
++
+*** End File
+*** Add File:ops/quantum/simulator_bench.py
++#!/usr/bin/env python3
++"""
++Simple simulator benchmarking utility to measure runtime for circuits.
++Outputs JSON with runtime statistics suitable for CI/perf baselines.
++"""
++import time
++import json
++from qiskit import QuantumCircuit
++from qiskit.providers.aer import AerSimulator
++
++def bench(qasm_str, shots=1024, repeat=3):
++    backend = AerSimulator()
++    durations = []
++    for _ in range(repeat):
++        qc = QuantumCircuit.from_qasm_str(qasm_str)
++        start = time.time()
++        backend.run(qc, shots=shots).result()
++        durations.append(time.time() - start)
++    return {"durations": durations, "mean_s": sum(durations)/len(durations)}
++
++if __name__ == "__main__":
++    import argparse
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--qasm-file", required=True)
++    args = ap.parse_args()
++    qasm = open(args.qasm_file).read()
++    stats = bench(qasm)
++    print(json.dumps(stats, indent=2))
++
+*** End File
+*** End Patch

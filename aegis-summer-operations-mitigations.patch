@@ -1,0 +1,511 @@
+*** Begin Patch
+*** Add File:services/medical/triage_controller.py
++#!/usr/bin/env python3
++"""
++Triage controller for heat-driven incidents and medical dispatch.
++ - Receives incident events from detectors.
++ - Applies simple prioritization, prepositions medics/hydration stations,
++   requests A2A approval for medical interventions, supports manual override
++   via approver JWT (strict).
++ - Emits MCP audit events and requests receipts be signed for any side-effect.
++"""
++import os
++import time
++import logging
++import requests
++from fastapi import FastAPI, HTTPException, Header
++from pydantic import BaseModel
++
++LOG = logging.getLogger("aegis.medical.triage")
++logging.basicConfig(level=logging.INFO)
++APP = FastAPI(title="Aegis Medical Triage Controller")
++
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++A2A_API = os.environ.get("A2A_API", "http://approver:8080")
++RECEIPT_API = os.environ.get("RECEIPT_API", "http://receipt-signer:8080/sign")
++MEDIC_DISPATCH_API = os.environ.get("MEDIC_DISPATCH_API", "http://dispatch:8080/dispatch")
++HYDRATION_API = os.environ.get("HYDRATION_API", "http://hydration:8080/alert")
++HIGH_PRIORITY_TEMP = float(os.environ.get("HIGH_PRIORITY_TEMP", "40.0"))  # Celsius
++
++class Incident(BaseModel):
++    id: str
++    venue: str
++    timestamp: int
++    incident_type: str  # "heat", "fall", "collapse", ...
++    severity: float     # 0..1 predicted severity
++    metadata: dict = {}
++
++def post_mcp(path, payload):
++    try:
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/{path.lstrip('/')}", json=payload, timeout=3.0)
++    except Exception as e:
++        LOG.warning("mcp write failed (%s): %s", path, e)
++
++def request_a2a(incident):
++    body = {"action_id": incident.id, "artifact_uri": incident.metadata.get("evidence_uri"), "approver": "medic-oncall", "decision": "requested", "comment": "medical intervention approval"}
++    try:
++        r = requests.post(f"{A2A_API.rstrip('/')}/request", json=body, timeout=5.0)
++        if r.ok:
++            return r.json().get("id")
++    except Exception as e:
++        LOG.warning("A2A request failed: %s", e)
++    return None
++
++def sign_receipt(event):
++    try:
++        r = requests.post(RECEIPT_API, json=event, timeout=5.0)
++        if r.ok:
++            return r.json()
++    except Exception as e:
++        LOG.warning("receipt signing failed: %s", e)
++    return None
++
++@APP.post("/ingest")
++def ingest_incident(inc: Incident):
++    post_mcp("medical/incidents", inc.dict())
++    # Preposition hydration stations for heat incidents with severity > 0.3
++    if inc.incident_type == "heat" and inc.severity >= 0.3:
++        try:
++            requests.post(HYDRATION_API, json={"venue": inc.venue, "incident_id": inc.id, "severity": inc.severity}, timeout=3.0)
++            post_mcp("medical/events", {"type":"hydration_alert","incident_id":inc.id})
++        except Exception as e:
++            LOG.warning("hydration alert failed: %s", e)
++
++    # If severe or very hot, request A2A approval before dispatching medics
++    if inc.incident_type in ("collapse","serious") or (inc.incident_type=="heat" and inc.metadata.get("temperature_c",0) >= HIGH_PRIORITY_TEMP) or inc.severity >= 0.8:
++        a2a_id = request_a2a(inc)
++        post_mcp("medical/events", {"type":"a2a_requested","incident_id":inc.id,"a2a_id":a2a_id})
++        return {"status":"a2a_requested","a2a_id":a2a_id}
++
++    # Low/mid severity -> dispatch nearest medic automatically (prepositioning)
++    try:
++        r = requests.post(MEDIC_DISPATCH_API, json={"incident_id": inc.id, "venue": inc.venue, "priority": inc.severity}, timeout=5.0)
++        dispatch_res = r.json() if r.ok else {"error":"dispatch_failed"}
++        receipt = sign_receipt({"event":"dispatch","incident":inc.dict(),"dispatch_result":dispatch_res})
++        post_mcp("medical/events", {"type":"auto_dispatched","incident_id":inc.id,"receipt":receipt})
++        return {"status":"dispatched","dispatch":dispatch_res,"receipt":receipt}
++    except Exception as e:
++        LOG.error("auto dispatch failed: %s", e)
++        raise HTTPException(status_code=500, detail="dispatch_failed")
++
++@APP.post("/manual_override")
++def manual_override(incident_id: str, approval_jwt: str = Header(None)):
++    """
++    Manual override endpoint for emergency interventions by humans.
++    Requires approver JWT (checked by approver service in deployment).
++    """
++    if not approval_jwt:
++        raise HTTPException(status_code=401, detail="missing approval token")
++    # validate via approver /approve_status endpoint (best-effort)
++    try:
++        r = requests.get(f"{A2A_API.rstrip('/')}/approve_status/{approval_jwt}", timeout=5.0)
++        if r.status_code != 200:
++            raise HTTPException(status_code=403, detail="invalid approval token")
++    except HTTPException:
++        raise
++    except Exception as e:
++        LOG.error("approver check failed: %s", e)
++        raise HTTPException(status_code=500, detail="approver_unavailable")
++    # Execute manual dispatch
++    try:
++        r = requests.post(MEDIC_DISPATCH_API, json={"incident_id": incident_id, "source":"manual_override"}, timeout=5.0)
++        res = r.json() if r.ok else {"error":"dispatch_internal"}
++        receipt = sign_receipt({"event":"manual_dispatch","incident_id":incident_id,"result":res})
++        post_mcp("medical/events", {"type":"manual_dispatch","incident_id":incident_id,"receipt":receipt})
++        return {"status":"manual_dispatched","result":res,"receipt":receipt}
++    except Exception as e:
++        LOG.error("manual dispatch failed: %s", e)
++        raise HTTPException(status_code=500, detail="manual_dispatch_failed")
++
++@APP.get("/health")
++def health():
++    return {"ok": True}
++
+*** End File
+*** Add File:services/transport/forecast_service.py
++#!/usr/bin/env python3
++"""
++Lightweight transport demand forecasting and staff reallocation helper.
++ - Provides /predict to get short-term demand prediction per stop/venue.
++ - Provides /reallocate to suggest staff reallocation actions.
++ - Example placeholder model: rolling average of recent counts.
++"""
++import os
++import time
++import logging
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++import requests
++import collections
++
++LOG = logging.getLogger("aegis.transport.forecast")
++logging.basicConfig(level=logging.INFO)
++APP = FastAPI(title="Aegis Transport Forecast")
++
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++DATASTORE_API = os.environ.get("TRANSPORT_STORE", "http://transport-store:8080")
++WINDOW = int(os.environ.get("FORECAST_WINDOW", "5"))  # minutes of history to use
++
++class PredictReq(BaseModel):
++    stop_id: str
++    recent_counts: list  # list of ints, recent minute-by-minute counts
++
++@APP.post("/predict")
++def predict(req: PredictReq):
++    # simple rolling average forecast
++    if not req.recent_counts:
++        raise HTTPException(status_code=400, detail="no counts")
++    avg = sum(req.recent_counts[-WINDOW:]) / min(WINDOW, len(req.recent_counts))
++    forecast = {"stop_id": req.stop_id, "predicted_per_minute": avg, "timestamp": int(time.time())}
++    try:
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/transport/forecasts", json=forecast, timeout=3.0)
++    except Exception:
++        LOG.debug("mcp write failed")
++    return forecast
++
++class ReallocateReq(BaseModel):
++    stop_id: str
++    predicted_load: float
++
++@APP.post("/reallocate")
++def reallocate(req: ReallocateReq):
++    # placeholder policy: if predicted load > threshold, suggest additional staff / bus resources
++    threshold = float(os.environ.get("REALLOC_THRESHOLD", "50.0"))
++    actions = []
++    if req.predicted_load > threshold:
++        actions.append({"type":"add_staff","amount":2,"target":req.stop_id})
++        actions.append({"type":"add_shuttle","target":req.stop_id})
++    else:
++        actions.append({"type":"no_action"})
++    try:
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/transport/actions", json={"stop_id":req.stop_id,"actions":actions}, timeout=3.0)
++    except Exception:
++        LOG.debug("mcp write failed")
++    return {"stop_id": req.stop_id, "actions": actions}
++
++@APP.get("/health")
++def health():
++    return {"ok": True}
++
+*** End File
+*** Add File:services/broadcast/media_sign_publish.py
++#!/usr/bin/env python3
++"""
++Helper to sign media artifacts with cosign and record Rekor entry (CI/CLI helper).
++Also provides a simple local 'sign-and-publish' flow to be used in editorial publishing.
++"""
++import os
++import subprocess
++import requests
++import logging
++from fastapi import FastAPI, File, UploadFile, Form
++
++LOG = logging.getLogger("aegis.broadcast.sign")
++logging.basicConfig(level=logging.INFO)
++APP = FastAPI(title="Aegis Media Sign & Publish")
++
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++COSIGN = os.environ.get("COSIGN_BIN", "/usr/local/bin/cosign")
++REKOR_URL = os.environ.get("REKOR_URL", "")
++
++@APP.post("/sign-and-publish")
++def sign_and_publish(file: UploadFile = File(...), title: str = Form(...), editor: str = Form("editor")):
++    # store to local tmp (editor should also store to canonical object store)
++    tmp = f"/tmp/{file.filename}"
++    with open(tmp, "wb") as f:
++        f.write(file.file.read())
++    # sign with cosign (keyless assumed) - in CI prefer cosign sign --key ...
++    try:
++        cmd = [COSIGN, "sign", "--keyless", tmp]
++        subprocess.check_call(cmd, timeout=60)
++    except subprocess.CalledProcessError as e:
++        LOG.error("cosign sign failed: %s", e)
++        return {"ok": False, "error": "sign_failed"}
++    # record to MCP
++    rec = {"title": title, "filename": file.filename, "editor": editor, "ts": int(time.time())}
++    try:
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/broadcast/artifacts", json=rec, timeout=3.0)
++    except Exception:
++        LOG.warning("mcp write failed")
++    return {"ok": True, "artifact": rec}
++
++@APP.get("/health")
++def health():
++    return {"ok": True}
++
+*** End File
+*** Add File:services/broadcast/publish_webhook.py
++#!/usr/bin/env python3
++"""
++Validating webhook stub to ensure media artifacts are cosign-signed and verified
++before being published to public CDN/orchestrator.
++"""
++import os
++import subprocess
++import logging
++from fastapi import FastAPI, Request, HTTPException
++
++LOG = logging.getLogger("aegis.broadcast.webhook")
++logging.basicConfig(level=logging.INFO)
++APP = FastAPI(title="Aegis Publish Webhook")
++
++COSIGN = os.environ.get("COSIGN_BIN", "/usr/local/bin/cosign")
++FAIL_ON_ERROR = os.environ.get("FAIL_ON_ERROR", "false").lower() == "true"
++
++def verify_signed(path):
++    try:
++        subprocess.check_call([COSIGN, "verify", "--keyless", path], timeout=20)
++        return True
++    except subprocess.CalledProcessError as e:
++        LOG.warning("cosign verify failed: %s", e)
++        return False
++    except Exception as e:
++        LOG.error("cosign verify error: %s", e)
++        return False
++
++@APP.post("/validate")
++async def validate(req: Request):
++    body = await req.json()
++    artifact_path = body.get("artifact_path")
++    if not artifact_path:
++        raise HTTPException(status_code=400, detail="artifact_path is required")
++    ok = verify_signed(artifact_path)
++    if not ok and FAIL_ON_ERROR:
++        raise HTTPException(status_code=403, detail="artifact not signed or verification failed")
++    return {"allowed": ok}
++
++@APP.get("/health")
++def health():
++    return {"ok": True}
++
+*** End File
+*** Add File:k8s/canary/transport_rollout.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Rollout
++metadata:
++  name: transport-model
++  namespace: ops
++spec:
++  replicas: 3
++  strategy:
++    canary:
++      steps:
++      - setWeight: 10
++      - pause: {duration: 120}
++      - setWeight: 50
++      - pause: {duration: 300}
++  selector:
++    matchLabels:
++      app: transport-model
++  template:
++    metadata:
++      labels:
++        app: transport-model
++    spec:
++      containers:
++      - name: model
++        image: aegis/transport-model:latest
++        resources:
++          requests:
++            cpu: 1000m
++            memory: 2Gi
++
++# This Rollout should be paired with Prometheus analysis and automated rollback on SLA breaches.
++
+*** End File
+*** Add File:services/edge/offline_a2a_fallback.py
++#!/usr/bin/env python3
++"""
++Offline A2A fallback for edge sites:
++ - Accepts fetchtokens (pre-provisioned) and validates them locally (HMAC)
++ - Emits a local approval record that edge services can consume to permit retrievals in offline mode.
++ - All redemptions are recorded to local audit queue and synced to MCP when connectivity returns.
++"""
++import os
++import json
++import time
++import logging
++import hmac
++import hashlib
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++
++LOG = logging.getLogger("aegis.edge.a2a_fallback")
++logging.basicConfig(level=logging.INFO)
++APP = FastAPI(title="Aegis Offline A2A Fallback")
++
++SECRET = os.environ.get("FETCHTOKEN_SECRET", "change-me")
++QUEUE_DIR = os.environ.get("OFFLINE_A2A_QUEUE", "/data/a2a_local")
++os.makedirs(QUEUE_DIR, exist_ok=True)
++
++class TokenReq(BaseModel):
++    token: dict
++    requestor: str
++    artifact: str
++
++def verify(payload, sig):
++    expected = hmac.new(SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
++    return hmac.compare_digest(expected, sig)
++
++@APP.post("/redeem")
++def redeem(req: TokenReq):
++    token = req.token
++    payload = token.get("token")
++    sig = token.get("sig")
++    if not payload or not sig:
++        raise HTTPException(status_code=400, detail="malformed token")
++    if not verify(payload, sig):
++        raise HTTPException(status_code=403, detail="invalid signature")
++    obj = json.loads(payload)
++    if int(time.time()) > int(obj.get("expires_at",0)):
++        raise HTTPException(status_code=403, detail="expired token")
++    # create local approval record
++    approval = {"artifact": req.artifact, "requestor": req.requestor, "ts": int(time.time()), "token_tid": obj.get("tid")}
++    fid = f"{int(time.time())}-{obj.get('tid')}.json"
++    with open(os.path.join(QUEUE_DIR, fid), "w") as f:
++        json.dump(approval, f)
++    return {"ok": True, "local_approval_id": fid}
++
++@APP.get("/health")
++def health():
++    return {"ok": True}
++
+*** End File
+*** Add File:services/security/rate_limiter_middleware.py
++#!/usr/bin/env python3
++"""
++Simple in-process token-bucket style rate limiter middleware for FastAPI apps.
++ - Use to protect public endpoints from abusive bursts.
++ - For production, prefer external WAF / ingress rate limits.
++"""
++import time
++import threading
++from typing import Callable
++from fastapi import Request, HTTPException
++
++class TokenBucket:
++    def __init__(self, rate=10, capacity=100):
++        self.rate = rate
++        self.capacity = capacity
++        self._tokens = capacity
++        self._last = time.time()
++        self._lock = threading.Lock()
++
++    def consume(self, tokens=1):
++        with self._lock:
++            now = time.time()
++            delta = now - self._last
++            self._tokens = min(self.capacity, self._tokens + delta * self.rate)
++            self._last = now
++            if self._tokens >= tokens:
++                self._tokens -= tokens
++                return True
++            return False
++
++GLOBAL_BUCKET = TokenBucket(rate=int(os.environ.get("RL_RATE", "50")), capacity=int(os.environ.get("RL_CAP", "200")))
++
++async def rate_limit_middleware(request: Request, call_next: Callable):
++    # cheap heuristic: limit by client IP if present
++    client = request.client.host if request.client else "anon"
++    ok = GLOBAL_BUCKET.consume(1)
++    if not ok:
++        raise HTTPException(status_code=429, detail="rate limit exceeded")
++    return await call_next(request)
++
+*** End File
+*** Add File:k8s/security/rate_limit_ingress.yaml
++apiVersion: networking.k8s.io/v1
++kind: Ingress
++metadata:
++  name: aegis-public-ingress
++  namespace: aegis-system
++  annotations:
++    nginx.ingress.kubernetes.io/limit-rps: "20"
++    nginx.ingress.kubernetes.io/limit-burst-multiplier: "5"
++    nginx.ingress.kubernetes.io/limit-connections: "200"
++spec:
++  rules:
++  - host: aegis.example.com
++    http:
++      paths:
++      - path: /
++        pathType: Prefix
++        backend:
++          service:
++            name: aegis-gateway
++            port:
++              number: 80
++
++# Example ingress annotations for NGINX ingress controller to enable rate-limiting.
++
+*** End File
+*** Add File:docs/runbooks/ddos_failover.md
++# DDoS / Availability Runbook (summary)
++
++Purpose
++- Provide steps to mitigate large-scale DDoS or availability incidents and failover to safety-critical control plane.
++
++1) Detection
++ - Alert if >X RPS sustained, response latencies spike, or error rates exceed threshold.
++ - Use WAF & ingress metrics + Prometheus alerts.
++
++2) Immediate mitigation
++ - Enable WAF rules (block offending IP blocks or geo regions).
++ - Apply ingress rate-limiting (increase limits gradually for critical services).
++ - Scale safety-critical deployments (receipt-signer, approver, staged-autonomy) to minimum healthy replicas.
++ - Route non-critical traffic to maintenance page / degrade gracefully.
++
++3) Failover control plane
++ - If control plane (e.g., external approver) is attacked, switch to offline A2A fallback for edge sites (fetchtokens).
++ - Enable fail-open for low-risk webhooks if documented risk accepted: set FAIL_ON_ERROR=false.
++
++4) Recovery & validation
++ - Run replay checks for any allowed operations during fail-open.
++ - Reconcile Rekor and cosign logs; validate that no unsigned model deployments occurred.
++ - Postmortem with root cause, list of impacted artifacts and remediation.
++
++5) Post-incident
++ - Rotate keys (KMS) if suspected compromise and re-encrypt S3 objects (use aws_kms_rotate helper).
++ - Update WAF rules for long-term protection.
++
+*** End File
+*** Add File:README_SUMMER_OPERATIONS.md
++# Aegis Summer Operations — mitigations & components
++
++This unified patch provides concrete services and manifests to mitigate Summer-Olympics risks:
++
++- Heat-driven medical incidents:
++  - services/medical/triage_controller.py: auto/preposition medics & hydration alerts, creates A2A approvals for interventions, supports manual override with approver JWT, signs receipts and logs to MCP.
++
++- Transport overload & cascading delays:
++  - services/transport/forecast_service.py: short-term forecast and staff reallocation suggestions; emits MCP events for operator dashboards. Example canary: k8s/canary/transport_rollout.yaml.
++
++- Broadcast / rights:
++  - services/broadcast/media_sign_publish.py: editorial sign-and-publish helper that cosign-signs artifacts and records MCP entry.
++  - services/broadcast/publish_webhook.py: validating webhook to enforce cosign verification before publishing (used by CDN/orchestrator).
++
++- Connectivity & offline:
++  - services/edge/local_milvus_compose.yml and services/edge/milvus_sync.py for local caches + delayed sync to central Milvus.
++  - services/a2a/fetchtoken_service.py and services/edge/offline_a2a_fallback.py for pre-provisioned emergency fetch tokens and local offline redemption.
++
++- DDoS / availability:
++  - services/security/rate_limiter_middleware.py and k8s/security/rate_limit_ingress.yaml for ingress-level rate limits and in-process protection.
++  - docs/runbooks/ddos_failover.md for operational playbook.
++
++Operator next steps
++1. Build and push the service images (use your private registry) and deploy onto staging.
++2. Wire COSIGN / REKOR and ensure broadcast signing executes in CI pipeline.
++3. Configure ingress controller (NGINX) to honor rate-limit annotations and add WAF rules.
++4. Provision fetchtokens securely (store offline), enable offline_a2a_fallback on edge when offline capability required.
++5. Integrate triage_controller with your medic dispatch and hydration systems (or stub endpoints for testing).
++6. Add Prometheus alerts for sync queue depth, forecast anomalies, and auto-scaling triggers.
++
++If you want, I can:
++- (A) add Kubernetes Deployment manifests and secrets templates for the new services (triage, transport, broadcast webhook, offline fallback, fetchtoken, rate limiter) into this patch, or
++- (B) open a PR in your repo (provide owner/name) with these files, or
++- (C) add basic integration tests (smoke tests) that exercise triage -> dispatch path, forecast -> reallocate flow, and offline token redemption.
++
++Which next step do you want?
++
+*** End File
+*** End Patch

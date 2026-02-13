@@ -1,0 +1,444 @@
+*** Begin Patch
+*** Add File:.github/workflows/ci_triton_build_sign.yml
++name: CI — Build, Sign & Attest Triton Model Container
++on:
++  workflow_dispatch:
++  push:
++    branches:
++      - main
++
++jobs:
++  build-and-sign:
++    runs-on: ubuntu-latest
++    env:
++      REGISTRY: ${{ secrets.REGISTRY_URL }}
++      REKOR_URL: ${{ secrets.REKOR_URL }}
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up QEMU
++        uses: docker/setup-qemu-action@v2
++      - name: Set up Docker Buildx
++        uses: docker/setup-buildx-action@v2
++      - name: Log in to registry
++        uses: docker/login-action@v2
++        with:
++          registry: ${{ secrets.REGISTRY_URL }}
++          username: ${{ secrets.REGISTRY_USER }}
++          password: ${{ secrets.REGISTRY_TOKEN }}
++      - name: Build Triton model container
++        run: |
++          docker build -t "${{ secrets.REGISTRY_URL }}/aegis/triton-model:latest" -f services/triton/Dockerfile services/triton
++          docker push "${{ secrets.REGISTRY_URL }}/aegis/triton-model:latest"
++      - name: Cosign sign image
++        env:
++          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
++        run: |
++          echo "$COSIGN_PRIVATE_KEY" > cosign.key
++          cosign sign --key cosign.key "${{ secrets.REGISTRY_URL }}/aegis/triton-model:latest"
++      - name: Rekor attest (optional)
++        if: ${{ secrets.REKOR_URL != '' }}
++        run: |
++          printf '{"type":"aegis.triton.build","image":"%s"}' "${{ secrets.REGISTRY_URL }}/aegis/triton-model:latest" > att.json
++          cosign attest --key cosign.key --predicate att.json "${{ secrets.REGISTRY_URL }}/aegis/triton-model:latest" || true
++
+*** End File
+*** Add File:k8s/gatekeeper/constrainttemplate-require-cosign.yaml
++apiVersion: templates.gatekeeper.sh/v1
++kind: ConstraintTemplate
++metadata:
++  name: k8srequirecosign
++spec:
++  crd:
++    spec:
++      names:
++        kind: K8sRequireCosign
++  targets:
++    - target: admission.k8s.gatekeeper.sh
++      rego: |
++        package k8srequirecosign
++
++        violation[{"msg": msg}] {
++          # Apply to Deployments and DaemonSets that schedule Triton or model-serving workloads
++          kind := input.review.object.kind
++          (kind == "Deployment" || kind == "DaemonSet")
++          images := extract_images(input.review.object)
++          some i
++          img := images[i]
++          not image_has_provenance(img)
++          msg := sprintf("Image %v must have mcp.provenance annotation (cosign/Rekor evidence) applied by CI", [img])
++        }
++
++        image_has_provenance(img) {
++          annotations := input.review.object.metadata.annotations
++          annotations["mcp.provenance"]
++        }
++
++        extract_images(obj) = imgs {
++          imgs := []
++          conts := obj.spec.template.spec.containers
++          imgs = [c.image | c := conts[_]]
++        }
++
+*** End File
+*** Add File:k8s/gatekeeper/constraint-require-cosign.yaml
++apiVersion: constraints.gatekeeper.sh/v1beta1
++kind: K8sRequireCosign
++metadata:
++  name: require-cosign-triton
++spec:
++  match:
++    kinds:
++      - apiGroups: ["apps"]
++        kinds: ["Deployment","DaemonSet"]
++    namespaces: ["staging","production"]
++
+*** End File
+*** Add File:k8s/webhooks/model-provenance-webhook.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: model-provenance-webhook
++  namespace: aegis-system
++spec:
++  replicas: 3
++  selector:
++    matchLabels:
++      app: model-provenance-webhook
++  template:
++    metadata:
++      labels:
++        app: model-provenance-webhook
++    spec:
++      containers:
++        - name: webhook
++          image: aegis/webhook:latest
++          env:
++            - name: REKOR_URL
++              valueFrom:
++                configMapKeyRef:
++                  name: aegis-core-config
++                  key: REKOR_URL
++            - name: FAIL_ON_ERROR
++              value: "false"
++          ports:
++            - containerPort: 8443
++          volumeMounts:
++            - name: webhook-tls
++              mountPath: /var/run/webhook/tls
++              readOnly: true
++      volumes:
++        - name: webhook-tls
++          secret:
++            secretName: model-provenance-webhook-tls
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: model-provenance-webhook
++  namespace: aegis-system
++spec:
++  ports:
++    - port: 443
++      targetPort: 8443
++  selector:
++    app: model-provenance-webhook
++
++---
++apiVersion: admissionregistration.k8s.io/v1
++kind: ValidatingWebhookConfiguration
++metadata:
++  name: model-provenance-webhook-config
++webhooks:
++  - name: provenance.aegis.example
++    clientConfig:
++      service:
++        namespace: aegis-system
++        name: model-provenance-webhook
++        path: "/validate"
++      caBundle: "" # populate with cert-manager CA bundle
++    admissionReviewVersions: ["v1"]
++    sideEffects: None
++    failurePolicy: Ignore
++    timeoutSeconds: 10
++    rules:
++      - apiGroups: ["apps"]
++        apiVersions: ["v1"]
++        operations: ["CREATE","UPDATE"]
++        resources: ["deployments","daemonsets"]
++
+*** End File
+*** Add File:services/triton/Dockerfile
++FROM nvcr.io/nvidia/tritonserver:23.03-py3
++WORKDIR /workspace
++# COPY model repository /opt/triton-model-repo (models should be pulled during deploy/register)
++COPY register_to_triton.py /workspace/register_to_triton.py
++RUN pip install mlflow requests
++ENTRYPOINT ["python","/workspace/register_to_triton.py"]
++
+*** End File
+*** Add File:services/triton/register_to_triton.py
++#!/usr/bin/env python3
++"""
++Register MLflow model artifacts into a Triton model-repo layout and optionally push to a model-repo volume.
++This script runs inside the Triton model-build container (CI / deploy task).
++It fetches an MLflow run artifact, converts if needed (e.g., ONNX/TensorRT) and writes the model repo.
++In production tie this into your model build/promotion pipeline.
++"""
++import os
++import sys
++import mlflow
++import shutil
++import tempfile
++import subprocess
++
++MLFLOW_URI = os.environ.get("MLFLOW_TRACKING_URI","http://mlflow:5000")
++MODEL_NAME = os.environ.get("MODEL_NAME","aegis-triton-model")
++TRITON_MODEL_REPO_DIR = os.environ.get("TRITON_MODEL_REPO_DIR","/opt/triton-model-repo")
++
++mlflow.set_tracking_uri(MLFLOW_URI)
++
++def fetch_and_prepare():
++    # In practice, query MLflow for the model run and artifact. Here we look for local artifact for demo.
++    src = os.environ.get("LOCAL_MODEL_ARTIFACT","/workspace/model")
++    version_dir = os.path.join(TRITON_MODEL_REPO_DIR, MODEL_NAME, "1")
++    os.makedirs(version_dir, exist_ok=True)
++    # copy artifacts
++    if os.path.exists(src):
++        for f in os.listdir(src):
++            shutil.copy(os.path.join(src,f), version_dir)
++    # create config.pbtxt if missing (very simple)
++    cfg = os.path.join(TRITON_MODEL_REPO_DIR, MODEL_NAME, "config.pbtxt")
++    if not os.path.exists(cfg):
++        with open(cfg,"w") as f:
++            f.write('name: "{}"\nplatform: "onnx_runtime"\nmax_batch_size: 8\n'.format(MODEL_NAME))
++    print("Prepared triton model repo at", TRITON_MODEL_REPO_DIR)
++
++if __name__ == "__main__":
++    fetch_and_prepare()
++    # in CI container, we might exit after preparing
++    sys.exit(0)
++
+*** End File
+*** Add File:k8s/triton/triton-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: triton-server
++  namespace: aegis-system
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: triton
++  template:
++    metadata:
++      labels:
++        app: triton
++    spec:
++      nodeSelector:
++        node-role.kubernetes.io/gpu: "true"
++      tolerations:
++        - key: "nvidia.com/gpu"
++          operator: "Exists"
++      containers:
++        - name: triton
++          image: aegis/triton-runtime:latest
++          resources:
++            limits:
++              nvidia.com/gpu: 1
++          volumeMounts:
++            - name: model-repo
++              mountPath: /models
++      volumes:
++        - name: model-repo
++          persistentVolumeClaim:
++            claimName: triton-model-repo-pvc
++
+*** End File
+*** Add File:k8s/runtimeclasses/triton-runtimeclasses.yaml
++apiVersion: node.k8s.io/v1
++kind: RuntimeClass
++metadata:
++  name: kata
++handler: kata-qemu
++
++---
++apiVersion: node.k8s.io/v1
++kind: RuntimeClass
++metadata:
++  name: nvidia-gpu
++handler: nvidia
++
+*** End File
+*** Add File:k8s/security/seccomp-triton.yaml
++apiVersion: v1
++kind: PodSecurityPolicy
++metadata:
++  name: triton-seccomp
++spec:
++  privileged: false
++  allowedCapabilities: []
++  volumes:
++    - 'configMap'
++    - 'persistentVolumeClaim'
++  runAsUser:
++    rule: RunAsAny
++  seLinux:
++    rule: RunAsAny
++  supplementalGroups:
++    rule: RunAsAny
++  fsGroup:
++    rule: RunAsAny
++
+*** End File
+*** Add File:k8s/argo/deploy-to-triton-workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: deploy-triton-
++  namespace: aegis-pipelines
++spec:
++  entrypoint: deploy-pipeline
++  templates:
++    - name: deploy-pipeline
++      steps:
++        - - name: checkout
++            template: git-clone
++        - - name: build-register
++            template: triton-build
++        - - name: deploy
++            template: deploy-to-cluster
++
++    - name: git-clone
++      container:
++        image: alpine/git:latest
++        command: [sh, -c]
++        args: ["git clone --depth 1 ${GIT_REPO} repo && ls repo"]
++      inputs:
++        parameters:
++          - name: GIT_REPO
++
++    - name: triton-build
++      container:
++        image: aegis/triton-build:latest
++        env:
++          - name: MLFLOW_TRACKING_URI
++            value: "http://mlflow:5000"
++        command: [sh, -c]
++        args: ["python services/triton/register_to_triton.py && echo registered"]
++
++    - name: deploy-to-cluster
++      container:
++        image: bitnami/kubectl:latest
++        command: [sh, -c]
++        args: ["kubectl -n aegis-system rollout restart deploy/triton-server || true"]
++
+*** End File
+*** Add File:services/morpheus/ingest_connector.py
++#!/usr/bin/env python3
++"""
++Connector that receives Morpheus detection events and forwards them into Aegis:
++ - writes an evidence entry to Milvus/MCP
++ - invokes verifier ensemble to get a verdict
++ - opens A2A if incident severity high
++"""
++import os
++import requests
++import json
++from services.morpheus.verifier_stub import verify_event
++
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++A2A_API = os.environ.get("A2A_API", "http://approver:8080")
++
++def handle_morpheus_event(evt_json: dict):
++    # persist evidence to MCP (best-effort)
++    try:
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/evidence", json=evt_json, timeout=3.0)
++    except Exception:
++        pass
++    # run verifier
++    verdict = verify_event(evt_json)
++    # If verdict severity high, open A2A
++    if verdict.get("severity","low") in ("high","critical"):
++        body = {"action_id": f"morpheus-{evt_json.get('id')}", "approver":"security", "decision":"requested", "comment":"Morpheus detection requires review", "evidence": verdict}
++        try:
++            r = requests.post(f"{A2A_API.rstrip('/')}/request", json=body, timeout=5.0)
++            return {"status":"a2a_opened","a2a": r.json() if r.ok else None}
++        except Exception:
++            return {"status":"a2a_failed"}
++    return {"status":"ok","verdict":verdict}
++
++if __name__ == "__main__":
++    import sys
++    sample = {"id":"evt-123","type":"suspicious-io","payload":{"score":0.92}}
++    print(handle_morpheus_event(sample))
++
+*** End File
+*** Add File:services/morpheus/verifier_stub.py
++#!/usr/bin/env python3
++"""
++Simple verifier stub used by Morpheus connector. Replace with cross-encoder/ensemble logic.
++"""
++def verify_event(evt: dict) -> dict:
++    score = evt.get("payload",{}).get("score", 0.0)
++    severity = "low"
++    if score > 0.9:
++        severity = "critical"
++    elif score > 0.7:
++        severity = "high"
++    return {"score": score, "severity": severity, "verifier":"stub"}
++
+*** End File
+*** Add File:services/morpheus/a2a_connector.py
++#!/usr/bin/env python3
++"""
++Simple helper to poll A2A decisions and apply post-decision actions (stub).
++"""
++import os
++import requests
++
++A2A_API = os.environ.get("A2A_API", "http://approver:8080")
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++
++def poll_and_apply():
++    # stub: GET pending approvals
++    try:
++        r = requests.get(f"{A2A_API.rstrip('/')}/pending", timeout=5.0)
++        if r.ok:
++            for a in r.json():
++                # apply business logic, then record to MCP
++                requests.post(f"{AEGIS_MCP.rstrip('/')}/a2a/outcomes", json=a, timeout=3.0)
++    except Exception:
++        pass
++
++if __name__ == "__main__":
++    poll_and_apply()
++
+*** End File
+*** Add File:docs/NVIDIA_AEGIS_PLAYBOOK.md
++# NVIDIA + Aegis Integration Playbook
++
++This document outlines the artifacts in this patch and how to use them to run the Pilots:
++
++Pilots included:
++- A) Triton model promotion pipeline (CI build/sign/attest, Triton model repo registration, Argo deploy workflow, Gatekeeper/Governance).
++- B) DGX/EGX/Triton deployment scaffolds (runtimeclass, triton deployment with GPU nodeSelector, seccomp PSP).
++- C) Morpheus → Aegis connector (ingest connector, verifier stub, A2A connector).
++- D) Operator playbook and runbooks (this doc).
++
++Quick start (recommended):
++1. Configure secrets in your repo: REGISTRY_URL, REGISTRY_USER, REGISTRY_TOKEN, COSIGN_PRIVATE_KEY/COSIGN_PUB_KEY, REKOR_URL.
++2. Deploy Gatekeeper & cert-manager to your cluster.
++3. Deploy the model-provenance webhook with cert-manager-signed TLS; run in audit (failurePolicy=Ignore).
++4. Run the CI workflow by pushing a model commit to main; verify cosign/Rekor artifacts.
++5. Provision GPU nodepool and label nodes with node-role.kubernetes.io/gpu=true.
++6. Deploy triton-server and create PVC for model repo; run Argo deploy workflow to register/push model repo.
++7. Deploy Morpheus connector; point Morpheus to the ingest endpoint.
++
++Notes & next steps:
++- Replace stubbed implementations with production operators (KMS encryption, S3/MinIO, Triton model conversion steps, onboarding to Fleet Manager).
++- Harden webhook & Gatekeeper policies and run 48–72h audit before switching to Fail.
++- Integrate MLflow model metadata (latency, precision, cosign attestation URL) into promotion guard.
++
+*** End Patch

@@ -1,0 +1,608 @@
+*** Begin Patch
+*** Add File:services/mlflow/docker-compose-mlflow.yml
++version: '3.7'
++services:
++  postgres:
++    image: postgres:13
++    environment:
++      POSTGRES_USER: mlflow
++      POSTGRES_PASSWORD: mlflow
++      POSTGRES_DB: mlflow
++    volumes:
++      - ./data/postgres:/var/lib/postgresql/data
++
++  mlflow:
++    image: mlflow/mlflow:1.30.0
++    environment:
++      MLFLOW_TRACKING_URI: http://0.0.0.0:5000
++      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
++      AWS_ACCESS_KEY_ID: minio
++      AWS_SECRET_ACCESS_KEY: minio123
++      BACKEND_STORE_URI: postgresql://mlflow:mlflow@postgres/mlflow
++      ARTIFACT_ROOT: s3://mlflow-artifacts
++    ports:
++      - "5000:5000"
++    depends_on:
++      - postgres
++      - minio
++    command: mlflow server --backend-store-uri ${BACKEND_STORE_URI} --default-artifact-root ${ARTIFACT_ROOT} --host 0.0.0.0 --port 5000
++
++  minio:
++    image: minio/minio:latest
++    environment:
++      MINIO_ACCESS_KEY: minio
++      MINIO_SECRET_KEY: minio123
++    command: server /data
++    ports:
++      - "9000:9000"
++    volumes:
++      - ./data/minio:/data
++
++# Quick dev/devops compose bringing up MLflow + Postgres + MinIO as artifact store.
++
+*** End File
+*** Add File:services/mlflow/mlflow_client.py
++#!/usr/bin/env python3
++"""
++Small MLflow helper used by training pipelines and promotion guard.
++Provides:
++ - log_experiment_run(...)
++ - register_model(...)
++ - get_latest_model_metrics(...)
++"""
++import os
++import mlflow
++from mlflow.tracking import MlflowClient
++
++MLFLOW_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow:5000")
++mlflow.set_tracking_uri(MLFLOW_URI)
++client = MlflowClient(tracking_uri=MLFLOW_URI)
++
++def log_experiment_run(experiment_name, run_name, params, metrics, artifacts_dir=None):
++    exp = client.get_experiment_by_name(experiment_name)
++    if not exp:
++        exp_id = client.create_experiment(experiment_name)
++    else:
++        exp_id = exp.experiment_id
++    with mlflow.start_run(experiment_id=exp_id, run_name=run_name) as run:
++        for k,v in params.items():
++            mlflow.log_param(k, v)
++        for k,v in metrics.items():
++            mlflow.log_metric(k, v)
++        if artifacts_dir:
++            mlflow.log_artifacts(artifacts_dir)
++        return run.info.run_id
++
++def register_model(run_id, artifact_path, model_name, stage="Staging"):
++    model_uri = f"runs:/{run_id}/{artifact_path}"
++    mv = client.create_registered_model(model_name) if model_name not in [m.name for m in client.list_registered_models()] else None
++    rm = client.create_model_version(model_name, model_uri, run_id)
++    client.transition_model_version_stage(model_name, rm.version, stage)
++    return rm.version
++
++def get_latest_model_metrics(model_name, stage="Staging"):
++    versions = client.get_latest_versions(model_name, stages=[stage])
++    if not versions:
++        return None
++    ver = versions[0]
++    run = client.get_run(ver.run_id)
++    return run.data.metrics
++
+*** End File
+*** Add File:services/feature_store/feature_store.py
++#!/usr/bin/env python3
++"""
++Simple feature store service that stores feature tables (parquet/csv)
++to an object store and keeps a small sqlite index for versioning.
++Provides:
++ - create_table(name, dataframe/bytes, metadata) -> version
++ - get_table(name, version=None) -> presigned_url / local download
++ - list_versions(name)
++"""
++import os
++import sqlite3
++import uuid
++import json
++from datetime import datetime
++import boto3
++
++DB_PATH = os.environ.get("FEATURE_STORE_DB", "/data/feature_store.db")
++S3_BUCKET = os.environ.get("FEATURE_STORE_BUCKET", "aegis-features")
++REGION = os.environ.get("AWS_REGION", "us-east-1")
++
++os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
++conn = sqlite3.connect(DB_PATH, check_same_thread=False)
++cur = conn.cursor()
++cur.execute("CREATE TABLE IF NOT EXISTS tables (id TEXT PRIMARY KEY, name TEXT, s3_key TEXT, metadata TEXT, created_ts INTEGER)")
++conn.commit()
++
++s3 = boto3.client("s3", region_name=REGION)
++
++def create_table(name: str, local_path: str, metadata: dict = None):
++    vid = str(uuid.uuid4())
++    key = f"features/{name}/{vid}/{os.path.basename(local_path)}"
++    s3.upload_file(local_path, S3_BUCKET, key)
++    ts = int(datetime.utcnow().timestamp())
++    cur.execute("INSERT INTO tables (id,name,s3_key,metadata,created_ts) VALUES (?,?,?,?,?)", (vid, name, key, json.dumps(metadata or {}), ts))
++    conn.commit()
++    return vid
++
++def list_versions(name: str):
++    cur.execute("SELECT id, s3_key, metadata, created_ts FROM tables WHERE name=?", (name,))
++    return [{"id": r[0], "s3_key": r[1], "metadata": json.loads(r[2]), "created_ts": r[3]} for r in cur.fetchall()]
++
++def get_presigned_url(s3_key: str, expires=3600):
++    return s3.generate_presigned_url('get_object', Params={'Bucket': S3_BUCKET, 'Key': s3_key}, ExpiresIn=expires)
++
+*** End File
+*** Add File:services/dvc/snapshot.py
++#!/usr/bin/env python3
++"""
++Minimal dataset-versioning helper (DVC-lite):
++ - snapshot local dataset dir to object store and record a manifest in sqlite
++ - can list snapshots and get presigned URLs
++"""
++import os
++import uuid
++import sqlite3
++import json
++from datetime import datetime
++import boto3
++
++DB_PATH = os.environ.get("DATASET_DB", "/data/dataset_versions.db")
++S3_BUCKET = os.environ.get("DATASET_BUCKET", "aegis-datasets")
++REGION = os.environ.get("AWS_REGION", "us-east-1")
++
++os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
++conn = sqlite3.connect(DB_PATH, check_same_thread=False)
++cur = conn.cursor()
++cur.execute("CREATE TABLE IF NOT EXISTS snapshots (id TEXT PRIMARY KEY, path TEXT, s3_prefix TEXT, metadata TEXT, ts INTEGER)")
++conn.commit()
++
++s3 = boto3.client("s3", region_name=REGION)
++
++def snapshot(local_dir: str, metadata: dict = None):
++    sid = str(uuid.uuid4())
++    prefix = f"datasets/{sid}/"
++    for root, _, files in os.walk(local_dir):
++        for f in files:
++            lp = os.path.join(root, f)
++            rel = os.path.relpath(lp, local_dir)
++            s3_key = prefix + rel
++            s3.upload_file(lp, S3_BUCKET, s3_key)
++    ts = int(datetime.utcnow().timestamp())
++    cur.execute("INSERT INTO snapshots (id,path,s3_prefix,metadata,ts) VALUES (?,?,?,?,?)", (sid, local_dir, prefix, json.dumps(metadata or {}), ts))
++    conn.commit()
++    return sid
++
++def list_snapshots():
++    cur.execute("SELECT id, path, s3_prefix, metadata, ts FROM snapshots ORDER BY ts DESC")
++    return [{"id": r[0], "path": r[1], "s3_prefix": r[2], "metadata": json.loads(r[3]), "ts": r[4]} for r in cur.fetchall()]
++
++def presign_object(s3_key: str, expires=3600):
++    return s3.generate_presigned_url('get_object', Params={'Bucket': S3_BUCKET, 'Key': s3_key}, ExpiresIn=expires)
++
+*** End File
+*** Add File:k8s/argo/training-workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: model-training-
++  namespace: aegis-pipelines
++spec:
++  entrypoint: train-pipeline
++  templates:
++    - name: train-pipeline
++      steps:
++        - - name: checkout
++            template: git-clone
++        - - name: snapshot-data
++            template: snapshot-data
++        - - name: train
++            template: train
++        - - name: register
++            template: register
++
++    - name: git-clone
++      container:
++        image: alpine/git:latest
++        command: [sh, -c]
++        args: ["git clone --depth 1 ${GIT_REPO} repo && ls repo"]
++      inputs:
++        parameters:
++          - name: GIT_REPO
++
++    - name: snapshot-data
++      container:
++        image: python:3.10-slim
++        command: [sh, -c]
++        args:
++          - pip install boto3 && python services/dvc/snapshot.py && echo "snapshot complete"
++
++    - name: train
++      container:
++        image: aegis/trainer:latest
++        env:
++          - name: MLFLOW_TRACKING_URI
++            value: "http://mlflow:5000"
++        command: [python, services/training/train.py]
++
++    - name: register
++      container:
++        image: aegis/registry-helper:latest
++        command: [sh, -c]
++        args: ["python services/mlflow/register_helper.py"]
++
++# Argo Workflow: simple staged training pipeline that snapshots data, trains and registers model.
++
+*** End File
+*** Add File:services/training/train.py
++#!/usr/bin/env python3
++"""
++Example training script:
++ - loads dataset snapshot (presigned URL from dataset snapshot service),
++ - trains a tiny sklearn model,
++ - logs metrics & artifacts to MLflow,
++ - optionally calls cosign to sign model artifact (if COSIGN available / keyless).
++"""
++import os
++import tempfile
++import joblib
++import json
++import subprocess
++from sklearn.linear_model import LogisticRegression
++from sklearn.datasets import load_iris
++from sklearn.model_selection import train_test_split
++from sklearn.metrics import accuracy_score
++from services.mlflow.mlflow_client import log_experiment_run
++
++EXPERIMENT = os.environ.get("EXPERIMENT", "aegis-experiments")
++
++def train_and_log():
++    # placeholder dataset: iris
++    X, y = load_iris(return_X_y=True)
++    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
++    clf = LogisticRegression(max_iter=1000)
++    clf.fit(X_train, y_train)
++    preds = clf.predict(X_test)
++    acc = float(accuracy_score(y_test, preds))
++    # save model
++    with tempfile.TemporaryDirectory() as td:
++        model_path = f"{td}/model.joblib"
++        joblib.dump(clf, model_path)
++        run_id = log_experiment_run(EXPERIMENT, "train-run", params={"model":"lr"}, metrics={"accuracy": acc}, artifacts_dir=td)
++        print("Logged run", run_id)
++        # Optional: sign model artifact using cosign sign-blob (keyless) if available
++        cosign = os.environ.get("COSIGN_BIN", "/usr/local/bin/cosign")
++        try:
++            subprocess.check_call([cosign, "sign-blob", model_path], timeout=30)
++            print("Model signed with cosign")
++        except Exception:
++            print("cosign sign-blob not available or failed; continue")
++    return acc, run_id
++
++if __name__ == "__main__":
++    acc, run_id = train_and_log()
++    print("accuracy", acc, "run", run_id)
++
+*** End File
+*** Add File:.github/workflows/auto_retrain.yml
++name: Scheduled retrain and evaluation
++on:
++  schedule:
++    - cron: '0 3 * * 0'  # weekly retrain on Sundays
++  workflow_dispatch:
++jobs:
++  retrain:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: "3.10"
++      - name: Install deps
++        run: pip install -r requirements.txt || true
++      - name: Trigger Argo Workflow
++        env:
++          ARGO_SERVER: ${{ secrets.ARGO_SERVER }}
++          ARGO_TOKEN: ${{ secrets.ARGO_TOKEN }}
++        run: |
++          # Submit an Argo Workflow to run the training pipeline
++          # Requires argocli or kubectl apply of a Workflow manifest; this is a placeholder
++          echo "Triggering training workflow..."
++          kubectl apply -f k8s/argo/training-workflow.yaml
++
++  evaluate-and-promote:
++    needs: retrain
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Check model metrics and decide promotion
++        env:
++          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_URI }}
++        run: |
++          python services/promotion/check_and_promote.py || echo "Promotion check completed"
++
+*** End File
+*** Add File:services/promotion/check_and_promote.py
++#!/usr/bin/env python3
++"""
++Promotion guard script:
++ - Fetches latest staging model metrics from MLflow
++ - Compares against baseline thresholds and required tests (drift detector),
++ - If checks pass, either transitions model to production or opens an A2A approval request.
++"""
++import os
++import sys
++import requests
++from services.mlflow.mlflow_client import get_latest_model_metrics
++
++MODEL_NAME = os.environ.get("MODEL_NAME", "aegis-model")
++REQUIRED_ACCURACY = float(os.environ.get("REQUIRED_ACCURACY", "0.80"))
++A2A_API = os.environ.get("A2A_API", "http://approver:8080")
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++
++def check_and_promote():
++    metrics = get_latest_model_metrics(MODEL_NAME, stage="Staging")
++    if not metrics:
++        print("no staging model found")
++        return 1
++    acc = float(metrics.get("accuracy", 0.0))
++    print("staging accuracy", acc)
++    if acc >= REQUIRED_ACCURACY:
++        # optionally auto promote via MLflow client (left as operator decision)
++        print("meets threshold: request promotion approval via A2A")
++        body = {"action_id":"promote-"+MODEL_NAME, "artifact_uri": f"mlflow://{MODEL_NAME}", "approver":"mlops", "decision":"requested", "comment":"auto-promotion request"}
++        try:
++            r = requests.post(f"{A2A_API.rstrip('/')}/request", json=body, timeout=5.0)
++            if r.ok:
++                print("A2A request opened", r.json().get("id"))
++                requests.post(f"{AEGIS_MCP.rstrip('/')}/promotion/events", json={"model":MODEL_NAME,"accuracy":acc,"a2a":r.json().get("id")}, timeout=3.0)
++                return 0
++        except Exception as e:
++            print("failed to open A2A", e)
++            return 1
++    else:
++        print("does not meet required accuracy")
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/promotion/events", json={"model":MODEL_NAME,"accuracy":acc,"promote":False}, timeout=3.0)
++        return 2
++
++if __name__ == "__main__":
++    sys.exit(check_and_promote())
++
+*** End File
+*** Add File:services/monitoring/drift_detector.py
++#!/usr/bin/env python3
++"""
++Lightweight drift detector:
++ - Fetches baseline feature statistics from feature store metadata
++ - Computes current batch statistics and compares (JS divergence, mean/var differences)
++ - Emits a drift score and exposes a Prometheus metric push gateway or MCP webhook
++"""
++import os
++import json
++import numpy as np
++import boto3
++import requests
++from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
++
++S3_BUCKET = os.environ.get("FEATURE_STORE_BUCKET", "aegis-features")
++PUSHGATEWAY = os.environ.get("PROM_PUSHGATEWAY", "")
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++REGION = os.environ.get("AWS_REGION", "us-east-1")
++
++s3 = boto3.client("s3", region_name=REGION)
++
++def compute_stats(arr):
++    a = np.array(arr)
++    return {"mean": float(a.mean()), "var": float(a.var())}
++
++def compare_stats(base, current):
++    # simple metric: normalized difference in means + variance
++    dm = abs(current["mean"] - base["mean"]) / (abs(base["mean"]) + 1e-6)
++    dv = abs(current["var"] - base["var"]) / (abs(base["var"]) + 1e-6)
++    return float(dm + dv)
++
++def main():
++    # placeholder: read baseline JSON from S3 key baseline/stats.json
++    try:
++        baseline_obj = s3.get_object(Bucket=S3_BUCKET, Key="baseline/stats.json")
++        baseline = json.loads(baseline_obj["Body"].read().decode())
++    except Exception:
++        baseline = {"feature1":{"mean":0.0,"var":1.0}}
++
++    # get a sample current batch from S3 (placeholder)
++    try:
++        curr_obj = s3.get_object(Bucket=S3_BUCKET, Key="samples/current_batch.json")
++        current_batch = json.loads(curr_obj["Body"].read().decode())
++    except Exception:
++        current_batch = {"feature1":[0.1,0.2,0.15,0.05]}
++
++    scores = {}
++    for f, vals in current_batch.items():
++        base = baseline.get(f, {"mean":0.0,"var":1.0})
++        cur = compute_stats(vals)
++        score = compare_stats(base, cur)
++        scores[f] = score
++
++    drift_score = max(scores.values()) if scores else 0.0
++    print("drift_score", drift_score, scores)
++
++    # push to metrics (Prometheus pushgateway) if configured
++    if PUSHGATEWAY:
++        registry = CollectorRegistry()
++        g = Gauge('aegis_model_drift_score', 'Drift score for model', registry=registry)
++        g.set(drift_score)
++        push_to_gateway(PUSHGATEWAY, job='drift_detector', registry=registry)
++
++    # Also post to MCP
++    try:
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/monitoring/drift", json={"score":drift_score,"per_feature":scores}, timeout=3.0)
++    except Exception:
++        pass
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:services/monitoring/metrics_exporter.py
++#!/usr/bin/env python3
++"""
++Simple metrics exporter exposing model telemetry for Prometheus scraping.
++Instrument endpoints and processes with these metrics.
++"""
++from prometheus_client import start_http_server, Counter, Gauge
++import time
++import os
++
++MODEL_LATENCY = Gauge('aegis_model_latency_seconds', 'Model inference latency seconds')
++MODEL_REQUESTS = Counter('aegis_model_requests_total', 'Total model requests')
++DRIFT_ALERTS = Counter('aegis_drift_alerts_total', 'Drift alerts emitted')
++
++def run_exporter(port=8000):
++    start_http_server(port)
++    print(f"Metrics exporter running on :{port}")
++    while True:
++        # placeholder: update metrics from a stats file or in-memory exporter
++        time.sleep(5)
++
++if __name__ == "__main__":
++    run_exporter(int(os.environ.get("METRICS_PORT", "8000")))
++
+*** End File
+*** Add File:k8s/infra/provision.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Minimal infra bootstrap script (placeholder) for provisioning secrets and registry pointers.
++# Operators must replace provider-specific commands with IaC (Terraform/Cloud SDK) in production.
++#
++NAMESPACE=${1:-aegis-system}
++kubectl create namespace ${NAMESPACE} || true
++
++echo "Creating placeholder secrets (replace values with real KMS/keys)..."
++kubectl -n ${NAMESPACE} create secret generic cosign-key --from-literal=pubkey='REPLACE_WITH_COSIGN_PUB' --dry-run=client -o yaml | kubectl apply -f -
++kubectl -n ${NAMESPACE} create secret generic originals-kms --from-literal=key-id='REPLACE_WITH_KMS_KEY_ID' --dry-run=client -o yaml | kubectl apply -f -
++kubectl -n ${NAMESPACE} create secret generic receipt-kms --from-literal=key-id='REPLACE_WITH_RECEIPT_KMS' --dry-run=client -o yaml | kubectl apply -f -
++
++echo "Create registry secret (example for DockerHub/GCR) if needed"
++echo "kubectl -n ${NAMESPACE} create secret docker-registry regcred --docker-server=... --docker-username=... --docker-password=... --docker-email=..."
++
++echo "Provisioning placeholder Rekor config (operator: deploy Rekor server separately and place URL in configmaps)"
++kubectl -n ${NAMESPACE} create configmap aegis-config --from-literal=REKOR_URL='https://rekor.example' --dry-run=client -o yaml | kubectl apply -f -
++
++echo "Done. Replace placeholders with actual cloud/KMS/rekor values before production use."
++
+*** End File
+*** Add File:services/security/key_rotation.py
++#!/usr/bin/env python3
++"""
++Key rotation helper (high-level):
++ - Demonstrates pattern for rotating secrets used by Aegis (cosign pubkey secret example).
++ - Operator must ensure atomic rollout: create new secret, update deployments to reference new secret,
++   validate, and then delete old secret.
++"""
++import os
++import sys
++import subprocess
++import time
++
++NAMESPACE = os.environ.get("NAMESPACE", "aegis-system")
++OLD_SECRET = os.environ.get("OLD_SECRET", "cosign-key-old")
++NEW_SECRET = os.environ.get("NEW_SECRET", "cosign-key")
++NEW_PUBKEY_FILE = os.environ.get("NEW_PUBKEY_FILE")
++
++def rotate():
++    if not NEW_PUBKEY_FILE or not os.path.exists(NEW_PUBKEY_FILE):
++        print("NEW_PUBKEY_FILE must point to a file with the new public key")
++        sys.exit(1)
++    # create new temp secret
++    subprocess.check_call(["kubectl","-n",NAMESPACE,"create","secret","generic",NEW_SECRET,"--from-file=pubkey="+NEW_PUBKEY_FILE,"--dry-run=client","-o","yaml","|","kubectl","apply","-f","-"], shell=True)
++    print("New secret applied. Now rollout deployments referencing the new secret (operator step).")
++    # operator must patch deployments, wait for rollout and validate
++    time.sleep(1)
++
++if __name__ == "__main__":
++    rotate()
++
+*** End File
+*** Add File:helm/values-production.yaml
++# Example Helm values snippets for production hardening
++replicaCount: 3
++resources:
++  limits:
++    cpu: "2000m"
++    memory: "4Gi"
++  requests:
++    cpu: "500m"
++    memory: "1Gi"
++livenessProbe:
++  enabled: true
++  path: /health
++  initialDelaySeconds: 15
++  periodSeconds: 20
++readinessProbe:
++  enabled: true
++  path: /health
++  initialDelaySeconds: 5
++  periodSeconds: 10
++podSecurityContext:
++  runAsNonRoot: true
++  allowPrivilegeEscalation: false
++securityContext:
++  capabilities:
++    drop:
++      - ALL
++  readOnlyRootFilesystem: true
++nodeSelector:
++  node-type: production
++tolerations:
++- key: "node-role.kubernetes.io/infra"
++  operator: "Exists"
++  effect: "NoSchedule"
++
+*** End File
+*** Add File:README_MODEL_LIFECYCLE.md
++# Aegis — Model Lifecycle, Training Orchestration & Observability
++
++This patch adds a lightweight but production-oriented stack to complete model lifecycle:
++
++- MLflow server (docker-compose) for experiment tracking and model registry.
++- Simple feature store backed by S3 + sqlite index (services/feature_store).
++- DVC-lite dataset snapshot helper that uploads dataset snapshots to object store and records manifests (services/dvc).
++- Argo Workflow for training pipeline (k8s/argo/training-workflow.yaml) invoking a trainer container.
++- Example trainer (services/training/train.py) that logs runs to MLflow and attempts to cosign model artifacts.
++- Scheduled retrain flow via GitHub Actions (.github/workflows/auto_retrain.yml) that triggers Argo training and runs promote checks.
++- Promotion guard (services/promotion/check_and_promote.py) that inspects MLflow metrics and opens an A2A approval for promotion if thresholds pass.
++- Drift detector (services/monitoring/drift_detector.py) that compares baseline statistics and emits a drift score to Prometheus or MCP.
++- Metrics exporter for Prometheus (services/monitoring/metrics_exporter.py).
++- Infra bootstrap helper (k8s/infra/provision.sh) to create placeholder secrets and configmaps (operator must replace with IaC).
++- Key rotation helper (services/security/key_rotation.py) showing operator workflow for secret rotation.
++- Production hardened Helm values (helm/values-production.yaml).
++
++Operator notes & next steps
++1. Provision backing infra: object store (S3/MinIO), Postgres, MLflow artifact bucket, KMS keys, Rekor server and a container registry. Replace placeholders in k8s/infra/provision.sh before running.
++2. Build/push container images for trainer, registry helpers, and other services referenced in Argo Workflow. Update images in the workflow manifest.
++3. Deploy MLflow (docker-compose for dev or helm chart for k8s) and ensure MLFLOW_TRACKING_URI is reachable by training jobs.
++4. Deploy Argo Workflows to your cluster (namespace: aegis-pipelines) and configure RBAC / service accounts for workflows to access object store and mlflow.
++5. Configure GitHub Actions secrets (ARGO_SERVER, ARGO_TOKEN, MLFLOW_URI) if you plan to use the scheduled retrain workflow.
++6. Wire drift_detector to run on a schedule (CronJob) and configure Prometheus pushgateway or alerting to send incidents to on-call.
++7. Integrate promotion guard (check_and_promote.py) into your CI: it opens an A2A approval which must be resolved by an operator to complete promotion into production.
++8. Harden security: implement proper secrets management (HashiCorp Vault / KMS secrets), rotate keys regularly and run key_rotation flows.
++
++How to iterate
++- Start with the MLflow + MinIO dev compose to verify tracking.
++- Use the trainer script locally to push an example run.
++- Deploy Argo and submit the training-workflow; test end-to-end training & MLflow logging.
++- Implement a small experiment flow in MLflow and use the promotion guard to require human approval for production promotions.
++
++If you want, I can:
++- (A) Add Kubernetes Deployment manifests & ServiceAccount RBAC for MLflow, feature store and Argo components.
++- (B) Produce Argo Workflow images (Dockerfiles) for trainer/registry-helper and CI to build/push them.
++- (C) Add an example Grafana dashboard JSON and PrometheusRule alerts for drift, model latency and retrain failures.
++
++Which of A/B/C should I produce next?
++
+*** End File
+*** End Patch

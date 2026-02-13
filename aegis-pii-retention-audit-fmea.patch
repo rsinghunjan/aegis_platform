@@ -1,0 +1,584 @@
+*** Begin Patch
+*** Add File:services/pii/presidio_adapter.py
++#!/usr/bin/env python3
++"""
++Presidio adapter: enforce scanning & redaction before ingestion.
++- Exposes a small HTTP API to analyze and anonymize text payloads.
++- Writes an audit record to MCP for every item scanned.
++"""
++import os, logging, json, requests
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++
++LOG = logging.getLogger("aegis.presidio")
++APP = FastAPI(title="Aegis Presidio Adapter")
++PRESIDIO_API = os.environ.get("PRESIDIO_API", "http://presidio-analyzer:3000")
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++
++class ScanReq(BaseModel):
++    id: str
++    text: str
++    source: str = "unknown"
++    metadata: dict = {}
++
++@APP.post("/scan")
++def scan_and_redact(req: ScanReq):
++    # call Presidio analyzer
++    try:
++        r = requests.post(f"{PRESIDIO_API.rstrip('/')}/analyze", json={"text": req.text}, timeout=10.0)
++        r.raise_for_status()
++        entities = r.json().get("entities", [])
++        # anonymize / redact
++        r2 = requests.post(f"{PRESIDIO_API.rstrip('/')}/anonymize", json={"text": req.text, "entities": entities}, timeout=10.0)
++        r2.raise_for_status()
++        redacted = r2.json().get("text", "")
++    except Exception as e:
++        LOG.error("Presidio error: %s", e)
++        raise HTTPException(status_code=503, detail="presidio unavailable")
++
++    audit = {
++        "artifact_id": req.id,
++        "source": req.source,
++        "entities": entities,
++        "redacted_text_snippet": redacted[:512],
++        "metadata": req.metadata
++    }
++    try:
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/pii/scan", json=audit, timeout=5.0)
++    except Exception as e:
++        LOG.warning("failed to write PII audit to MCP: %s", e)
++
++    return {"id": req.id, "redacted_text": redacted, "entities": entities}
++
++@APP.get("/health")
++def health():
++    return {"ok": True}
++
+*** End File
+*** Add File:services/pii/encrypt_store.py
++#!/usr/bin/env python3
++"""
++Encrypt + store original artifacts in S3 with KMS encryption and annotated metadata.
++- Must be called only after PII scanning (or from trusted ingest pipeline).
++- Stores metadata & retention policy annotations and writes MCP audit entry.
++"""
++import os, logging, json, uuid, boto3, requests
++from fastapi import FastAPI, UploadFile, File, Form, HTTPException
++
++LOG = logging.getLogger("aegis.encrypt-store")
++APP = FastAPI(title="Aegis Encrypt Store")
++S3_BUCKET = os.environ.get("ORIGINALS_S3_BUCKET", "aegis-originals")
++REGION = os.environ.get("AWS_REGION", "us-east-1")
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++KMS_KEY_ID = os.environ.get("ORIGINALS_KMS_KEY_ID")
++
++s3 = boto3.client("s3", region_name=REGION)
++kms = boto3.client("kms", region_name=REGION) if KMS_KEY_ID else None
++
++@APP.post("/store")
++def store_original(filename: str = Form(...), retention_days: int = Form(365), source: str = Form("unknown"), file: UploadFile = File(...)):
++    oid = str(uuid.uuid4())
++    key = f"originals/{oid}/{filename}"
++    body = file.file.read()
++    # Server-side encryption: use SSE-KMS with provided KMS key
++    try:
++        extra = {}
++        if KMS_KEY_ID:
++            extra = {"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": KMS_KEY_ID}
++        s3.put_object(Bucket=S3_BUCKET, Key=key, Body=body, **extra)
++    except Exception as e:
++        LOG.error("s3 put failed: %s", e)
++        raise HTTPException(status_code=500, detail="store failed")
++
++    # write MCP audit with retention and provenance placeholder
++    audit = {"artifact_id": oid, "s3_key": key, "source": source, "retention_days": retention_days}
++    try:
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/pii/originals", json=audit, timeout=5.0)
++    except Exception as e:
++        LOG.warning("failed writing originals audit to MCP: %s", e)
++
++    return {"artifact_id": oid, "s3_key": key}
++
++@APP.get("/health")
++def health():
++    return {"ok": True}
++
+*** End File
+*** Add File:services/pii/retrieval_guard.py
++#!/usr/bin/env python3
++"""
++Guarded retrieval of encrypted originals:
++ - Requires an approval_id obtained from A2A (approver service).
++ - Confirms approval maps to artifact and decision is 'approved', then returns a presigned URL.
++ - Logs retrieval action to MCP and emits KMS-signed receipt via receipt_signer service.
++"""
++import os, logging, requests, boto3
++from fastapi import FastAPI, HTTPException, Query
++
++APP = FastAPI(title="Aegis Originals Retrieval Guard")
++S3_BUCKET = os.environ.get("ORIGINALS_S3_BUCKET", "aegis-originals")
++REGION = os.environ.get("AWS_REGION", "us-east-1")
++APPROVER_API = os.environ.get("A2A_API", "http://approver:8080")
++RECEIPT_SIGNER_API = os.environ.get("RECEIPT_SIGNER_API", "http://receipt-signer:8080/sign")
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++
++s3 = boto3.client("s3", region_name=REGION)
++
++@APP.get("/get_original")
++def get_original(s3_key: str = Query(...), approval_id: str = Query(...), requestor: str = Query("unknown")):
++    # verify approval exists and matches artifact
++    try:
++        r = requests.get(f"{APPROVER_API.rstrip('/')}/approve_status/{approval_id}", timeout=5.0)
++        r.raise_for_status()
++        data = r.json()
++        if data.get("artifact_uri") != s3_key or data.get("decision") != "approved":
++            raise HTTPException(status_code=403, detail="invalid or not-approved")
++    except HTTPException:
++        raise
++    except Exception as e:
++        raise HTTPException(status_code=500, detail=f"approver check failed: {e}")
++
++    # generate presigned URL
++    try:
++        url = s3.generate_presigned_url('get_object', Params={'Bucket': S3_BUCKET, 'Key': s3_key}, ExpiresIn=3600)
++    except Exception as e:
++        raise HTTPException(status_code=500, detail=f"presign failed: {e}")
++
++    # write MCP retrieval audit
++    audit = {"s3_key": s3_key, "approval_id": approval_id, "requestor": requestor}
++    try:
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/pii/retrievals", json=audit, timeout=5.0)
++    except Exception as e:
++        logging.warning("failed writing retrieval audit to MCP: %s", e)
++
++    # request receipt signer to sign this retrieval event
++    try:
++        r2 = requests.post(RECEIPT_SIGNER_API, json={"event_type": "retrieval", "artifact": s3_key, "requestor": requestor, "approval_id": approval_id}, timeout=5.0)
++        r2.raise_for_status()
++    except Exception as e:
++        LOG.warning("failed to get signed receipt: %s", e)
++
++    return {"presigned_url": url}
++
++@APP.get("/health")
++def health():
++    return {"ok": True}
++
+*** End File
+*** Add File:services/compliance/sanitization_job.py
++#!/usr/bin/env python3
++"""
++Scheduled sanitization job:
++ - Scans training data files for PII, redacts, writes sanitized copies, and logs sanitization events to MCP.
++ - Enforces retention annotations by adding 'retention_expires' metadata if missing.
++"""
++import os, json, glob, requests
++from datetime import datetime, timedelta
++
++PRESIDIO_API = os.environ.get("PRESIDIO_API", "http://presidio-analyzer:3000")
++TRAIN_DIR = os.environ.get("TRAIN_DIR", "training_data")
++SANITIZED_DIR = os.environ.get("SANITIZED_DIR", "training_data_sanitized")
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++DEFAULT_RETENTION_DAYS = int(os.environ.get("DEFAULT_RETENTION_DAYS", "365"))
++
++os.makedirs(SANITIZED_DIR, exist_ok=True)
++
++def analyze_and_anonymize(text):
++    r = requests.post(f"{PRESIDIO_API.rstrip('/')}/analyze", json={"text": text}, timeout=10.0)
++    r.raise_for_status()
++    entities = r.json().get("entities", [])
++    r2 = requests.post(f"{PRESIDIO_API.rstrip('/')}/anonymize", json={"text": text, "entities": entities}, timeout=10.0)
++    r2.raise_for_status()
++    return r2.json().get("text", ""), entities
++
++def main():
++    report = {"sanitized": [], "errors": []}
++    for path in glob.glob(os.path.join(TRAIN_DIR, "*.txt")):
++        try:
++            text = open(path).read()
++            redacted, entities = analyze_and_anonymize(text)
++            out_path = os.path.join(SANITIZED_DIR, os.path.basename(path))
++            open(out_path, "w").write(redacted)
++            # annotate retention
++            retention_expires = (datetime.utcnow() + timedelta(days=DEFAULT_RETENTION_DAYS)).isoformat() + "Z"
++            ev = {"file": path, "sanitized_path": out_path, "entities": len(entities), "retention_expires": retention_expires}
++            requests.post(f"{AEGIS_MCP.rstrip('/')}/compliance/sanitization", json=ev, timeout=5.0)
++            report["sanitized"].append(ev)
++        except Exception as e:
++            report["errors"].append({"file": path, "error": str(e)})
++    print(json.dumps(report, indent=2))
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:k8s/compliance/sanitization-cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: training-data-sanitization
++  namespace: aegis-system
++spec:
++  schedule: "0 2 * * SUN"
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          containers:
++          - name: sanitization
++            image: aegis/sanitizer:latest
++            env:
++            - name: PRESIDIO_API
++              value: "http://presidio-analyzer:3000"
++            - name: TRAIN_DIR
++              value: "/data/training"
++            - name: SANITIZED_DIR
++              value: "/data/sanitized"
++          restartPolicy: OnFailure
++
+*** End File
+*** Add File:services/a2a/approver_strict.py
++#!/usr/bin/env python3
++"""
++A2A Approver (strict): enforces JWKS verification, issues KMS-signed approval records,
++and links approvals to actions and optional FMEA IDs.
++"""
++import os, time, uuid, json, logging, requests
++from fastapi import FastAPI, Header, HTTPException
++from pydantic import BaseModel
++import psycopg2
++from psycopg2.extras import Json
++from services.a2a.jwks_jwt_verify import verify_jwt
++import boto3
++
++LOG = logging.getLogger("aegis.a2a.strict")
++APP = FastAPI(title="Aegis A2A Approver Strict")
++DB_DSN = os.environ.get("APPROVER_POSTGRES_DSN")
++JWKS_URL = os.environ.get("APPROVER_JWKS_URL")
++KMS_KEY_ID = os.environ.get("APPROVER_KMS_KEY_ID")
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++
++def get_db_conn():
++    if not DB_DSN:
++        raise RuntimeError("APPROVER_POSTGRES_DSN not set")
++    return psycopg2.connect(DB_DSN)
++
++def sign_payload(payload_bytes: bytes):
++    kms = boto3.client("kms")
++    resp = kms.sign(KeyId=KMS_KEY_ID, Message=payload_bytes, MessageType='RAW', SigningAlgorithm='RSASSA_PKCS1_V1_5_SHA_256')
++    return resp.get("Signature")
++
++class ApprovalReq(BaseModel):
++    action_id: str
++    artifact_uri: str
++    approver: str
++    decision: str  # "approved" or "denied"
++    fmea_id: str = None
++    comment: str = ""
++
++@APP.post("/request")
++def request_approval(req: ApprovalReq, authorization: str = Header(None)):
++    if not authorization:
++        raise HTTPException(status_code=401, detail="missing auth")
++    token = authorization.split("Bearer ")[-1]
++    # verify JWT signature and audience via JWKS
++    try:
++        claims = verify_jwt(token, JWKS_URL, audience=None)
++    except Exception as e:
++        raise HTTPException(status_code=403, detail=f"invalid token: {e}")
++
++    approval_id = str(uuid.uuid4())
++    ts = int(time.time())
++    record = {"id": approval_id, "action_id": req.action_id, "artifact_uri": req.artifact_uri, "approver": req.approver, "decision": req.decision, "fmea_id": req.fmea_id, "comment": req.comment, "ts": ts, "claims": claims}
++    payload = json.dumps(record).encode("utf-8")
++    signature = None
++    if KMS_KEY_ID:
++        try:
++            signature = sign_payload(payload)
++        except Exception as e:
++            LOG.error("kms sign failed: %s", e)
++    # persist to DB
++    with get_db_conn() as conn:
++        with conn.cursor() as cur:
++            cur.execute("INSERT INTO a2a_approvals (id, payload, signature, ts) VALUES (%s, %s, %s, %s)", (approval_id, Json(record), signature, ts))
++            conn.commit()
++
++    # write to MCP for auditing
++    try:
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/a2a/approvals", json={"id": approval_id, "record": record, "signature": signature.hex() if signature else None}, timeout=5.0)
++    except Exception:
++        LOG.warning("failed to write approval to MCP")
++
++    return {"id": approval_id, "signed": signature is not None}
++
++@APP.get("/approve_status/{id}")
++def approve_status(id: str):
++    with get_db_conn() as conn:
++        with conn.cursor() as cur:
++            cur.execute("SELECT payload, signature FROM a2a_approvals WHERE id=%s", (id,))
++            row = cur.fetchone()
++            if not row:
++                raise HTTPException(status_code=404, detail="not found")
++            payload, signature = row
++            return {"id": id, "payload": payload, "signature": signature.hex() if signature else None, "decision": payload.get("decision")}
++
+*** End File
+*** Add File:services/audit/receipt_signer.py
++#!/usr/bin/env python3
++"""
++Receipt signer: accepts event payloads (side effects, retrievals) and returns a KMS-signed receipt.
++Writes the receipt to MCP and (optionally) Rekor can be invoked by caller.
++"""
++import os, time, json, logging, boto3, requests
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++
++LOG = logging.getLogger("aegis.receipt")
++APP = FastAPI(title="Aegis Receipt Signer")
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++KMS_KEY_ID = os.environ.get("RECEIPT_KMS_KEY_ID")
++
++kms = boto3.client("kms") if KMS_KEY_ID else None
++
++class Event(BaseModel):
++    event_type: str
++    artifact: str
++    requestor: str
++    approval_id: str = None
++    evidence: dict = {}
++
++def sign(payload: bytes):
++    if not kms:
++        return None
++    resp = kms.sign(KeyId=KMS_KEY_ID, Message=payload, MessageType='RAW', SigningAlgorithm='RSASSA_PKCS1_V1_5_SHA_256')
++    return resp.get("Signature")
++
++@APP.post("/sign")
++def sign_event(ev: Event):
++    record = {"event": ev.dict(), "ts": int(time.time())}
++    payload = json.dumps(record).encode("utf-8")
++    sig = None
++    try:
++        sig = sign(payload)
++    except Exception as e:
++        LOG.error("kms sign failed: %s", e)
++        raise HTTPException(status_code=500, detail="sign failed")
++    rec = {"receipt": record, "signature": sig.hex() if sig else None}
++    try:
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/receipts", json=rec, timeout=5.0)
++    except Exception as e:
++        LOG.warning("failed to post receipt to MCP: %s", e)
++    return {"signed": True, "receipt": rec}
++
++@APP.get("/health")
++def health():
++    return {"ok": True}
++
+*** End File
+*** Add File:services/fmea/fmea_service.py
++#!/usr/bin/env python3
++"""
++Lightweight FMEA service:
++ - Stores FMEA entries and allows linking HIL evidence IDs to FMEA item IDs.
++ - Writes all events to MCP for traceability.
++"""
++import os, time, json, logging
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++import sqlite3, uuid, requests
++
++LOG = logging.getLogger("aegis.fmea")
++APP = FastAPI(title="Aegis FMEA Service")
++DB_PATH = os.environ.get("FMEA_DB", "/data/fmea.db")
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++
++def init_db():
++    conn = sqlite3.connect(DB_PATH)
++    c = conn.cursor()
++    c.execute("CREATE TABLE IF NOT EXISTS fmea (id TEXT PRIMARY KEY, title TEXT, description TEXT, mitigations TEXT, created_ts INTEGER)")
++    c.execute("CREATE TABLE IF NOT EXISTS hil_links (id TEXT PRIMARY KEY, fmea_id TEXT, evidence_id TEXT, ts INTEGER)")
++    conn.commit()
++    conn.close()
++
++init_db()
++
++class FMEAEntry(BaseModel):
++    title: str
++    description: str
++    mitigations: str = ""
++
++class LinkReq(BaseModel):
++    fmea_id: str
++    evidence_id: str
++
++@APP.post("/fmea")
++def create_fmea(e: FMEAEntry):
++    fid = str(uuid.uuid4())
++    ts = int(time.time())
++    conn = sqlite3.connect(DB_PATH)
++    c = conn.cursor()
++    c.execute("INSERT INTO fmea (id,title,description,mitigations,created_ts) VALUES (?,?,?,?,?)", (fid, e.title, e.description, e.mitigations, ts))
++    conn.commit()
++    conn.close()
++    # log to MCP
++    try:
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/fmea", json={"id": fid, "title": e.title, "ts": ts}, timeout=5.0)
++    except Exception:
++        LOG.warning("failed writing fmea to MCP")
++    return {"id": fid}
++
++@APP.post("/link")
++def link_evidence(l: LinkReq):
++    lid = str(uuid.uuid4())
++    ts = int(time.time())
++    conn = sqlite3.connect(DB_PATH)
++    c = conn.cursor()
++    c.execute("INSERT INTO hil_links (id,fmea_id,evidence_id,ts) VALUES (?,?,?,?)", (lid, l.fmea_id, l.evidence_id, ts))
++    conn.commit()
++    conn.close()
++    try:
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/fmea/links", json={"id": lid, "fmea_id": l.fmea_id, "evidence_id": l.evidence_id, "ts": ts}, timeout=5.0)
++    except Exception:
++        LOG.warning("failed writing fmea link to MCP")
++    return {"linked": True, "link_id": lid}
++
++@APP.get("/health")
++def health():
++    return {"ok": True}
++
+*** End File
+*** Add File:k8s/pii/encrypt-store-deploy.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: originals-encrypt-store
++  namespace: default
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: originals-encrypt-store
++  template:
++    metadata:
++      labels:
++        app: originals-encrypt-store
++    spec:
++      containers:
++      - name: encrypt-store
++        image: aegis/encrypt-store:latest
++        env:
++        - name: ORIGINALS_S3_BUCKET
++          value: "aegis-originals"
++        - name: ORIGINALS_KMS_KEY_ID
++          valueFrom:
++            secretKeyRef:
++              name: originals-kms
++              key: key-id
++        - name: AEGIS_MCP_API
++          value: "http://mcp:8082"
++        resources:
++          requests:
++            cpu: 200m
++            memory: 256Mi
++
+*** End File
+*** Add File:k8s/pii/retrieval-guard-deploy.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: originals-retrieval-guard
++  namespace: default
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: originals-retrieval-guard
++  template:
++    metadata:
++      labels:
++        app: originals-retrieval-guard
++    spec:
++      containers:
++      - name: retrieval
++        image: aegis/originals-retrieval-guard:latest
++        env:
++        - name: A2A_API
++          value: "http://approver:8080"
++        - name: RECEIPT_SIGNER_API
++          value: "http://receipt-signer:8080/sign"
++        - name: ORIGINALS_S3_BUCKET
++          value: "aegis-originals"
++        - name: AEGIS_MCP_API
++          value: "http://mcp:8082"
++        resources:
++          requests:
++            cpu: 100m
++            memory: 128Mi
++
+*** End File
+*** Add File:k8s/compliance/sanitizer-deploy.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: sanitization-worker
++  namespace: aegis-system
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: sanitization-worker
++  template:
++    metadata:
++      labels:
++        app: sanitization-worker
++    spec:
++      containers:
++      - name: sanitizer
++        image: aegis/sanitizer:latest
++        env:
++        - name: PRESIDIO_API
++          value: "http://presidio-analyzer:3000"
++        - name: TRAIN_DIR
++          value: "/data/training"
++        - name: SANITIZED_DIR
++          value: "/data/sanitized"
++        - name: DEFAULT_RETENTION_DAYS
++          value: "365"
++
+*** End File
+*** Add File:README_PII_COMPLIANCE.md
++# PII Minimization, Retention & Auditable Decisions (Aegis)
++
++This patch adds services and orchestration to enforce:
++- Presidio scanning & redaction before ingestion.
++- Encryption of raw originals with KMS and guarded retrieval via A2A approvals.
++- Scheduled sanitization of training data and retention metadata enforcement.
++- Mandatory KMS-signed receipts for sensitive retrievals and side effects, stored in MCP.
++- A2A approver hardening (JWKS verification) and linking approvals to FMEA IDs.
++- Lightweight FMEA service to record failure modes and link HIL evidence to FMEA entries.
++
++Key services added:
++- services/pii/presidio_adapter.py — analyze & redact API
++- services/pii/encrypt_store.py — upload & server-side KMS encrypt originals
++- services/pii/retrieval_guard.py — enforces A2A approval for presigned retrievals and requests signed receipt
++- services/compliance/sanitization_job.py (+cronjob) — periodic training-data sanitization and retention annotation
++- services/a2a/approver_strict.py — A2A approver with JWKS verification + KMS-signed approvals + FMEA linking support
++- services/audit/receipt_signer.py — signs side-effect / retrieval events and writes to MCP
++- services/fmea/fmea_service.py — lightweight FMEA store and evidence linking
++
++Operator next steps:
++1. Build and push Docker images for the added services and update k8s/deploy manifests.
++2. Ensure PRESIDIO, S3/KMS, MCP, and Postgres for approver are provisioned and reachable.
++3. Create KMS keys and secrets (originals-kms, receipt signer KMS, approver KMS).
++4. Run sanitization CronJob and verify MCP reports and sanitized outputs.
++5. Enforce that ingestion pipelines call Presidio adapter prior to storing originals with encrypt_store.
++6. Configure approver to require JWTs from your OIDC provider (APPROVER_JWKS_URL) and test retrieval guard flows.
++
++Acceptance criteria (examples):
++- All training data in production is sanitized or has annotated retention_expires metadata via MCP.
++- Any retrieval of raw originals requires A2A approval; retrievals produce KMS-signed receipts stored in MCP.
++- Any automated side-effect that affects people records a signed receipt with the chain of evidence (model version, verifier score, HIL evidence reference).
++- FMEA entries exist for each HIL scenario and HIL evidence is linked to FMEA.
++
+*** End File
+*** End Patch

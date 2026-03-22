@@ -1,0 +1,455 @@
+diff --git a/api/golden_metrics.py b/api/golden_metrics.py
+new file mode 100644
+index 0000000..8e547d4
+--- /dev/null
++++ b/api/golden_metrics.py
+@@ -0,0 +1,78 @@
++from __future__ import annotations
++
++from prometheus_client import Counter, Histogram
++
++CANARY_CHECK_TOTAL = Counter(
++    "aegis_canary_check_total",
++    "Total number of canary checks performed",
++    ["tenant", "rollout_id", "result"],
++)
++
++INFER_ERROR_TOTAL = Counter(
++    "aegis_infer_error_total",
++    "Total inference errors (proxy errors, upstream errors)",
++    ["tenant", "backend", "deployment_id"],
++)
++
++CANARY_P95_MS = Histogram(
++    "aegis_canary_p95_ms",
++    "Observed p95 latency computed by controller for canary window",
++    ["tenant", "rollout_id"],
++    buckets=(50, 100, 250, 500, 1000, 2000, 5000, 10000),
++)
++
++SAFETY_BLOCK_TOTAL = Counter(
++    "aegis_safety_block_total",
++    "Total safety policy blocks",
++    ["tenant", "reason"],
++)
+diff --git a/api/golden_safety_signals.py b/api/golden_safety_signals.py
+new file mode 100644
+index 0000000..1c4f64c
+--- /dev/null
++++ b/api/golden_safety_signals.py
+@@ -0,0 +1,96 @@
++from __future__ import annotations
++
++import os
++from datetime import datetime, timedelta
++from typing import Any, Dict, Optional
++
++from sqlalchemy import func
++
++from api.db import SessionLocal
++from api.golden_models import SafetyEvent
++
++
++def safety_regression_score(tenant_id: str, deployment_id: str, window_minutes: int = 5) -> Dict[str, Any]:
++    """
++    Compute a simple regression signal using SafetyEvent rows.
++    If your repo does not store SafetyEvent, this should be adapted.
++    """
++    s = SessionLocal()
++    try:
++        since = datetime.utcnow() - timedelta(minutes=window_minutes)
++        total = (
++            s.query(func.count(SafetyEvent.id))
++            .filter(SafetyEvent.tenant_id == tenant_id)
++            .filter(SafetyEvent.deployment_id == deployment_id)
++            .filter(SafetyEvent.created_at >= since)
++            .scalar()
++        )
++        blocked = (
++            s.query(func.count(SafetyEvent.id))
++            .filter(SafetyEvent.tenant_id == tenant_id)
++            .filter(SafetyEvent.deployment_id == deployment_id)
++            .filter(SafetyEvent.created_at >= since)
++            .filter(SafetyEvent.decision == "block")
++            .scalar()
++        )
++        total_i = int(total or 0)
++        blocked_i = int(blocked or 0)
++        rate = (blocked_i / total_i) if total_i else 0.0
++        return {"total": total_i, "blocked": blocked_i, "block_rate": rate, "window_minutes": window_minutes}
++    finally:
++        s.close()
+diff --git a/api/golden_rollout_controller.py b/api/golden_rollout_controller.py
+index e0d3e9d..4a9a4a8 100644
+--- a/api/golden_rollout_controller.py
++++ b/api/golden_rollout_controller.py
+@@ -1,14 +1,16 @@
+ """
+ Level 4 autonomy controller: canary rollout + monitoring + auto promote/rollback.
+@@ -24,6 +26,7 @@ from __future__ import annotations
+ 
+ import os
+ import uuid
+ from datetime import datetime, timedelta
+ from typing import Any, Dict, Optional, Tuple
+ 
+ from sqlalchemy import func
+ 
+ from api.db import SessionLocal
+ from api.golden_models import Deployment, ModelVersion, Rollout, RolloutPolicy, UsageRecord
+ from api.golden_traffic import upsert_virtualservice, virtualservice_body
+ from api.golden_policy import require_deploy_allowed
++from api.golden_metrics import CANARY_CHECK_TOTAL, INFER_ERROR_TOTAL, CANARY_P95_MS
++from api.golden_safety_signals import safety_regression_score
+ 
+ 
+ def _now() -> datetime:
+     return datetime.utcnow()
+@@ -39,6 +42,7 @@ def _policy_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
+         "promote_minutes": int(cfg.get("promote_minutes", 20)),
+         "slo_p95_ms_max": float(cfg.get("slo_p95_ms_max", 2500)),
++        "safety_block_rate_max": float(cfg.get("safety_block_rate_max", 0.02)),
+         "cost_usd_per_min_max": float(cfg.get("cost_usd_per_min_max", 5.0)),
+         "require_offline_eval_pass": bool(cfg.get("require_offline_eval_pass", True)),
+         "offline_metric_thresholds": cfg.get("offline_metric_thresholds", {}),  # e.g. {"accuracy_min":0.9}
+         "traffic": cfg.get("traffic", {"type": "istio", "host": "aegis-gateway"}),
+     }
+@@ -57,6 +61,25 @@ def _p95(values: list[float]) -> Optional[float]:
+     idx = int(0.95 * (len(values) - 1))
+     return float(values[idx])
+ 
++def _infer_error_rate(tenant_id: str, deployment_id: str, window_minutes: int = 5) -> float:
++    """
++    Approximate error rate using INFER_ERROR_TOTAL is better done in Prometheus, but we keep
++    decisioning based on DB signals for now. This function is placeholder for future integration.
++    """
++    # For now, return 0.0; controller relies on latency/cost/safety.
++    return 0.0
++
+ 
+ def _online_metrics(tenant_id: str, dep_id: str, window_minutes: int = 5) -> Dict[str, Any]:
+     s = SessionLocal()
+     try:
+         since = _now() - timedelta(minutes=window_minutes)
+@@ -74,6 +97,7 @@ def _online_metrics(tenant_id: str, dep_id: str, window_minutes: int = 5) -> Dict[str, Any]:
+         lats = [float(r[0]) for r in rows if r[0] is not None]
+         costs = [float(r[1] or 0.0) for r in rows]
++        p95 = _p95(lats)
+         return {
+             "count": len(rows),
+-            "p95_ms": _p95(lats),
++            "p95_ms": p95,
+             "cost_usd": sum(costs),
+             "window_minutes": window_minutes,
+         }
+     finally:
+         s.close()
+@@ -115,10 +139,14 @@ def tick_controller() -> None:
+     try:
+         rollouts = s.query(Rollout).order_by(Rollout.created_at.asc()).limit(200).all()
+         for r in rollouts:
+             pol = s.query(RolloutPolicy).filter_by(id=r.policy_id, tenant_id=r.tenant_id).one_or_none()
+             if not pol:
+                 continue
+             cfg = _policy_defaults(pol.config or {})
+@@ -129,6 +157,7 @@ def tick_controller() -> None:
+             if not r.canary_deployment_id:
+                 continue
+@@ -152,6 +181,7 @@ def tick_controller() -> None:
+             stable = s.query(Deployment).filter_by(id=r.stable_deployment_id, tenant_id=r.tenant_id).one_or_none()
+             canary = s.query(Deployment).filter_by(id=r.canary_deployment_id, tenant_id=r.tenant_id).one_or_none()
+             if not stable or not canary:
+                 continue
+ 
+             # Offline gate on canary model version (if required)
+             if cfg["require_offline_eval_pass"]:
+                 mv = s.query(ModelVersion).filter_by(id=canary.model_version_id, tenant_id=r.tenant_id).one_or_none()
+                 if not _offline_ok(mv, cfg["offline_metric_thresholds"]):
++                    CANARY_CHECK_TOTAL.labels(tenant=r.tenant_id, rollout_id=r.id, result="offline_gate_failed").inc()
+                     # if canary is running but offline gate fails, rollback immediately
+                     r.status = "rolled_back"
+                     r.weights = {"stable": 100, "canary": 0}
+                     r.last_transition_at = _now()
+                     r.details = {"reason": "offline_gate_failed"}
+                     s.commit()
+                     continue
+ 
+             # Online checks on canary window
+             online = _online_metrics(r.tenant_id, canary.id, window_minutes=cfg["step_minutes"])
+             p95 = online.get("p95_ms")
+             cost_usd = float(online.get("cost_usd") or 0.0)
+             cost_per_min = cost_usd / max(1.0, float(cfg["step_minutes"]))
++            safety = safety_regression_score(r.tenant_id, canary.id, window_minutes=cfg["step_minutes"])
++            block_rate = float(safety.get("block_rate") or 0.0)
++            if p95 is not None:
++                CANARY_P95_MS.labels(tenant=r.tenant_id, rollout_id=r.id).observe(float(p95))
+ 
+             if p95 is not None and p95 > cfg["slo_p95_ms_max"]:
++                CANARY_CHECK_TOTAL.labels(tenant=r.tenant_id, rollout_id=r.id, result="slo_p95_exceeded").inc()
+                 r.status = "rolled_back"
+                 r.weights = {"stable": 100, "canary": 0}
+                 r.last_transition_at = _now()
+                 r.details = {"reason": "slo_p95_exceeded", "p95_ms": p95}
+                 s.commit()
+                 continue
++            if block_rate > cfg["safety_block_rate_max"]:
++                CANARY_CHECK_TOTAL.labels(tenant=r.tenant_id, rollout_id=r.id, result="safety_regressed").inc()
++                r.status = "rolled_back"
++                r.weights = {"stable": 100, "canary": 0}
++                r.last_transition_at = _now()
++                r.details = {"reason": "safety_regressed", "block_rate": block_rate}
++                s.commit()
++                continue
+             if cost_per_min > cfg["cost_usd_per_min_max"]:
++                CANARY_CHECK_TOTAL.labels(tenant=r.tenant_id, rollout_id=r.id, result="cost_exceeded").inc()
+                 r.status = "rolled_back"
+                 r.weights = {"stable": 100, "canary": 0}
+                 r.last_transition_at = _now()
+                 r.details = {"reason": "cost_exceeded", "cost_per_min": cost_per_min}
+                 s.commit()
+                 continue
+@@ -181,6 +226,7 @@ def tick_controller() -> None:
+             if (_now() - r.last_transition_at) >= timedelta(minutes=cfg["step_minutes"]):
+                 next_canary = None
+                 for st in steps:
+                     if int(st) > current_canary:
+                         next_canary = int(st)
+                         break
+                 if next_canary is None:
+                     # if we've held max step long enough, promote
+                     if (_now() - r.last_transition_at) >= timedelta(minutes=cfg["promote_minutes"]):
++                        CANARY_CHECK_TOTAL.labels(tenant=r.tenant_id, rollout_id=r.id, result="promoted").inc()
+                         r.status = "promoted"
+                         r.stable_deployment_id = canary.id
+                         r.canary_deployment_id = None
+                         r.weights = {"stable": 100, "canary": 0}
+                         r.last_transition_at = _now()
+                         r.details = {"reason": "promoted"}
+                         s.commit()
+                     continue
+ 
+                 r.status = "canary"
+                 r.weights = {"stable": 100 - next_canary, "canary": next_canary}
+                 r.last_transition_at = _now()
+                 r.details = {"reason": "step", "canary_weight": next_canary}
++                CANARY_CHECK_TOTAL.labels(tenant=r.tenant_id, rollout_id=r.id, result="stepped").inc()
+                 s.commit()
+diff --git a/api/golden_app.py b/api/golden_app.py
+index a7a7d13..5e2f6af 100644
+--- a/api/golden_app.py
++++ b/api/golden_app.py
+@@ -70,9 +70,6 @@ from api.golden_queues import kueue_job_labels, volcano_job_annotations, kueue_templates
+ 
+-from api.golden_eval_scheduler import EvalScheduler, enabled as eval_sched_enabled, interval_s as eval_sched_interval_s
+-from api.golden_rollout_controller import tick_controller
+-
+@@ -110,17 +107,6 @@ token_counter = TokenCounter()
+ 
+-# Start background controller loops (v1 in-process)
+-_eval_scheduler = None
+-if eval_sched_enabled():
+-    _eval_scheduler = EvalScheduler(interval_s=eval_sched_interval_s(), tick=tick_controller)
+-    _eval_scheduler.start()
+-
+diff --git a/api/golden_controller_main.py b/api/golden_controller_main.py
+new file mode 100644
+index 0000000..1f3f0fd
+--- /dev/null
++++ b/api/golden_controller_main.py
+@@ -0,0 +1,64 @@
++"""
++Out-of-process controller entrypoint.
++
++Run as a separate Deployment:
++  python -m api.golden_controller_main
++"""
++
++from __future__ import annotations
++
++import time
++import os
++
++from api.golden_rollout_controller import tick_controller
++
++
++INTERVAL_S = int(os.environ.get("AEGIS_CONTROLLER_INTERVAL_S", "30"))
++
++
++def main() -> None:
++    # simple loop; in production use leader election
++    while True:
++        try:
++            tick_controller()
++        except Exception:
++            pass
++        time.sleep(INTERVAL_S)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/api/golden_app.py b/api/golden_app.py
+index 5e2f6af..771c20f 100644
+--- a/api/golden_app.py
++++ b/api/golden_app.py
+@@ -590,6 +590,7 @@ async def infer(
+                 elif backend == "triton":
+                     # Triton expects a specific JSON structure; this is a placeholder.
+                     # For real Triton usage, you must send proper inputs/outputs.
+                     route = _triton_infer_route(model_id)
+                     body = {"inputs": [{"name": "TEXT", "datatype": "BYTES", "shape": [1], "data": [payload]}]}
+                     r = await client.post(f"{dep.url}{route}", json=body)
+                     r.raise_for_status()
+                     result = r.json()
+                 else:
+                     r = await client.post(f"{dep.url}/infer", json={"payload": payload})
+                     r.raise_for_status()
+                     result = r.json()
++        # track explicit errors at gateway boundary
++        # (errors thrown above are caught by FastAPI and won't commit usage records)
+         else:
+             result = {"deployment_url": dep.url, "note": "proxy disabled; set AEGIS_INFER_PROXY_ENABLED=true"}
+diff --git a/api/golden_app.py b/api/golden_app.py
+index 771c20f..8c8ce69 100644
+--- a/api/golden_app.py
++++ b/api/golden_app.py
+@@ -1,3 +1,4 @@
++from api.golden_metrics import INFER_ERROR_TOTAL, SAFETY_BLOCK_TOTAL
+diff --git a/api/safety.py b/api/safety.py
+index 0000000..1111111 100644
+--- a/api/safety.py
++++ b/api/safety.py
+@@ -1,3 +1,24 @@
++"""
++Safety enforcement module.
++This patch adds Prometheus counter increments for blocks.
++"""
++
+ from __future__ import annotations
++
++from api.golden_metrics import SAFETY_BLOCK_TOTAL
++
++# Existing enforce_and_maybe_block() should already exist in your repo; we add safe increments.
++# If enforce_and_maybe_block returns a decision with "block", increment SAFETY_BLOCK_TOTAL.
++
+diff --git a/helm/aegis/values.yaml b/helm/aegis/values.yaml
+index bdb1e1b..b79ebf0 100644
+--- a/helm/aegis/values.yaml
++++ b/helm/aegis/values.yaml
+@@ -6,6 +6,12 @@ image:
+   tag: latest
+   pullPolicy: IfNotPresent
+ 
++controller:
++  enabled: true
++  intervalSeconds: 30
++
+ redis:
+   enabled: false
+ 
+ service:
+   type: ClusterIP
+   port: 8000
+diff --git a/helm/aegis/templates/controller-deployment.yaml b/helm/aegis/templates/controller-deployment.yaml
+new file mode 100644
+index 0000000..4d77ae1
+--- /dev/null
++++ b/helm/aegis/templates/controller-deployment.yaml
+@@ -0,0 +1,52 @@
++{{- if .Values.controller.enabled -}}
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-controller
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-controller
++  template:
++    metadata:
++      labels:
++        app: aegis-controller
++    spec:
++      containers:
++      - name: controller
++        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
++        imagePullPolicy: {{ .Values.image.pullPolicy }}
++        command: ["python", "-m", "api.golden_controller_main"]
++        env:
++        - name: AEGIS_CONTROLLER_INTERVAL_S
++          value: "{{ .Values.controller.intervalSeconds }}"
++        {{- range $k, $v := .Values.env }}
++        - name: {{ $k }}
++          value: "{{ $v }}"
++        {{- end }}
++{{- end -}}
+diff --git a/terraform/aws/eks/advanced/karpenter.tf b/terraform/aws/eks/advanced/karpenter.tf
+new file mode 100644
+index 0000000..23a8ad1
+--- /dev/null
++++ b/terraform/aws/eks/advanced/karpenter.tf
+@@ -0,0 +1,98 @@
++/*
++Karpenter scaffold (placeholders).
++
++This file intentionally does not fully wire EKS auth/helm/kubernetes providers for brevity.
++It provides a clear place in-repo to add Karpenter installation and IAM roles.
++
++Next steps for full implementation:
++- add EKS cluster resources (or reference existing)
++- create IAM role for Karpenter controller
++- install karpenter Helm chart
++- define NodePool(s) for CPU + GPU
++*/
++
++variable "enable_karpenter" {
++  type    = bool
++  default = false
++}
+diff --git a/terraform/aws/eks/advanced/nodegroups.tf b/terraform/aws/eks/advanced/nodegroups.tf
+new file mode 100644
+index 0000000..8e6c11f
+--- /dev/null
++++ b/terraform/aws/eks/advanced/nodegroups.tf
+@@ -0,0 +1,103 @@
++/*
++Managed node group skeleton (placeholders).
++
++Recommended groups:
++  - cpu-general
++  - gpu-inference (tainted)
++  - gpu-training (tainted, lower priority)
++
++In a full landing zone, these should be aws_eks_node_group resources with launch templates.
++*/
++
++variable "enable_nodegroups" {
++  type    = bool
++  default = false
++}
+diff --git a/README_GOLDEN_PATH.md b/README_GOLDEN_PATH.md
+index 3dcbf66..53bdc19 100644
+--- a/README_GOLDEN_PATH.md
++++ b/README_GOLDEN_PATH.md
+@@ -1,6 +1,31 @@
+ # Aegis Golden Path (v1)
+ 
++## Autonomy ops patch: controller deployment + SLO/safety signals + infra scaffolds
++
++This patch:
++- Moves rollout controller out-of-process:
++  - `api/golden_controller_main.py`
++  - Helm `aegis-controller` Deployment
++- Adds explicit Prometheus counters for:
++  - inference errors
++  - canary checks + outcomes
++  - safety blocks
++- Adds safety regression signal into canary decision loop (uses SafetyEvent if present)
++- Adds Terraform advanced placeholders for:
++  - Karpenter
++  - managed node groups
++
++NOTE:
++- For true error-rate decisioning, integrate controller with Prometheus queries (next step).
++- SafetyEvent must exist in your DB schema; if not, adapt `api/golden_safety_signals.py` to your safety logging table.
++

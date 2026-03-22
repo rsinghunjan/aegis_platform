@@ -1,0 +1,909 @@
+diff --git a/api/golden_otel.py b/api/golden_otel.py
+new file mode 100644
+index 0000000..d55a84c
+--- /dev/null
++++ b/api/golden_otel.py
+@@ -0,0 +1,248 @@
++from __future__ import annotations
++
++"""
++OpenTelemetry (OTel) ingestion + correlation.
++
++This is intentionally minimal and uses OTLP/HTTP JSON as a best-effort sink.
++For production, you should:
++  - run an OpenTelemetry Collector
++  - export traces/metrics/logs to your backend (Tempo/Jaeger/Prometheus/Loki)
++  - use exemplars / trace IDs in metrics
++
++This patch provides:
++  - /v1/otel/v1/traces ingestion endpoint (tenant-scoped)
++  - trace correlation fields stored into audit events via external_context/_external
++"""
++
++import json
++from datetime import datetime
++from typing import Any, Dict, Optional
++
++from fastapi import HTTPException
++
++from api.db import SessionLocal
++from api.golden_models import AuditEvent
++
++
++def _extract_trace_context(payload: Dict[str, Any]) -> Dict[str, Any]:
++    """
++    Best-effort extraction of trace_id/span_id from OTLP/HTTP JSON format.
++    """
++    out: Dict[str, Any] = {}
++    try:
++        rs = (payload.get("resourceSpans") or [])
++        if not rs:
++            return out
++        ils = ((rs[0] or {}).get("scopeSpans") or (rs[0] or {}).get("instrumentationLibrarySpans") or [])
++        if not ils:
++            return out
++        spans = ((ils[0] or {}).get("spans") or [])
++        if not spans:
++            return out
++        sp0 = spans[0] or {}
++        tid = sp0.get("traceId")
++        sid = sp0.get("spanId")
++        if tid:
++            out["trace_id"] = tid
++        if sid:
++            out["span_id"] = sid
++    except Exception:
++        return {}
++    return out
++
++
++def store_trace_marker(tenant_id: str, actor_sub: str, payload: Dict[str, Any]) -> Dict[str, Any]:
++    """
++    Store a lightweight audit marker pointing to a trace.
++    """
++    ctx = _extract_trace_context(payload)
++    if not ctx:
++        return {"stored": False, "reason": "no_trace_context"}
++    s = SessionLocal()
++    try:
++        ev = AuditEvent(
++            tenant_id=tenant_id,
++            actor_sub=actor_sub,
++            action="otel.trace.ingest",
++            entity_type="otel",
++            entity_id=str(ctx.get("trace_id") or ""),
++            decision="allow",
++            details={"_external": {"trace": ctx}},
++            created_at=datetime.utcnow(),
++        )
++        s.add(ev)
++        s.commit()
++        return {"stored": True, **ctx}
++    finally:
++        s.close()
+diff --git a/api/golden_prometheus.py b/api/golden_prometheus.py
+index b002c5c..84b3a7c 100644
+--- a/api/golden_prometheus.py
++++ b/api/golden_prometheus.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import os
+ from typing import Any, Dict, Optional
+ 
+ import httpx
+@@ -13,6 +14,7 @@ PROM_TIMEOUT_S = float(os.environ.get("AEGIS_PROMETHEUS_TIMEOUT_S", "5"))
+ PROM_BEARER_TOKEN = os.environ.get("AEGIS_PROMETHEUS_BEARER_TOKEN", "")
++PROM_RANGE_STEP = os.environ.get("AEGIS_PROMETHEUS_RANGE_STEP", "30s")
+ 
+ 
+ class PrometheusUnavailable(RuntimeError):
+     pass
+ 
+ 
+ async def prom_query(query: str) -> Dict[str, Any]:
+@@ -25,3 +27,21 @@ async def prom_query(query: str) -> Dict[str, Any]:
+     async with httpx.AsyncClient(timeout=PROM_TIMEOUT_S) as client:
+         r = await client.get(f"{PROM_URL}/api/v1/query", params={"query": query}, headers=headers)
+         r.raise_for_status()
+         return r.json()
++
++
++async def prom_query_range(query: str, start_ts: float, end_ts: float, step: Optional[str] = None) -> Dict[str, Any]:
++    """
++    Range query for drift / trend monitoring.
++    """
++    if not PROM_URL:
++        raise PrometheusUnavailable("AEGIS_PROMETHEUS_URL is not set")
++    headers = {}
++    if PROM_BEARER_TOKEN:
++        headers["Authorization"] = f"Bearer {PROM_BEARER_TOKEN}"
++    params = {"query": query, "start": start_ts, "end": end_ts, "step": step or PROM_RANGE_STEP}
++    async with httpx.AsyncClient(timeout=PROM_TIMEOUT_S) as client:
++        r = await client.get(f"{PROM_URL}/api/v1/query_range", params=params, headers=headers)
++        r.raise_for_status()
++        return r.json()
+diff --git a/api/golden_slo.py b/api/golden_slo.py
+new file mode 100644
+index 0000000..9aa4bcb
+--- /dev/null
++++ b/api/golden_slo.py
+@@ -0,0 +1,168 @@
++from __future__ import annotations
++
++"""
++Robust SLO error-rate decisioning from PromQL.
++
++This converts PromQL results into numeric error rates and provides a helper
++to evaluate a policy threshold.
++"""
++
++from typing import Any, Dict, Optional, Tuple
++
++
++def extract_instant_scalar(resp: Dict[str, Any]) -> Optional[float]:
++    """
++    Prometheus instant query response:
++      data.result[0].value = [ts, "number"]
++    """
++    try:
++        data = resp.get("data") or {}
++        res = data.get("result") or []
++        if not res:
++            return None
++        v = (res[0] or {}).get("value")
++        if not v or len(v) < 2:
++            return None
++        return float(v[1])
++    except Exception:
++        return None
++
++
++def error_rate_promql(service: str, window: str = "5m") -> str:
++    """
++    Assumes you export request counters as:
++      http_requests_total{service="aegis-gateway",code=~"5.."}
++      http_requests_total{service="aegis-gateway"}
++    Adjust labels to match your environment.
++    """
++    return (
++        f"(sum(rate(http_requests_total{{service=\"{service}\",code=~\"5..\"}}[{window}])) "
++        f"/ clamp_min(sum(rate(http_requests_total{{service=\"{service}\"}}[{window}])), 1))"
++    )
++
++
++def decide_error_rate(error_rate: Optional[float], max_allowed: float) -> Tuple[bool, Dict[str, Any]]:
++    if error_rate is None:
++        return True, {"decision": "allow", "reason": "no_data"}
++    if float(error_rate) > float(max_allowed):
++        return False, {"decision": "deny", "reason": "error_rate_exceeded", "error_rate": float(error_rate), "max_allowed": float(max_allowed)}
++    return True, {"decision": "allow", "reason": "ok", "error_rate": float(error_rate), "max_allowed": float(max_allowed)}
+diff --git a/api/golden_drift.py b/api/golden_drift.py
+new file mode 100644
+index 0000000..8a3bada
+--- /dev/null
++++ b/api/golden_drift.py
+@@ -0,0 +1,222 @@
++from __future__ import annotations
++
++"""
++Drift monitoring as a first-class signal type.
++
++This patch adds:
++  - a DB model for drift signals (drift_signals)
++  - a minimal detector that compares two time windows from Prometheus query_range
++
++Design:
++  - Drift signals are generic: "metric_name", "baseline_value", "current_value", "drift_score"
++  - You can plug in better drift logic later (PSI, KL divergence, embedding drift, etc.)
++"""
++
++import math
++import time
++from dataclasses import dataclass
++from typing import Any, Dict, List, Optional, Tuple
++
++from api.golden_prometheus import prom_query_range
++
++
++def _avg_from_range(resp: Dict[str, Any]) -> Optional[float]:
++    """
++    Prometheus range response:
++      data.result[0].values = [[ts, "v"], ...]
++    """
++    try:
++        data = resp.get("data") or {}
++        res = data.get("result") or []
++        if not res:
++            return None
++        values = (res[0] or {}).get("values") or []
++        xs = [float(v[1]) for v in values if v and len(v) >= 2]
++        if not xs:
++            return None
++        return sum(xs) / float(len(xs))
++    except Exception:
++        return None
++
++
++def drift_score(baseline: float, current: float) -> float:
++    """
++    Simple symmetric relative drift score.
++    """
++    denom = max(1e-9, abs(baseline) + abs(current))
++    return abs(current - baseline) / denom
++
++
++async def detect_drift_from_prometheus(
++    promql: str,
++    *,
++    baseline_minutes: int = 60,
++    current_minutes: int = 15,
++    step: str = "30s",
++) -> Dict[str, Any]:
++    now = time.time()
++    cur_end = now
++    cur_start = now - current_minutes * 60
++    base_end = cur_start
++    base_start = base_end - baseline_minutes * 60
++    base_resp = await prom_query_range(promql, base_start, base_end, step=step)
++    cur_resp = await prom_query_range(promql, cur_start, cur_end, step=step)
++    base_avg = _avg_from_range(base_resp)
++    cur_avg = _avg_from_range(cur_resp)
++    if base_avg is None or cur_avg is None:
++        return {"ok": False, "reason": "insufficient_data"}
++    return {
++        "ok": True,
++        "baseline_avg": base_avg,
++        "current_avg": cur_avg,
++        "drift_score": drift_score(float(base_avg), float(cur_avg)),
++        "baseline_window_min": baseline_minutes,
++        "current_window_min": current_minutes,
++    }
+diff --git a/api/golden_drift_models.py b/api/golden_drift_models.py
+new file mode 100644
+index 0000000..6b0d9bb
+--- /dev/null
++++ b/api/golden_drift_models.py
+@@ -0,0 +1,63 @@
++from __future__ import annotations
++
++from datetime import datetime
++
++from sqlalchemy import Column, DateTime, Float, Index, String, JSON
++
++from api.db import Base
++
++
++class DriftSignal(Base):
++    __tablename__ = "drift_signals"
++
++    id = Column(String(100), primary_key=True)
++    tenant_id = Column(String(100), nullable=False, index=True)
++    deployment_id = Column(String(100), nullable=True, index=True)
++    model_id = Column(String(100), nullable=True, index=True)
++    metric_name = Column(String(200), nullable=False)
++    baseline_value = Column(Float, nullable=True)
++    current_value = Column(Float, nullable=True)
++    drift_score = Column(Float, nullable=False)
++    details = Column(JSON, nullable=True)
++    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
++
++    __table_args__ = (
++        Index("ix_drift_signals_tenant_created", "tenant_id", "created_at"),
++        Index("ix_drift_signals_deployment_created", "deployment_id", "created_at"),
++    )
+diff --git a/api/golden_external_models.py b/api/golden_external_models.py
+index b6d8b2f..ba8c964 100644
+--- a/api/golden_external_models.py
++++ b/api/golden_external_models.py
+@@ -36,6 +36,7 @@ class ExternalClient(Base):
+     __tablename__ = "external_clients"
+ 
+     id = Column(String(100), primary_key=True)  # e.g. "openclaw"
+     tenant_id = Column(String(100), nullable=False, index=True)
+     name = Column(String(200), nullable=False)
+     allowed_tools = Column(JSON, nullable=False, default=list)  # list[str]
+     budgets = Column(JSON, nullable=True)  # {"max_cost_usd":10,"max_minutes":30,"max_high_risk_per_day":0}
+     status = Column(String(50), nullable=False, default="active")  # active|disabled
+     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+@@ -58,6 +59,10 @@ class ExternalApproval(Base):
+     context = Column(JSON, nullable=True)  # {"channel":"...","thread":"...","message":"..."}
+ 
+     status = Column(String(50), nullable=False, default="pending")  # pending|approved|denied|expired
++    expires_at = Column(DateTime, nullable=True)
++    required_approvals = Column(Integer, nullable=False, default=1)
++    approvals = Column(JSON, nullable=True)  # [{"by": "...", "at": "...", "decision":"approve"}]
+     approved_by = Column(String(200), nullable=True)
+     approved_at = Column(DateTime, nullable=True)
+     decision_reason = Column(Text, nullable=True)
+diff --git a/api/golden_external_policy.py b/api/golden_external_policy.py
+index a3c98f3..fc5a6a6 100644
+--- a/api/golden_external_policy.py
++++ b/api/golden_external_policy.py
+@@ -1,9 +1,10 @@
+ from __future__ import annotations
+ 
+ import time
++from datetime import datetime
+ from typing import Any, Dict, List, Optional
+ 
+ from fastapi import HTTPException
+ 
+ from api.db import SessionLocal
+ from api.golden_external_models import ExternalClient, ExternalApproval
+@@ -40,6 +41,10 @@ def require_approval_if_needed(
+     try:
+         a = (
+             s.query(ExternalApproval)
+             .filter_by(id=approval_id, tenant_id=tenant_id, client_id=client_id)
+             .one_or_none()
+         )
+         if not a or a.status != "approved":
+             raise HTTPException(status_code=403, detail="approval not granted")
++        if a.expires_at and datetime.utcnow() > a.expires_at:
++            raise HTTPException(status_code=403, detail="approval expired")
+         if a.requested_tool != tool:
+             raise HTTPException(status_code=403, detail="approval tool mismatch")
+     finally:
+         s.close()
+diff --git a/api/golden_notifications.py b/api/golden_notifications.py
+new file mode 100644
+index 0000000..c3e04e0
+--- /dev/null
++++ b/api/golden_notifications.py
+@@ -0,0 +1,68 @@
++from __future__ import annotations
++
++"""
++Notifications scaffold.
++
++Enterprise approval workflow usually requires notifications. This patch provides a stub that logs.
++Integrations can be added:
++  - Slack webhooks
++  - Teams connectors
++  - Email (SES)
++  - PagerDuty
++"""
++
++import os
++import logging
++from typing import Any, Dict, Optional
++
++import httpx
++
++logger = logging.getLogger("aegis.notifications")
++
++SLACK_WEBHOOK_URL = os.environ.get("AEGIS_SLACK_WEBHOOK_URL", "")
++
++
++async def notify(event: str, payload: Dict[str, Any]) -> None:
++    if SLACK_WEBHOOK_URL:
++        try:
++            async with httpx.AsyncClient(timeout=5) as client:
++                await client.post(SLACK_WEBHOOK_URL, json={"text": f"[{event}] {payload}"})
++        except Exception:
++            logger.exception("failed to send slack notification")
++        return
++    logger.info("notify event=%s payload=%s", event, payload)
+diff --git a/api/golden_app.py b/api/golden_app.py
+index 01e9c12..3cfa2cf 100644
+--- a/api/golden_app.py
++++ b/api/golden_app.py
+@@ -1,10 +1,11 @@
+ from __future__ import annotations
+ import os
+ import uuid
+ import json
+ import time
+ import logging
++from datetime import datetime, timedelta
+ from typing import Any, Dict, Optional, List
+ 
+ import httpx
+ from fastapi import FastAPI, Request, HTTPException, Body, Form
+@@ -48,6 +49,8 @@ from api.golden_agent_models import AgentPlan
+ from api.golden_external_models import ExternalClient, ExternalApproval
++from api.golden_drift_models import DriftSignal
++from api.golden_otel import store_trace_marker
+ from api.golden_store import put_artifact_bytes
+ from api.golden_signing import sign_sha256, SIGN_MODE
+ from api.golden_policy import require_signature_valid, require_deploy_allowed, require_metrics_thresholds
+@@ -92,6 +95,10 @@ from api.golden_metrics import INFER_ERROR_TOTAL, SAFETY_BLOCK_TOTAL
+ from api.golden_external_tools import execute_external_tool, tool_risk
++from api.golden_prometheus import prom_query
++from api.golden_slo import extract_instant_scalar, error_rate_promql, decide_error_rate
++from api.golden_drift import detect_drift_from_prometheus
++from api.golden_notifications import notify
+ 
+@@ -1120,6 +1127,57 @@ async def external_request_approval(
+     actor = actor_from_request(request)
+     require_any_role(actor, ["tenant_user", "tenant_developer", "tenant_admin", "platform_admin"])
+ 
+     risk = tool_risk(tool)
+     if risk != "high":
+         raise HTTPException(status_code=400, detail="approval is only required for high-risk tools")
+ 
+     s = SessionLocal()
+     try:
+         aid = str(uuid.uuid4())
++        # enterprise polish: default expiration + required approvals
++        expires_at = datetime.utcnow() + timedelta(minutes=int((os.environ.get("AEGIS_APPROVAL_EXPIRES_MIN", "60"))))
++        required = int(os.environ.get("AEGIS_APPROVAL_REQUIRED_COUNT", "1"))
+         a = ExternalApproval(
+             id=aid,
+             tenant_id=actor.tenant_id,
+             client_id=client_id,
+             requested_by=external_user_id,
+             requested_tool=tool,
+             requested_args=json.loads(args) if args else {},
+             context=json.loads(external_context) if external_context else {},
+             status="pending",
++            expires_at=expires_at,
++            required_approvals=required,
++            approvals=[],
+         )
+         s.add(a)
+         s.commit()
+         record_audit_event(
+             actor.tenant_id,
+             actor.sub,
+             "external.approval.request",
+             "external_approval",
+             aid,
+             decision="allow",
+             details={"client_id": client_id, "tool": tool},
+             external_context=a.context,
+         )
++        try:
++            await notify("approval.requested", {"tenant_id": actor.tenant_id, "approval_id": aid, "tool": tool, "client_id": client_id})
++        except Exception:
++            pass
+         return {"approval_id": aid, "status": "pending"}
+     finally:
+         s.close()
+@@ -1130,6 +1188,63 @@ async def external_approve(
+     actor = actor_from_request(request)
+     require_any_role(actor, ["tenant_admin", "platform_admin"])
+     s = SessionLocal()
+     try:
+         a = s.query(ExternalApproval).filter_by(id=approval_id, tenant_id=actor.tenant_id).one_or_none()
+         if not a:
+             raise HTTPException(status_code=404, detail="approval not found")
+         if a.status != "pending":
+             raise HTTPException(status_code=409, detail="approval not pending")
+-        a.status = "approved"
+-        a.approved_by = actor.sub
+-        a.approved_at = datetime.utcnow()
+-        a.decision_reason = reason
++        if a.expires_at and datetime.utcnow() > a.expires_at:
++            a.status = "expired"
++            s.commit()
++            raise HTTPException(status_code=409, detail="approval expired")
++        # 2-person (or N-person) approval support
++        approvals = list(a.approvals or [])
++        approvals.append({"by": actor.sub, "at": datetime.utcnow().isoformat() + "Z", "decision": "approve", "reason": reason})
++        a.approvals = approvals
++        if len([x for x in approvals if x.get("decision") == "approve"]) >= int(a.required_approvals or 1):
++            a.status = "approved"
++            a.approved_by = actor.sub
++            a.approved_at = datetime.utcnow()
++            a.decision_reason = reason
++        else:
++            # still pending until required approvals reached
++            a.status = "pending"
+         s.commit()
+         record_audit_event(
+             actor.tenant_id,
+             actor.sub,
+             "external.approval.approve",
+             "external_approval",
+             approval_id,
+             decision="allow",
+             details={"tool": a.requested_tool, "client_id": a.client_id, "reason": reason},
+             external_context=a.context,
+         )
++        try:
++            await notify("approval.updated", {"tenant_id": actor.tenant_id, "approval_id": approval_id, "status": a.status, "approvals": a.approvals})
++        except Exception:
++            pass
+         return {"approval_id": approval_id, "status": "approved"}
+     finally:
+         s.close()
+@@ -1177,6 +1292,104 @@ async def external_tools_execute(
+     out = execute_external_tool(
+         tenant_id=actor.tenant_id,
+         client_id=client_id,
+         actor_sub=actor_sub,
+         tool=tool,
+         args=a,
+         estimated_cost_usd=float(estimated_cost_usd or 0.0),
+         started_at_ts=started,
+         approval_id=approval_id,
+     )
+@@ -1190,3 +1403,99 @@ async def external_tools_execute(
+         external_context=ctx,
+     )
+     return {"ok": True, "tool": tool, "result": out}
++
++
++@app.post("/v1/otel/v1/traces")
++async def otel_traces_ingest(request: Request, body: Dict[str, Any] = Body(...)):
++    """
++    Minimal OTel trace ingestion endpoint to preserve trace IDs for correlation.
++    Recommend using an OTel Collector in front of this.
++    """
++    actor = actor_from_request(request)
++    require_any_role(actor, ["tenant_developer", "tenant_admin", "platform_admin"])
++    res = store_trace_marker(actor.tenant_id, actor.sub, body)
++    return {"ok": True, "stored": res}
++
++
++@app.get("/v1/slo/error-rate")
++async def slo_error_rate_check(request: Request, service: str = "aegis-gateway", window: str = "5m", max_allowed: float = 0.01):
++    """
++    Robust SLO check computed from PromQL (instant query).
++    """
++    actor = actor_from_request(request)
++    require_any_role(actor, ["tenant_admin", "platform_admin"])
++    q = error_rate_promql(service=service, window=window)
++    resp = await prom_query(q)
++    er = extract_instant_scalar(resp)
++    ok, details = decide_error_rate(er, max_allowed=max_allowed)
++    record_audit_event(actor.tenant_id, actor.sub, "slo.error_rate.check", "slo", service, decision="allow" if ok else "deny", details=details)
++    return {"ok": ok, "error_rate": er, "details": details, "promql": q}
++
++
++@app.post("/v1/drift/check")
++async def drift_check(
++    request: Request,
++    metric_name: str = Form(...),
++    promql: str = Form(...),
++    baseline_minutes: int = Form(60),
++    current_minutes: int = Form(15),
++    drift_threshold: float = Form(0.15),
++    deployment_id: Optional[str] = Form(None),
++    model_id: Optional[str] = Form(None),
++):
++    """
++    Create a drift signal from Prometheus trend comparison and persist it as a first-class record.
++    """
++    actor = actor_from_request(request)
++    require_any_role(actor, ["tenant_developer", "tenant_admin", "platform_admin"])
++    res = await detect_drift_from_prometheus(promql, baseline_minutes=int(baseline_minutes), current_minutes=int(current_minutes))
++    if not res.get("ok"):
++        raise HTTPException(status_code=400, detail=res.get("reason", "drift detection failed"))
++
++    ds = DriftSignal(
++        id=str(uuid.uuid4()),
++        tenant_id=actor.tenant_id,
++        deployment_id=deployment_id,
++        model_id=model_id,
++        metric_name=metric_name,
++        baseline_value=float(res["baseline_avg"]),
++        current_value=float(res["current_avg"]),
++        drift_score=float(res["drift_score"]),
++        details={"promql": promql, **res},
++    )
++    s = SessionLocal()
++    try:
++        s.add(ds)
++        s.commit()
++    finally:
++        s.close()
++    decision = "deny" if float(ds.drift_score) >= float(drift_threshold) else "allow"
++    record_audit_event(actor.tenant_id, actor.sub, "drift.check", "drift_signal", ds.id, decision=decision, details={"metric": metric_name, "drift_score": ds.drift_score, "threshold": drift_threshold})
++    return {"id": ds.id, "metric_name": metric_name, "drift_score": ds.drift_score, "threshold": drift_threshold, "decision": decision}
+diff --git a/alembic/versions/0011_drift_signals_and_approval_polish.py b/alembic/versions/0011_drift_signals_and_approval_polish.py
+new file mode 100644
+index 0000000..33d1c2f
+--- /dev/null
++++ b/alembic/versions/0011_drift_signals_and_approval_polish.py
+@@ -0,0 +1,73 @@
++"""Drift signals + approval workflow polish
++
++Revision ID: 0011_drift_signals_and_approval_polish
++Revises: 0010_external_clients_and_approvals
++Create Date: 2026-03-22
++"""
++
++from alembic import op
++import sqlalchemy as sa
++
++revision = "0011_drift_signals_and_approval_polish"
++down_revision = "0010_external_clients_and_approvals"
++branch_labels = None
++depends_on = None
++
++
++def upgrade():
++    op.create_table(
++        "drift_signals",
++        sa.Column("id", sa.String(length=100), primary_key=True),
++        sa.Column("tenant_id", sa.String(length=100), nullable=False, index=True),
++        sa.Column("deployment_id", sa.String(length=100), nullable=True, index=True),
++        sa.Column("model_id", sa.String(length=100), nullable=True, index=True),
++        sa.Column("metric_name", sa.String(length=200), nullable=False),
++        sa.Column("baseline_value", sa.Float(), nullable=True),
++        sa.Column("current_value", sa.Float(), nullable=True),
++        sa.Column("drift_score", sa.Float(), nullable=False),
++        sa.Column("details", sa.JSON(), nullable=True),
++        sa.Column("created_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
++    )
++    op.create_index("ix_drift_signals_tenant_created", "drift_signals", ["tenant_id", "created_at"])
++    op.create_index("ix_drift_signals_deployment_created", "drift_signals", ["deployment_id", "created_at"])
++
++    op.add_column("external_approvals", sa.Column("expires_at", sa.DateTime(), nullable=True))
++    op.add_column("external_approvals", sa.Column("required_approvals", sa.Integer(), nullable=False, server_default="1"))
++    op.add_column("external_approvals", sa.Column("approvals", sa.JSON(), nullable=True))
++
++
++def downgrade():
++    op.drop_column("external_approvals", "approvals")
++    op.drop_column("external_approvals", "required_approvals")
++    op.drop_column("external_approvals", "expires_at")
++    op.drop_index("ix_drift_signals_deployment_created", table_name="drift_signals")
++    op.drop_index("ix_drift_signals_tenant_created", table_name="drift_signals")
++    op.drop_table("drift_signals")
+diff --git a/api/golden_multimodal.py b/api/golden_multimodal.py
+new file mode 100644
+index 0000000..f57d06d
+--- /dev/null
++++ b/api/golden_multimodal.py
+@@ -0,0 +1,212 @@
++from __future__ import annotations
++
++"""
++First-class multimodal request/response contracts (v1).
++
++This does NOT guarantee your underlying model supports the modality.
++It provides a stable API contract Aegis can validate + meter.
++
++Supported input item types (v1):
++  - text: {"type":"text","text":"..."}
++  - image_url: {"type":"image_url","image_url":{"url":"https://..."}}
++  - image_base64: {"type":"image_base64","image_base64":{"b64":"...","mime":"image/png"}}
++  - audio_base64: {"type":"audio_base64","audio_base64":{"b64":"...","mime":"audio/wav"}}
++
++This is aligned with common OpenAI-style "content parts" patterns.
++"""
++
++from typing import Any, Dict, List, Optional, Tuple
++
++
++def normalize_mm_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    """
++    Convert multimodal content parts into a format that upstreams (like vLLM OpenAI-compatible)
++    often accept (content list of parts) without losing structure.
++    """
++    out = []
++    for m in messages or []:
++        role = m.get("role") or "user"
++        content = m.get("content")
++        if isinstance(content, str):
++            out.append({"role": role, "content": content})
++            continue
++        if isinstance(content, list):
++            # Validate parts lightly
++            parts = []
++            for p in content:
++                if not isinstance(p, dict) or "type" not in p:
++                    continue
++                t = p["type"]
++                if t == "text" and isinstance(p.get("text"), str):
++                    parts.append({"type": "text", "text": p["text"]})
++                elif t == "image_url" and isinstance((p.get("image_url") or {}).get("url"), str):
++                    parts.append({"type": "image_url", "image_url": {"url": p["image_url"]["url"]}})
++                elif t == "image_base64" and isinstance((p.get("image_base64") or {}).get("b64"), str):
++                    parts.append({"type": "image_url", "image_url": {"url": f"data:{(p.get('image_base64') or {}).get('mime','image/png')};base64,{p['image_base64']['b64']}"}})
++                elif t == "audio_base64" and isinstance((p.get("audio_base64") or {}).get("b64"), str):
++                    # pass through as a custom part; upstream may not support yet
++                    parts.append({"type": "audio_base64", "audio_base64": p["audio_base64"]})
++            out.append({"role": role, "content": parts})
++            continue
++        out.append({"role": role, "content": ""})
++    return out
+diff --git a/api/golden_app.py b/api/golden_app.py
+index 3cfa2cf..f2a84b8 100644
+--- a/api/golden_app.py
++++ b/api/golden_app.py
+@@ -24,7 +24,7 @@ from fastapi.middleware.gzip import GZipMiddleware
+ from starlette.middleware.cors import CORSMiddleware
+ from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, Counter, Summary
+ 
+ from api.db import engine as sqlalchemy_engine, SessionLocal
+@@ -62,6 +62,7 @@ from api.golden_otel import store_trace_marker
+ from api.golden_store import put_artifact_bytes
+ from api.golden_signing import sign_sha256, SIGN_MODE
+ from api.golden_policy import require_signature_valid, require_deploy_allowed, require_metrics_thresholds
++from api.golden_multimodal import normalize_mm_messages
+@@ -300,6 +301,36 @@ async def openai_chat_completions(
+     finally:
+         session.close()
+ 
++
++@app.post("/v1/openai/mm/chat/completions")
++async def openai_multimodal_chat_completions(request: Request, body: Dict[str, Any] = Body(...)):
++    """
++    Multimodal chat completions contract.
++    This normalizes content parts and forwards to the same upstream vLLM route.
++    """
++    actor = actor_from_request(request)
++    require_any_role(actor, ["tenant_user", "tenant_developer", "tenant_admin", "platform_admin"])
++    msgs = body.get("messages") or []
++    if not isinstance(msgs, list):
++        raise HTTPException(status_code=400, detail="messages must be a list")
++    body = dict(body)
++    body["messages"] = normalize_mm_messages(msgs)
++    # Reuse existing endpoint logic by calling the handler directly
++    return await openai_chat_completions(request, body)
+diff --git a/api/requirements-golden.txt b/api/requirements-golden.txt
+index c5f7b2a..0c1db3f 100644
+--- a/api/requirements-golden.txt
++++ b/api/requirements-golden.txt
+@@ -1,11 +1,12 @@
+ fastapi==0.111.0
+ uvicorn==0.30.1
+ sqlalchemy==2.0.31
+ alembic==1.13.1
+ prometheus-client==0.20.0
+ httpx==0.27.0
+ boto3==1.34.131
+ kubernetes==29.0.0
+ requests==2.32.3
+ PyYAML==6.0.2
+ tiktoken==0.7.0
+ redis==5.2.0
+diff --git a/terraform/aws/eks/advanced/nodegroups.tf b/terraform/aws/eks/advanced/nodegroups.tf
+index 8e6c11f..1fe85a3 100644
+--- a/terraform/aws/eks/advanced/nodegroups.tf
++++ b/terraform/aws/eks/advanced/nodegroups.tf
+@@ -1,15 +1,56 @@
+ /*
+ Managed node group skeleton (placeholders).
+ 
+ Recommended groups:
+   - cpu-general
+   - gpu-inference (tainted)
+   - gpu-training (tainted, lower priority)
+ 
+ In a full landing zone, these should be aws_eks_node_group resources with launch templates.
+ */
+ 
+ variable "enable_nodegroups" {
+   type    = bool
+   default = false
+ }
++
++# Production defaults (multi-AZ) - scaffold: wire to your cluster module outputs.
++variable "nodegroup_subnet_ids" {
++  type    = list(string)
++  default = []
++}
++
++variable "nodegroup_instance_types_cpu" {
++  type    = list(string)
++  default = ["m6i.xlarge"]
++}
++
++variable "nodegroup_instance_types_gpu" {
++  type    = list(string)
++  default = ["g5.2xlarge"]
++}
++
++variable "nodegroup_desired_size_cpu" { type = number, default = 3 }
++variable "nodegroup_min_size_cpu" { type = number, default = 3 }
++variable "nodegroup_max_size_cpu" { type = number, default = 20 }
++
++variable "nodegroup_desired_size_gpu" { type = number, default = 1 }
++variable "nodegroup_min_size_gpu" { type = number, default = 0 }
++variable "nodegroup_max_size_gpu" { type = number, default = 10 }
++
++# NOTE: wire these into aws_eks_node_group resources in your cluster module.
+diff --git a/terraform/aws/eks/advanced/karpenter.tf b/terraform/aws/eks/advanced/karpenter.tf
+index 23a8ad1..e8e2d2f 100644
+--- a/terraform/aws/eks/advanced/karpenter.tf
++++ b/terraform/aws/eks/advanced/karpenter.tf
+@@ -1,19 +1,66 @@
+ /*
+ Karpenter scaffold (placeholders).
+ 
+ This file intentionally does not fully wire EKS auth/helm/kubernetes providers for brevity.
+ It provides a clear place in-repo to add Karpenter installation and IAM roles.
+ 
+ Next steps for full implementation:
+ - add EKS cluster resources (or reference existing)
+ - create IAM role for Karpenter controller
+ - install karpenter Helm chart
+ - define NodePool(s) for CPU + GPU
+ */
+ 
+ variable "enable_karpenter" {
+   type    = bool
+   default = false
+ }
++
++variable "karpenter_cluster_name" {
++  type    = string
++  default = ""
++}
++
++variable "karpenter_node_role_arn" {
++  type    = string
++  default = ""
++}
++
++# Helm values should include:
++# - clusterName
++# - interruptionQueue
++# - serviceAccount annotations for IAM role
+diff --git a/terraform/aws/eks/advanced/README.md b/terraform/aws/eks/advanced/README.md
+index 6a1b5f0..5f3d4bc 100644
+--- a/terraform/aws/eks/advanced/README.md
++++ b/terraform/aws/eks/advanced/README.md
+@@ -1,12 +1,18 @@
+ # Advanced AWS landing-zone scaffold (EKS)
+ 
+ This is a scaffold towards enterprise-ready:
+ - private subnets + NAT
+ - placeholders for:
+   - multi-AZ
+   - managed node groups (CPU + GPU)
+   - Karpenter/Cluster Autoscaler
+   - private EKS endpoint
+   - private RDS (multi-AZ)
+   - secrets integration (External Secrets / CSI)
+   - Vault HA + DR
+   - multi-region DR drills + upgrade playbooks
+ 
+ Why it's a scaffold:
+ Enterprise landing zones vary heavily by org constraints. This gives structure in-repo and
+ keeps Aegis installability moving in the right direction without pretending to solve all infra.
++
++This patch upgrades the scaffold with production-default variables (multi-AZ nodegroups and Karpenter wiring placeholders),
++but still expects you to connect them to your EKS module outputs and Helm providers.
+diff --git a/README_GOLDEN_PATH.md b/README_GOLDEN_PATH.md
+index 9a06769..b1411fb 100644
+--- a/README_GOLDEN_PATH.md
++++ b/README_GOLDEN_PATH.md
+@@ -1,6 +1,103 @@
+ # Aegis Golden Path (v1)
+ 
++## Enterprise hardening + multimodal contracts patch
++
++This patch addresses four gaps:
++
++### A) Observability / perception (expanded)
++- OTel trace ingestion endpoint:
++  - POST `/v1/otel/v1/traces` (stores trace markers for correlation)
++- Robust SLO error-rate decisioning from PromQL:
++  - GET `/v1/slo/error-rate`
++- Drift monitoring as first-class signals:
++  - POST `/v1/drift/check` -> persists `drift_signals` records
++
++### B) Approvals workflow polish
++- Approvals now support:
++  - expiration (`expires_at`)
++  - N-person approval (`required_approvals`, `approvals[]`)
++  - notifications stub (Slack webhook optional)
++
++Env:
++- `AEGIS_APPROVAL_EXPIRES_MIN=60`
++- `AEGIS_APPROVAL_REQUIRED_COUNT=2` (for prod)
++- `AEGIS_SLACK_WEBHOOK_URL=...` (optional)
++
++### C) Infra landing zone (more production defaults)
++- Advanced Terraform scaffold upgraded with:
++  - production-default variables for multi-AZ nodegroups
++  - additional Karpenter wiring placeholders
++
++### D) Multimodality (first-class contracts)
++- Adds a multimodal chat contract endpoint:
++  - POST `/v1/openai/mm/chat/completions`
++  - normalizes content parts (text + image_url + base64 image) to upstream-friendly format
++
++Migrations:
++```bash
++alembic upgrade head
++```
++
+ ## OpenClaw integration-critical patch (external tools + approvals + delegation + audit context)

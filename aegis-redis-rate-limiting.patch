@@ -1,0 +1,335 @@
+diff --git a/api/golden_gateway_limits.py b/api/golden_gateway_limits.py
+index a1747b9..f25a653 100644
+--- a/api/golden_gateway_limits.py
++++ b/api/golden_gateway_limits.py
+@@ -1,172 +1,318 @@
+ from __future__ import annotations
+ 
+ import time
++import json
+ from dataclasses import dataclass
+ from typing import Dict, Optional, Tuple
+ 
+ from fastapi import HTTPException
+ 
+-from api.db import SessionLocal
+-from api.golden_models import Deployment, UsageRecord
++from api.db import SessionLocal
++from api.golden_models import Deployment, UsageRecord
+ 
+ 
+ @dataclass(frozen=True)
+ class Limits:
+     max_rpm: Optional[int] = None
+     max_concurrency: Optional[int] = None
+     max_daily_units: Optional[int] = None
+ 
+ 
+ def _parse_limits(dep: Deployment) -> Limits:
+     cfg = dep.limits or {}
+     def _i(k):
+         v = cfg.get(k)
+         if v is None:
+             return None
+         return int(v)
+     return Limits(max_rpm=_i("max_rpm"), max_concurrency=_i("max_concurrency"), max_daily_units=_i("max_daily_units"))
+ 
++def _redis_client():
++    """
++    Lazy import to keep redis optional for dev.
++    """
++    import os
++    url = os.environ.get("AEGIS_REDIS_URL", "").strip()
++    if not url:
++        return None
++    try:
++        import redis  # type: ignore
++        return redis.Redis.from_url(url, decode_responses=True)
++    except Exception:
++        return None
++
++
++def _key(prefix: str, tenant_id: str, dep_id: str, suffix: str) -> str:
++    return f"aegis:{prefix}:tenant:{tenant_id}:dep:{dep_id}:{suffix}"
++
++
++def _window_bucket(now: float, window_s: int) -> int:
++    return int(now // window_s)
++
++
++def _enforce_limits_db(tenant_id: str, dep: Deployment, predicted_units: int) -> None:
++    """
++    Old DB-backed enforcement retained as fallback if Redis is unavailable.
++    """
++    lim = _parse_limits(dep)
++    if not (lim.max_rpm or lim.max_daily_units):
++        return
++    s = SessionLocal()
++    try:
++        if lim.max_rpm:
++            recent = (
++                s.query(UsageRecord)
++                .filter(UsageRecord.tenant_id == tenant_id)
++                .filter(UsageRecord.deployment_id == dep.id)
++                .order_by(UsageRecord.id.desc())
++                .limit(lim.max_rpm + 5)
++                .all()
++            )
++            if len(recent) >= lim.max_rpm:
++                raise HTTPException(status_code=429, detail="rate limit exceeded (max_rpm)")
++
++        if lim.max_daily_units:
++            rows = (
++                s.query(UsageRecord.units)
++                .filter(UsageRecord.tenant_id == tenant_id)
++                .filter(UsageRecord.deployment_id == dep.id)
++                .order_by(UsageRecord.id.desc())
++                .limit(50000)
++                .all()
++            )
++            used = sum(int(r[0] or 0) for r in rows)
++            if used + int(predicted_units) > lim.max_daily_units:
++                raise HTTPException(status_code=429, detail="quota exceeded (max_daily_units)")
++    finally:
++        s.close()
++
++
++def _enforce_limits_redis(tenant_id: str, dep: Deployment, predicted_units: int) -> None:
++    """
++    Redis-backed enforcement:
++      - max_rpm: fixed window counter per 60s bucket
++      - max_daily_units: fixed window counter per day bucket
++
++    This is accurate under load and O(1) per request.
++
++    NOTE:
++      - For best results, call enforce_limits() before doing expensive inference work.
++      - This does not implement concurrency limiting yet (requires token bucket / semaphore pattern).
++    """
++    r = _redis_client()
++    if r is None:
++        _enforce_limits_db(tenant_id, dep, predicted_units)
++        return
++
++    lim = _parse_limits(dep)
++    if not (lim.max_rpm or lim.max_daily_units):
++        return
++
++    now = time.time()
++    pipe = r.pipeline()
++    checks = []
++
++    # RPM
++    if lim.max_rpm:
++        bucket = _window_bucket(now, 60)
++        k = _key("rl", tenant_id, dep.id, f"rpm:{bucket}")
++        pipe.incr(k, 1)
++        # expire a little after the window
++        pipe.expire(k, 90)
++        checks.append(("rpm", lim.max_rpm, k))
++
++    # Daily units
++    if lim.max_daily_units:
++        day_bucket = _window_bucket(now, 86400)
++        k = _key("quota", tenant_id, dep.id, f"day:{day_bucket}")
++        pipe.incrby(k, int(predicted_units))
++        pipe.expire(k, 86400 + 3600)
++        checks.append(("daily_units", lim.max_daily_units, k))
++
++    res = pipe.execute()
++
++    # res contains [incrVal, expireBool, incrVal, expireBool,...] in the same order
++    # We evaluate only incr values.
++    idx = 0
++    for typ, limit, keyname in checks:
++        current = res[idx]
++        idx += 2
++        try:
++            current_i = int(current)
++        except Exception:
++            current_i = 0
++        if typ == "rpm" and lim.max_rpm and current_i > lim.max_rpm:
++            raise HTTPException(status_code=429, detail="rate limit exceeded (max_rpm)")
++        if typ == "daily_units" and lim.max_daily_units and current_i > lim.max_daily_units:
++            raise HTTPException(status_code=429, detail="quota exceeded (max_daily_units)")
++
+ 
+ def enforce_limits(tenant_id: str, dep: Deployment, predicted_units: int) -> None:
+     """
+-    Minimal per-deployment enforcement:
+-      - max_rpm: queries last 60 seconds usage_records
+-      - max_daily_units: queries last 24 hours units
+-
+-    NOTE: For high throughput, move this to Redis counters.
++    Enforce per-deployment limits.
++
++    Strategy:
++      - Use Redis counters if AEGIS_REDIS_URL is configured and redis-py is available
++      - Fallback to DB-backed checks otherwise
+     """
+-    lim = _parse_limits(dep)
+-    if not (lim.max_rpm or lim.max_daily_units):
+-        return
+-    s = SessionLocal()
+-    try:
+-        now = time.time()
+-        if lim.max_rpm:
+-            cutoff = now - 60.0
+-            # UsageRecord.created_at is datetime; we approximate by ordering on id where DB time exists.
+-            # If you want accurate windows, add a timestamp filter using DB funcs.
+-            recent = (
+-                s.query(UsageRecord)
+-                .filter(UsageRecord.tenant_id == tenant_id)
+-                .filter(UsageRecord.deployment_id == dep.id)
+-                .order_by(UsageRecord.id.desc())
+-                .limit(lim.max_rpm + 5)
+-                .all()
+-            )
+-            # approximate: if we already recorded >= max_rpm records recently, block
+-            if len(recent) >= lim.max_rpm:
+-                raise HTTPException(status_code=429, detail="rate limit exceeded (max_rpm)")
+-
+-        if lim.max_daily_units:
+-            # approximate daily units by summing recent rows; for scale use rollups.
+-            rows = (
+-                s.query(UsageRecord.units)
+-                .filter(UsageRecord.tenant_id == tenant_id)
+-                .filter(UsageRecord.deployment_id == dep.id)
+-                .order_by(UsageRecord.id.desc())
+-                .limit(50000)
+-                .all()
+-            )
+-            used = sum(int(r[0] or 0) for r in rows)
+-            if used + int(predicted_units) > lim.max_daily_units:
+-                raise HTTPException(status_code=429, detail="quota exceeded (max_daily_units)")
+-    finally:
+-        s.close()
++    _enforce_limits_redis(tenant_id, dep, predicted_units)
+diff --git a/api/requirements-golden.txt b/api/requirements-golden.txt
+index 86a55cf..f51f64c 100644
+--- a/api/requirements-golden.txt
++++ b/api/requirements-golden.txt
+@@ -1,14 +1,15 @@
+ # Golden-path dependencies
+ -r api/requirements-api2.txt
+ -r api/requirements-db.txt
+ 
+ prometheus-client==0.20.0
+ httpx==0.27.0
+ boto3==1.34.131
+ kubernetes==29.0.0
+ requests==2.32.3
+ PyYAML==6.0.2
+ tiktoken==0.7.0
++redis==5.2.0
+diff --git a/helm/aegis/values.yaml b/helm/aegis/values.yaml
+index 7a0f2ea..9d5b37a 100644
+--- a/helm/aegis/values.yaml
++++ b/helm/aegis/values.yaml
+@@ -1,15 +1,17 @@
+ image:
+   repository: rsinghunjan/aegis
+   tag: latest
+   pullPolicy: IfNotPresent
+ 
+ service:
+   type: ClusterIP
+   port: 8000
+ 
+ env:
+   AEGIS_DISABLE_DOCS: "true"
+   AEGIS_INFER_PROXY_ENABLED: "false"
+   AEGIS_VAULT_AGENT_INJECTOR_ENABLED: "true"
+   AEGIS_VAULT_ROLE: "REPLACE_ME"
+   AEGIS_SERVING_SERVICE_ACCOUNT: "aegis-model-serving"
+   AEGIS_S3_CREDS_SECRET_NAME: "aegis-s3-creds"
+   AEGIS_ARTIFACT_INIT_IMAGE: "REPLACE_ME_REGISTRY/aegis-artifact-init:REPLACE_ME"
+   AEGIS_REQUIRE_CALLBACK_SIGNATURE: "true"
++  # Enable Redis-backed rate limiting/quota enforcement
++  AEGIS_REDIS_URL: "redis://aegis-redis:6379/0"
+ 
+ resources: {}
+ 
+ postgres:
+   enabled: false
+   url: "REPLACE_ME"
+diff --git a/helm/aegis/templates/redis.yaml b/helm/aegis/templates/redis.yaml
+new file mode 100644
+index 0000000..7a0a4a8
+--- /dev/null
++++ b/helm/aegis/templates/redis.yaml
+@@ -0,0 +1,70 @@
++{{- if .Values.redis.enabled -}}
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-redis
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-redis
++  template:
++    metadata:
++      labels:
++        app: aegis-redis
++    spec:
++      containers:
++      - name: redis
++        image: redis:7.2-alpine
++        ports:
++        - containerPort: 6379
++        args: ["--save", "", "--appendonly", "no"]
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: aegis-redis
++spec:
++  selector:
++    app: aegis-redis
++  ports:
++  - name: redis
++    port: 6379
++    targetPort: 6379
++{{- end -}}
+diff --git a/helm/aegis/values.yaml b/helm/aegis/values.yaml
+index 9d5b37a..bdb1e1b 100644
+--- a/helm/aegis/values.yaml
++++ b/helm/aegis/values.yaml
+@@ -1,6 +1,12 @@
+ image:
+   repository: rsinghunjan/aegis
+   tag: latest
+   pullPolicy: IfNotPresent
++
++redis:
++  enabled: false
+ 
+ service:
+   type: ClusterIP
+   port: 8000
+diff --git a/README_GOLDEN_PATH.md b/README_GOLDEN_PATH.md
+index bca5e65..3ccda65 100644
+--- a/README_GOLDEN_PATH.md
++++ b/README_GOLDEN_PATH.md
+@@ -1,6 +1,23 @@
+ # Aegis Golden Path (v1)
+ 
++## Redis-backed rate limiting / quotas (follow-up patch)
++
++This patch replaces DB-backed enforcement with Redis counters for accuracy and performance.
++
++Enable:
++- Set `AEGIS_REDIS_URL=redis://<host>:6379/0`
++- Optional: Helm can deploy a dev Redis (`helm/aegis`):
++  - set `redis.enabled=true`
++
++Limits are defined per deployment in `deployments.limits`:
++- `max_rpm`
++- `max_daily_units`
++
++Notes:
++- This uses fixed windows (60s for rpm, 1 day for quota). Upgrade to sliding window/token bucket if needed.
++
+ Implements the minimal end-to-end platform loop:

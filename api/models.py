@@ -1,10 +1,11 @@
 """
 Canonical datastore models for Aegis (SQLAlchemy ORM)
 - User, RefreshToken, Model, ModelVersion, Job
+- AuditLog, DataRetentionPolicy, SafetyEvent, BillingAccount, Invoice, Tenant
 """
 from datetime import datetime
 from sqlalchemy import (
-    Column, Integer, String, Boolean, DateTime, ForeignKey, Text, JSON, UniqueConstraint, Index
+    Column, Integer, String, Boolean, DateTime, ForeignKey, Text, JSON, UniqueConstraint, Index, Float
 )
 from sqlalchemy.orm import relationship
 from .db import Base
@@ -71,3 +72,77 @@ class Job(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     user = relationship("User", back_populates="jobs")
+
+
+class SafetyEvent(Base):
+    __tablename__ = "safety_events"
+    id = Column(Integer, primary_key=True, index=True)
+    request_id = Column(String(100), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    model_version_id = Column(Integer, ForeignKey("model_versions.id", ondelete="SET NULL"), nullable=True, index=True)
+    decision = Column(String(20), nullable=False, index=True)  # ALLOW|FLAG|BLOCK
+    reasons = Column(JSON, nullable=False, default=[])
+    input_snapshot = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    action = Column(String(200), nullable=False, index=True)
+    actor = Column(String(200), nullable=False)
+    target_type = Column(String(200), nullable=False)
+    target_id = Column(Integer, nullable=True)
+    details = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class DataRetentionPolicy(Base):
+    __tablename__ = "data_retention_policies"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(200), nullable=False, unique=True)
+    table_name = Column(String(200), nullable=False)
+    timestamp_column = Column(String(200), nullable=False, default="created_at")
+    retention_days = Column(Integer, nullable=False, default=90)
+    action = Column(String(20), nullable=False, default="delete")  # delete | anonymize
+    tenant_column = Column(String(200), nullable=True)
+    filter_sql = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class Tenant(Base):
+    __tablename__ = "tenants"
+    id = Column(String(200), primary_key=True)  # tenant id / slug
+    name = Column(String(200), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class BillingAccount(Base):
+    __tablename__ = "billing_accounts"
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(String(200), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    gateway_customer_id = Column(String(200), nullable=True)
+    billing_suspended = Column(Boolean, default=False, nullable=False)
+    dunning_level = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class Invoice(Base):
+    __tablename__ = "invoices"
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(String(200), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    amount = Column(Float, nullable=False, default=0.0)
+    currency = Column(String(10), nullable=False, default="usd")
+    units = Column(Integer, nullable=False, default=0)
+    status = Column(String(50), nullable=False, default="open", index=True)
+    provider_charge_id = Column(String(200), nullable=True)
+    period_start = Column(DateTime, nullable=True)
+    period_end = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    paid_at = Column(DateTime, nullable=True)
+
+
+# Indexes (optional; keep names stable)
+Index("ix_jobs_status", Job.status)
+Index("ix_safety_events_request_id", SafetyEvent.request_id)

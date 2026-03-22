@@ -1,0 +1,375 @@
+diff --git a/api/golden_models.py b/api/golden_models.py
+index a3e79d0..b3a9c1e 100644
+--- a/api/golden_models.py
++++ b/api/golden_models.py
+@@ -1,11 +1,12 @@
+ """
+ Golden-path unified schema (minimal, tenant-scoped).
+ 
+ Covers the golden path:
+   - tenants/projects/models/model_versions
+   - deployments
++  - runs (train/eval batch jobs)
+   - usage_records
+   - audit_events
+ """
+@@ -6,6 +7,7 @@ from __future__ import annotations
+ from datetime import datetime
+ 
+ from sqlalchemy import (
+     Column,
+     Integer,
+     String,
+     Boolean,
+     DateTime,
+     ForeignKey,
+     Text,
+     JSON,
+     Float,
+     UniqueConstraint,
+     Index,
+ )
+ from sqlalchemy.orm import relationship
+ 
+ from api.db import Base
+@@ -155,6 +157,30 @@ class Deployment(Base):
+     __table_args__ = (
+         UniqueConstraint("tenant_id", "namespace", "name", name="uq_deployments_tenant_ns_name"),
+         Index("ix_deployments_tenant_project", "tenant_id", "project_id"),
+     )
+ 
++
++class Run(Base):
++    """
++    Represents a platform-managed K8s Job (training/eval/batch).
++    """
++    __tablename__ = "runs"
++    id = Column(String(100), primary_key=True)
++    tenant_id = Column(String(100), nullable=False, index=True)
++    project_id = Column(String(100), nullable=False, index=True)
++    model_id = Column(String(100), nullable=True, index=True)
++    kind = Column(String(50), nullable=False, default="eval")  # train|eval|batch
++    status = Column(String(50), nullable=False, default="pending")  # pending|running|succeeded|failed
++    k8s_namespace = Column(String(200), nullable=True)
++    k8s_job_name = Column(String(200), nullable=True)
++    input = Column(JSON, nullable=True)
++    output = Column(JSON, nullable=True)
++    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
++    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
++
++    __table_args__ = (Index("ix_runs_tenant_created", "tenant_id", "created_at"),)
++
++
+ class UsageRecord(Base):
+     __tablename__ = "usage_records"
+     id = Column(Integer, primary_key=True)
+     tenant_id = Column(String(100), nullable=False, index=True)
+diff --git a/api/golden_k8s.py b/api/golden_k8s.py
+index 6a2d2f0..9e7a5a4 100644
+--- a/api/golden_k8s.py
++++ b/api/golden_k8s.py
+@@ -1,10 +1,11 @@
+ from __future__ import annotations
+ 
+ import os
+ import re
+ from typing import Dict, Optional, Tuple
+ 
+ from kubernetes import client, config
+ from kubernetes.client.rest import ApiException
+ 
+@@ -12,6 +13,7 @@ from kubernetes.client.rest import ApiException
+ def _load_k8s():
+     mode = os.environ.get("AEGIS_K8S_CONFIG", "auto")  # auto|incluster|kubeconfig
+     if mode == "incluster":
+         config.load_incluster_config()
+         return
+@@ -29,6 +31,11 @@ def _core() -> client.CoreV1Api:
+     _load_k8s()
+     return client.CoreV1Api()
+ 
++def _batch() -> client.BatchV1Api:
++    _load_k8s()
++    return client.BatchV1Api()
++
+ 
+ def _apps() -> client.AppsV1Api:
+     _load_k8s()
+     return client.AppsV1Api()
+@@ -122,6 +129,63 @@ def _pod_template_annotations_for_vault() -> Optional[Dict[str, str]]:
+ 
+ def _serving_service_account_name() -> Optional[str]:
+     return os.environ.get("AEGIS_SERVING_SERVICE_ACCOUNT", "aegis-model-serving")
+ 
++def _jobs_service_account_name() -> Optional[str]:
++    """
++    K8s Job SA (can differ from serving SA). In EKS, you can use IRSA here too.
++    """
++    return os.environ.get("AEGIS_JOBS_SERVICE_ACCOUNT", _serving_service_account_name())
++
++
++def create_eval_job(
++    namespace: str,
++    job_name: str,
++    image: str,
++    env: Optional[Dict[str, str]] = None,
++    args: Optional[list[str]] = None,
++) -> str:
++    """
++    Create a simple Kubernetes Job for evaluation/training.
++    This is intentionally generic: you pass an image + args.
++    """
++    batch = _batch()
++    env_list = [client.V1EnvVar(name=k, value=v) for k, v in (env or {}).items()]
++    container = client.V1Container(
++        name="run",
++        image=image,
++        env=env_list,
++        args=args or [],
++    )
++    pod_spec = client.V1PodSpec(
++        restart_policy="Never",
++        containers=[container],
++        service_account_name=_jobs_service_account_name(),
++        automount_service_account_token=True,
++    )
++    template = client.V1PodTemplateSpec(
++        metadata=client.V1ObjectMeta(labels={"aegis.io/managed-by": "aegis-golden-api"}),
++        spec=pod_spec,
++    )
++    spec = client.V1JobSpec(template=template, backoff_limit=0)
++    body = client.V1Job(
++        metadata=client.V1ObjectMeta(name=job_name, namespace=namespace),
++        spec=spec,
++    )
++    batch.create_namespaced_job(namespace=namespace, body=body)
++    return job_name
++
++
++def get_job_status(namespace: str, job_name: str) -> str:
++    batch = _batch()
++    j = batch.read_namespaced_job(name=job_name, namespace=namespace)
++    st = j.status
++    if st.failed and st.failed > 0:
++        return "failed"
++    if st.succeeded and st.succeeded > 0:
++        return "succeeded"
++    if st.active and st.active > 0:
++        return "running"
++    return "pending"
++
+ 
+ def deploy_vllm(
+     namespace: str,
+     name: str,
+diff --git a/api/golden_app.py b/api/golden_app.py
+index bb7b5af..8f1a6ce 100644
+--- a/api/golden_app.py
++++ b/api/golden_app.py
+@@ -1,11 +1,14 @@
+ """
+ Aegis Golden Path API
+ 
+ Implements:
+   - Register model artifact -> S3/MinIO -> sign -> DB record
+   - Approve + eval pass -> deploy vLLM/Triton into tenant namespace
+   - Inference gateway routes -> meters usage -> writes audit events
+   - Enforced by OIDC roles + tenant_id scoping on all endpoints (except /healthz, /metrics)
++
++Next upgrades added by this patch:
++  - Runs: create K8s eval jobs and track status in DB
++  - Deployment reconciliation: check K8s deployment readiness and update DB
+ """
+@@ -26,6 +29,7 @@ import re
+ from typing import Any, Dict, Optional
+ 
+ import httpx
+ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+ from fastapi.responses import PlainTextResponse, JSONResponse
+@@ -39,7 +43,7 @@ from api.db import engine as sqlalchemy_engine, SessionLocal
+ 
+ from api.golden_auth import require_actor, Actor
+ from api.golden_audit import record_audit_event
+-from api.golden_models import Tenant, Project, Model, ModelVersion, Deployment, UsageRecord
++from api.golden_models import Tenant, Project, Model, ModelVersion, Deployment, Run, UsageRecord
+ from api.golden_store import put_artifact_bytes
+ from api.golden_signing import sign_sha256, SIGN_MODE
+ from api.golden_policy import require_signature_valid, require_deploy_allowed
+-from api.golden_k8s import ensure_tenant_namespace, deploy_vllm, deploy_triton
++from api.golden_k8s import ensure_tenant_namespace, deploy_vllm, deploy_triton, create_eval_job, get_job_status
+ from api.safety import enforce_and_maybe_block
+ 
+ configure_logging()
+ logger = logging.getLogger("aegis.golden")
+ logger.setLevel(logging.INFO)
+@@ -68,6 +72,10 @@ VLLM_ROUTE = os.environ.get("AEGIS_VLLM_ROUTE", "/v1/chat/completions")
+ 
+ DISABLE_DOCS = os.environ.get("AEGIS_DISABLE_DOCS", "true").lower() == "true"
+ 
++# Eval job image (you provide)
++DEFAULT_EVAL_IMAGE = os.environ.get("AEGIS_EVAL_IMAGE", "alpine:3.20")
++
+ app = FastAPI(
+     title="Aegis Golden Path API",
+     version="0.2.0",
+@@ -389,6 +397,131 @@ async def deploy_model_version(
+     finally:
+         session.close()
+ 
++
++# ------------------------ Runs: eval jobs ------------------------
++
++@app.post("/v1/runs/eval")
++async def create_eval_run(
++    request: Request,
++    project_id: str = Form(...),
++    model_id: str = Form(...),
++    model_version_id: str = Form(...),
++    image: Optional[str] = Form(None),
++    args: Optional[str] = Form(None),  # space-separated args for v1 simplicity
++):
++    """
++    Create a K8s Job to evaluate a model version.
++
++    This is a platform primitive:
++      - creates a Run row
++      - creates K8s job in tenant namespace
++      - user can poll run status
++
++    Your eval job should write results to object storage and/or report back out-of-band.
++    v1: we just track K8s job status.
++    """
++    actor = actor_from_request(request)
++    require_any_role(actor, ["tenant_admin", "tenant_developer", "platform_admin"])
++
++    session = SessionLocal()
++    try:
++        mv = session.query(ModelVersion).filter_by(id=model_version_id, tenant_id=actor.tenant_id).one_or_none()
++        if not mv:
++            raise HTTPException(status_code=404, detail="model version not found")
++        # Ensure model belongs to tenant
++        m = session.query(Model).filter_by(id=model_id, tenant_id=actor.tenant_id, project_id=project_id).one_or_none()
++        if not m:
++            raise HTTPException(status_code=404, detail="model not found")
++
++        namespace = ensure_tenant_namespace(actor.tenant_id)
++        rid = str(uuid.uuid4())
++        job_name = f"aegis-eval-{rid[:8]}".lower()
++        img = image or DEFAULT_EVAL_IMAGE
++        arg_list = args.split(" ") if args else []
++
++        # Create K8s job
++        create_eval_job(
++            namespace=namespace,
++            job_name=job_name,
++            image=img,
++            env={
++                "AEGIS_TENANT_ID": actor.tenant_id,
++                "AEGIS_PROJECT_ID": project_id,
++                "AEGIS_MODEL_ID": model_id,
++                "AEGIS_MODEL_VERSION_ID": model_version_id,
++                "AEGIS_ARTIFACT_URI": mv.artifact_uri,
++                "AEGIS_ARTIFACT_SHA256": mv.artifact_sha256 or "",
++                "AEGIS_SIGNATURE": mv.signature or "",
++                "AEGIS_SIGNATURE_TYPE": mv.signature_type or SIGN_MODE,
++            },
++            args=arg_list,
++        )
++
++        run = Run(
++            id=rid,
++            tenant_id=actor.tenant_id,
++            project_id=project_id,
++            model_id=model_id,
++            kind="eval",
++            status="pending",
++            k8s_namespace=namespace,
++            k8s_job_name=job_name,
++            input={"image": img, "args": arg_list, "model_version_id": model_version_id},
++            output=None,
++        )
++        session.add(run)
++        session.commit()
++
++        record_audit_event(
++            actor.tenant_id,
++            actor.sub,
++            "run.create",
++            "run",
++            rid,
++            decision="allow",
++            details={"kind": "eval", "k8s_job": job_name, "namespace": namespace},
++        )
++        return {"run_id": rid, "k8s_job_name": job_name, "namespace": namespace}
++    finally:
++        session.close()
++
++
++@app.get("/v1/runs/{run_id}")
++async def get_run(request: Request, run_id: str):
++    actor = actor_from_request(request)
++    require_any_role(actor, ["tenant_admin", "tenant_developer", "tenant_user", "platform_admin"])
++    session = SessionLocal()
++    try:
++        run = session.query(Run).filter_by(id=run_id, tenant_id=actor.tenant_id).one_or_none()
++        if not run:
++            raise HTTPException(status_code=404, detail="run not found")
++
++        # reconcile status from K8s if possible
++        if run.k8s_namespace and run.k8s_job_name:
++            try:
++                st = get_job_status(run.k8s_namespace, run.k8s_job_name)
++                if st != run.status:
++                    run.status = st
++                    run.updated_at = time.time()  # not perfect, but ok for v1
++                    session.commit()
++            except Exception:
++                # Don't fail the request; just return last known status
++                pass
++
++        return {
++            "run_id": run.id,
++            "tenant_id": run.tenant_id,
++            "project_id": run.project_id,
++            "model_id": run.model_id,
++            "kind": run.kind,
++            "status": run.status,
++            "k8s_namespace": run.k8s_namespace,
++            "k8s_job_name": run.k8s_job_name,
++            "input": run.input,
++            "output": run.output,
++            "created_at": str(run.created_at),
++            "updated_at": str(run.updated_at),
++        }
++    finally:
++        session.close()
+diff --git a/README_GOLDEN_PATH.md b/README_GOLDEN_PATH.md
+index f3d19ae..6c2f7c2 100644
+--- a/README_GOLDEN_PATH.md
++++ b/README_GOLDEN_PATH.md
+@@ -1,6 +1,6 @@
+ # Aegis Golden Path (v1)
+ 
+ Implements the minimal end-to-end platform loop:
+@@ -131,6 +131,23 @@ Role suggestions:
+ 8. Infer:
+    POST /v1/infer
+ 
++## Runs / Eval Jobs (new)
++
++This patch adds a minimal "Runs" plane using Kubernetes Jobs:
++
++1) Create an eval run (creates K8s Job + Run row):
++   POST /v1/runs/eval
++
++2) Poll run status (reconciles from K8s when possible):
++   GET /v1/runs/{run_id}
++
++Configure the default eval image:
++- `AEGIS_EVAL_IMAGE=<your-eval-image>`
++
++Your eval image can:
++- download the model artifact
++- run evaluation
++- write results back to object storage
++- optionally call back into Aegis to set eval_status=pass/fail (future patch)

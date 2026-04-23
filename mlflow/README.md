@@ -1,105 +1,148 @@
-  1
-  2
-  3
-  4
-  5
-  6
-  7
-  8
-  9
- 10
- 11
- 12
- 13
- 14
- 15
- 16
- 17
- 18
- 19
- 20
- 21
- 22
- 23
- 24
- 25
- 26
- 27
- 28
- 29
- 30
- 31
- 32
- 33
- 34
- 35
- 36
- 37
- 38
- 39
- 40
- 41
- 42
- 43
- 44
- 45
- 46
- 47
- 48
- 49
- 50
- 51
- 52
-```markdown
-MLflow integration for Aegis — quickstart
+# MLflow Integration for Aegis
 
-This folder provides a minimal MLflow stack (Postgres + MinIO + MLflow server) and example scripts
-to instrument training runs and register artifacts into Aegis.
+This folder provides MLflow integration for the Aegis multimodal AI system, including:
+- MLflow server deployment (local and Kubernetes)
+- Training scripts with MLflow logging
+- Model artifact packaging and Vault transit signing
+- CI/CD workflows for experiment tracking and model promotion
 
-Prerequisites
+## Prerequisites
+
 - Docker & Docker Compose (v2 plugin preferred)
 - Python 3.9+
-- If you want to sign artifacts in CI/runtime, configure Vault (VAULT_ADDR + VAULT_TOKEN or OIDC login)
+- HashiCorp Vault (for artifact signing)
+- Kubernetes cluster (for production deployment)
 
-Start the MLflow stack (local dev)
-1. From repo root:
-   docker compose -f docker/docker-compose.mlflow.yml up -d
+## Quick Start (Local Development)
 
-2. Wait for services:
-   - MLflow UI at http://localhost:5000
-   - MinIO console (if needed) at http://localhost:9000 (user/minioadmin)
+### 1. Start the MLflow Stack
 
-Environment variables for training scripts
-You can point training scripts to the MLflow server by setting:
-- MLFLOW_TRACKING_URI (e.g. http://localhost:5000)
-- AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (for MinIO usage)
-- MLFLOW_S3_ENDPOINT_URL (e.g. http://localhost:9000)
-
-Example training & registration workflow
-1. Run example training script:
-   python examples/train_with_mlflow.py --experiment demo-mlflow --run-name trial1
-
-   The script will:
-   - log params/metrics via MLflow
-   - log a model artifact (model.joblib) into MLflow artifact store
-
-2. Register model artifact with Aegis (optional):
-   python scripts/register_model_from_mlflow.py --run-id <RUN_ID> --artifact-path model.joblib --model-name my-model --sign-key aegis-model-sign
-
-   Notes:
-   - register script will attempt to sign artifact using Vault Transit via api.model_signing.sign_model_artifact().
-   - It will attempt to call `api.registry.register()` if that API exists in your repo. If your registry API differs, adapt the script.
-
-CI example
-A sample GitHub Actions workflow (.github/workflows/mlflow-training.yml) demonstrates:
-- starting the mlflow stack in the job
-- running the training script and storing run/run_id as job output
-- calling the registration script (requires Vault OIDC action to obtain ephemeral VAULT_TOKEN if signing)
-
-Next steps
-- Integrate MLflow runs with your ModelRegistry by storing run_id and provenance metadata.
-- Add CI gating: require model validation (evaluation job) before promoting a model version.
-- Replace local MinIO with your shared artifact bucket (S3) for team usage.
-
+```bash
+docker compose -f docker/docker-compose.mlflow.yml up -d
 ```
-mlflow/README.md
+
+Wait for services:
+- MLflow UI: http://localhost:5000
+- MinIO console: http://localhost:9000 (user/minioadmin)
+
+### 2. Environment Variables
+
+Set the following environment variables for training scripts:
+
+```bash
+export MLFLOW_TRACKING_URI=http://localhost:5000
+export AWS_ACCESS_KEY_ID=minioadmin
+export AWS_SECRET_ACCESS_KEY=minioadmin
+export MLFLOW_S3_ENDPOINT_URL=http://localhost:9000
+```
+
+## Kubernetes Deployment
+
+Deploy MLflow to Kubernetes using the provided manifest:
+
+```bash
+kubectl apply -f mlflow/k8s/mlflow-deployment.yaml
+```
+
+**Placeholders to replace:**
+- `REPLACE_WITH_BUCKET` - S3 bucket for artifact storage
+
+## Training Scripts
+
+### DeepSpeed Training with MLflow
+
+```bash
+python training/train_deepspeed.py \
+  --out-dir ./model_registry/demo-models/cifar_deepspeed/0.1 \
+  --max-epochs 3
+```
+
+### Select Best Run from Experiment
+
+```bash
+python scripts/select_best_mlflow_run.py \
+  --experiment-name aegis-demo \
+  --metric val/accuracy \
+  --maximize
+```
+
+## Distributed Training with Argo Workflows
+
+Submit a distributed DeepSpeed training job:
+
+```bash
+argo submit argo/workflows/distributed_training_deepspeed.yaml \
+  -p experiment-name=aegis-demo \
+  -p mlflow-tracking-uri=http://mlflow.aegis.svc.cluster.local:5000 \
+  -p object-store-bucket=your-bucket-name
+```
+
+## Model Packaging and Signing
+
+### Vault Transit Signing
+
+The system uses HashiCorp Vault transit engine for artifact signing:
+
+```bash
+./scripts/package_and_sign_vault.sh ./model_dir ./output.tar.gz
+```
+
+**Required environment variables:**
+- `VAULT_ADDR` - Vault server address
+- `VAULT_TOKEN` - Vault authentication token
+
+### GitHub Actions Workflow
+
+Use the `mlflow_pack_sign.yml` workflow for CI/CD:
+
+```yaml
+# Trigger manually or via workflow_call
+uses: ./.github/workflows/mlflow_pack_sign.yml
+with:
+  experiment-name: aegis-demo
+  metric: train/dummy_loss
+  selection-mode: minimize
+```
+
+## SageMaker Integration
+
+For AWS SageMaker training jobs, use the adapter:
+
+```bash
+python adapters/sagemaker/capture_and_sign.py \
+  --model-dir /opt/ml/model \
+  --output-bucket s3://your-bucket/model-artifacts \
+  --vault-addr https://vault.example.com \
+  --vault-key aegis-cosign
+```
+
+## Configuration Placeholders
+
+The following placeholders should be replaced with actual values:
+
+| Placeholder | Description |
+|------------|-------------|
+| `REPLACE_WITH_BUCKET` | S3 bucket name for model artifacts |
+| `VAULT_ADDR` | HashiCorp Vault server address |
+| `VAULT_AUDIENCE` | JWT audience for Vault OIDC authentication |
+
+## Testing
+
+### Test Plan
+
+1. **Deploy MLflow**: Start local stack or deploy to Kubernetes
+2. **Run Training**: Execute DeepSpeed training script
+3. **Verify Logging**: Check MLflow UI for logged metrics/artifacts
+4. **Run Argo Workflow**: Submit workflow in staging environment
+5. **Verify Artifacts**: Check S3 bucket for packaged artifacts and signatures
+6. **Run GitHub Action**: Trigger `mlflow_pack_sign.yml` manually
+7. **Verify Signatures**: Confirm signature verification passes
+
+## Related Files
+
+- `argo/workflows/distributed_training_deepspeed.yaml` - Argo workflow for distributed training
+- `training/train_deepspeed.py` - DeepSpeed training script
+- `scripts/select_best_mlflow_run.py` - MLflow experiment query tool
+- `scripts/package_and_sign_vault.sh` - Vault transit signing script
+- `conversion/convert_to_onnx.py` - ONNX model conversion
+- `adapters/sagemaker/capture_and_sign.py` - SageMaker integration

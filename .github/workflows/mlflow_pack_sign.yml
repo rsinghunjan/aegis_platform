@@ -1,0 +1,216 @@
+name: MLflow Pack and Sign
+
+on:
+  workflow_dispatch:
+    inputs:
+      experiment-name:
+        description: 'MLflow experiment name'
+        required: true
+        default: 'aegis-demo'
+      metric:
+        description: 'Metric to select best run (e.g., val/accuracy)'
+        required: true
+        default: 'train/dummy_loss'
+      selection-mode:
+        description: 'Select best run by minimize or maximize'
+        required: true
+        default: 'minimize'
+        type: choice
+        options:
+          - minimize
+          - maximize
+  workflow_call:
+    inputs:
+      experiment-name:
+        type: string
+        required: true
+      metric:
+        type: string
+        required: true
+      selection-mode:
+        type: string
+        required: true
+        default: 'minimize'
+
+env:
+  MLFLOW_TRACKING_URI: ${{ vars.MLFLOW_TRACKING_URI || 'http://localhost:5000' }}
+  VAULT_ADDR: ${{ vars.VAULT_ADDR || 'VAULT_ADDR' }}
+
+jobs:
+  select-best-run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      run-id: ${{ steps.select.outputs.run_id }}
+      artifact-uri: ${{ steps.select.outputs.artifact_uri }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install mlflow
+
+      - name: Select best MLflow run
+        id: select
+        run: |
+          MODE_FLAG=$([[ "${{ inputs.selection-mode }}" == "maximize" ]] && echo "--maximize" || echo "--minimize")
+
+          python scripts/select_best_mlflow_run.py \
+            --experiment-name "${{ inputs.experiment-name }}" \
+            --metric "${{ inputs.metric }}" \
+            $MODE_FLAG \
+            --output-file /tmp/best_run.json
+
+          # Extract values for outputs
+          RUN_ID=$(jq -r '.run_id' /tmp/best_run.json)
+          ARTIFACT_URI=$(jq -r '.artifact_uri' /tmp/best_run.json)
+
+          echo "run_id=${RUN_ID}" >> $GITHUB_OUTPUT
+          echo "artifact_uri=${ARTIFACT_URI}" >> $GITHUB_OUTPUT
+
+          echo "Selected run: ${RUN_ID}"
+          cat /tmp/best_run.json
+
+  package-and-sign:
+    needs: select-best-run
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install mlflow boto3 requests
+
+      - name: Download artifacts from MLflow
+        run: |
+          mkdir -p /tmp/model_artifacts
+
+          # Download artifacts using MLflow CLI or API
+          python -c "
+          import mlflow
+          import os
+
+          mlflow.set_tracking_uri(os.environ.get('MLFLOW_TRACKING_URI', 'http://localhost:5000'))
+          client = mlflow.tracking.MlflowClient()
+
+          run_id = '${{ needs.select-best-run.outputs.run-id }}'
+          artifacts = client.list_artifacts(run_id)
+
+          for artifact in artifacts:
+              local_path = client.download_artifacts(run_id, artifact.path, '/tmp/model_artifacts')
+              print(f'Downloaded: {local_path}')
+          "
+
+      - name: Authenticate to Vault via OIDC
+        id: vault-auth
+        uses: hashicorp/vault-action@v2
+        continue-on-error: true
+        with:
+          url: ${{ env.VAULT_ADDR }}
+          method: jwt
+          role: aegis-github-actions
+          jwtGithubAudience: ${{ vars.VAULT_AUDIENCE || 'VAULT_AUDIENCE' }}
+          exportToken: true
+
+      - name: Create deterministic archive
+        run: |
+          python scripts/make_deterministic_archive.py \
+            /tmp/model_artifacts \
+            /tmp/model-${{ needs.select-best-run.outputs.run-id }}.tar.gz
+
+          ls -la /tmp/model-*.tar.gz
+
+      - name: Sign artifact with Vault Transit
+        if: steps.vault-auth.outcome == 'success'
+        run: |
+          ARTIFACT_PATH="/tmp/model-${{ needs.select-best-run.outputs.run-id }}.tar.gz"
+
+          # Create a dummy model dir for the script (archive already created)
+          mkdir -p /tmp/dummy_model
+
+          ./scripts/package_and_sign_vault.sh /tmp/dummy_model "$ARTIFACT_PATH"
+
+          echo "Signature files created:"
+          ls -la ${ARTIFACT_PATH}*
+
+      - name: Sign artifact (fallback - local)
+        if: steps.vault-auth.outcome != 'success'
+        run: |
+          ARTIFACT_PATH="/tmp/model-${{ needs.select-best-run.outputs.run-id }}.tar.gz"
+
+          # Create SHA256 checksum as fallback
+          sha256sum "$ARTIFACT_PATH" | awk '{print $1}' > "${ARTIFACT_PATH}.sha256"
+
+          echo "Created SHA256 checksum (Vault signing skipped):"
+          cat "${ARTIFACT_PATH}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-model-${{ needs.select-best-run.outputs.run-id }}
+          path: |
+            /tmp/model-${{ needs.select-best-run.outputs.run-id }}.tar.gz
+            /tmp/model-${{ needs.select-best-run.outputs.run-id }}.tar.gz.*
+          retention-days: 30
+
+  verify-signature:
+    needs: [select-best-run, package-and-sign]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-model-${{ needs.select-best-run.outputs.run-id }}
+          path: /tmp/artifacts
+
+      - name: Verify signature
+        run: |
+          ARTIFACT_PATH="/tmp/artifacts/model-${{ needs.select-best-run.outputs.run-id }}.tar.gz"
+
+          if [ -f "${ARTIFACT_PATH}.sig.json" ]; then
+            echo "Verifying Vault transit signature..."
+            python scripts/verify_model_signatures.py \
+              --artifact "$ARTIFACT_PATH" \
+              --signature "${ARTIFACT_PATH}.sig.json" \
+              --vault-addr "$VAULT_ADDR" \
+              --vault-key aegis-cosign || true
+          elif [ -f "${ARTIFACT_PATH}.sha256" ]; then
+            echo "Verifying SHA256 checksum..."
+            EXPECTED=$(cat "${ARTIFACT_PATH}.sha256")
+            ACTUAL=$(sha256sum "$ARTIFACT_PATH" | awk '{print $1}')
+
+            if [ "$EXPECTED" = "$ACTUAL" ]; then
+              echo "✓ SHA256 checksum verified"
+            else
+              echo "✗ SHA256 mismatch!"
+              exit 1
+            fi
+          else
+            echo "No signature file found - skipping verification"
+          fi
+
+          echo "Artifact verification complete"

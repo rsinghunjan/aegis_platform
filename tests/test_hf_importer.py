@@ -42,4 +42,3 @@ def test_import_upload_s3_raises_without_bucket(monkeypatch, fake_hf_repo):
     monkeypatch.setattr("api.hf_importer.snapshot_download", lambda repo_id, cache_dir, resume_download: fake_hf_repo)
     with pytest.raises(ValueError):
         import_from_hf(repo_id="fake/repo", model_name="fake-model", upload_s3=True, register=False)
-tests/test_hf_importer.py

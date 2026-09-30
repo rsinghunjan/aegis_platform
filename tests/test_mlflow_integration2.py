@@ -10,6 +10,7 @@ Run: pytest tests/test_mlflow_integration.py -q
 """
 import tempfile
 import os
+import sys
 from unittest import mock
 
 import pytest
@@ -34,7 +35,8 @@ class DummyClient:
 def test_register_download_and_sign(monkeypatch, tmp_path):
     # monkeypatch MlflowClient
     dummy = DummyClient(download_return=str(tmp_path))
-    monkeypatch.setattr("mlflow.tracking.MlflowClient", lambda uri=None: dummy)
+    monkeypatch.setattr(reg_script, "mlflow", mock.MagicMock())
+    monkeypatch.setattr(reg_script, "MlflowClient", lambda uri=None: dummy)
     # monkeypatch sign_model_artifact
     sign_calls = []
     def fake_sign(p, key):
@@ -51,7 +53,6 @@ def test_register_download_and_sign(monkeypatch, tmp_path):
 
     # invoke main with args
     test_args = ["--run-id", "r1", "--artifact-path", "model/model.joblib", "--model-name", "mymodel", "--sign-key", "k1"]
-    import sys
     old_argv = sys.argv[:]
     sys.argv = [sys.argv[0]] + test_args
     try:
@@ -64,4 +65,3 @@ def test_register_download_and_sign(monkeypatch, tmp_path):
     # assert registry.register called (best-effort)
     # fake_registry.register called with model name and version pattern
     assert fake_registry.register.called
-tests/test_mlflow_integration.py

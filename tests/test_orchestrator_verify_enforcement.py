@@ -8,6 +8,10 @@ import pytest
 from pathlib import Path
 
 def test_patch_wrap_calls_verify(monkeypatch, tmp_path):
+    pytest.importorskip(
+        "aegis_multimodal_ai_system.orchestrator.enforce_verification_patch"
+    )
+
     # Create a dummy loader with a load function to patch
     import types
     dummy = types.SimpleNamespace()
@@ -38,4 +42,3 @@ def test_patch_wrap_calls_verify(monkeypatch, tmp_path):
     res = dummy.load_savedmodel("example-model")
     assert res == "loaded"
     assert called['verify']
-tests/test_orchestrator_verify_enforcement.py

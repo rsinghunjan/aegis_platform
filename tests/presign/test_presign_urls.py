@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 import pytest
 
-from aegis_multimodal_ai_system.storage.factory import create_storage_client
+from storage.factory import create_storage_client
 
 @pytest.mark.skipif(not os.environ.get("OBJECT_STORE_TYPE"), reason="No OBJECT_STORE_TYPE configured")
 def test_get_presigned_url_roundtrip():
@@ -28,4 +28,3 @@ def test_get_presigned_url_roundtrip():
     except NotImplementedError:
         pytest.skip("Presigned URL not implemented for this provider in adapter")
     assert url and isinstance(url, str)
-tests/presign/test_presign_urls.py

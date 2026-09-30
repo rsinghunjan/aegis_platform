@@ -1,107 +1,3 @@
-  1
-  2
-  3
-  4
-  5
-  6
-  7
-  8
-  9
- 10
- 11
- 12
- 13
- 14
- 15
- 16
- 17
- 18
- 19
- 20
- 21
- 22
- 23
- 24
- 25
- 26
- 27
- 28
- 29
- 30
- 31
- 32
- 33
- 34
- 35
- 36
- 37
- 38
- 39
- 40
- 41
- 42
- 43
- 44
- 45
- 46
- 47
- 48
- 49
- 50
- 51
- 52
- 53
- 54
- 55
- 56
- 57
- 58
- 59
- 60
- 61
- 62
- 63
- 64
- 65
- 66
- 67
- 68
- 69
- 70
- 71
- 72
- 73
- 74
- 75
- 76
- 77
- 78
- 79
- 80
- 81
- 82
- 83
- 84
- 85
- 86
- 87
- 88
- 89
- 90
- 91
- 92
- 93
- 94
- 95
- 96
- 97
- 98
- 99
-100
-101
-102
-103
-104
 #!/usr/bin/env python
 """
 Download an artifact from MLflow run, sign it with Vault Transit, and register in Aegis ModelRegistry (if available).
@@ -121,13 +17,20 @@ import tempfile
 import logging
 from pathlib import Path
 
-import mlflow
-from mlflow.tracking import MlflowClient
+try:
+    import mlflow
+    from mlflow.tracking import MlflowClient
+except ImportError:
+    mlflow = None
+    MlflowClient = None
 
 logger = logging.getLogger("aegis.register_model_from_mlflow")
 logging.basicConfig(level=logging.INFO)
 
 def main():
+    if mlflow is None or MlflowClient is None:
+        raise ImportError("mlflow is required to import artifacts from MLflow")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--artifact-path", required=True, help="relative path inside MLflow run artifacts (e.g. model/model.joblib)")
@@ -206,4 +109,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-scripts/register_model_from_mlflow.py

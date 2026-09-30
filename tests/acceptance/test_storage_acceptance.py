@@ -14,8 +14,15 @@ import tempfile
 from pathlib import Path
 import uuid
 
-from aegis_multimodal_ai_system.storage.factory import create_storage_client
+import pytest
 
+from storage.factory import create_storage_client
+
+
+@pytest.mark.skipif(
+    not os.environ.get("OBJECT_STORE_TYPE"),
+    reason="Object storage is not configured",
+)
 def test_minio_upload_download_roundtrip():
     # Create a small temp file
     tmp = tempfile.mkdtemp()

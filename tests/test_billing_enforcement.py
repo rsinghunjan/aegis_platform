@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 import api.db as db_mod
 from api.models import Base, BillingAccount
@@ -26,7 +27,11 @@ TEST_SQLITE_URL = "sqlite:///:memory:"
 
 @pytest.fixture
 def test_session_factory():
-    engine = create_engine(TEST_SQLITE_URL, connect_args={"check_same_thread": False})
+    engine = create_engine(
+        TEST_SQLITE_URL,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     TestingSessionLocal = sessionmaker(bind=engine)
     # create tables
     Base.metadata.create_all(bind=engine)

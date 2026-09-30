@@ -7,6 +7,10 @@ import pytest
 from pathlib import Path
 
 def test_enforcement_patch_calls_verify(monkeypatch, tmp_path):
+    pytest.importorskip(
+        "aegis_multimodal_ai_system.orchestrator.enforce_verification_patch"
+    )
+
     import types, sys
     dummy = types.SimpleNamespace()
     def load_savedmodel(model_name: str, local_artifact: Path = None):

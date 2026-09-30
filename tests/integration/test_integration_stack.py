@@ -89,4 +89,3 @@ def test_enqueue_job_and_worker_processing(integration_stack):
             break
         time.sleep(1)
     assert s in ("SUCCESS", "FAILED")  # worker executed; we consider FAIL also meaningful (task run)
-tests/integration/test_integration_stack.py

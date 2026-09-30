@@ -17,20 +17,10 @@ import tempfile
 import logging
 from pathlib import Path
 
-try:
-    import mlflow
-    from mlflow.tracking import MlflowClient
-except ImportError:
-    mlflow = None
-    MlflowClient = None
-
 logger = logging.getLogger("aegis.register_model_from_mlflow")
 logging.basicConfig(level=logging.INFO)
 
 def main():
-    if mlflow is None or MlflowClient is None:
-        raise ImportError("mlflow is required to import artifacts from MLflow")
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--artifact-path", required=True, help="relative path inside MLflow run artifacts (e.g. model/model.joblib)")
@@ -39,6 +29,9 @@ def main():
     parser.add_argument("--sign-key", default=None)
     parser.add_argument("--tracking-uri", default=None)
     args = parser.parse_args()
+
+    import mlflow
+    from mlflow.tracking import MlflowClient
 
     tracking_uri = args.tracking_uri or os.environ.get("MLFLOW_TRACKING_URI", "http://localhost:5000")
     mlflow.set_tracking_uri(tracking_uri)

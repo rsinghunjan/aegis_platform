@@ -18,10 +18,18 @@ import pytest
 
 from storage.factory import create_storage_client
 
-
 @pytest.mark.skipif(
-    not os.environ.get("OBJECT_STORE_TYPE"),
-    reason="Object storage is not configured",
+    os.environ.get("OBJECT_STORE_TYPE") != "minio"
+    or not all(
+        os.environ.get(name)
+        for name in (
+            "OBJECT_STORE_ENDPOINT",
+            "OBJECT_STORE_ACCESS_KEY",
+            "OBJECT_STORE_SECRET_KEY",
+            "OBJECT_STORE_BUCKET",
+        )
+    ),
+    reason="MinIO acceptance test requires configured object storage",
 )
 def test_minio_upload_download_roundtrip():
     # Create a small temp file

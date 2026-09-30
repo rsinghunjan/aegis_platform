@@ -11,6 +11,7 @@ Run: pytest tests/test_mlflow_integration.py -q
 import tempfile
 import os
 import sys
+import types
 from unittest import mock
 
 import pytest
@@ -33,10 +34,15 @@ class DummyClient:
         return out_dir
 
 def test_register_download_and_sign(monkeypatch, tmp_path):
-    # monkeypatch MlflowClient
+    # provide the optional MLflow dependency without requiring it in unit tests
     dummy = DummyClient(download_return=str(tmp_path))
-    monkeypatch.setattr(reg_script, "mlflow", mock.MagicMock())
-    monkeypatch.setattr(reg_script, "MlflowClient", lambda uri=None: dummy)
+    tracking = types.ModuleType("mlflow.tracking")
+    tracking.MlflowClient = lambda uri=None: dummy
+    mlflow = types.ModuleType("mlflow")
+    mlflow.set_tracking_uri = lambda uri: None
+    mlflow.tracking = tracking
+    monkeypatch.setitem(sys.modules, "mlflow", mlflow)
+    monkeypatch.setitem(sys.modules, "mlflow.tracking", tracking)
     # monkeypatch sign_model_artifact
     sign_calls = []
     def fake_sign(p, key):

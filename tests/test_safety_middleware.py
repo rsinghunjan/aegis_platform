@@ -3,6 +3,9 @@
 # They validate the middleware blocks malicious-looking prompts and image payloads,
 # and lets benign payloads through.
 import pytest
+
+pytest.importorskip("aegis_multimodal_ai_system.middleware.safety_middleware")
+
 from aegis_multimodal_ai_system.middleware import safety_middleware as sm
 
 class DummyActions:

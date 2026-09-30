@@ -1,27 +1,3 @@
-  7
-  8
-  9
- 10
- 11
- 12
- 13
- 14
- 15
- 16
- 17
- 18
- 19
- 20
- 21
- 22
- 23
- 24
- 25
- 26
- 27
- 28
- 29
- 30
 #!/usr/bin/env python3
 """
 Unit test to ensure enforcement patch calls fetch_and_verify_model before loader runs.

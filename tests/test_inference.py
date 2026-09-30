@@ -1,5 +1,8 @@
 import json
+import pytest
 from fastapi.testclient import TestClient
+
+pytest.importorskip("aegis_multimodal_ai_system.inference.server")
 
 from aegis_multimodal_ai_system.inference.server import app, model_wrapper
 

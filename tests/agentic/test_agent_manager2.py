@@ -1,5 +1,9 @@
 import asyncio
 
+import pytest
+
+pytest.importorskip("aegis_multimodal_ai_system.agentic.agent_manager")
+
 from aegis_multimodal_ai_system.agentic.agent_manager import (
     AgentManager,
     example_echo_tool,

@@ -1,69 +1,3 @@
-  1
-  2
-  3
-  4
-  5
-  6
-  7
-  8
-  9
- 10
- 11
- 12
- 13
- 14
- 15
- 16
- 17
- 18
- 19
- 20
- 21
- 22
- 23
- 24
- 25
- 26
- 27
- 28
- 29
- 30
- 31
- 32
- 33
- 34
- 35
- 36
- 37
- 38
- 39
- 40
- 41
- 42
- 43
- 44
- 45
- 46
- 47
- 48
- 49
- 50
- 51
- 52
- 53
- 54
- 55
- 56
- 57
- 58
- 59
- 60
- 61
- 62
- 63
- 64
- 65
- 66
 """
 Unit-style tests for MLflow registration wiring.
 
@@ -76,6 +10,8 @@ Run: pytest tests/test_mlflow_integration.py -q
 """
 import tempfile
 import os
+import sys
+import types
 from unittest import mock
 
 import pytest
@@ -98,9 +34,15 @@ class DummyClient:
         return out_dir
 
 def test_register_download_and_sign(monkeypatch, tmp_path):
-    # monkeypatch MlflowClient
+    # provide the optional MLflow dependency without requiring it in unit tests
     dummy = DummyClient(download_return=str(tmp_path))
-    monkeypatch.setattr("mlflow.tracking.MlflowClient", lambda uri=None: dummy)
+    tracking = types.ModuleType("mlflow.tracking")
+    tracking.MlflowClient = lambda uri=None: dummy
+    mlflow = types.ModuleType("mlflow")
+    mlflow.set_tracking_uri = lambda uri: None
+    mlflow.tracking = tracking
+    monkeypatch.setitem(sys.modules, "mlflow", mlflow)
+    monkeypatch.setitem(sys.modules, "mlflow.tracking", tracking)
     # monkeypatch sign_model_artifact
     sign_calls = []
     def fake_sign(p, key):
@@ -117,7 +59,6 @@ def test_register_download_and_sign(monkeypatch, tmp_path):
 
     # invoke main with args
     test_args = ["--run-id", "r1", "--artifact-path", "model/model.joblib", "--model-name", "mymodel", "--sign-key", "k1"]
-    import sys
     old_argv = sys.argv[:]
     sys.argv = [sys.argv[0]] + test_args
     try:

@@ -1,103 +1,3 @@
-  1
-  2
-  3
-  4
-  5
-  6
-  7
-  8
-  9
- 10
- 11
- 12
- 13
- 14
- 15
- 16
- 17
- 18
- 19
- 20
- 21
- 22
- 23
- 24
- 25
- 26
- 27
- 28
- 29
- 30
- 31
- 32
- 33
- 34
- 35
- 36
- 37
- 38
- 39
- 40
- 41
- 42
- 43
- 44
- 45
- 46
- 47
- 48
- 49
- 50
- 51
- 52
- 53
- 54
- 55
- 56
- 57
- 58
- 59
- 60
- 61
- 62
- 63
- 64
- 65
- 66
- 67
- 68
- 69
- 70
- 71
- 72
- 73
- 74
- 75
- 76
- 77
- 78
- 79
- 80
- 81
- 82
- 83
- 84
- 85
- 86
- 87
- 88
- 89
- 90
- 91
- 92
- 93
- 94
- 95
- 96
- 97
- 98
- 99
-100
 """
 Asynchronous tasks for Aegis.
 
@@ -124,6 +24,13 @@ from api.models import Job
 
 logger = logging.getLogger("aegis_tasks")
 logging.basicConfig(level=logging.INFO)
+
+# Per-unit simulated work duration (seconds). Kept small by default and
+# configurable via env var so this demo/placeholder loop doesn't needlessly
+# tie up a Celery worker thread/process for multiple seconds per job; replace
+# time.sleep with real (ideally I/O-bound, non-blocking-where-possible) work
+# in production.
+UNIT_WORK_SLEEP_S = float(os.environ.get("AEGIS_TASK_UNIT_SLEEP_S", "0.05"))
 
 
 def _now():
@@ -169,8 +76,12 @@ def process_job(self, request_id: str):
                 return {"status": "cancelled", "request_id": request_id}
 
             logger.info("Processing unit %d/%d for job %s", i + 1, work_units, request_id)
-            # simulate CPU-bound or IO-bound work; replace with real ops
-            time.sleep(1.0)
+            # simulate CPU-bound or IO-bound work; replace with real ops.
+            # Uses a small, configurable sleep (see UNIT_WORK_SLEEP_S) instead
+            # of a hardcoded 1s so this demo loop doesn't waste a worker
+            # process/thread for longer than necessary.
+            if UNIT_WORK_SLEEP_S > 0:
+                time.sleep(UNIT_WORK_SLEEP_S)
             results.append({"unit": i + 1, "label": "demo", "score": 0.9})
 
         # Simulate postprocessing (aggregating results)

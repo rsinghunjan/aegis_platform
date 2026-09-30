@@ -1,58 +1,3 @@
-  2
-  3
-  4
-  5
-  6
-  7
-  8
-  9
- 10
- 11
- 12
- 13
- 14
- 15
- 16
- 17
- 18
- 19
- 20
- 21
- 22
- 23
- 24
- 25
- 26
- 27
- 28
- 29
- 30
- 31
- 32
- 33
- 34
- 35
- 36
- 37
- 38
- 39
- 40
- 41
- 42
- 43
- 44
- 45
- 46
- 47
- 48
- 49
- 50
- 51
- 52
- 53
- 54
- 55
- 56
 #!/usr/bin/env python3
 """
 Simple canary traffic generator for canary tests.
@@ -64,7 +9,7 @@ from __future__ import annotations
 import argparse
 import time
 import random
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, ALL_COMPLETED
 import httpx
 
 def send_request(url: str, payload: dict, timeout: float = 5.0):
@@ -90,23 +35,41 @@ def main():
 
     end = time.time() + args.duration
     pool = ThreadPoolExecutor(max_workers=100)
-    futures = []
+    # See simulate_canary_load.py: harvest completed futures incrementally so
+    # `pending` doesn't grow across the whole run for long/high-qps tests.
+    pending = set()
+    total = 0
+    ok = 0
+
+    def harvest(block: bool):
+        nonlocal ok, total
+        if not pending:
+            return
+        done, still_pending = wait(
+            pending,
+            timeout=None if block else 0,
+            return_when=FIRST_COMPLETED if block else ALL_COMPLETED,
+        )
+        for f in done:
+            status = f.result()
+            total += 1
+            if 200 <= status < 300:
+                ok += 1
+        pending.clear()
+        pending.update(still_pending)
+
     while time.time() < end:
         for _ in range(args.qps):
             bad = random.random() < args.error_rate
             payload = make_payload(bad=bad)
-            futures.append(pool.submit(send_request, args.url, payload))
+            pending.add(pool.submit(send_request, args.url, payload))
         time.sleep(1)
+        harvest(block=False)
 
-    total = 0
-    ok = 0
-    for f in as_completed(futures):
-        status = f.result()
-        total += 1
-        if 200 <= status < 300:
-            ok += 1
+    while pending:
+        harvest(block=True)
+    pool.shutdown(wait=True)
     print(f"Sent {total} requests, successful: {ok}/{total}")
 
 if __name__ == "__main__":
     main()
-scripts/simulate_canary_load.py

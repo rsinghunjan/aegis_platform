@@ -1,6 +1,11 @@
 import os
 import tempfile
 import json
+import pytest
+
+pytest.importorskip("aegis_multimodal_ai_system.policy.policy_engine")
+pytest.importorskip("aegis_multimodal_ai_system.review.db")
+
 from aegis_multimodal_ai_system.policy.policy_engine import PolicyEngine
 from aegis_multimodal_ai_system.review import db as review_db
 

@@ -1,33 +1,3 @@
-  1
-  2
-  3
-  4
-  5
-  6
-  7
-  8
-  9
- 10
- 11
- 12
- 13
- 14
- 15
- 16
- 17
- 18
- 19
- 20
- 21
- 22
- 23
- 24
- 25
- 26
- 27
- 28
- 29
- 30
 #!/usr/bin/env python3
 """
 Presigned / PAR semantics test.
@@ -41,7 +11,7 @@ import tempfile
 from pathlib import Path
 import pytest
 
-from aegis_multimodal_ai_system.storage.factory import create_storage_client
+from storage.factory import create_storage_client
 
 @pytest.mark.skipif(not os.environ.get("OBJECT_STORE_TYPE"), reason="No OBJECT_STORE_TYPE configured")
 def test_get_presigned_url_roundtrip():
@@ -58,4 +28,3 @@ def test_get_presigned_url_roundtrip():
     except NotImplementedError:
         pytest.skip("Presigned URL not implemented for this provider in adapter")
     assert url and isinstance(url, str)
-tests/presign/test_presign_urls.py

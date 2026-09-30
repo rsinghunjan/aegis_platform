@@ -1,38 +1,3 @@
- 10
- 11
- 12
- 13
- 14
- 15
- 16
- 17
- 18
- 19
- 20
- 21
- 22
- 23
- 24
- 25
- 26
- 27
- 28
- 29
- 30
- 31
- 32
- 33
- 34
- 35
- 36
- 37
- 38
- 39
- 40
- 41
- 42
- 43
- 44
 """
 Unit tests for HF importer. Uses monkeypatch to avoid network calls.
 
@@ -77,4 +42,3 @@ def test_import_upload_s3_raises_without_bucket(monkeypatch, fake_hf_repo):
     monkeypatch.setattr("api.hf_importer.snapshot_download", lambda repo_id, cache_dir, resume_download: fake_hf_repo)
     with pytest.raises(ValueError):
         import_from_hf(repo_id="fake/repo", model_name="fake-model", upload_s3=True, register=False)
-tests/test_hf_importer.py

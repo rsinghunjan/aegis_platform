@@ -1,38 +1,3 @@
-  1
-  2
-  3
-  4
-  5
-  6
-  7
-  8
-  9
- 10
- 11
- 12
- 13
- 14
- 15
- 16
- 17
- 18
- 19
- 20
- 21
- 22
- 23
- 24
- 25
- 26
- 27
- 28
- 29
- 30
- 31
- 32
- 33
- 34
- 35
 #!/usr/bin/env python3
 """
 Acceptance tests that validate the storage adapters against the MinIO dev stack.
@@ -49,8 +14,23 @@ import tempfile
 from pathlib import Path
 import uuid
 
-from aegis_multimodal_ai_system.storage.factory import create_storage_client
+import pytest
 
+from storage.factory import create_storage_client
+
+@pytest.mark.skipif(
+    os.environ.get("OBJECT_STORE_TYPE") != "minio"
+    or not all(
+        os.environ.get(name)
+        for name in (
+            "OBJECT_STORE_ENDPOINT",
+            "OBJECT_STORE_ACCESS_KEY",
+            "OBJECT_STORE_SECRET_KEY",
+            "OBJECT_STORE_BUCKET",
+        )
+    ),
+    reason="MinIO acceptance test requires configured object storage",
+)
 def test_minio_upload_download_roundtrip():
     # Create a small temp file
     tmp = tempfile.mkdtemp()

@@ -5,7 +5,7 @@ import flwr as fl
 import numpy as np
 from flwr.server.strategy import FedAvg
 
-from ..metrics.metrics import start_metrics_server
+from metrics.metrics import start_metrics_server
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -23,10 +23,10 @@ def main():
     # Configure strategy
     strategy = FedAvg(
         fraction_fit=1.0,
-        fraction_eval=1.0,
-        min_fit_clients=1,
-        min_eval_clients=1,
-        min_available_clients=1,
+        fraction_evaluate=1.0,
+        min_fit_clients=2,
+        min_evaluate_clients=2,
+        min_available_clients=2,
         evaluate_metrics_aggregation_fn=None,
     )
 

@@ -1,38 +1,3 @@
-  1
-  2
-  3
-  4
-  5
-  6
-  7
-  8
-  9
- 10
- 11
- 12
- 13
- 14
- 15
- 16
- 17
- 18
- 19
- 20
- 21
- 22
- 23
- 24
- 25
- 26
- 27
- 28
- 29
- 30
- 31
- 32
- 33
- 34
- 35
 #!/usr/bin/env python3
 """
 Storage client factory.
@@ -44,7 +9,7 @@ from __future__ import annotations
 from typing import Optional
 from pathlib import Path
 
-from aegis_multimodal_ai_system import config
+import config
 
 from .abstract import StorageClient
 
@@ -68,4 +33,3 @@ def create_storage_client(bucket: Optional[str] = None) -> StorageClient:
         from .azure_adapter import AzureBlobStorageAdapter
         return AzureBlobStorageAdapter(container=bucket)
     raise RuntimeError(f"Unsupported OBJECT_STORE_TYPE: {typ}")
-aegis_multimodal_ai_system/storage/factory.py

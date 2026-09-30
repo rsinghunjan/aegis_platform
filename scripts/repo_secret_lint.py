@@ -11,10 +11,10 @@ import re
 from pathlib import Path
 
 PATTERNS = [
-    re.compile(r"COSIGN_PRIVATE_KEY_B64"),
-    re.compile(r"COSIGN_PASSWORD"),
-    re.compile(r"-----BEGIN .*PRIVATE KEY-----"),
-    re.compile(r"PRIVATE_KEY_B64"),
+    re.compile(r"COSIGN_" + r"PRIVATE_" + r"KEY_B64"),
+    re.compile(r"COSIGN_" + r"PASS" + r"WORD"),
+    re.compile(r"-----BEGIN .*" + r"PRIVATE" + r" KEY-----"),
+    re.compile(r"PRIVATE_" + r"KEY_B64"),
 ]
 
 def scan_file(path: Path):
@@ -34,9 +34,12 @@ def main(paths):
     found = []
     for p in paths:
         base = Path(p)
-        files = (base,) if base.is_file() else base.rglob("*")
+        files = [base] if base.is_file() else base.rglob("*")
         for f in files:
-            if f.is_file() and f.suffix not in {".png", ".jpg", ".jpeg", ".gif", ".so", ".bin"}:
+            if (
+                f.is_file()
+                and f.suffix not in {".png", ".jpg", ".jpeg", ".gif", ".so", ".bin"}
+            ):
                 found += scan_file(f)
     if found:
         print("Potential secret/key patterns found:")

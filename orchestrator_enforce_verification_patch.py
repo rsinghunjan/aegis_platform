@@ -1,27 +1,3 @@
- 42
- 43
- 44
- 45
- 46
- 47
- 48
- 49
- 50
- 51
- 52
- 53
- 54
- 55
- 56
- 57
- 58
- 59
- 60
- 61
- 62
- 63
- 64
- 65
 #!/usr/bin/env python3
 """
 Lightweight runtime enforcement patch.
@@ -33,7 +9,7 @@ so you can deploy quickly and then convert callers to the explicit fetch_and_pre
 
 Usage:
   # early in app startup:
-  import aegis_multimodal_ai_system.orchestrator.enforce_verification_patch as ev
+  import orchestrator_enforce_verification_patch as ev
   ev.patch_loaders()
 """
 from __future__ import annotations
@@ -41,7 +17,7 @@ import logging
 from functools import wraps
 from typing import Callable, Any
 
-from aegis_multimodal_ai_system.model_registry.verify_and_download import fetch_and_verify_model
+from model_registry import verify_and_download
 
 LOG = logging.getLogger("aegis.enforce_verify")
 
@@ -57,7 +33,9 @@ def _wrap_loader(fn: Callable[..., Any], model_name_arg_index: int = 0, artifact
             if model_name:
                 LOG.debug("Enforcing verification for model %s", model_name)
                 # will raise on verification failure
-                local_path = fetch_and_verify_model(str(model_name), artifact_name=artifact_name)
+                local_path = verify_and_download.fetch_and_verify_model(
+                    str(model_name), artifact_name=artifact_name
+                )
                 # inject resolved local path into kwargs as 'local_artifact' if caller accepts it
                 kwargs.setdefault("local_artifact", local_path)
         except Exception as e:
@@ -87,4 +65,3 @@ def patch_loaders():
             LOG.info("Patched onnx_loader.load_onnx_model to enforce verification")
     except Exception:
         LOG.debug("onnx_loader not present or could not be patched")
-aegis_multimodal_ai_system/orchestrator/enforce_verification_patch.py

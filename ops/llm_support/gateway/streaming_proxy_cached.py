@@ -43,6 +43,12 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 CACHE_SAFE_SCORE = float(os.environ.get("CACHE_SAFE_SCORE", "0.1"))
 CACHE_DP_ALLOW_HITS = os.environ.get("CACHE_DP_ALLOW_HITS", "false").lower() in ("1", "true")
 CACHE_MAX_TEMPERATURE = float(os.environ.get("CACHE_MAX_TEMPERATURE", "0.0"))
+# Cap on how much of a streamed response we accumulate in memory purely for
+# the purpose of (potentially) caching it. The response itself is always
+# streamed to the client chunk-by-chunk regardless of this limit; once the
+# accumulated size exceeds this cap we stop buffering and simply skip caching
+# for that (very long) generation, bounding per-request memory growth.
+CACHE_MAX_BUFFER_CHARS = int(os.environ.get("CACHE_MAX_BUFFER_CHARS", "200000"))
 
 LLM_BACKEND_HTTP = os.environ.get("LLM_BACKEND_HTTP", "http://vllm.model-serving.svc.cluster.local:8080/generate_stream")
 DP_SERVICE = os.environ.get("DP_SERVICE", "http://dp-service:8084")
@@ -132,6 +138,15 @@ async def backend_stream(payload: dict) -> AsyncIterator[dict]:
                     yield {"text": line}
 
 
+async def notify_orchestrator(payload: dict) -> None:
+    """Best-effort webhook notification; failures must not break the request path."""
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as c:
+            await c.post(ORCH_WEBHOOK, json=payload)
+    except Exception:
+        LOG.exception("failed to notify orchestrator webhook")
+
+
 @app.post("/generate")
 async def generate(req: Request):
     """
@@ -190,35 +205,56 @@ async def generate(req: Request):
         else:
             CACHE_MISSES.labels(backend="redis").inc()
 
-    # Cache miss: stream from backend and accumulate full response
+    # Cache miss: stream from backend and accumulate full response. The
+    # streaming body must be produced by an async generator wrapped in a
+    # StreamingResponse rather than `yield`-ing directly from the route
+    # handler coroutine (an async generator can't itself `return` the
+    # earlier cache-hit Response objects above).
     CACHE_MISSES.labels(backend="backend").inc()
-    final_chunks = []
-    safety_score_max = 0.0
-    async for chunk in backend_stream(body):
-        # each chunk might be {"text": "..."} or {"text":"...", "score":0.01}
-        text = chunk.get("text", "")
-        score = float(chunk.get("score", 0.0))
-        if score > safety_score_max:
-            safety_score_max = score
-        # stream chunk to client as incremental NDJSON for low-latency UX
-        yield_chunk = json.dumps({"status": "ok", "text": text}) + "\n"
-        final_chunks.append(text)
-        yield yield_chunk
 
-    # After backend completed, decide caching
-    full_response = "".join(final_chunks)
-    # only cache if request is cacheable and safety score below threshold
-    if cacheable_request(body) and safety_score_max <= CACHE_SAFE_SCORE:
-        entry = {"response": full_response, "meta": {"model": model, "model_version": model_version, "cached_at": int(time.time())}}
-        # write to redis and local depending on mode
-        if CACHE_MODE in ("redis", "hybrid") and _redis_cache:
-            try:
-                _redis_cache.set(key, entry, ttl=LOCAL_CACHE_TTL)
-            except Exception:
-                LOG.exception("redis set failed on caching")
-        if CACHE_MODE in ("local", "hybrid"):
-            _local_cache.set(key, entry)
-            LOCAL_CACHE_SIZE_GAUGE.set(len(_local_cache))
+    async def _stream() -> AsyncIterator[str]:
+        final_chunks = []
+        buffered_chars = 0
+        buffer_overflowed = False
+        safety_score_max = 0.0
+        async for chunk in backend_stream(body):
+            # each chunk might be {"text": "..."} or {"text":"...", "score":0.01}
+            text = chunk.get("text", "")
+            score = float(chunk.get("score", 0.0))
+            if score > safety_score_max:
+                safety_score_max = score
+            # stream chunk to client as incremental NDJSON for low-latency UX
+            yield_chunk = json.dumps({"status": "ok", "text": text}) + "\n"
+            if not buffer_overflowed:
+                buffered_chars += len(text)
+                if buffered_chars > CACHE_MAX_BUFFER_CHARS:
+                    # Stop buffering for caching purposes only; the response
+                    # keeps streaming to the client unaffected. Drop what we
+                    # already buffered so memory doesn't keep growing with the
+                    # response length.
+                    buffer_overflowed = True
+                    final_chunks = []
+                else:
+                    final_chunks.append(text)
+            yield yield_chunk
 
-    elapsed = time.time() - start
-    CACHE_LATENCY.observe(elapsed)
+        # After backend completed, decide caching
+        full_response = "".join(final_chunks)
+        # only cache if request is cacheable, safety score below threshold, and we
+        # didn't exceed the in-memory buffering cap above
+        if not buffer_overflowed and cacheable_request(body) and safety_score_max <= CACHE_SAFE_SCORE:
+            entry = {"response": full_response, "meta": {"model": model, "model_version": model_version, "cached_at": int(time.time())}}
+            # write to redis and local depending on mode
+            if CACHE_MODE in ("redis", "hybrid") and _redis_cache:
+                try:
+                    _redis_cache.set(key, entry, ttl=LOCAL_CACHE_TTL)
+                except Exception:
+                    LOG.exception("redis set failed on caching")
+            if CACHE_MODE in ("local", "hybrid"):
+                _local_cache.set(key, entry)
+                LOCAL_CACHE_SIZE_GAUGE.set(len(_local_cache))
+
+        elapsed = time.time() - start
+        CACHE_LATENCY.observe(elapsed)
+
+    return StreamingResponse(_stream(), media_type="application/x-ndjson")

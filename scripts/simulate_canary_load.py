@@ -1,33 +1,3 @@
- 34
- 35
- 36
- 37
- 38
- 39
- 40
- 41
- 42
- 43
- 44
- 45
- 46
- 47
- 48
- 49
- 50
- 51
- 52
- 53
- 54
- 55
- 56
- 57
- 58
- 59
- 60
- 61
- 62
- 63
 #!/usr/bin/env python3
 """
 Simple canary traffic generator.
@@ -44,7 +14,7 @@ import argparse
 import httpx
 import time
 import random
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, ALL_COMPLETED
 
 def send_request(url: str, payload: dict, timeout: float = 5.0):
     try:
@@ -69,26 +39,49 @@ def main():
 
     end = time.time() + args.duration
     pool = ThreadPoolExecutor(max_workers=100)
-    futures = []
+    # Only keep in-flight/not-yet-harvested futures in memory; completed ones
+    # are tallied and discarded immediately below instead of accumulating the
+    # full run's futures list (which can grow very large for long/high-qps
+    # runs and needlessly hides client-side memory pressure behind the test).
+    pending = set()
     sent = 0
+    ok = 0
+    total = 0
+
+    def harvest(block: bool):
+        nonlocal ok, total
+        if not pending:
+            return
+        done, still_pending = wait(
+            pending,
+            timeout=None if block else 0,
+            return_when=FIRST_COMPLETED if block else ALL_COMPLETED,
+        )
+        for f in done:
+            status, _body = f.result()
+            total += 1
+            if 200 <= status < 300:
+                ok += 1
+        pending.clear()
+        pending.update(still_pending)
+
     while time.time() < end:
         for _ in range(args.qps):
             bad = random.random() < args.error_rate
             payload = make_payload(bad=bad)
-            futures.append(pool.submit(send_request, args.url, payload))
+            pending.add(pool.submit(send_request, args.url, payload))
             sent += 1
         # sleep 1 second per QPS loop
         time.sleep(1)
+        # drain any requests that already completed so `pending` doesn't grow
+        # unbounded over a long run
+        harvest(block=False)
 
-    ok = 0
-    total = 0
-    for f in as_completed(futures):
-        status, body = f.result()
-        total += 1
-        if status >= 200 and status < 300:
-            ok += 1
+    # drain whatever is left after the run ends
+    while pending:
+        harvest(block=True)
+    pool.shutdown(wait=True)
     print(f"Sent {sent} requests, successful: {ok}/{total}")
 
 if __name__ == "__main__":
     main()
-scripts/simulate_canary_load.py

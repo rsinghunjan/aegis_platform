@@ -40,6 +40,11 @@ MAX_SPEC_CHUNK_LEN = int(os.environ.get("SPEC_CHUNK_LEN", "8"))
 
 EVENT_LOG_PATH = os.environ.get("SPEC_EVENT_LOG", "/var/log/aegis/speculative_events.jsonl")
 METRICS_PORT = int(os.environ.get("SPEC_METRICS_PORT", "9460"))
+# Backpressure bound for the in-memory scoring queue. Without a cap, a burst
+# of requests (or a slow/unavailable teacher endpoint) can grow
+# _BATCH_QUEUE/_PENDING_FUTURES without limit, risking unbounded memory
+# growth under sustained load or client disconnects.
+MAX_QUEUE_SIZE = int(os.environ.get("SPEC_MAX_QUEUE_SIZE", "2048"))
 
 # Prometheus metrics
 MET_REQS = Counter("aegis_spec_requests_total", "Speculative decode requests received")
@@ -49,6 +54,8 @@ MET_REQ_FALLBACK = Counter("aegis_spec_fallback_count_total", "Requests that fel
 MET_ACCEPTANCE_RATE = Gauge("aegis_spec_acceptance_rate", "Acceptance rate of student-proposed tokens (rolling, set by app)")
 MET_TOKENS_SAVED = Counter("aegis_spec_tokens_saved_total", "Total teacher autoreg steps saved (approx)")
 MET_ENERGY_SAVED_KWH = Counter("aegis_spec_energy_saved_kwh_total", "Estimated kWh saved by speculative decoding")
+MET_QUEUE_DEPTH = Gauge("aegis_spec_queue_depth", "Current depth of the in-memory scoring batch queue")
+MET_QUEUE_REJECTED = Counter("aegis_spec_queue_rejected_total", "Scoring requests rejected because the batch queue was full")
 
 # In-memory batch queue and synchronization
 _BATCH_QUEUE: List[Dict[str, Any]] = []
@@ -60,10 +67,14 @@ app = FastAPI(title="Aegis Speculative Orchestrator")
 
 # Helpers
 async def write_event(ev: Dict[str, Any]):
-    try:
+    """Append an audit event to the JSONL log without blocking the event loop."""
+    def _write():
         os.makedirs(os.path.dirname(EVENT_LOG_PATH), exist_ok=True)
         with open(EVENT_LOG_PATH, "a") as f:
             f.write(json.dumps(ev) + "\n")
+
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, _write)
     except Exception:
         pass
 
@@ -100,8 +111,15 @@ async def enqueue_for_scoring(context: str, draft: str) -> Dict[str, Any]:
     fut = asyncio.get_event_loop().create_future()
     job = {"job_id": job_id, "context": context, "draft": draft}
     async with _BATCH_LOCK:
+        if len(_BATCH_QUEUE) >= MAX_QUEUE_SIZE:
+            # Backpressure: reject instead of growing the in-memory queue
+            # without bound (e.g. teacher endpoint slow/unavailable or a
+            # sustained burst of traffic).
+            MET_QUEUE_REJECTED.inc()
+            raise RuntimeError("scoring queue full; try again later")
         _BATCH_QUEUE.append(job)
         _PENDING_FUTURES[job_id] = fut
+        MET_QUEUE_DEPTH.set(len(_BATCH_QUEUE))
         # If queue large, leave batching to background worker; worker wakes periodically
     # wait for future
     try:
@@ -124,6 +142,7 @@ async def _batch_worker():
                 continue
             batch = _BATCH_QUEUE[:BATCH_MAX]
             del _BATCH_QUEUE[:len(batch)]
+            MET_QUEUE_DEPTH.set(len(_BATCH_QUEUE))
         # prepare payload
         payload = [{"job_id": j["job_id"], "context": j["context"], "draft": j["draft"]} for j in batch]
         # call teacher score batch

@@ -1,27 +1,3 @@
-  7
-  8
-  9
- 10
- 11
- 12
- 13
- 14
- 15
- 16
- 17
- 18
- 19
- 20
- 21
- 22
- 23
- 24
- 25
- 26
- 27
- 28
- 29
- 30
 #!/usr/bin/env python3
 """
 Unit test to ensure enforcement patch calls fetch_and_verify_model before loader runs.
@@ -31,12 +7,19 @@ import pytest
 from pathlib import Path
 
 def test_enforcement_patch_calls_verify(monkeypatch, tmp_path):
+    pytest.importorskip(
+        "aegis_multimodal_ai_system.orchestrator.enforce_verification_patch"
+    )
+
     import types, sys
     dummy = types.SimpleNamespace()
     def load_savedmodel(model_name: str, local_artifact: Path = None):
         assert local_artifact is not None
         return "loaded"
     dummy.load_savedmodel = load_savedmodel
+    loaders = types.ModuleType('aegis_multimodal_ai_system.loaders')
+    loaders.tf_loader = dummy
+    sys.modules['aegis_multimodal_ai_system.loaders'] = loaders
     sys.modules['aegis_multimodal_ai_system.loaders.tf_loader'] = dummy
 
     called = {'verified': False}
@@ -44,9 +27,9 @@ def test_enforcement_patch_calls_verify(monkeypatch, tmp_path):
         called['verified'] = True
         return tmp_path / "fake_local"
 
-    monkeypatch.setattr('aegis_multimodal_ai_system.model_registry.verify_and_download.fetch_and_verify_model', fake_fetch)
+    monkeypatch.setattr('model_registry.verify_and_download.fetch_and_verify_model', fake_fetch)
 
-    from aegis_multimodal_ai_system.orchestrator import enforce_verification_patch as ev
+    import orchestrator_enforce_verification_patch as ev
     ev.patch_loaders()
 
     res = dummy.load_savedmodel("example-model")

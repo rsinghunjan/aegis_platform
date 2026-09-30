@@ -45,6 +45,67 @@ def test_agent_api_fails_closed_without_tenant_authorizer(tmp_path):
     assert response.json()["detail"] == "agent API authorization is not configured"
 
 
+def test_operator_read_models_are_authorized_and_return_summaries(tmp_path):
+    runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'operator.db'}"))
+    runtime.register_tool(
+        ToolSpec(name="echo", idempotent=True),
+        lambda _payload: {"ok": True},
+    )
+    with TestClient(
+        create_app(runtime, tenant_authorizer=lambda *_args: True)
+    ) as client:
+        created = client.post(
+            "/agent/runs",
+            json={
+                "tenant_id": "tenant-a",
+                "goal": '{"tool":"echo","input":{"api_key":"must-not-be-returned"}}',
+            },
+        )
+        run_id = created.json()["run_id"]
+        listing = client.get("/operator/agent/runs", params={"tenant_id": "tenant-a"})
+        timeline = client.get(
+            f"/operator/agent/runs/{run_id}/timeline",
+            params={"tenant_id": "tenant-a"},
+        )
+        catalog = client.get(
+            "/operator/agent/capabilities", params={"tenant_id": "tenant-a"}
+        )
+        summary = client.get(
+            "/operator/agent/evidence-summary",
+            params={"tenant_id": "tenant-a", "run_id": run_id},
+        )
+    assert listing.status_code == timeline.status_code == catalog.status_code == 200
+    assert "goal" not in listing.json()["items"][0]
+    assert "must-not-be-returned" not in repr(listing.json())
+    assert catalog.json()["items"][0]["name"] == "echo"
+    assert summary.json()["count"] >= 1
+
+
+def test_run_can_be_created_then_executed_separately(tmp_path):
+    runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'separate.db'}"))
+    calls = []
+    runtime.register_tool(
+        ToolSpec(name="echo", idempotent=True),
+        lambda _payload: calls.append(True) or {"ok": True},
+    )
+    with TestClient(
+        create_app(runtime, tenant_authorizer=lambda *_args: True)
+    ) as client:
+        created = client.post(
+            "/agent/runs/create",
+            json={"tenant_id": "tenant-a", "goal": '{"tool":"echo","input":{}}'},
+        )
+        assert created.status_code == 200
+        assert created.json()["status"] == "PENDING"
+        executed = client.post(
+            f"/agent/runs/{created.json()['run_id']}/execute",
+            json={"tenant_id": "tenant-a"},
+        )
+    assert executed.status_code == 200
+    assert executed.json()["status"] == "SUCCEEDED"
+    assert calls == [True]
+
+
 def test_agent_approval_requires_authorized_actor(tmp_path):
     runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'approval.db'}"))
     runtime.register_tool(
@@ -78,6 +139,33 @@ def test_agent_approval_requires_authorized_actor(tmp_path):
     assert approved.status_code == 200
     assert approved.json()["status"] == "SUCCEEDED"
     assert authorizations[-1] == ("tenant-a", "approve", "release-manager")
+
+
+def test_new_approval_notification_is_injected_and_evidence_safe(tmp_path):
+    runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'notify.db'}"))
+    runtime.register_tool(ToolSpec(name="release", risk_level="high"), lambda _: {})
+    notifications = []
+    with TestClient(
+        create_app(
+            runtime,
+            tenant_authorizer=lambda *_args: True,
+            approval_notifier=lambda approval: notifications.append(approval),
+        )
+    ) as client:
+        response = client.post(
+            "/agent/runs",
+            json={
+                "tenant_id": "tenant-a",
+                "goal": '{"tool":"release","input":{}}',
+            },
+        )
+    assert response.json()["status"] == "WAITING_APPROVAL"
+    assert len(notifications) == 1
+    assert notifications[0].tool_name == "release"
+    assert any(
+        item.kind == "approval_notification"
+        for item in runtime.list_evidence(response.json()["run_id"], "tenant-a")
+    )
 
 
 def test_dockerfile_defaults_to_nonroot_uvicorn_service():

@@ -12,7 +12,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
 # Start server in background
-python -m aegis_multimodal_ai_system.federated.server &
+python -m federated.server &
 SERVER_PID=$!
 echo "Started federated server (pid=${SERVER_PID})"
 
@@ -46,11 +46,11 @@ PY
 done
 
 # Start two clients (background)
-python -m aegis_multimodal_ai_system.federated.client --cid 1 --host 127.0.0.1:8080 &
+python -m federated.client --cid 1 --host 127.0.0.1:8080 &
 C1_PID=$!
 echo "Started client 1 (pid=${C1_PID})"
 
-python -m aegis_multimodal_ai_system.federated.client --cid 2 --host 127.0.0.1:8080 &
+python -m federated.client --cid 2 --host 127.0.0.1:8080 &
 C2_PID=$!
 echo "Started client 2 (pid=${C2_PID})"
 
@@ -68,8 +68,8 @@ while kill -0 "${SERVER_PID}" >/dev/null 2>&1; do
 done
 
 # Reap clients and server
-wait "${SERVER_PID}" || true
-wait "${C1_PID}" || true
-wait "${C2_PID}" || true
+wait "${SERVER_PID}"
+wait "${C1_PID}"
+wait "${C2_PID}"
 
 echo "Federated smoke test completed successfully"

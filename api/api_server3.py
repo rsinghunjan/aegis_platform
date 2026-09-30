@@ -1,13 +1,16 @@
 
 # (excerpt) server routes for async job submission & status
 # Add the new endpoints to the existing api/api_server.py file you already have.
-# I am showing the new route handlers below — drop them into the file after registry exists.
+import uuid
 
-from fastapi import BackgroundTasks
-from api.tasks import process_job
+from fastapi import Depends, HTTPException
+from sqlalchemy.exc import SQLAlchemyError
+
+from api import auth
+from api.api_server2 import app
+from api.celery_app import app as celery_app
 from api.db import SessionLocal
 from api.models import Job
-from sqlalchemy.exc import SQLAlchemyError
 
 # ... existing imports and code above remain unchanged ...
 
@@ -41,7 +44,9 @@ async def create_job(payload: dict, current_user = Depends(auth.require_scopes([
         session.refresh(job)
 
         # enqueue Celery task (use request_id to correlate)
-        task = process_job.apply_async(args=[request_id], queue="aegis_tasks")
+        task = celery_app.send_task(
+            "aegis.process_job", args=[request_id], queue="aegis_tasks"
+        )
 
         # Optionally store celery task id back in job (extend model if desired)
         job_meta = {"celery_task_id": task.id}

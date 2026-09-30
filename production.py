@@ -70,8 +70,11 @@ def create_app(
     tenant_authorizer: Optional[
         Callable[[Request, str, str, Optional[str]], Any]
     ] = None,
+    approval_notifier: Optional[Callable[[Any], Any]] = None,
 ) -> FastAPI:
     selected_runtime = runtime or AgentRuntime()
+    if approval_notifier is not None:
+        selected_runtime.approval_notifier = approval_notifier
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):

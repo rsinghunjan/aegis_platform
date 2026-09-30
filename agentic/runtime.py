@@ -552,6 +552,7 @@ class AgentRuntime:
             sla = 3600
         self.approval_sla_seconds = max(1, int(sla))
         self.catalog = CapabilityCatalog()
+        self.approval_notifier: Optional[Callable[[Approval], Any]] = None
         self._tools: dict[str, tuple[ToolSpec, Callable[..., Any]]] = {}
 
     def register_tool(self, spec: ToolSpec, tool: Callable[..., Any]) -> None:
@@ -1270,36 +1271,68 @@ class AgentRuntime:
             if action == "review":
                 run.status = "WAITING_APPROVAL"
                 step.status = "WAITING_APPROVAL"
-                if not session.scalar(
+                pending_approval = session.scalar(
                     select(ApprovalRow).where(
                         ApprovalRow.run_id == run_id,
                         ApprovalRow.tenant_id == tenant_id,
                         ApprovalRow.step_id == step_id,
                         ApprovalRow.status == "pending",
                     )
-                ):
-                    session.add(
-                        ApprovalRow(
-                            approval_id=str(uuid.uuid4()),
-                            run_id=run_id,
-                            tenant_id=tenant_id,
-                            step_id=step_id,
-                            tool_name=spec.name,
-                            status="pending",
-                            created_at=_now(),
-                            requested_at=_now(),
-                            expires_at=_now()
-                            + timedelta(
-                                seconds=spec.approval_sla_seconds
-                                or self.approval_sla_seconds
-                            ),
-                            sla_seconds=spec.approval_sla_seconds
-                            or self.approval_sla_seconds,
-                            escalation_status="none",
-                            capability_version=active_capability,
-                        )
+                )
+                new_approval = None
+                if pending_approval is None:
+                    new_approval = ApprovalRow(
+                        approval_id=str(uuid.uuid4()),
+                        run_id=run_id,
+                        tenant_id=tenant_id,
+                        step_id=step_id,
+                        tool_name=spec.name,
+                        status="pending",
+                        created_at=_now(),
+                        requested_at=_now(),
+                        expires_at=_now()
+                        + timedelta(
+                            seconds=spec.approval_sla_seconds
+                            or self.approval_sla_seconds
+                        ),
+                        sla_seconds=spec.approval_sla_seconds
+                        or self.approval_sla_seconds,
+                        escalation_status="none",
+                        capability_version=active_capability,
                     )
+                    session.add(new_approval)
                 session.commit()
+                if new_approval and self.approval_notifier:
+                    try:
+                        approval_payload = self._as_approval(new_approval)
+                        if inspect.iscoroutinefunction(self.approval_notifier):
+                            await asyncio.wait_for(
+                                self.approval_notifier(approval_payload),
+                                timeout=self.step_timeout,
+                            )
+                        else:
+                            callback_result = await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    self.approval_notifier, approval_payload
+                                ),
+                                timeout=self.step_timeout,
+                            )
+                            if inspect.isawaitable(callback_result):
+                                await asyncio.wait_for(
+                                    callback_result, timeout=self.step_timeout
+                                )
+                        notification_status = "sent"
+                    except Exception:
+                        notification_status = "failed"
+                    self.record_evidence(
+                        run_id,
+                        tenant_id,
+                        "approval_notification",
+                        {
+                            "approval_id": new_approval.approval_id,
+                            "status": notification_status,
+                        },
+                    )
                 return {
                     "status": "WAITING_APPROVAL",
                     "run_id": run_id,

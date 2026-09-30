@@ -58,8 +58,9 @@ async handlers are awaited. Both have a configurable timeout.
 - Approval rows bind tenant, run, step, tool, and capability version. The default
   SLA is 3600 seconds; expiration blocks execution. Halfway escalation is
   available via `ApprovalService`, with optional notification/escalation
-  callbacks. A scheduler must invoke expiry/escalation methods; the core server
-  does not run a background scheduler.
+  callbacks. `create_app(..., approval_notifier=...)` can notify when a new
+  request is persisted. A scheduler must invoke expiry/escalation methods; the
+  core server does not run a background scheduler.
 - Approvals are bound to the individual plan step and tool; approving one action
   does not authorize later high-risk actions in the same run.
 - `AEGIS_AUTONOMY_ENABLED=false` blocks autonomous actions globally. A recorded

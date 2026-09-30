@@ -141,6 +141,33 @@ def test_agent_approval_requires_authorized_actor(tmp_path):
     assert authorizations[-1] == ("tenant-a", "approve", "release-manager")
 
 
+def test_new_approval_notification_is_injected_and_evidence_safe(tmp_path):
+    runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'notify.db'}"))
+    runtime.register_tool(ToolSpec(name="release", risk_level="high"), lambda _: {})
+    notifications = []
+    with TestClient(
+        create_app(
+            runtime,
+            tenant_authorizer=lambda *_args: True,
+            approval_notifier=lambda approval: notifications.append(approval),
+        )
+    ) as client:
+        response = client.post(
+            "/agent/runs",
+            json={
+                "tenant_id": "tenant-a",
+                "goal": '{"tool":"release","input":{}}',
+            },
+        )
+    assert response.json()["status"] == "WAITING_APPROVAL"
+    assert len(notifications) == 1
+    assert notifications[0].tool_name == "release"
+    assert any(
+        item.kind == "approval_notification"
+        for item in runtime.list_evidence(response.json()["run_id"], "tenant-a")
+    )
+
+
 def test_dockerfile_defaults_to_nonroot_uvicorn_service():
     from pathlib import Path
 

@@ -16,6 +16,8 @@ class ApprovalService:
         self.runtime = runtime
         self.notifier = notifier
         self.escalator = escalator
+        if notifier:
+            runtime.approval_notifier = notifier
 
     def pending(self, tenant_id: Optional[str] = None) -> list[Approval]:
         return self.runtime.list_approvals(tenant_id, status="pending")

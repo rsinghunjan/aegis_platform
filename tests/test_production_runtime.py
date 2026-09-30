@@ -81,6 +81,31 @@ def test_operator_read_models_are_authorized_and_return_summaries(tmp_path):
     assert summary.json()["count"] >= 1
 
 
+def test_run_can_be_created_then_executed_separately(tmp_path):
+    runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'separate.db'}"))
+    calls = []
+    runtime.register_tool(
+        ToolSpec(name="echo", idempotent=True),
+        lambda _payload: calls.append(True) or {"ok": True},
+    )
+    with TestClient(
+        create_app(runtime, tenant_authorizer=lambda *_args: True)
+    ) as client:
+        created = client.post(
+            "/agent/runs/create",
+            json={"tenant_id": "tenant-a", "goal": '{"tool":"echo","input":{}}'},
+        )
+        assert created.status_code == 200
+        assert created.json()["status"] == "PENDING"
+        executed = client.post(
+            f"/agent/runs/{created.json()['run_id']}/execute",
+            json={"tenant_id": "tenant-a"},
+        )
+    assert executed.status_code == 200
+    assert executed.json()["status"] == "SUCCEEDED"
+    assert calls == [True]
+
+
 def test_agent_approval_requires_authorized_actor(tmp_path):
     runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'approval.db'}"))
     runtime.register_tool(

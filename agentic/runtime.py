@@ -336,8 +336,8 @@ class AgentStore:
             for column in sqlalchemy_inspect(self.engine).get_columns("agent_approvals")
         }
         additions = {
-            "requested_at": "DATETIME",
-            "expires_at": "DATETIME",
+            "requested_at": "TIMESTAMP",
+            "expires_at": "TIMESTAMP",
             "sla_seconds": "INTEGER NOT NULL DEFAULT 3600",
             "escalation_status": "VARCHAR(32) NOT NULL DEFAULT 'none'",
             "denial_reason": "TEXT",
@@ -489,11 +489,15 @@ def _matches_schema(value: Any, schema: dict[str, Any]) -> bool:
         "null": type(None),
     }
     if expected_type in type_map and not isinstance(value, type_map[expected_type]):
-        if expected_type == "integer" and isinstance(value, bool):
+        if expected_type in {"integer", "number"} and isinstance(value, bool):
             return False
+        return False
+    if expected_type in {"integer", "number"} and isinstance(value, bool):
         return False
     if isinstance(value, dict):
         properties = schema.get("properties", {})
+        if schema.get("additionalProperties") is False and set(value) - set(properties):
+            return False
         if any(
             key not in value or not _matches_schema(value[key], child)
             for key, child in properties.items()
@@ -551,21 +555,31 @@ class AgentRuntime:
         self._tools: dict[str, tuple[ToolSpec, Callable[..., Any]]] = {}
 
     def register_tool(self, spec: ToolSpec, tool: Callable[..., Any]) -> None:
-        if not spec.name or not callable(tool):
+        if not spec.name or len(spec.name) > 128 or not callable(tool):
             raise AgentRuntimeError("A named callable is required to register a tool")
-        if spec.max_cost < 0:
+        if not math.isfinite(spec.max_cost) or spec.max_cost < 0:
             raise AgentRuntimeError("Tool max_cost cannot be negative")
         if spec.max_input_bytes <= 0 or spec.max_output_bytes <= 0:
             raise AgentRuntimeError("Tool payload limits must be positive")
-        if spec.timeout_seconds is not None and spec.timeout_seconds <= 0:
+        if spec.timeout_seconds is not None and (
+            not math.isfinite(spec.timeout_seconds) or spec.timeout_seconds <= 0
+        ):
             raise AgentRuntimeError("Tool timeout must be positive")
         if spec.sandbox_profile not in {profile.value for profile in SandboxProfile}:
             raise AgentRuntimeError("Unknown sandbox profile")
+        try:
+            safe_spec = _persistable(spec.dict())
+            spec_size = len(
+                json.dumps(safe_spec, default=str, allow_nan=False).encode("utf-8")
+            )
+        except (TypeError, ValueError) as exc:
+            raise AgentRuntimeError("Tool metadata must be JSON-compatible") from exc
+        if spec_size > 32768:
+            raise AgentRuntimeError("Tool metadata exceeds the catalog size limit")
         self._tools[spec.name] = (spec, tool)
         self.catalog.register(spec)
         self.store.initialize()
         with self.store.sessions() as session:
-            safe_spec = _persistable(spec.dict())
             session.merge(
                 CapabilityRow(
                     name=spec.name,
@@ -939,7 +953,11 @@ class AgentRuntime:
             return self._as_approval(pending)
 
     def list_approvals(
-        self, tenant_id: Optional[str] = None, status: Optional[str] = None
+        self,
+        tenant_id: Optional[str] = None,
+        status: Optional[str] = None,
+        offset: int = 0,
+        limit: int = 50,
     ) -> list[Approval]:
         with self.store.sessions() as session:
             query = select(ApprovalRow)
@@ -947,9 +965,14 @@ class AgentRuntime:
                 query = query.where(ApprovalRow.tenant_id == tenant_id)
             if status is not None:
                 query = query.where(ApprovalRow.status == status)
+            rows = session.scalars(
+                query.order_by(ApprovalRow.created_at)
+                .offset(max(0, offset))
+                .limit(max(1, min(limit, 100)))
+            ).all()
             return [
                 self._as_approval(row)
-                for row in session.scalars(query.order_by(ApprovalRow.created_at)).all()
+                for row in rows
             ]
 
     def list_runs(
@@ -965,8 +988,10 @@ class AgentRuntime:
             ).all()
             return [self._as_run(row) for row in rows]
 
-    def list_timeline(self, run_id: str, tenant_id: str) -> list[dict[str, Any]]:
-        return [
+    def list_timeline(
+        self, run_id: str, tenant_id: str, offset: int = 0, limit: int = 50
+    ) -> dict[str, Any]:
+        entries = [
             {
                 "evidence_id": item.evidence_id,
                 "kind": item.kind,
@@ -976,6 +1001,16 @@ class AgentRuntime:
             }
             for item in self.list_evidence(run_id, tenant_id)
         ]
+        page_offset = max(0, offset)
+        page_limit = max(1, min(limit, 100))
+        return {
+            "items": entries[page_offset:page_offset + page_limit],
+            "offset": page_offset,
+            "limit": page_limit,
+            "next_offset": (
+                page_offset + page_limit if page_offset + page_limit < len(entries) else None
+            ),
+        }
 
     def record_evidence(
         self, run_id: str, tenant_id: str, kind: str, metadata: dict[str, Any]
@@ -1005,7 +1040,26 @@ class AgentRuntime:
                 )
             )
 
-    def list_remediation_events(self, tenant_id: str) -> list[dict[str, Any]]:
+    def has_evidence(
+        self,
+        run_id: str,
+        tenant_id: str,
+        kind: str,
+        metadata_key: Optional[str] = None,
+        metadata_value: Optional[Any] = None,
+    ) -> bool:
+        return any(
+            item.kind == kind
+            and (
+                metadata_key is None
+                or item.metadata.get(metadata_key) == metadata_value
+            )
+            for item in self.list_evidence(run_id, tenant_id)
+        )
+
+    def list_remediation_events(
+        self, tenant_id: str, offset: int = 0, limit: int = 50
+    ) -> dict[str, Any]:
         events = []
         for run in self.list_runs(tenant_id, 0, 100):
             for item in self.list_evidence(run.run_id, tenant_id):
@@ -1021,7 +1075,16 @@ class AgentRuntime:
                             "created_at": item.created_at,
                         }
                     )
-        return events
+        page_offset = max(0, offset)
+        page_limit = max(1, min(limit, 100))
+        return {
+            "items": events[page_offset:page_offset + page_limit],
+            "offset": page_offset,
+            "limit": page_limit,
+            "next_offset": (
+                page_offset + page_limit if page_offset + page_limit < len(events) else None
+            ),
+        }
 
     def list_blocked_decisions(self, tenant_id: str) -> list[dict[str, Any]]:
         with self.store.sessions() as session:
@@ -1486,7 +1549,7 @@ class AgentRuntime:
     def _active_capability_version(self, spec: ToolSpec) -> str:
         with self.store.sessions() as session:
             row = session.get(CapabilityRow, spec.name)
-            return row.version if row else spec.version
+            return row.spec_hash if row else _hash(_persistable(spec.dict()))
 
     def _capability_is_active(self, spec: ToolSpec) -> bool:
         with self.store.sessions() as session:
@@ -1494,6 +1557,7 @@ class AgentRuntime:
             return bool(
                 row
                 and row.version == spec.version
+                and row.spec_hash == _hash(row.spec_json)
                 and row.spec_hash == _hash(_persistable(spec.dict()))
             )
 

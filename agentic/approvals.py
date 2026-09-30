@@ -20,6 +20,20 @@ class ApprovalService:
     def pending(self, tenant_id: Optional[str] = None) -> list[Approval]:
         return self.runtime.list_approvals(tenant_id, status="pending")
 
+    def approve(
+        self, run_id: str, tenant_id: str, actor: str, reason: str = ""
+    ) -> Approval:
+        approval = self.runtime.approve(run_id, tenant_id, actor, reason)
+        self.notify(approval)
+        return approval
+
+    def deny(
+        self, run_id: str, tenant_id: str, actor: str, reason: str
+    ) -> Approval:
+        approval = self.runtime.deny(run_id, tenant_id, actor, reason)
+        self.notify(approval)
+        return approval
+
     def expire(self) -> int:
         return self.runtime.expire_approvals()
 

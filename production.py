@@ -150,6 +150,44 @@ def create_app(
         except AgentRuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/agent/runs/create", tags=["agentic"])
+    async def create_agent_run_only(
+        request: Request, body: CreateAgentRunRequest
+    ) -> dict[str, Any]:
+        await authorize(request, body.tenant_id, "execute")
+        try:
+            run = app.state.agent_runtime.create_run(
+                tenant_id=body.tenant_id,
+                goal=body.goal,
+                budget=body.budget,
+                idempotency_key=body.idempotency_key,
+            )
+            return _run_summary(run)
+        except AgentRuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/agent/runs/{run_id}/execute", tags=["agentic"])
+    async def execute_agent_run(
+        request: Request, run_id: str, body: ResumeAgentRunRequest
+    ) -> dict[str, Any]:
+        await authorize(request, body.tenant_id, "execute")
+        try:
+            result = await app.state.agent_runtime.execute(
+                run_id,
+                body.tenant_id,
+                role=body.role,
+                environment=body.environment,
+                scopes=set(body.scopes),
+            )
+            return {
+                "run": _run_summary(
+                    app.state.agent_runtime.get_run(run_id, body.tenant_id)
+                ),
+                **result,
+            }
+        except AgentRuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.get("/agent/runs/{run_id}", tags=["agentic"])
     async def get_agent_run(
         request: Request, run_id: str, tenant_id: str
@@ -208,12 +246,18 @@ def create_app(
 
     @app.get("/agent/approvals", tags=["agentic"])
     async def list_agent_approvals(
-        request: Request, tenant_id: str, status: str = "pending"
+        request: Request,
+        tenant_id: str,
+        status: str = "pending",
+        offset: int = 0,
+        limit: int = 50,
     ) -> list[dict[str, Any]]:
         await authorize(request, tenant_id, "read")
         return [
             item.dict()
-            for item in app.state.agent_runtime.list_approvals(tenant_id, status)
+            for item in app.state.agent_runtime.list_approvals(
+                tenant_id, status, offset, limit
+            )
         ]
 
     @app.post("/agent/approvals/{approval_id}/decision", tags=["agentic"])
@@ -278,11 +322,17 @@ def create_app(
 
     @app.get("/operator/agent/runs/{run_id}/timeline", tags=["operator"])
     async def operator_timeline(
-        request: Request, run_id: str, tenant_id: str
-    ) -> list[dict[str, Any]]:
+        request: Request,
+        run_id: str,
+        tenant_id: str,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> dict[str, Any]:
         await authorize(request, tenant_id, "operator_read")
         try:
-            return app.state.agent_runtime.list_timeline(run_id, tenant_id)
+            return app.state.agent_runtime.list_timeline(
+                run_id, tenant_id, offset, limit
+            )
         except AgentRuntimeError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -313,11 +363,22 @@ def create_app(
 
     @app.get("/operator/agent/capabilities", tags=["operator"])
     async def operator_capabilities(
-        request: Request, tenant_id: str
+        request: Request, tenant_id: str, offset: int = 0, limit: int = 50
     ) -> dict[str, Any]:
         await authorize(request, tenant_id, "operator_read")
         runtime = app.state.agent_runtime
-        return {**runtime.catalog.summary(), "items": runtime.catalog.list()}
+        items = runtime.catalog.list()
+        page_offset = max(0, offset)
+        page_limit = max(1, min(limit, 100))
+        return {
+            **runtime.catalog.summary(),
+            "items": items[page_offset:page_offset + page_limit],
+            "offset": page_offset,
+            "limit": page_limit,
+            "next_offset": (
+                page_offset + page_limit if page_offset + page_limit < len(items) else None
+            ),
+        }
 
     @app.get("/operator/agent/capabilities/version", tags=["operator"])
     async def operator_capability_version(
@@ -338,10 +399,12 @@ def create_app(
 
     @app.get("/operator/agent/remediation-events", tags=["operator"])
     async def operator_remediation_events(
-        request: Request, tenant_id: str
-    ) -> list[dict[str, Any]]:
+        request: Request, tenant_id: str, offset: int = 0, limit: int = 50
+    ) -> dict[str, Any]:
         await authorize(request, tenant_id, "operator_read")
-        return app.state.agent_runtime.list_remediation_events(tenant_id)
+        return app.state.agent_runtime.list_remediation_events(
+            tenant_id, offset, limit
+        )
 
     if os.getenv("AEGIS_MOUNT_LEGACY_API", "").lower() in {"1", "true", "yes"}:
         try:

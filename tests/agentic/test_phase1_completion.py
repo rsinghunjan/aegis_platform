@@ -10,6 +10,7 @@ from agentic.planner import OpenAICompatiblePlanner
 from agentic.remediation import (
     DriftFinding,
     DriftRemediationAdapter,
+    RemediationAdapters,
     local_simulation_adapter,
 )
 from agentic.runtime import (
@@ -124,6 +125,30 @@ def test_pure_sandbox_rejects_commands_before_tool_execution(tmp_path):
     )
 
 
+def test_approval_cannot_survive_capability_metadata_change(tmp_path):
+    runtime = make_runtime(tmp_path / "approval-version.db")
+    calls = []
+    runtime.register_tool(
+        ToolSpec(name="release", risk_level="high", version="1.0.0"),
+        lambda _payload: calls.append("v1") or {"released": True},
+    )
+    run = runtime.create_run("tenant-a", '{"tool":"release","input":{}}')
+    assert asyncio.run(runtime.execute(run.run_id, "tenant-a"))[
+        "status"
+    ] == "WAITING_APPROVAL"
+    runtime.register_tool(
+        ToolSpec(name="release", risk_level="high", version="1.0.1"),
+        lambda _payload: calls.append("v2") or {"released": True},
+    )
+    try:
+        runtime.approve(run.run_id, "tenant-a", "operator")
+    except AgentRuntimeError as exc:
+        assert "capability version" in str(exc)
+    else:
+        raise AssertionError("approval must be invalidated after capability change")
+    assert calls == []
+
+
 def test_approval_deny_expiration_and_escalation(tmp_path):
     runtime = make_runtime(
         tmp_path / "approvals.db", approval_sla_seconds=120
@@ -210,7 +235,17 @@ def test_drift_low_risk_simulation_and_high_risk_approval(tmp_path):
 
 def test_local_drift_smoke_registers_diagnosis_and_is_idempotent(tmp_path):
     runtime = make_runtime(tmp_path / "local-drift.db")
-    adapter = DriftRemediationAdapter.local(runtime)
+    notifications = []
+    promotions = []
+    adapter = DriftRemediationAdapter(
+        runtime,
+        adapters=RemediationAdapters(
+            canary_deploy=local_simulation_adapter,
+            rollback=local_simulation_adapter,
+            promote=lambda payload: promotions.append(payload),
+            notify=lambda payload: notifications.append(payload),
+        ),
+    )
     finding = DriftFinding(
         tenant_id="tenant-local",
         model_name="model",
@@ -225,3 +260,4 @@ def test_local_drift_smoke_registers_diagnosis_and_is_idempotent(tmp_path):
     assert first["run_id"] == second["run_id"]
     assert first["remediation"]["status"] == "SUCCEEDED"
     assert first["remediation"]["result_hash"]
+    assert len(notifications) == len(promotions) == 1

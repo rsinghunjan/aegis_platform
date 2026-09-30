@@ -45,8 +45,11 @@ class SandboxBoundary:
                 raise SandboxViolation("sandbox_environment_not_allowed")
             if self.network_policy is None:
                 raise SandboxViolation("network_policy_not_configured")
-            decision = self.network_policy(payload, environment)
-            if decision is False:
+            try:
+                decision = self.network_policy(payload, environment)
+            except Exception as exc:
+                raise SandboxViolation("network_policy_error") from exc
+            if decision is not True:
                 raise SandboxViolation("network_policy_denied")
         if profile == SandboxProfile.PURE.value and _contains_executable_request(payload):
             raise SandboxViolation("executable_payload_rejected")

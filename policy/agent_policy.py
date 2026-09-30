@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from typing import Any, Optional
 
+
 class AgentPolicyGate:
     """Apply identity, scope, environment, budget, risk, and autonomy controls."""
 
@@ -41,7 +42,7 @@ class AgentPolicyGate:
         approved: bool,
         autonomous: bool,
     ) -> tuple[str, str]:
-        if self.autonomy_mode == "disabled" or (autonomous and not self.autonomy_enabled):
+        if self.autonomy_mode == "disabled" or not self.autonomy_enabled:
             return "block", "global_autonomy_disabled"
         if spec.allowed_tenants and run.tenant_id not in spec.allowed_tenants:
             return "block", "tenant_not_allowed"

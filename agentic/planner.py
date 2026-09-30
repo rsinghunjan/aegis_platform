@@ -9,7 +9,6 @@ import urllib.request
 from typing import Any, Optional
 
 from agentic.runtime import (
-    AgentRuntimeError,
     DeterministicJSONPlanner,
     Plan,
     PlanStep,

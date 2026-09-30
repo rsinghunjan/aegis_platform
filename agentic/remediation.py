@@ -4,11 +4,35 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from pydantic import BaseModel, validator
 
 from agentic.runtime import AgentRuntime, RiskLevel, ToolSpec
+
+
+@dataclass
+class RemediationAdapters:
+    """Optional hooks; the defaults never contact model or cloud systems."""
+
+    retrain: Optional[Callable[[dict[str, Any]], Any]] = None
+    canary_deploy: Optional[Callable[[dict[str, Any]], Any]] = None
+    promote: Optional[Callable[[dict[str, Any]], Any]] = None
+    rollback: Optional[Callable[[dict[str, Any]], Any]] = None
+    notify: Optional[Callable[[dict[str, Any]], Any]] = None
+
+    def actions(self) -> dict[str, Callable[[dict[str, Any]], Any]]:
+        return {
+            name: callback
+            for name, callback in (
+                ("retrain", self.retrain),
+                ("canary_deploy", self.canary_deploy),
+                ("promote", self.promote),
+                ("rollback", self.rollback),
+            )
+            if callback is not None
+        }
 
 
 class DriftFinding(BaseModel):
@@ -48,11 +72,18 @@ class DriftRemediationAdapter:
         diagnosis_tool: str = "diagnose_drift",
         promotion_adapter: Optional[Callable[[dict[str, Any]], Any]] = None,
         remediation_adapters: Optional[dict[str, Callable[[dict[str, Any]], Any]]] = None,
+        adapters: Optional[RemediationAdapters] = None,
     ):
         self.runtime = runtime
         self.diagnosis_tool = diagnosis_tool
-        self.promotion_adapter = promotion_adapter
-        self.remediation_adapters = remediation_adapters or {}
+        self.promotion_adapter = promotion_adapter or (
+            adapters.promote if adapters else None
+        )
+        self.notification_adapter = adapters.notify if adapters else None
+        self.remediation_adapters = {
+            **(adapters.actions() if adapters else {}),
+            **(remediation_adapters or {}),
+        }
         if diagnosis_tool not in runtime._tools:
             runtime.register_tool(
                 ToolSpec(
@@ -118,9 +149,43 @@ class DriftRemediationAdapter:
                 "context_ref": finding.context_ref,
             },
         )
+        if self.notification_adapter and not self.runtime.has_evidence(
+            run.run_id,
+            finding.tenant_id,
+            "remediation_notification",
+            "finding_hash",
+            fingerprint,
+        ):
+            try:
+                self.notification_adapter(
+                    {
+                        "tenant_id": finding.tenant_id,
+                        "finding_hash": fingerprint,
+                        "metric": finding.metric,
+                    }
+                )
+                notification_status = "sent"
+            except Exception:
+                notification_status = "failed"
+            self.runtime.record_evidence(
+                run.run_id,
+                finding.tenant_id,
+                "remediation_notification",
+                {"finding_hash": fingerprint, "status": notification_status},
+            )
         outcome = await self.runtime.execute(run.run_id, finding.tenant_id)
-        action = "rollback" if finding.value >= finding.threshold * 2 else "canary_deploy"
-        high_risk = action == "rollback"
+        if (
+            finding.metric in {"accuracy_drop", "performance_drift"}
+            and "retrain" in self.remediation_adapters
+        ):
+            action = "retrain"
+        else:
+            action = (
+                "rollback"
+                if finding.value >= finding.threshold * 2
+                else "canary_deploy"
+            )
+        high_risk = action in {"rollback", "retrain", "promote"}
         self.runtime.record_evidence(
             run.run_id,
             finding.tenant_id,
@@ -166,14 +231,35 @@ class DriftRemediationAdapter:
                 remediation_run.run_id, finding.tenant_id
             )
             remediation = {"run_id": remediation_run.run_id, **remediation}
-        if outcome.get("status") == "SUCCEEDED" and self.promotion_adapter:
-            self.promotion_adapter(
-                {
-                    "tenant_id": finding.tenant_id,
-                    "model_name": finding.model_name,
-                    "run_id": run.run_id,
-                    "finding_hash": fingerprint,
-                }
+        if (
+            remediation
+            and remediation.get("status") == "SUCCEEDED"
+            and self.promotion_adapter
+            and not self.runtime.has_evidence(
+                remediation["run_id"],
+                finding.tenant_id,
+                "remediation_promotion",
+                "finding_hash",
+                fingerprint,
+            )
+        ):
+            try:
+                self.promotion_adapter(
+                    {
+                        "tenant_id": finding.tenant_id,
+                        "model_name": finding.model_name,
+                        "run_id": remediation["run_id"],
+                        "finding_hash": fingerprint,
+                    }
+                )
+                promotion_status = "sent"
+            except Exception:
+                promotion_status = "failed"
+            self.runtime.record_evidence(
+                remediation["run_id"],
+                finding.tenant_id,
+                "remediation_promotion",
+                {"finding_hash": fingerprint, "status": promotion_status},
             )
         return {
             "run_id": run.run_id,

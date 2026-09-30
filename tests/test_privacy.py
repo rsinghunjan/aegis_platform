@@ -56,7 +56,7 @@ def test_anonymize_user_and_audit():
     session = SessionLocal()
     updated = session.query(User).filter_by(id=uid).one_or_none()
     assert updated.username.startswith("anon-")
-    assert updated.password_hash is None
+    assert updated.password_hash != "hash"
     assert updated.disabled is True
 
     # audit log should contain entry

@@ -35,19 +35,24 @@ def integration_stack():
 
     # wait for api health
     try:
-        subprocess.run(f"scripts/wait_for_services.sh {API_BASE}/health 60 2", shell=True, check=True, cwd=cwd)
+        subprocess.run(
+            ["bash", "scripts/wait_for_services.sh", f"{API_BASE}/health", "60", "2"],
+            check=True,
+            cwd=cwd,
+        )
     except subprocess.CalledProcessError as exc:
         # dump logs for debugging
         print("API failed to become healthy. Dumping logs:")
         subprocess.run(f"docker compose -f {COMPOSE} logs api", shell=True, cwd=cwd)
         raise
 
-    # Run migrations inside api container
-    print("Running alembic migrations inside api container...")
-    subprocess.run(f"docker compose -f {COMPOSE} exec -T api alembic upgrade head", shell=True, check=True, cwd=cwd)
-
-    # seed db
-    subprocess.run(f"docker compose -f {COMPOSE} exec -T api python scripts/seed_db.py", shell=True, check=True, cwd=cwd)
+    # Create the schema from the application's SQLAlchemy models and seed test data.
+    subprocess.run(
+        f"docker compose -f {COMPOSE} exec -T api python -m scripts.seed_db",
+        shell=True,
+        check=True,
+        cwd=cwd,
+    )
 
     yield
 

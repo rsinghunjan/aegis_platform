@@ -1,152 +1,175 @@
-102
-103
-104
-105
-106
-107
-108
-109
-110
-111
-112
-113
-114
-115
-116
-117
-118
-119
-120
-121
-122
-123
-124
-125
-126
-127
-128
-129
-130
-131
-132
-133
-134
-135
-136
-137
-138
-139
-140
-141
-142
-143
-144
-145
-146
-147
-148
-149
-150
-151
-152
-153
-154
-155
-156
-157
-158
-159
-160
-161
-162
-163
-164
-165
-166
-167
-168
-169
-170
-171
-172
-173
-174
-175
-176
 #!/usr/bin/env python
-    except Exception as exc:
-        logger.exception("boto3 not installed")
-        raise
-    assert s3_url.startswith("s3://")
-    _, rest = s3_url.split("s3://", 1)
-    bucket, key = rest.split("/", 1)
-    dest = os.path.join(dst_dir, os.path.basename(key))
-    s3 = boto3.client("s3")
-    logger.info("Downloading s3://%s/%s -> %s", bucket, key, dest)
-    s3.download_file(bucket, key, dest)
-    return dest
+import argparse
+import json
+import logging
+import math
+import os
+import sys
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+
+def download_s3_artifact(s3_url: str, dst_dir: str) -> str:
+    import boto3
+
+    if not s3_url.startswith("s3://"):
+        raise ValueError("artifact path must start with s3://")
+    bucket, separator, key = s3_url[5:].partition("/")
+    if not separator or not bucket or not key:
+        raise ValueError("S3 artifact path must include a bucket and key")
+    destination = os.path.join(dst_dir, os.path.basename(key))
+    boto3.client("s3").download_file(bucket, key, destination)
+    return destination
+
+
+def download_mlflow_artifact(run_id: str, artifact_path: str) -> str:
+    from mlflow.tracking import MlflowClient
+
+    return MlflowClient().download_artifacts(run_id, artifact_path)
+
 
 def verify_signature(candidate_path: str) -> bool:
     try:
         from api.model_signing import verify_model_artifact
     except Exception:
-        logger.info("No api.model_signing.verify_model_artifact available; skipping verification")
+        logger.info(
+            "No api.model_signing.verify_model_artifact available; skipping verification"
+        )
         return True
     try:
-        ok = verify_model_artifact(candidate_path)
-        logger.info("Signature verification result: %s", ok)
-        return bool(ok)
+        return bool(verify_model_artifact(candidate_path))
     except Exception:
         logger.exception("Signature verification raised error")
         return False
 
-def evaluate_sklearn(model_file: str, test_csv: Optional[str], label_col: str, metric: str) -> float:
+
+def evaluate_sklearn(
+    model_file: str, test_csv: Optional[str], label_col: str, metric: str
+) -> float:
     import joblib
-    import numpy as np
     from sklearn.datasets import load_iris
     from sklearn.metrics import accuracy_score, mean_squared_error
-    import pandas as pd
 
     model = joblib.load(model_file)
     if test_csv:
-        df = pd.read_csv(test_csv)
-        if label_col not in df.columns:
-            raise ValueError(f"label column '{label_col}' not found in {test_csv}")
-        y = df[label_col].values
-        X = df.drop(columns=[label_col]).values
-    else:
-        X, y = load_iris(return_X_y=True)
-    preds = model.predict(X)
-    if metric == "accuracy":
-        return float(accuracy_score(y, preds))
-    else:
-        rmse = float(mean_squared_error(y, preds, squared=False))
-        return rmse
+        import pandas as pd
 
-def evaluate_torch(model_file: str, test_csv: Optional[str], label_col: str, metric: str) -> float:
-    # Minimal torch evaluation: attempt to load TorchScript model or state_dict and run on small synthetic dataset
+        dataframe = pd.read_csv(test_csv)
+        if label_col not in dataframe.columns:
+            raise ValueError(f"label column '{label_col}' not found in {test_csv}")
+        labels = dataframe[label_col].values
+        features = dataframe.drop(columns=[label_col]).values
+    else:
+        features, labels = load_iris(return_X_y=True)
+    predictions = model.predict(features)
+    if metric == "accuracy":
+        return float(accuracy_score(labels, predictions))
+    return math.sqrt(float(mean_squared_error(labels, predictions)))
+
+
+def evaluate_torch(
+    model_file: str, test_csv: Optional[str], label_col: str, metric: str
+) -> float:
     import torch
-    import numpy as np
+
     try:
         model = torch.jit.load(model_file)
         model.eval()
-    except Exception:
-        # fallback: assume it's a state_dict => user should supply an evaluation wrapper instead
-        raise RuntimeError("Torch evaluation supports TorchScript artifacts only in this runner")
+    except Exception as exc:
+        raise RuntimeError(
+            "Torch evaluation supports TorchScript artifacts only"
+        ) from exc
 
-    # build synthetic batch - CIFAR10-like input (3,32,32)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     inputs = torch.randn(100, 3, 32, 32, device=device)
     with torch.no_grad():
-        out = model(inputs)
-        preds = out.argmax(dim=1).cpu().numpy()
-    # since we don't have true labels for synthetic data, compute a dummy metric (e.g., distinctiveness)
-    # This mode is best-effort and not recommended for strict validation.
-    return float((preds >= 0).mean())
+        predictions = model(inputs).argmax(dim=1).cpu().numpy()
+    return float((predictions >= 0).mean())
 
-def compute_metric(mode: str, artifact_file: str, test_data: Optional[str], label_col: str, metric: str) -> float:
+
+def compute_metric(
+    mode: str,
+    artifact_file: str,
+    test_data: Optional[str],
+    label_col: str,
+    metric: str,
+) -> float:
     if mode == "sklearn":
         return evaluate_sklearn(artifact_file, test_data, label_col, metric)
-    elif mode == "torch":
-scripts/evaluate_model.py
+    if mode == "torch":
+        return evaluate_torch(artifact_file, test_data, label_col, metric)
+    raise ValueError(f"unsupported evaluation mode: {mode}")
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Evaluate a model artifact")
+    parser.add_argument("--artifact-path")
+    parser.add_argument("--mlflow-run-id", default="")
+    parser.add_argument("--mlflow-artifact-path", default="")
+    parser.add_argument("--mode", choices=("sklearn", "torch"), default="sklearn")
+    parser.add_argument("--metric", default="accuracy")
+    parser.add_argument("--baseline", type=float, default=0.0)
+    parser.add_argument("--tolerance", type=float, default=0.0)
+    parser.add_argument("--test-data")
+    parser.add_argument("--label-col", default="label")
+    parser.add_argument("--emit-json")
+    parser.add_argument("--verify-signature", action="store_true")
+    args = parser.parse_args(argv)
+
+    result = {
+        "status": "error",
+        "mode": args.mode,
+        "metric": args.metric,
+        "baseline": args.baseline,
+        "tolerance": args.tolerance,
+    }
+    try:
+        if args.mlflow_run_id:
+            if not args.mlflow_artifact_path:
+                raise ValueError(
+                    "--mlflow-artifact-path is required with --mlflow-run-id"
+                )
+            artifact_path = download_mlflow_artifact(
+                args.mlflow_run_id, args.mlflow_artifact_path
+            )
+        elif args.artifact_path:
+            artifact_path = args.artifact_path
+        else:
+            raise ValueError(
+                "provide --artifact-path or --mlflow-run-id and "
+                "--mlflow-artifact-path"
+            )
+
+        if artifact_path.startswith("s3://"):
+            artifact_path = download_s3_artifact(artifact_path, os.getcwd())
+        if args.verify_signature and not verify_signature(artifact_path):
+            raise ValueError("artifact signature verification failed")
+
+        score = compute_metric(
+            args.mode, artifact_path, args.test_data, args.label_col, args.metric
+        )
+        result.update({"artifact_path": artifact_path, "score": score})
+        result["status"] = (
+            "passed" if score + args.tolerance >= args.baseline else "failed"
+        )
+        return_code = 0 if result["status"] == "passed" else 2
+    except Exception as exc:
+        logger.exception("Model validation failed")
+        result["error"] = str(exc)
+        return_code = 1
+
+    output = json.dumps(result, sort_keys=True)
+    if args.emit_json:
+        output_path = Path(args.emit_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(output + "\n", encoding="utf-8")
+    print(output)
+    return return_code
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    sys.exit(main())

@@ -174,7 +174,7 @@ def anonymize_user(user_id: int, actor: str = "system") -> bool:
     """
     Anonymize a user record (PII removal). This operation:
     - sets username -> anonymized placeholder (anon-<id>-<ts>)
-    - clears password_hash, scopes, disables account
+    - replaces password_hash with an unusable marker, clears scopes, disables account
     - updates related tables per policy (jobs.user_id -> NULL)
     - records an audit log
     Returns True on success.
@@ -187,7 +187,7 @@ def anonymize_user(user_id: int, actor: str = "system") -> bool:
         anon_name = f"anon-{user_id}-{int(datetime.utcnow().timestamp())}"
         # clear sensitive fields
         user.username = anon_name
-        user.password_hash = None
+        user.password_hash = "!"
         user.scopes = []
         user.disabled = True
         session.commit()

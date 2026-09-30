@@ -66,7 +66,10 @@ def promote():
         )
     except PromotionError as exc:
         app.logger.info("Promotion request rejected: %s", exc)
-        return jsonify({"error": "run failed promotion validation", "run_id": run_id}), 400
+        return (
+            jsonify({"error": "run failed promotion validation", "run_id": run_id}),
+            400,
+        )
     except Exception:
         app.logger.exception("Model promotion failed")
         return jsonify({"error": "promotion could not be persisted"}), 500

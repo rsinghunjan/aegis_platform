@@ -46,6 +46,24 @@ def get_engine():
     return _ENGINE
 
 
+def create_sessionmaker(database_url: str):
+    """Create an engine and session factory for an explicitly configured URL."""
+    if "postgresql+psycopg://" in database_url and not _try_import_psycopg3():
+        if _try_import_psycopg2():
+            log.warning("psycopg3 not available; falling back to psycopg2")
+            database_url = database_url.replace(
+                "postgresql+psycopg://", "postgresql+psycopg2://", 1
+            )
+
+    engine_options = {"pool_pre_ping": True}
+    if database_url.startswith("sqlite"):
+        engine_options["connect_args"] = {"check_same_thread": False}
+
+    engine = create_engine(database_url, **engine_options)
+    factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    return engine, factory
+
+
 def get_sessionmaker():
     global _SessionLocal
     if _SessionLocal is None:

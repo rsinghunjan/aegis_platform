@@ -19,6 +19,11 @@ compatibility fallback. The application provides `/healthz`, `/readyz`,
 must be registered by the embedding application before an agent plan can call
 it; planner output cannot execute shell or Python code.
 
+Agent HTTP routes fail closed until `create_app` is given a
+`tenant_authorizer(request, tenant_id, action, actor)` callback. The embedding
+service must derive identity and tenant membership from its trusted auth
+context; request-body tenant and actor fields are not credentials.
+
 Run tests with:
 
 ```bash
@@ -43,7 +48,8 @@ docker run --rm -p 8000:8000 -v aegis-data:/data aegis-platform
   adds a tenant/session-scoped persistent backend with retention and bounded
   compaction.
 - `api/tasks.py` is a Celery lifecycle adapter. It executes only explicitly
-  registered handlers; it does not return simulated inference output.
+  registered handlers; retries are enabled only for handlers registered as
+  idempotent. It does not return simulated inference output.
 
 Risk levels `low`, `medium`, and `high` are declared on tool metadata. Medium
 actions require approval by default; high-risk actions always require explicit
@@ -74,6 +80,4 @@ chain.
 
 See [`docs/repository-hygiene.md`](docs/repository-hygiene.md) for the
 historical patch/diff artifacts and canonical paths.
-
-
 

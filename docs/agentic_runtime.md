@@ -13,7 +13,8 @@ reconciled.
 PENDING -> PLANNING -> RUNNING -> SUCCEEDED
                           |  \-> WAITING_APPROVAL -> RUNNING
                           |  \-> RETRYING -> RUNNING
-                          |  \-> REPLANNING -> FAILED
+                          |  \-> REPLANNING -> PLANNING -> RUNNING
+                          |                    \--------> FAILED
                           \----> BLOCKED
 ```
 
@@ -36,18 +37,26 @@ async handlers are awaited. Both have a configurable timeout.
 - Medium-risk tools require approval by default. This can be changed when
   constructing `AgentPolicyGate`.
 - High-risk tools always require a persisted explicit approval.
+- Approvals are bound to the individual plan step and tool; approving one action
+  does not authorize later high-risk actions in the same run.
 - `AEGIS_AUTONOMY_ENABLED=false` blocks autonomous actions globally. A recorded
   approval is resumed through the explicit approval endpoint/facade.
 - A denied or review decision is persisted with a decision ID and reason before
   the executor can run.
 - Retries are bounded and only repeated for tools marked idempotent. Non-
   idempotent failures are not replayed automatically.
+  On explicit resume after a process interruption, an in-flight idempotent step
+  may be retried; an in-flight non-idempotent step is marked interrupted and
+  sent to recovery planning instead of being silently replayed or marked
+  successful.
 
 `/agent/runs/{run_id}/approve` records the actor and reason, then resumes that
-run. Tenant IDs are checked for run, memory, and evidence reads. Authentication
-for these new endpoints is expected to be provided by the deployment gateway
-or the embedding service; the tenant ID is not itself an authentication
-credential.
+run. Agent HTTP routes return 503 until `create_app` receives a
+`tenant_authorizer(request, tenant_id, action, actor)` callback; rejected access
+returns 403. The embedding service must derive actor and tenant membership from
+trusted authentication state. A body tenant or actor ID is not a credential.
+The in-process runtime approval method is intended to be called only after the
+embedding service has authorized the human approver.
 
 ## Persistence and evidence
 

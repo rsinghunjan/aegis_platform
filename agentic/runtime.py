@@ -24,6 +24,7 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     select,
+    update,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
@@ -111,6 +112,8 @@ class Approval(BaseModel):
     approval_id: str
     run_id: str
     tenant_id: str
+    step_id: str
+    tool_name: str
     status: str
     actor: Optional[str] = None
     reason: Optional[str] = None
@@ -208,6 +211,8 @@ class ApprovalRow(AgentBase):
     approval_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.run_id"), nullable=False, index=True)
     tenant_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    step_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    tool_name: Mapped[str] = mapped_column(String(128), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     actor: Mapped[Optional[str]] = mapped_column(String(255))
     reason: Mapped[Optional[str]] = mapped_column(Text)
@@ -505,6 +510,8 @@ class AgentRuntime:
             row = self._owned_run(session, run_id, tenant_id)
             if row.status in {"SUCCEEDED", "BLOCKED", "FAILED"}:
                 return self._execution_result(row)
+            if row.status in {"RUNNING", "PLANNING"}:
+                return self._execution_result(row)
             recovering = row.status == "REPLANNING"
             row.status = "PLANNING"
             row.updated_at = _now()
@@ -622,6 +629,62 @@ class AgentRuntime:
             return self._execution_result(row)
 
     async def resume(self, run_id: str, tenant_id: str, **kwargs: Any) -> dict[str, Any]:
+        with self.store.sessions() as session:
+            run = self._owned_run(session, run_id, tenant_id)
+            if run.status == "PLANNING" and run.plan_json is None:
+                run.status = "PENDING"
+                run.updated_at = _now()
+            running_steps = session.scalars(
+                select(PlanStepRow).where(
+                    PlanStepRow.run_id == run_id,
+                    PlanStepRow.tenant_id == tenant_id,
+                    PlanStepRow.status == "RUNNING",
+                )
+            ).all()
+            if running_steps:
+                all_idempotent = all(
+                    step.tool_name in self._tools
+                    and self._tools[step.tool_name][0].idempotent
+                    for step in running_steps
+                )
+                call_rows = session.scalars(
+                    select(ToolCallRow).where(
+                        ToolCallRow.run_id == run_id,
+                        ToolCallRow.tenant_id == tenant_id,
+                        ToolCallRow.step_id.in_([step.step_id for step in running_steps]),
+                        ToolCallRow.status == "RUNNING",
+                    )
+                ).all()
+                for call in call_rows:
+                    call.status = "INTERRUPTED"
+                    call.error = "execution_interrupted"
+                for step in running_steps:
+                    if all_idempotent:
+                        step.status = "RETRYING"
+                        step.attempts = max(0, step.attempts - 1)
+                    else:
+                        step.status = "FAILED"
+                        step.error = "execution_interrupted"
+                if all_idempotent:
+                    run.status = "RETRYING"
+                    run.error = None
+                elif any(step.tool_name not in self._tools for step in running_steps):
+                    run.status = "FAILED"
+                    run.error = "interrupted_tool_unavailable"
+                else:
+                    run.status = "REPLANNING"
+                    run.error = "interrupted_non_idempotent_step"
+                run.updated_at = _now()
+                self._add_evidence(
+                    session,
+                    run,
+                    "interrupted_execution",
+                    {
+                        "step_ids": [step.step_id for step in running_steps],
+                        "recovery": run.status,
+                    },
+                )
+                session.commit()
         return await self.execute(run_id, tenant_id, **kwargs)
 
     def approve(self, run_id: str, tenant_id: str, actor: str, reason: str = "") -> Approval:
@@ -636,32 +699,33 @@ class AgentRuntime:
                     ApprovalRow.status == "pending",
                 )
             )
-            now = _now()
             if pending is None:
-                pending = ApprovalRow(
-                    approval_id=str(uuid.uuid4()),
-                    run_id=run_id,
-                    tenant_id=tenant_id,
-                    status="approved",
-                    actor=actor,
-                    reason=reason,
-                    created_at=now,
-                    decided_at=now,
-                )
-                session.add(pending)
-            else:
-                pending.status = "approved"
-                pending.actor = actor
-                pending.reason = reason
-                pending.decided_at = now
+                raise AgentRuntimeError("No pending approval for this run")
+            now = _now()
+            pending.status = "approved"
+            pending.actor = actor
+            pending.reason = reason
+            pending.decided_at = now
             row.status = "PENDING"
             row.updated_at = now
-            self._add_evidence(session, row, "approval", {"actor": actor, "status": "approved"})
+            self._add_evidence(
+                session,
+                row,
+                "approval",
+                {
+                    "actor": actor,
+                    "status": "approved",
+                    "step_id": pending.step_id,
+                    "tool_name": pending.tool_name,
+                },
+            )
             session.commit()
             return Approval(
                 approval_id=pending.approval_id,
                 run_id=run_id,
                 tenant_id=tenant_id,
+                step_id=pending.step_id,
+                tool_name=pending.tool_name,
                 status=pending.status,
                 actor=pending.actor,
                 reason=pending.reason,
@@ -713,6 +777,7 @@ class AgentRuntime:
                     select(ApprovalRow).where(
                         ApprovalRow.run_id == run_id,
                         ApprovalRow.tenant_id == tenant_id,
+                        ApprovalRow.step_id == step_id,
                         ApprovalRow.status == "approved",
                     )
                 )
@@ -751,6 +816,7 @@ class AgentRuntime:
                     select(ApprovalRow).where(
                         ApprovalRow.run_id == run_id,
                         ApprovalRow.tenant_id == tenant_id,
+                        ApprovalRow.step_id == step_id,
                         ApprovalRow.status == "pending",
                     )
                 ):
@@ -759,6 +825,8 @@ class AgentRuntime:
                             approval_id=str(uuid.uuid4()),
                             run_id=run_id,
                             tenant_id=tenant_id,
+                            step_id=step_id,
+                            tool_name=spec.name,
                             status="pending",
                             created_at=_now(),
                         )
@@ -769,8 +837,27 @@ class AgentRuntime:
                     "run_id": run_id,
                     "decision_id": decision.decision_id,
                 }
-            step.status = "RUNNING"
-            step.attempts += 1
+            claim = session.execute(
+                update(PlanStepRow)
+                .where(
+                    PlanStepRow.step_id == step_id,
+                    PlanStepRow.tenant_id == tenant_id,
+                    PlanStepRow.status.in_(
+                        ["PENDING", "RETRYING", "WAITING_APPROVAL"]
+                    ),
+                )
+                .values(
+                    status="RUNNING",
+                    attempts=PlanStepRow.attempts + 1,
+                    updated_at=_now(),
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if claim.rowcount != 1:
+                session.refresh(step)
+                session.commit()
+                return {"status": step.status, "run_id": run_id}
+            session.refresh(step)
             run.status = "RUNNING"
             risk_rank = {RiskLevel.LOW.value: 0, RiskLevel.MEDIUM.value: 1, RiskLevel.HIGH.value: 2}
             current_risk = run.risk

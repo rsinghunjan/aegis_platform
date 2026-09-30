@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from celery import current_app, shared_task
@@ -14,22 +14,25 @@ from api.models import Job
 logger = logging.getLogger("aegis_tasks")
 
 JobHandler = Callable[[dict[str, Any]], Any]
-_HANDLERS: dict[str, tuple[JobHandler, Optional[Callable[[dict[str, Any]], None]]]] = {}
+_HANDLERS: dict[
+    str, tuple[JobHandler, Optional[Callable[[dict[str, Any]], None]], bool]
+] = {}
 
 
 def register_job_handler(
     kind: str,
     handler: JobHandler,
     validator: Optional[Callable[[dict[str, Any]], None]] = None,
+    idempotent: bool = False,
 ) -> None:
     """Register an application-owned handler; there is deliberately no fake default."""
     if not kind or not callable(handler):
         raise ValueError("A job kind and callable handler are required")
-    _HANDLERS[kind] = (handler, validator)
+    _HANDLERS[kind] = (handler, validator, idempotent)
 
 
 def _now() -> datetime:
-    return datetime.utcnow()
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def cancel_job(request_id: str) -> bool:
@@ -48,7 +51,10 @@ def cancel_job(request_id: str) -> bool:
         session.commit()
     finally:
         session.close()
-    current_app.control.revoke(task_id, terminate=True)
+    try:
+        current_app.control.revoke(task_id, terminate=True)
+    except Exception:
+        logger.exception("Could not revoke Celery delivery for cancelled job %s", request_id)
     return True
 
 
@@ -56,6 +62,7 @@ def cancel_job(request_id: str) -> bool:
 def process_job(self, request_id: str) -> dict[str, Any]:
     """Validate, execute, and persist the lifecycle for a registered job kind."""
     session = SessionLocal()
+    handler_idempotent = False
     try:
         job = session.query(Job).filter_by(request_id=request_id).one_or_none()
         if job is None:
@@ -77,7 +84,7 @@ def process_job(self, request_id: str) -> dict[str, Any]:
             session.commit()
             return {"status": "FAILED", "request_id": request_id, "error": "handler unavailable"}
 
-        handler, validator = handler_spec
+        handler, validator, handler_idempotent = handler_spec
         if not isinstance(payload, dict):
             raise ValueError("Job input must be a JSON object")
         handler_payload = {
@@ -99,6 +106,8 @@ def process_job(self, request_id: str) -> dict[str, Any]:
             return {"status": job.status, "request_id": request_id}
         session.expire_all()
         job = session.query(Job).filter_by(request_id=request_id).one()
+        if job.status == "CANCELLED":
+            return {"status": "CANCELLED", "request_id": request_id}
         result = handler(handler_payload)
         if hasattr(result, "__await__"):
             raise TypeError("Celery job handlers must be synchronous")
@@ -113,13 +122,18 @@ def process_job(self, request_id: str) -> dict[str, Any]:
     except Exception as exc:
         session.rollback()
         job = session.query(Job).filter_by(request_id=request_id).one_or_none()
+        retry_allowed = (
+            handler_idempotent and self.request.retries < self.max_retries
+        )
         if job:
-            job.status = "RETRYING" if self.request.retries < self.max_retries else "FAILED"
+            if job.status == "CANCELLED":
+                return {"status": "CANCELLED", "request_id": request_id}
+            job.status = "RETRYING" if retry_allowed else "FAILED"
             job.output_payload = {"error": f"{type(exc).__name__}: {str(exc)[:500]}"}
             job.updated_at = _now()
             session.commit()
         logger.exception("Job %s failed", request_id)
-        if self.request.retries < self.max_retries:
+        if retry_allowed:
             raise self.retry(exc=exc, countdown=min(60, 2**self.request.retries))
         raise
     finally:

@@ -32,3 +32,30 @@ def test_persistent_memory_is_tenant_scoped_and_compacted(tmp_path):
         "session-1", "tenant-b", database_url=database_url
     )
     assert other_tenant.get_messages() == []
+
+
+def test_optional_retrieval_hook_is_scoped_to_tenant_and_session(tmp_path):
+    memory = PersistentConversationMemory(
+        "session-a",
+        "tenant-a",
+        database_url=f"sqlite:///{tmp_path / 'hook.db'}",
+        retrieval_hook=lambda _query, tenant, session, _limit: [
+            {
+                "tenant_id": tenant,
+                "session_id": session,
+                "content": "relevant",
+            }
+        ],
+    )
+    assert memory.retrieve("search") == [
+        {
+            "tenant_id": "tenant-a",
+            "session_id": "session-a",
+            "content": "relevant",
+        }
+    ]
+    memory.retrieval_hook = lambda *_args: [
+        {"tenant_id": "tenant-b", "session_id": "session-a"}
+    ]
+    with pytest.raises(PermissionError):
+        memory.retrieve("cross-tenant")

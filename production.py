@@ -4,9 +4,10 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Any
+import inspect
+from typing import Any, Callable, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from agentic.runtime import AgentRuntime, AgentRuntimeError, AgentStore
@@ -30,7 +31,19 @@ class ApprovalRequest(BaseModel):
     reason: str = ""
 
 
-def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
+class ResumeAgentRunRequest(BaseModel):
+    tenant_id: str
+    role: str = "agent"
+    environment: str = "local"
+    scopes: list[str] = Field(default_factory=list)
+
+
+def create_app(
+    runtime: AgentRuntime | None = None,
+    tenant_authorizer: Optional[
+        Callable[[Request, str, str, Optional[str]], Any]
+    ] = None,
+) -> FastAPI:
     selected_runtime = runtime or AgentRuntime()
 
     @asynccontextmanager
@@ -53,6 +66,20 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
     )
     app.state.agent_runtime = selected_runtime
 
+    async def authorize(
+        request: Request, tenant_id: str, action: str, actor: Optional[str] = None
+    ) -> None:
+        if tenant_authorizer is None:
+            raise HTTPException(
+                status_code=503,
+                detail="agent API authorization is not configured",
+            )
+        allowed = tenant_authorizer(request, tenant_id, action, actor)
+        if inspect.isawaitable(allowed):
+            allowed = await allowed
+        if not allowed:
+            raise HTTPException(status_code=403, detail="tenant access denied")
+
     @app.get("/healthz", tags=["health"])
     def healthz() -> dict[str, str]:
         return {"status": "ok"}
@@ -68,49 +95,80 @@ def create_app(runtime: AgentRuntime | None = None) -> FastAPI:
         return {"status": "ready"}
 
     @app.post("/agent/runs", tags=["agentic"])
-    async def create_agent_run(request: CreateAgentRunRequest) -> dict[str, Any]:
+    async def create_agent_run(
+        request: Request, body: CreateAgentRunRequest
+    ) -> dict[str, Any]:
+        await authorize(request, body.tenant_id, "execute")
         try:
             agent_runtime = app.state.agent_runtime
             run = agent_runtime.create_run(
-                tenant_id=request.tenant_id,
-                goal=request.goal,
-                budget=request.budget,
-                idempotency_key=request.idempotency_key,
+                tenant_id=body.tenant_id,
+                goal=body.goal,
+                budget=body.budget,
+                idempotency_key=body.idempotency_key,
             )
             result = await agent_runtime.execute(
                 run.run_id,
-                request.tenant_id,
-                role=request.role,
-                environment=request.environment,
-                scopes=set(request.scopes),
+                body.tenant_id,
+                role=body.role,
+                environment=body.environment,
+                scopes=set(body.scopes),
             )
-            return {"run": agent_runtime.get_run(run.run_id, request.tenant_id).dict(), **result}
+            return {
+                "run": agent_runtime.get_run(run.run_id, body.tenant_id).dict(),
+                **result,
+            }
         except AgentRuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/agent/runs/{run_id}", tags=["agentic"])
-    def get_agent_run(run_id: str, tenant_id: str) -> dict[str, Any]:
+    async def get_agent_run(
+        request: Request, run_id: str, tenant_id: str
+    ) -> dict[str, Any]:
+        await authorize(request, tenant_id, "read")
         try:
             return app.state.agent_runtime.get_run(run_id, tenant_id).dict()
         except AgentRuntimeError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.post("/agent/runs/{run_id}/resume", tags=["agentic"])
+    async def resume_agent_run(
+        request: Request, run_id: str, body: ResumeAgentRunRequest
+    ) -> dict[str, Any]:
+        await authorize(request, body.tenant_id, "execute")
+        try:
+            return await app.state.agent_runtime.resume(
+                run_id,
+                body.tenant_id,
+                role=body.role,
+                environment=body.environment,
+                scopes=set(body.scopes),
+            )
+        except AgentRuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/agent/runs/{run_id}/approve", tags=["agentic"])
-    async def approve_agent_run(run_id: str, request: ApprovalRequest) -> dict[str, Any]:
+    async def approve_agent_run(
+        request: Request, run_id: str, body: ApprovalRequest
+    ) -> dict[str, Any]:
+        await authorize(request, body.tenant_id, "approve", body.actor)
         try:
             agent_runtime = app.state.agent_runtime
             approval = agent_runtime.approve(
-                run_id, request.tenant_id, request.actor, request.reason
+                run_id, body.tenant_id, body.actor, body.reason
             )
             result = await agent_runtime.resume(
-                run_id, request.tenant_id, autonomous=False
+                run_id, body.tenant_id, autonomous=False
             )
             return {"approval": approval.dict(), **result}
         except AgentRuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/agent/runs/{run_id}/evidence", tags=["agentic"])
-    def get_agent_evidence(run_id: str, tenant_id: str) -> list[dict[str, Any]]:
+    async def get_agent_evidence(
+        request: Request, run_id: str, tenant_id: str
+    ) -> list[dict[str, Any]]:
+        await authorize(request, tenant_id, "read")
         try:
             return [
                 item.dict()

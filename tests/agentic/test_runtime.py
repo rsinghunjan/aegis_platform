@@ -9,6 +9,7 @@ from agentic.runtime import (
     AgentRuntimeError,
     AgentStore,
     AgentRunRow,
+    PlanStepRow,
     PolicyDecisionRow,
     ToolCallRow,
     ToolSpec,
@@ -85,6 +86,36 @@ def test_high_risk_requires_explicit_approval_and_resumes(tmp_path):
     assert decisions == ["review", "allow"]
 
 
+def test_high_risk_approval_is_bound_to_a_single_plan_step(tmp_path):
+    runtime = make_runtime(tmp_path / "step-approval.db")
+    calls = []
+    for name in ("release_a", "release_b"):
+        runtime.register_tool(
+            ToolSpec(name=name, risk_level="high"),
+            lambda _payload, name=name: calls.append(name) or {"released": name},
+        )
+    goal = (
+        '{"steps":['
+        '{"tool":"release_a","input":{}},'
+        '{"tool":"release_b","input":{}}]}'
+    )
+    run = runtime.create_run("tenant-a", goal)
+    assert asyncio.run(runtime.execute(run.run_id, "tenant-a"))["status"] == "WAITING_APPROVAL"
+
+    runtime.approve(run.run_id, "tenant-a", "operator-a")
+    second_review = asyncio.run(
+        runtime.resume(run.run_id, "tenant-a", autonomous=False)
+    )
+    assert second_review["status"] == "WAITING_APPROVAL"
+    assert calls == ["release_a"]
+
+    runtime.approve(run.run_id, "tenant-a", "operator-b")
+    assert asyncio.run(
+        runtime.resume(run.run_id, "tenant-a", autonomous=False)
+    )["status"] == "SUCCEEDED"
+    assert calls == ["release_a", "release_b"]
+
+
 def test_global_autonomy_kill_switch_blocks(tmp_path):
     runtime = make_runtime(
         tmp_path / "disabled.db",
@@ -151,6 +182,33 @@ def test_idempotent_tool_retry_and_verification_failure(tmp_path):
     assert len(attempts) == 2
 
 
+def test_async_tool_timeout_enters_recovery(tmp_path):
+    runtime = make_runtime(
+        tmp_path / "timeout.db", max_retries=0, step_timeout=0.01
+    )
+    calls = []
+
+    async def slow(_payload):
+        calls.append("slow")
+        await asyncio.sleep(1)
+        return {"ok": True}
+
+    runtime.register_tool(ToolSpec(name="slow", idempotent=True), slow)
+    runtime.register_tool(
+        ToolSpec(name="fallback", idempotent=True),
+        lambda _payload: {"recovered": True},
+    )
+    goal = (
+        '{"tool":"slow","input":{},'
+        '"recovery_steps":[{"tool":"fallback","input":{}}]}'
+    )
+    run = runtime.create_run("tenant-a", goal)
+    result = asyncio.run(runtime.execute(run.run_id, "tenant-a"))
+    assert result["status"] == "REPLANNING"
+    assert calls == ["slow"]
+    assert asyncio.run(runtime.resume(run.run_id, "tenant-a"))["status"] == "SUCCEEDED"
+
+
 def test_unregistered_planner_tool_is_rejected(tmp_path):
     runtime = make_runtime(tmp_path / "invalid.db")
     run = runtime.create_run("tenant-a", '{"tool":"shell","input":{"cmd":"whoami"}}')
@@ -207,3 +265,30 @@ def test_persisted_inputs_redact_secret_fields(tmp_path):
         assert "never-persist-this" not in step.plan_json["steps"][0]["input"]["api_key"]
         evidence_text = repr(runtime.list_evidence(run.run_id, "tenant-a"))
         assert "never-persist-this" not in evidence_text
+
+
+def test_resume_recovers_interrupted_idempotent_step(tmp_path):
+    runtime = make_runtime(tmp_path / "interrupted.db")
+    calls = []
+    runtime.register_tool(
+        ToolSpec(name="safe_retry", idempotent=True),
+        lambda _payload: calls.append("called") or {"ok": True},
+    )
+    run = runtime.create_run("tenant-a", '{"tool":"safe_retry","input":{}}')
+    assert asyncio.run(runtime.execute(run.run_id, "tenant-a"))["status"] == "SUCCEEDED"
+    with runtime.store.sessions() as session:
+        row = session.get(AgentRunRow, run.run_id)
+        row.status = "RUNNING"
+        step = session.scalar(
+            select(PlanStepRow).where(PlanStepRow.run_id == run.run_id)
+        )
+        step.status = "RUNNING"
+        session.commit()
+
+    resumed = asyncio.run(runtime.resume(run.run_id, "tenant-a"))
+    assert resumed["status"] == "SUCCEEDED"
+    assert len(calls) == 2
+    assert any(
+        item.kind == "interrupted_execution"
+        for item in runtime.list_evidence(run.run_id, "tenant-a")
+    )

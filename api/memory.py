@@ -74,6 +74,7 @@ class PersistentConversationMemory:
         retention_days: int = 30,
         database_url: Optional[str] = None,
         summary_fn: Optional[Callable[[str], str]] = None,
+        retrieval_hook: Optional[Callable[[str, str, str, int], list[Dict[str, Any]]]] = None,
     ):
         if not session_id or not tenant_id:
             raise ValueError("session_id and tenant_id are required")
@@ -84,6 +85,7 @@ class PersistentConversationMemory:
         self.capacity = capacity
         self.retention_days = retention_days
         self.summary_fn = summary_fn
+        self.retrieval_hook = retrieval_hook
         self.engine, self.session_factory = create_sessionmaker(
             database_url
             or os.getenv("AEGIS_MEMORY_DATABASE_URL")
@@ -151,6 +153,30 @@ class PersistentConversationMemory:
             for message in self.get_messages(tenant_id=tenant_id)
         )
         return history[-max_chars:] if max_chars > 0 else ""
+
+    def retrieve(
+        self,
+        query: str,
+        tenant_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> list[Dict[str, Any]]:
+        if tenant_id is not None and tenant_id != self.tenant_id:
+            raise PermissionError("Conversation memory is tenant-scoped")
+        maximum = max(1, min(limit or self.capacity, self.capacity))
+        if self.retrieval_hook is None:
+            return self.get_messages(tenant_id=tenant_id, limit=maximum)
+        results = self.retrieval_hook(
+            query, self.tenant_id, self.session_id, maximum
+        )
+        authorized = []
+        for item in results[:maximum]:
+            if (
+                item.get("tenant_id") != self.tenant_id
+                or item.get("session_id") != self.session_id
+            ):
+                raise PermissionError("Retrieval hook returned unauthorized memory")
+            authorized.append(item)
+        return authorized
 
     def clear(self, tenant_id: Optional[str] = None) -> None:
         if tenant_id is not None and tenant_id != self.tenant_id:

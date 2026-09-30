@@ -11,7 +11,7 @@ RUN useradd --create-home --uid 10001 aegis \
     && mkdir -p /data \
     && chown aegis:aegis /data
 
-COPY requirements.txt /app/requirements.txt
+COPY requirements-control-plane.txt /app/requirements.txt
 RUN python -m pip install --upgrade pip \
     && python -m pip install -r /app/requirements.txt
 

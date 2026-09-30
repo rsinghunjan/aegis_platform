@@ -11,12 +11,24 @@ class AgentPolicyGate:
         self,
         autonomy_enabled: Optional[bool] = None,
         medium_requires_approval: bool = True,
+        autonomy_mode: Optional[str] = None,
     ):
         self.autonomy_enabled = (
             autonomy_enabled
             if autonomy_enabled is not None
             else os.getenv("AEGIS_AUTONOMY_ENABLED", "true").lower() in {"1", "true", "yes"}
         )
+        self.autonomy_mode = autonomy_mode or os.getenv(
+            "AEGIS_AUTONOMY_MODE",
+            "autonomous-for-low-risk" if self.autonomy_enabled else "disabled",
+        )
+        if self.autonomy_mode not in {
+            "disabled",
+            "advisory",
+            "supervised",
+            "autonomous-for-low-risk",
+        }:
+            raise ValueError("Unsupported AEGIS_AUTONOMY_MODE")
         self.medium_requires_approval = medium_requires_approval
 
     def evaluate(
@@ -29,7 +41,7 @@ class AgentPolicyGate:
         approved: bool,
         autonomous: bool,
     ) -> tuple[str, str]:
-        if autonomous and not self.autonomy_enabled:
+        if self.autonomy_mode == "disabled" or (autonomous and not self.autonomy_enabled):
             return "block", "global_autonomy_disabled"
         if spec.allowed_tenants and run.tenant_id not in spec.allowed_tenants:
             return "block", "tenant_not_allowed"
@@ -43,7 +55,8 @@ class AgentPolicyGate:
             return "block", "budget_exceeded"
         risk_level = getattr(spec.risk_level, "value", spec.risk_level)
         requires_approval = (
-            spec.requires_approval
+            self.autonomy_mode in {"advisory", "supervised"}
+            or spec.requires_approval
             or risk_level == "high"
             or (
                 risk_level == "medium"

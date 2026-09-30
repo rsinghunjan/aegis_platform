@@ -45,6 +45,42 @@ def test_agent_api_fails_closed_without_tenant_authorizer(tmp_path):
     assert response.json()["detail"] == "agent API authorization is not configured"
 
 
+def test_operator_read_models_are_authorized_and_return_summaries(tmp_path):
+    runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'operator.db'}"))
+    runtime.register_tool(
+        ToolSpec(name="echo", idempotent=True),
+        lambda _payload: {"ok": True},
+    )
+    with TestClient(
+        create_app(runtime, tenant_authorizer=lambda *_args: True)
+    ) as client:
+        created = client.post(
+            "/agent/runs",
+            json={
+                "tenant_id": "tenant-a",
+                "goal": '{"tool":"echo","input":{"api_key":"must-not-be-returned"}}',
+            },
+        )
+        run_id = created.json()["run_id"]
+        listing = client.get("/operator/agent/runs", params={"tenant_id": "tenant-a"})
+        timeline = client.get(
+            f"/operator/agent/runs/{run_id}/timeline",
+            params={"tenant_id": "tenant-a"},
+        )
+        catalog = client.get(
+            "/operator/agent/capabilities", params={"tenant_id": "tenant-a"}
+        )
+        summary = client.get(
+            "/operator/agent/evidence-summary",
+            params={"tenant_id": "tenant-a", "run_id": run_id},
+        )
+    assert listing.status_code == timeline.status_code == catalog.status_code == 200
+    assert "goal" not in listing.json()["items"][0]
+    assert "must-not-be-returned" not in repr(listing.json())
+    assert catalog.json()["items"][0]["name"] == "echo"
+    assert summary.json()["count"] >= 1
+
+
 def test_agent_approval_requires_authorized_actor(tmp_path):
     runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'approval.db'}"))
     runtime.register_tool(

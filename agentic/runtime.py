@@ -5,10 +5,11 @@ import asyncio
 import hashlib
 import inspect
 import json
+import math
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Optional
 
@@ -23,12 +24,17 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    inspect as sqlalchemy_inspect,
     select,
+    text,
     update,
 )
+
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from policy.agent_policy import AgentPolicyGate
+from agentic.capabilities import CapabilityCatalog
+from agentic.sandbox import SandboxBoundary, SandboxProfile
 
 
 class RiskLevel(str, Enum):
@@ -82,6 +88,12 @@ class ToolSpec(BaseModel):
     max_cost: float = 0.0
     allowed_tenants: list[str] = Field(default_factory=list)
     allowed_scopes: list[str] = Field(default_factory=list)
+    version: str = "1.0.0"
+    sandbox_profile: str = SandboxProfile.PURE.value
+    timeout_seconds: Optional[float] = None
+    approval_sla_seconds: Optional[int] = None
+    max_input_bytes: int = 65536
+    max_output_bytes: int = 65536
 
 
 class ToolCall(BaseModel):
@@ -119,6 +131,12 @@ class Approval(BaseModel):
     reason: Optional[str] = None
     created_at: datetime
     decided_at: Optional[datetime] = None
+    requested_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    sla_seconds: int = 3600
+    escalation_status: str = "none"
+    denial_reason: Optional[str] = None
+    capability_version: Optional[str] = None
 
 
 class Evidence(BaseModel):
@@ -218,6 +236,22 @@ class ApprovalRow(AgentBase):
     reason: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    requested_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    sla_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=3600)
+    escalation_status: Mapped[str] = mapped_column(String(32), nullable=False, default="none")
+    denial_reason: Mapped[Optional[str]] = mapped_column(Text)
+    capability_version: Mapped[Optional[str]] = mapped_column(String(64))
+
+
+class CapabilityRow(AgentBase):
+    __tablename__ = "agent_capabilities"
+
+    name: Mapped[str] = mapped_column(String(128), primary_key=True)
+    version: Mapped[str] = mapped_column(String(64), nullable=False)
+    spec_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    spec_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
 class EvidenceRow(AgentBase):
@@ -257,6 +291,8 @@ def _persistable(value: Any) -> Any:
         return [_persistable(item) for item in value]
     if isinstance(value, str) and len(value) > 4096:
         return {"sha256": _hash(value), "truncated": True}
+    if isinstance(value, float) and not math.isfinite(value):
+        raise AgentRuntimeError("Tool inputs and outputs must use finite numbers")
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     raise AgentRuntimeError("Tool inputs and outputs must be JSON-compatible")
@@ -295,6 +331,43 @@ class AgentStore:
 
     def initialize(self) -> None:
         AgentBase.metadata.create_all(self.engine, checkfirst=True)
+        existing = {
+            column["name"]
+            for column in sqlalchemy_inspect(self.engine).get_columns("agent_approvals")
+        }
+        additions = {
+            "requested_at": "DATETIME",
+            "expires_at": "DATETIME",
+            "sla_seconds": "INTEGER NOT NULL DEFAULT 3600",
+            "escalation_status": "VARCHAR(32) NOT NULL DEFAULT 'none'",
+            "denial_reason": "TEXT",
+            "capability_version": "VARCHAR(64)",
+        }
+        with self.engine.begin() as connection:
+            for name, sql_type in additions.items():
+                if name not in existing:
+                    connection.execute(
+                        text(f"ALTER TABLE agent_approvals ADD COLUMN {name} {sql_type}")
+                    )
+        with self.sessions() as session:
+            legacy_pending = session.scalars(
+                select(ApprovalRow).where(
+                    ApprovalRow.status == "pending",
+                    ApprovalRow.expires_at.is_(None),
+                )
+            ).all()
+            for approval in legacy_pending:
+                approval.requested_at = approval.created_at
+                approval.sla_seconds = 3600
+                approval.expires_at = approval.created_at + timedelta(hours=1)
+                approval.status = "expired"
+                approval.decided_at = _now()
+                approval.denial_reason = "legacy_approval_failed_closed"
+                run = session.get(AgentRunRow, approval.run_id)
+                if run and run.tenant_id == approval.tenant_id:
+                    run.status = "BLOCKED"
+                    run.error = "approval_expired"
+            session.commit()
 
 
 class Planner:
@@ -307,17 +380,27 @@ class Planner:
 class DeterministicJSONPlanner(Planner):
     """Accepts JSON {tool, input, acceptance} or {steps: [...]}; never runs code."""
 
+    max_steps = 32
+
     def plan(
         self, goal: str, registered_tools: set[str], recovery: bool = False
     ) -> Plan:
         try:
-            request = json.loads(goal)
+            request = json.loads(
+                goal,
+                parse_constant=lambda _value: (_ for _ in ()).throw(
+                    ValueError("non-finite JSON number")
+                ),
+            )
         except (TypeError, json.JSONDecodeError):
             if len(registered_tools) != 1:
                 raise AgentRuntimeError(
                     "Provide a JSON plan naming a registered tool when multiple tools exist"
                 )
             request = {"tool": next(iter(registered_tools)), "input": {"goal": goal}}
+        allowed_request_fields = {"tool", "input", "acceptance", "steps", "recovery_steps"}
+        if isinstance(request, dict) and set(request) - allowed_request_fields:
+            raise AgentRuntimeError("Planner returned unsupported request fields")
         steps = (
             request.get("recovery_steps")
             if recovery and isinstance(request, dict)
@@ -326,13 +409,17 @@ class DeterministicJSONPlanner(Planner):
         if recovery and steps is None:
             raise AgentRuntimeError("No recovery plan provided")
         if steps is None and isinstance(request, dict) and "tool" in request:
-            steps = [request]
-        if not isinstance(steps, list) or not steps:
+            steps = [
+                {key: request[key] for key in ("tool", "input", "acceptance") if key in request}
+            ]
+        if not isinstance(steps, list) or not steps or len(steps) > self.max_steps:
             raise AgentRuntimeError("Planner requires one or more tool steps")
         plan_steps = []
         for ordinal, spec in enumerate(steps):
             if not isinstance(spec, dict):
                 raise AgentRuntimeError("Each planned step must be a JSON object")
+            if set(spec) - {"tool", "input", "acceptance"}:
+                raise AgentRuntimeError("Planner returned unsupported step fields")
             tool_name = spec.get("tool")
             if not isinstance(tool_name, str) or tool_name not in registered_tools:
                 raise AgentRuntimeError(f"Planner selected an unregistered tool: {tool_name}")
@@ -340,6 +427,18 @@ class DeterministicJSONPlanner(Planner):
             acceptance = spec.get("acceptance", {})
             if not isinstance(tool_input, dict) or not isinstance(acceptance, dict):
                 raise AgentRuntimeError("Tool input and acceptance criteria must be JSON objects")
+            if set(acceptance) - {"required_keys", "equals"}:
+                raise AgentRuntimeError("Unsupported acceptance criteria")
+            if not isinstance(acceptance.get("required_keys", []), list) or any(
+                not isinstance(key, str) for key in acceptance.get("required_keys", [])
+            ):
+                raise AgentRuntimeError("Acceptance required_keys must be strings")
+            if not isinstance(acceptance.get("equals", {}), dict):
+                raise AgentRuntimeError("Acceptance equals must be a JSON object")
+            try:
+                json.dumps([tool_input, acceptance], allow_nan=False)
+            except (TypeError, ValueError) as exc:
+                raise AgentRuntimeError("Planner values must be strict JSON") from exc
             plan_steps.append(
                 PlanStep(
                     step_id=str(uuid.uuid4()),
@@ -417,14 +516,38 @@ class AgentRuntime:
         max_retries: int = 1,
         max_replans: int = 1,
         step_timeout: float = 30.0,
+        sandbox: Optional[SandboxBoundary] = None,
+        capability_enforcement: Optional[bool] = None,
+        approval_sla_seconds: Optional[int] = None,
     ):
         self.store = store or AgentStore()
-        self.planner = planner or DeterministicJSONPlanner()
+        if planner is None:
+            from agentic.planner import OpenAICompatiblePlanner
+
+            planner = OpenAICompatiblePlanner.from_environment()
+        self.planner = planner
         self.policy = policy or AgentPolicyGate()
         self.verifier = verifier or Verifier()
         self.max_retries = max(0, max_retries)
         self.max_replans = max(0, max_replans)
         self.step_timeout = step_timeout
+        self.sandbox = sandbox or SandboxBoundary()
+        self.capability_enforcement = (
+            capability_enforcement
+            if capability_enforcement is not None
+            else os.getenv("AEGIS_CAPABILITY_ENFORCEMENT", "").lower()
+            in {"1", "true", "yes"}
+        )
+        try:
+            sla = (
+                approval_sla_seconds
+                if approval_sla_seconds is not None
+                else int(os.getenv("AEGIS_APPROVAL_SLA_SECONDS", "3600"))
+            )
+        except ValueError:
+            sla = 3600
+        self.approval_sla_seconds = max(1, int(sla))
+        self.catalog = CapabilityCatalog()
         self._tools: dict[str, tuple[ToolSpec, Callable[..., Any]]] = {}
 
     def register_tool(self, spec: ToolSpec, tool: Callable[..., Any]) -> None:
@@ -432,7 +555,27 @@ class AgentRuntime:
             raise AgentRuntimeError("A named callable is required to register a tool")
         if spec.max_cost < 0:
             raise AgentRuntimeError("Tool max_cost cannot be negative")
+        if spec.max_input_bytes <= 0 or spec.max_output_bytes <= 0:
+            raise AgentRuntimeError("Tool payload limits must be positive")
+        if spec.timeout_seconds is not None and spec.timeout_seconds <= 0:
+            raise AgentRuntimeError("Tool timeout must be positive")
+        if spec.sandbox_profile not in {profile.value for profile in SandboxProfile}:
+            raise AgentRuntimeError("Unknown sandbox profile")
         self._tools[spec.name] = (spec, tool)
+        self.catalog.register(spec)
+        self.store.initialize()
+        with self.store.sessions() as session:
+            safe_spec = _persistable(spec.dict())
+            session.merge(
+                CapabilityRow(
+                    name=spec.name,
+                    version=spec.version,
+                    spec_json=safe_spec,
+                    spec_hash=_hash(safe_spec),
+                    updated_at=_now(),
+                )
+            )
+            session.commit()
 
     def create_run(
         self,
@@ -563,7 +706,10 @@ class AgentRuntime:
                 for step in plan.steps:
                     if step.tool_name not in self._tools:
                         raise AgentRuntimeError("Plan references an unregistered tool")
-                    if not _matches_schema(step.input, self._tools[step.tool_name][0].input_schema):
+                    spec = self._tools[step.tool_name][0]
+                    if self.capability_enforcement and not self._capability_is_active(spec):
+                        raise AgentRuntimeError("Plan references an inactive capability")
+                    if not _matches_schema(step.input, spec.input_schema):
                         raise AgentRuntimeError(f"Input schema mismatch for {step.tool_name}")
                     step.input = _persistable(step.input)
                     session.add(
@@ -591,7 +737,11 @@ class AgentRuntime:
                     {
                         "plan_id": plan.plan_id,
                         "step_count": len(plan.steps),
-                        "planner_version": "deterministic-json-v1",
+                        "planner_version": getattr(
+                            self.planner, "provider_name", "deterministic-json-v1"
+                        ),
+                        "model": getattr(self.planner, "model", None),
+                        "catalog_hash": self.catalog.sha256,
                     },
                 )
                 session.commit()
@@ -702,6 +852,19 @@ class AgentRuntime:
             if pending is None:
                 raise AgentRuntimeError("No pending approval for this run")
             now = _now()
+            if pending.expires_at and pending.expires_at <= now:
+                pending.status = "expired"
+                pending.decided_at = now
+                row.status = "BLOCKED"
+                row.error = "approval_expired"
+                session.commit()
+                raise AgentRuntimeError("Approval has expired")
+            spec = self._tools.get(pending.tool_name)
+            if (
+                spec is None
+                or self._active_capability_version(spec[0]) != pending.capability_version
+            ):
+                raise AgentRuntimeError("Approval capability version is no longer active")
             pending.status = "approved"
             pending.actor = actor
             pending.reason = reason
@@ -731,7 +894,210 @@ class AgentRuntime:
                 reason=pending.reason,
                 created_at=pending.created_at,
                 decided_at=pending.decided_at,
+                requested_at=pending.requested_at,
+                expires_at=pending.expires_at,
+                sla_seconds=pending.sla_seconds,
+                escalation_status=pending.escalation_status,
+                denial_reason=pending.denial_reason,
+                capability_version=pending.capability_version,
             )
+
+    def deny(self, run_id: str, tenant_id: str, actor: str, reason: str) -> Approval:
+        if not actor or not reason:
+            raise AgentRuntimeError("Approval actor and denial reason are required")
+        with self.store.sessions() as session:
+            run = self._owned_run(session, run_id, tenant_id)
+            pending = session.scalar(
+                select(ApprovalRow).where(
+                    ApprovalRow.run_id == run_id,
+                    ApprovalRow.tenant_id == tenant_id,
+                    ApprovalRow.status == "pending",
+                )
+            )
+            if pending is None:
+                raise AgentRuntimeError("No pending approval for this run")
+            now = _now()
+            pending.status = "denied"
+            pending.actor = actor
+            pending.reason = reason
+            pending.denial_reason = reason
+            pending.decided_at = now
+            run.status = "BLOCKED"
+            run.error = "approval_denied"
+            self._add_evidence(
+                session,
+                run,
+                "approval",
+                {
+                    "status": "denied",
+                    "actor": actor,
+                    "step_id": pending.step_id,
+                    "tool_name": pending.tool_name,
+                },
+            )
+            session.commit()
+            return self._as_approval(pending)
+
+    def list_approvals(
+        self, tenant_id: Optional[str] = None, status: Optional[str] = None
+    ) -> list[Approval]:
+        with self.store.sessions() as session:
+            query = select(ApprovalRow)
+            if tenant_id is not None:
+                query = query.where(ApprovalRow.tenant_id == tenant_id)
+            if status is not None:
+                query = query.where(ApprovalRow.status == status)
+            return [
+                self._as_approval(row)
+                for row in session.scalars(query.order_by(ApprovalRow.created_at)).all()
+            ]
+
+    def list_runs(
+        self, tenant_id: str, offset: int = 0, limit: int = 50
+    ) -> list[AgentRun]:
+        with self.store.sessions() as session:
+            rows = session.scalars(
+                select(AgentRunRow)
+                .where(AgentRunRow.tenant_id == tenant_id)
+                .order_by(AgentRunRow.created_at.desc())
+                .offset(max(0, offset))
+                .limit(max(1, min(limit, 100)))
+            ).all()
+            return [self._as_run(row) for row in rows]
+
+    def list_timeline(self, run_id: str, tenant_id: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "evidence_id": item.evidence_id,
+                "kind": item.kind,
+                "sha256": item.sha256,
+                "metadata": item.metadata,
+                "created_at": item.created_at,
+            }
+            for item in self.list_evidence(run_id, tenant_id)
+        ]
+
+    def record_evidence(
+        self, run_id: str, tenant_id: str, kind: str, metadata: dict[str, Any]
+    ) -> str:
+        safe_metadata = _persistable(metadata)
+        digest = _hash(safe_metadata)
+        with self.store.sessions() as session:
+            run = self._owned_run(session, run_id, tenant_id)
+            existing = session.scalar(
+                select(EvidenceRow).where(
+                    EvidenceRow.run_id == run_id,
+                    EvidenceRow.tenant_id == tenant_id,
+                    EvidenceRow.kind == kind,
+                    EvidenceRow.sha256 == digest,
+                )
+            )
+            if existing:
+                return existing.evidence_id
+            self._add_evidence(session, run, kind, safe_metadata)
+            session.commit()
+            return session.scalar(
+                select(EvidenceRow.evidence_id).where(
+                    EvidenceRow.run_id == run_id,
+                    EvidenceRow.tenant_id == tenant_id,
+                    EvidenceRow.kind == kind,
+                    EvidenceRow.sha256 == digest,
+                )
+            )
+
+    def list_remediation_events(self, tenant_id: str) -> list[dict[str, Any]]:
+        events = []
+        for run in self.list_runs(tenant_id, 0, 100):
+            for item in self.list_evidence(run.run_id, tenant_id):
+                if item.kind in {"drift_finding", "remediation_proposal"}:
+                    events.append(
+                        {
+                            "run_id": run.run_id,
+                            "status": run.status,
+                            "evidence_id": item.evidence_id,
+                            "kind": item.kind,
+                            "sha256": item.sha256,
+                            "metadata": item.metadata,
+                            "created_at": item.created_at,
+                        }
+                    )
+        return events
+
+    def list_blocked_decisions(self, tenant_id: str) -> list[dict[str, Any]]:
+        with self.store.sessions() as session:
+            rows = session.scalars(
+                select(PolicyDecisionRow)
+                .where(
+                    PolicyDecisionRow.tenant_id == tenant_id,
+                    PolicyDecisionRow.action == "block",
+                )
+                .order_by(PolicyDecisionRow.created_at.desc())
+                .limit(100)
+            ).all()
+            return [
+                {
+                    "decision_id": row.decision_id,
+                    "run_id": row.run_id,
+                    "tool_name": row.tool_name,
+                    "reason": row.reason,
+                    "created_at": row.created_at,
+                }
+                for row in rows
+            ]
+
+    def expire_approvals(self) -> int:
+        now = _now()
+        expired = 0
+        with self.store.sessions() as session:
+            pending = session.scalars(
+                select(ApprovalRow).where(
+                    ApprovalRow.status == "pending",
+                    ApprovalRow.expires_at <= now,
+                )
+            ).all()
+            for approval in pending:
+                approval.status = "expired"
+                approval.decided_at = now
+                approval.denial_reason = "approval_sla_expired"
+                run = self._owned_run(session, approval.run_id, approval.tenant_id)
+                run.status = "BLOCKED"
+                run.error = "approval_expired"
+                self._add_evidence(
+                    session,
+                    run,
+                    "approval",
+                    {
+                        "status": "expired",
+                        "step_id": approval.step_id,
+                        "tool_name": approval.tool_name,
+                    },
+                )
+                expired += 1
+            session.commit()
+        return expired
+
+    def escalate_approvals(self) -> int:
+        now = _now()
+        with self.store.sessions() as session:
+            pending = session.scalars(
+                select(ApprovalRow).where(
+                    ApprovalRow.status == "pending",
+                    ApprovalRow.expires_at > now,
+                    ApprovalRow.escalation_status == "none",
+                )
+            ).all()
+            pending = [
+                approval
+                for approval in pending
+                if approval.requested_at
+                and approval.requested_at
+                + timedelta(seconds=max(1, approval.sla_seconds // 2))
+                <= now
+            ]
+            for approval in pending:
+                approval.escalation_status = "escalated"
+            session.commit()
+            return len(pending)
 
     def list_evidence(self, run_id: str, tenant_id: str) -> list[Evidence]:
         with self.store.sessions() as session:
@@ -772,6 +1138,34 @@ class AgentRuntime:
             if step.status == "SUCCEEDED":
                 return {"status": "SUCCEEDED", "run_id": run_id}
             spec, tool = self._tools[step.tool_name]
+            try:
+                if self.capability_enforcement and not self._capability_is_active(spec):
+                    raise AgentRuntimeError("inactive_capability")
+                if len(
+                    json.dumps(step.input_json, separators=(",", ":"), default=str).encode()
+                ) > min(spec.max_input_bytes, self.sandbox.max_payload_bytes):
+                    raise AgentRuntimeError("sandbox_input_too_large")
+                self.sandbox.check_input(
+                    step.input_json, spec.sandbox_profile, environment
+                )
+            except (AgentRuntimeError, ValueError) as exc:
+                run.status = "BLOCKED"
+                run.error = str(exc)
+                step.status = "BLOCKED"
+                step.error = str(exc)
+                self._add_evidence(
+                    session,
+                    run,
+                    "sandbox_block",
+                    {
+                        "tool_name": spec.name,
+                        "sandbox_profile": spec.sandbox_profile,
+                        "reason": str(exc),
+                    },
+                )
+                session.commit()
+                return {"status": "BLOCKED", "run_id": run_id, "reason": str(exc)}
+            active_capability = self._active_capability_version(spec)
             approved = bool(
                 session.scalar(
                     select(ApprovalRow).where(
@@ -779,6 +1173,7 @@ class AgentRuntime:
                         ApprovalRow.tenant_id == tenant_id,
                         ApprovalRow.step_id == step_id,
                         ApprovalRow.status == "approved",
+                        ApprovalRow.capability_version == active_capability,
                     )
                 )
             )
@@ -829,6 +1224,16 @@ class AgentRuntime:
                             tool_name=spec.name,
                             status="pending",
                             created_at=_now(),
+                            requested_at=_now(),
+                            expires_at=_now()
+                            + timedelta(
+                                seconds=spec.approval_sla_seconds
+                                or self.approval_sla_seconds
+                            ),
+                            sla_seconds=spec.approval_sla_seconds
+                            or self.approval_sla_seconds,
+                            escalation_status="none",
+                            capability_version=active_capability,
                         )
                     )
                 session.commit()
@@ -877,7 +1282,16 @@ class AgentRuntime:
                     tool_name=spec.name,
                     status="RUNNING",
                     input_hash=input_hash,
-                    result_metadata={},
+                    result_metadata={
+                        "sandbox_profile": spec.sandbox_profile,
+                        "max_input_bytes": min(
+                            spec.max_input_bytes, self.sandbox.max_payload_bytes
+                        ),
+                        "max_output_bytes": min(
+                            spec.max_output_bytes, self.sandbox.max_output_bytes
+                        ),
+                        "timeout_seconds": spec.timeout_seconds or self.step_timeout,
+                    },
                     created_at=_now(),
                 )
             )
@@ -889,18 +1303,33 @@ class AgentRuntime:
                     "tool_name": spec.name,
                     "call_id": call_id,
                     "input_hash": input_hash,
+                    "sandbox_profile": spec.sandbox_profile,
+                    "max_input_bytes": min(
+                        spec.max_input_bytes, self.sandbox.max_payload_bytes
+                    ),
+                    "max_output_bytes": min(
+                        spec.max_output_bytes, self.sandbox.max_output_bytes
+                    ),
+                    "timeout_seconds": spec.timeout_seconds or self.step_timeout,
                 },
             )
             session.commit()
 
         try:
             if inspect.iscoroutinefunction(tool):
-                raw_result = await asyncio.wait_for(tool(safe_input), self.step_timeout)
+                raw_result = await asyncio.wait_for(
+                    tool(safe_input), spec.timeout_seconds or self.step_timeout
+                )
             else:
                 raw_result = await asyncio.wait_for(
-                    asyncio.to_thread(tool, safe_input), self.step_timeout
+                    asyncio.to_thread(tool, safe_input),
+                    spec.timeout_seconds or self.step_timeout,
                 )
             result = _persistable(raw_result)
+            self.sandbox.check_output(result)
+            output_size = len(json.dumps(result, default=str).encode())
+            if output_size > spec.max_output_bytes:
+                raise ValueError("sandbox_output_too_large")
             valid, verification_reason = self.verifier.verify(
                 result, spec.output_schema, step.acceptance_json
             )
@@ -928,7 +1357,15 @@ class AgentRuntime:
                 call.output_hash = output_hash
                 call.result_metadata = {
                     "type": type(result).__name__,
-                    "size_bytes": len(json.dumps(result, default=str).encode()),
+                    "size_bytes": output_size,
+                    "sandbox_profile": spec.sandbox_profile,
+                    "max_input_bytes": min(
+                        spec.max_input_bytes, self.sandbox.max_payload_bytes
+                    ),
+                    "max_output_bytes": min(
+                        spec.max_output_bytes, self.sandbox.max_output_bytes
+                    ),
+                    "timeout_seconds": spec.timeout_seconds or self.step_timeout,
                 }
                 self._add_evidence(
                     session,
@@ -1024,6 +1461,41 @@ class AgentRuntime:
             plan=plan,
             final_result_hash=row.final_result_hash,
         )
+
+    @staticmethod
+    def _as_approval(row: ApprovalRow) -> Approval:
+        return Approval(
+            approval_id=row.approval_id,
+            run_id=row.run_id,
+            tenant_id=row.tenant_id,
+            step_id=row.step_id,
+            tool_name=row.tool_name,
+            status=row.status,
+            actor=row.actor,
+            reason=row.reason,
+            created_at=row.created_at,
+            decided_at=row.decided_at,
+            requested_at=row.requested_at,
+            expires_at=row.expires_at,
+            sla_seconds=row.sla_seconds,
+            escalation_status=row.escalation_status,
+            denial_reason=row.denial_reason,
+            capability_version=row.capability_version,
+        )
+
+    def _active_capability_version(self, spec: ToolSpec) -> str:
+        with self.store.sessions() as session:
+            row = session.get(CapabilityRow, spec.name)
+            return row.version if row else spec.version
+
+    def _capability_is_active(self, spec: ToolSpec) -> bool:
+        with self.store.sessions() as session:
+            row = session.get(CapabilityRow, spec.name)
+            return bool(
+                row
+                and row.version == spec.version
+                and row.spec_hash == _hash(_persistable(spec.dict()))
+            )
 
     @staticmethod
     def _execution_result(row: AgentRunRow) -> dict[str, Any]:

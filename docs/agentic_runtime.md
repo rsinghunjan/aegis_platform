@@ -18,12 +18,30 @@ PENDING -> PLANNING -> RUNNING -> SUCCEEDED
                           \----> BLOCKED
 ```
 
-The JSON planner accepts either a `tool` step or an ordered `steps` list. Each
-step names an already registered `ToolSpec` and contains JSON input and optional
-acceptance criteria. Unregistered tools, malformed steps, and schema-invalid
-inputs fail closed. Model output is never interpreted as shell, Python, or
-another executable language. A hosted LLM planner can implement `Planner`, but
-must continue to produce this constrained plan representation.
+The deterministic JSON planner accepts either a `tool` step or an ordered
+`steps` list. When `AEGIS_LLM_PLANNER_ENABLED=true` and endpoint, model, and API
+key are configured, `OpenAICompatiblePlanner` sends an OpenAI-compatible
+chat-completions request. The adapter accepts only bounded JSON steps naming
+registered tools with object inputs and acceptance criteria. Provider errors or
+invalid output fall back to the deterministic planner. Prompts and credentials
+are not written to evidence; model/provider identifiers and hashes are.
+
+## Capability catalog and sandbox
+
+`CapabilityCatalog` exposes canonical metadata, a deterministic SHA-256 hash,
+and an optional signer callback. Runtime registrations are persisted in the
+`agent_capabilities` table. `AEGIS_CAPABILITY_ENFORCEMENT=true` requires the
+active registered version/hash at plan and execution time. Tool metadata
+includes version, risk, schemas, role/environment/scope/tenant allowlists,
+approval policy, idempotency, cost, timeouts, payload limits, and sandbox
+profile.
+
+Profiles are `pure` (default), `network` (requires an injected network-policy
+hook), `storage`, and `restricted-subprocess`. The built-in boundary rejects
+oversized payloads, code-like pure-profile fields, unconfigured network access,
+and subprocess profiles without an external adapter. Sync handlers run in a
+worker thread. This is a policy boundary around trusted registered handlers,
+not kernel/container isolation; do not register untrusted Python callables.
 
 Tools should be registered with their input/output schemas, risk level, roles,
 environments, approval setting, idempotency declaration, maximum cost, tenant
@@ -37,6 +55,11 @@ async handlers are awaited. Both have a configurable timeout.
 - Medium-risk tools require approval by default. This can be changed when
   constructing `AgentPolicyGate`.
 - High-risk tools always require a persisted explicit approval.
+- Approval rows bind tenant, run, step, tool, and capability version. The default
+  SLA is 3600 seconds; expiration blocks execution. Halfway escalation is
+  available via `ApprovalService`, with optional notification/escalation
+  callbacks. A scheduler must invoke expiry/escalation methods; the core server
+  does not run a background scheduler.
 - Approvals are bound to the individual plan step and tool; approving one action
   does not authorize later high-risk actions in the same run.
 - `AEGIS_AUTONOMY_ENABLED=false` blocks autonomous actions globally. A recorded
@@ -60,12 +83,12 @@ embedding service has authorized the human approver.
 
 ## Persistence and evidence
 
-Agent runs, plan steps, tool-call metadata, policy decisions, approvals, and
-evidence are durable. The idempotency key is unique within a tenant. Stored
-tool input redacts keys that look like credentials and truncates oversized
-strings; tool results are reduced to hashes and small type/size metadata in
-audit rows. Prompt/context references and final outcome hashes are audit
-evidence; raw prompt/result payloads are not copied into evidence rows.
+Agent runs, plan steps, tool-call metadata, policy decisions, approvals,
+capabilities, and evidence are durable. The idempotency key is unique within a
+tenant. Stored tool input redacts keys that look like credentials and truncates
+oversized strings; tool results are reduced to hashes and small type/size
+metadata in audit rows. Prompt/context references and final outcome hashes are
+audit evidence; raw prompts and result payloads are not copied into evidence.
 
 Configure storage with `AEGIS_AGENT_DATABASE_URL`; `DATABASE_URL` is accepted
 as a fallback. SQLite is the local default. PostgreSQL deployments must install
@@ -82,6 +105,23 @@ serving are adapter integration points and are not installed or enabled by the
 minimal server image.
 
 `DriftRemediationAdapter` accepts a normalized `DriftFinding`, creates an
-idempotent diagnosis run, and optionally calls an injected promotion adapter
-after successful verification. Monitoring libraries and external governance
-systems remain outside the core runtime.
+idempotent diagnosis run, stores a normalized event hash, and records a bounded
+remediation proposal. Optional injected adapters can execute canary deployment
+or rollback actions; rollback requires approval. `local_simulation_adapter`
+verifies a proposal without contacting a cloud provider. Retraining, promotion,
+rollback, and notification integrations remain optional callbacks.
+
+## Operator API
+
+Authorized `/operator/agent/*` read models provide paginated run summaries, run
+timelines, blocked policy decisions, evidence summaries, capability
+inspection/hash, and remediation events. `/agent/approvals` lists tenant-scoped
+approvals and `/agent/approvals/{approval_id}/decision` accepts authorized
+approve/deny decisions. Responses avoid raw prompts and tool results.
+
+## Autonomy configuration
+
+Set `AEGIS_AUTONOMY_MODE` to `disabled`, `advisory`, `supervised`, or
+`autonomous-for-low-risk`. Advisory and supervised modes hold all actions for an
+explicit human approval; disabled blocks even approved execution. The legacy
+`AEGIS_AUTONOMY_ENABLED=false` setting remains a global kill switch.

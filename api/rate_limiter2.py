@@ -100,6 +100,30 @@ class RateLimitExceeded(HTTPException):
         super().__init__(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=detail)
 
 
+def _fetch_tenant_quota_from_db(tenant_id: str) -> dict:
+    """
+    Blocking DB lookup, run off the event loop via run_in_executor (see
+    `_get_tenant_quota`) since SQLAlchemy's sync Session would otherwise stall
+    the async request path for the duration of the query.
+    """
+    try:
+        session = SessionLocal()
+        try:
+            tq = session.query(TenantQuota).filter_by(tenant_id=tenant_id).one_or_none()
+            if tq:
+                return {
+                    "rate_per_min": int(tq.rate_per_min) if tq.rate_per_min else DEFAULT_RATE,
+                    "burst": int(tq.burst) if tq.burst else DEFAULT_BURST,
+                    "daily_quota_units": int(tq.daily_quota_units) if tq.daily_quota_units else 0,
+                }
+            return {"rate_per_min": DEFAULT_RATE, "burst": DEFAULT_BURST, "daily_quota_units": 0}
+        finally:
+            session.close()
+    except Exception:
+        logger.exception("failed to load tenant quota from DB for %s", tenant_id)
+        return {"rate_per_min": DEFAULT_RATE, "burst": DEFAULT_BURST, "daily_quota_units": 0}
+
+
 async def _get_tenant_quota(tenant_id: Optional[str]) -> dict:
     """
     Return quota dict: {"rate_per_min": int, "burst": int, "daily_quota_units": int or 0}
@@ -119,26 +143,9 @@ async def _get_tenant_quota(tenant_id: Optional[str]) -> dict:
         except Exception:
             logger.exception("failed to read tenant quota cache for %s", tenant_id)
 
-    # load from DB
-    try:
-        session = SessionLocal()
-        tq = session.query(TenantQuota).filter_by(tenant_id=tenant_id).one_or_none()
-        if tq:
-            quota = {
-                "rate_per_min": int(tq.rate_per_min) if tq.rate_per_min else DEFAULT_RATE,
-                "burst": int(tq.burst) if tq.burst else DEFAULT_BURST,
-                "daily_quota_units": int(tq.daily_quota_units) if tq.daily_quota_units else 0,
-            }
-        else:
-            quota = {"rate_per_min": DEFAULT_RATE, "burst": DEFAULT_BURST, "daily_quota_units": 0}
-    except Exception:
-        logger.exception("failed to load tenant quota from DB for %s", tenant_id)
-        quota = {"rate_per_min": DEFAULT_RATE, "burst": DEFAULT_BURST, "daily_quota_units": 0}
-    finally:
-        try:
-            session.close()
-        except Exception:
-            pass
+    # Cache miss: load from DB without blocking the event loop.
+    loop = asyncio.get_event_loop()
+    quota = await loop.run_in_executor(None, _fetch_tenant_quota_from_db, tenant_id)
 
     # cache in Redis
     if r:
@@ -188,12 +195,20 @@ async def enforce_rate_limit(tenant_id: Optional[str], route_key: str, tokens: i
     """
     Public entrypoint for endpoints. Raises RateLimitExceeded on violation.
     """
+    start = time.monotonic()
     quota = await _get_tenant_quota(tenant_id)
     rate = int(quota.get("rate_per_min", DEFAULT_RATE))
     burst = int(quota.get("burst", DEFAULT_BURST))
     daily_quota = int(quota.get("daily_quota_units", 0) or 0)
 
     res = await _atomic_consume(tenant_id, route_key, tokens, rate, burst, daily_quota)
+    elapsed_ms = (time.monotonic() - start) * 1000.0
+    # Lightweight observability: surface slow rate-limit decisions (e.g. Redis
+    # latency spikes) without adding a metrics dependency to this hot path.
+    if elapsed_ms > 50.0:
+        logger.warning("rate limit check for tenant=%s route=%s took %.1fms", tenant_id, route_key, elapsed_ms)
+    else:
+        logger.debug("rate limit check for tenant=%s route=%s took %.1fms", tenant_id, route_key, elapsed_ms)
     if res.get("ok") == 1:
         # allowed
         return

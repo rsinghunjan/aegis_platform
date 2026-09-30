@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import time
 from dataclasses import dataclass
@@ -22,6 +24,12 @@ class OpaHttpEngine:
     timeout_s: float = 2.0
 
     def evaluate(self, policy_input: PolicyInput) -> EngineDecisionRecord:
+        """
+        Synchronous evaluation. This performs a blocking HTTP call and must
+        not be invoked directly from an async request handler / event loop
+        (use `evaluate_async` there instead) since it would stall the whole
+        worker for the duration of the OPA round-trip.
+        """
         payload = {"input": policy_input.to_json()}
         body = json.dumps(payload).encode("utf-8")
 
@@ -37,6 +45,19 @@ class OpaHttpEngine:
             raw_bytes = resp.read()
         latency_ms = int((time.time() - start) * 1000)
 
+        return self._build_decision_record(raw_bytes, latency_ms)
+
+    async def evaluate_async(self, policy_input: PolicyInput) -> EngineDecisionRecord:
+        """
+        Async-safe evaluation for use in request-handling code paths (e.g.
+        FastAPI handlers / middleware). Offloads the blocking urllib HTTP
+        call to the default thread-pool executor so the event loop stays
+        free to serve other requests while waiting on OPA's response.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, functools.partial(self.evaluate, policy_input))
+
+    def _build_decision_record(self, raw_bytes: bytes, latency_ms: int) -> EngineDecisionRecord:
         raw = json.loads(raw_bytes.decode("utf-8"))
         result = raw.get("result")
         if result is None or not isinstance(result, Mapping):

@@ -51,7 +51,10 @@ class ModelVersion(Base):
     id = Column(Integer, primary_key=True, index=True)
     model_id = Column(Integer, ForeignKey("models.id", ondelete="CASCADE"), nullable=False, index=True)
     version = Column(String(100), nullable=False)
-    metadata = Column(JSON, nullable=True)
+    # Named "extra_metadata" (not "metadata") because SQLAlchemy's Declarative
+    # API reserves the "metadata" attribute name on mapped classes; the
+    # underlying column name is left unchanged for compatibility.
+    extra_metadata = Column("metadata", JSON, nullable=True)
     artifact_path = Column(String(1000), nullable=True)  # object store or filesystem path
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
@@ -128,6 +131,18 @@ class BillingAccount(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+class TenantQuota(Base):
+    # Referenced by api/rate_limiter2.py and api/rate_limiter.py for the
+    # per-tenant DB fallback lookup when the Redis quota cache misses.
+    __tablename__ = "tenant_quotas"
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(String(200), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    rate_per_min = Column(Integer, nullable=True)  # requests per minute
+    burst = Column(Integer, nullable=True)  # burst capacity
+    daily_quota_units = Column(Integer, nullable=True)  # optional daily quota in units
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class Invoice(Base):
     __tablename__ = "invoices"
     id = Column(Integer, primary_key=True, index=True)
@@ -144,5 +159,7 @@ class Invoice(Base):
 
 
 # Indexes (optional; keep names stable)
-Index("ix_jobs_status", Job.status)
-Index("ix_safety_events_request_id", SafetyEvent.request_id)
+# Note: Job.status and SafetyEvent.request_id are already declared with
+# index=True above (which SQLAlchemy names ix_jobs_status /
+# ix_safety_events_request_id by convention), so no additional explicit
+# Index() declarations are needed here.

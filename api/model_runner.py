@@ -1,158 +1,3 @@
-  2
-  3
-  4
-  5
-  6
-  7
-  8
-  9
- 10
- 11
- 12
- 13
- 14
- 15
- 16
- 17
- 18
- 19
- 20
- 21
- 22
- 23
- 24
- 25
- 26
- 27
- 28
- 29
- 30
- 31
- 32
- 33
- 34
- 35
- 36
- 37
- 38
- 39
- 40
- 41
- 42
- 43
- 44
- 45
- 46
- 47
- 48
- 49
- 50
- 51
- 52
- 53
- 54
- 55
- 56
- 57
- 58
- 59
- 60
- 61
- 62
- 63
- 64
- 65
- 66
- 67
- 68
- 69
- 70
- 71
- 72
- 73
- 74
- 75
- 76
- 77
- 78
- 79
- 80
- 81
- 82
- 83
- 84
- 85
- 86
- 87
- 88
- 89
- 90
- 91
- 92
- 93
- 94
- 95
- 96
- 97
- 98
- 99
-100
-101
-102
-103
-104
-105
-106
-107
-108
-109
-110
-111
-112
-113
-114
-115
-116
-117
-118
-119
-120
-121
-122
-123
-124
-125
-126
-127
-128
-129
-130
-131
-132
-133
-134
-135
-136
-137
-138
-139
-140
-141
-142
-143
-144
-145
-146
-147
-148
-149
-150
-151
-152
-153
-154
-155
-156
 """
 ModelRegistry replacement with batching, concurrency control, warmup, and basic OOM protection.
 
@@ -204,30 +49,44 @@ class ModelRegistry:
         self._models: Dict[str, BaseModelWrapper] = {}
         self._batchers: Dict[str, AsyncBatcher] = {}
         self._semaphores: Dict[str, asyncio.Semaphore] = {}
-        self._loop = asyncio.get_event_loop()
+        # Per-model locks guarding on-demand load/warmup so concurrent requests
+        # for the same not-yet-loaded model coalesce into a single load instead
+        # of racing (which could otherwise trigger duplicate loads/warmups and
+        # waste CPU/GPU/memory under concurrency).
+        self._load_locks: Dict[str, asyncio.Lock] = {}
 
     def _key(self, model_name: str, version: str) -> str:
         return f"{model_name}:{version}"
+
+    def _get_load_lock(self, k: str) -> asyncio.Lock:
+        lock = self._load_locks.get(k)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._load_locks[k] = lock
+        return lock
 
     def register(self, model_name: str, version: str, config: ModelConfig):
         k = self._key(model_name, version)
         self._configs[k] = config
 
-    def load(self, model_name: str, version: str):
+    def _build_and_warmup_wrapper(self, model_name: str, version: str) -> BaseModelWrapper:
+        """
+        Blocking: construct the wrapper and perform model I/O / warmup.
+
+        Contains no asyncio-affine calls (no task/future/semaphore creation),
+        so it is safe to run off the event-loop thread (e.g. via
+        run_in_executor) from `load_async`.
+        """
         k = self._key(model_name, version)
-        if k in self._models:
-            return self._models[k]
         cfg = self._configs.get(k)
         if not cfg:
             raise KeyError("model config not registered")
-        # choose wrapper
         if cfg.runtime.lower().startswith("torch"):
             wrapper = TorchModelWrapper(cfg.model_path, model_name, version, device=cfg.device or get_preferred_device())
         elif cfg.runtime.lower().startswith("onnx"):
             wrapper = ONNXModelWrapper(cfg.model_path, model_name, version, use_gpu=(cfg.device == "cuda"))
         else:
             raise ValueError("unsupported runtime")
-        # load & warmup
         try:
             wrapper.load()
         except Exception:
@@ -238,21 +97,68 @@ class ModelRegistry:
                 wrapper.warmup(cfg.warmup_sample, iters=cfg.warmup_iters)
             except Exception:
                 logger.exception("warmup failed for %s", k)
-        # create batcher and sem
+        return wrapper
+
+    def _register_loaded_wrapper(self, model_name: str, version: str, wrapper: BaseModelWrapper):
+        """
+        Creates the batcher/semaphore for a freshly-loaded wrapper and
+        publishes it in the registry. Must run on the event-loop thread that
+        will drive the batcher's task (asyncio primitives aren't safe to
+        create from an arbitrary worker thread).
+        """
+        k = self._key(model_name, version)
+        cfg = self._configs[k]
         sem = asyncio.Semaphore(cfg.max_concurrency)
-        batcher = AsyncBatcher(process_batch=wrapper.predict_batch, max_batch_size=cfg.max_batch_size, max_latency_ms=cfg.batch_latency_ms, loop=self._loop)
+        batcher = AsyncBatcher(process_batch=wrapper.predict_batch, max_batch_size=cfg.max_batch_size, max_latency_ms=cfg.batch_latency_ms)
         self._models[k] = wrapper
         self._batchers[k] = batcher
         self._semaphores[k] = sem
         logger.info("Model %s loaded with concurrency=%d batch_size=%d", k, cfg.max_concurrency, cfg.max_batch_size)
         return wrapper
 
+    def load(self, model_name: str, version: str):
+        k = self._key(model_name, version)
+        if k in self._models:
+            return self._models[k]
+        wrapper = self._build_and_warmup_wrapper(model_name, version)
+        return self._register_loaded_wrapper(model_name, version, wrapper)
+
+    async def load_async(self, model_name: str, version: str):
+        """
+        Async-safe on-demand load/warmup.
+
+        `load()` runs potentially slow, blocking work (model I/O, warmup
+        inference). Calling it directly from an async handler would stall the
+        event loop for the whole duration. This wrapper:
+          - runs the blocking model I/O/warmup in the default thread-pool
+            executor so the event loop keeps serving other requests, then
+            finishes registration (batcher/semaphore creation) back on the
+            calling event-loop thread, and
+          - serializes concurrent on-demand loads of the *same* model/version
+            behind a per-key lock, so a burst of requests for a cold model
+            triggers exactly one load instead of N redundant (and
+            resource-contending) loads.
+        """
+        k = self._key(model_name, version)
+        if k in self._models:
+            return self._models[k]
+        lock = self._get_load_lock(k)
+        async with lock:
+            # Re-check: another waiter may have completed the load while we
+            # were blocked on the lock.
+            if k in self._models:
+                return self._models[k]
+            loop = asyncio.get_running_loop()
+            wrapper = await loop.run_in_executor(None, self._build_and_warmup_wrapper, model_name, version)
+            return self._register_loaded_wrapper(model_name, version, wrapper)
+
     async def predict_async(self, model_name: str, version: str, input_payload: Any, timeout_s: float = 30.0):
         k = self._key(model_name, version)
         if k not in self._models:
-            # try to load on demand
+            # try to load on demand (off the event loop, de-duplicated across
+            # concurrent callers for the same model/version)
             try:
-                self.load(model_name, version)
+                await self.load_async(model_name, version)
             except Exception:
                 raise KeyError("model not found")
         sem = self._semaphores[k]
@@ -301,6 +207,8 @@ class ModelRegistry:
             del self._semaphores[k]
         if k in self._configs:
             del self._configs[k]
+        if k in self._load_locks:
+            del self._load_locks[k]
         logger.info("Unloaded model %s", k)
 
     def list_models(self):

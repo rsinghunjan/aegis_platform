@@ -1,74 +1,32 @@
- 41
- 42
- 43
- 44
- 45
- 46
- 47
- 48
- 49
- 50
- 51
- 52
- 53
- 54
- 55
- 56
- 57
- 58
- 59
- 60
- 61
- 62
- 63
- 64
- 65
- 66
- 67
- 68
- 69
- 70
- 71
- 72
- 73
- 74
- 75
- 76
- 77
- 78
- 79
- 80
- 81
- 82
- 83
- 84
- 85
- 86
- 87
- 88
- 89
- 90
- 91
- 92
- 93
- 94
- 95
- 96
- 97
- 98
- 99
-100
-101
-102
-103
-104
-105
-106
-107
-108
-109
-110
 """
+Simple async batching worker for inference serving.
+
+BatchWorker collects individual prediction requests (submitted via enqueue())
+into batches bounded by max_batch_size / max_latency_s, then calls predict_fn
+once per batch and fans results back out to each caller's future.
+"""
+import asyncio
+import logging
+import time
+from typing import Any, List, Tuple
+
+logger = logging.getLogger("aegis.inference.batcher")
+
+
+class BatchWorker:
+    def __init__(self, predict_fn, max_batch_size: int = 8, max_latency_s: float = 0.05):
+        self.predict_fn = predict_fn
+        self.max_batch_size = max_batch_size
+        self.max_latency_s = max_latency_s
+        self._queue: "asyncio.Queue[Tuple[str, asyncio.Future]]" = asyncio.Queue()
+        self._stop = False
+        self._task = None
+
+    async def enqueue(self, text: str) -> Any:
+        """Submit one item for batched prediction and await its result."""
+        fut = asyncio.get_event_loop().create_future()
+        await self._queue.put((text, fut))
+        return await fut
     async def _drain_batch(self) -> List[Tuple[str, asyncio.Future]]:
         """
         Wait for at least one item, then collect up to max_batch_size items within max_latency_s.

@@ -1,111 +1,126 @@
-"""
-Asynchronous tasks for Aegis.
+"""Celery lifecycle adapter for registered, production job handlers."""
+from __future__ import annotations
 
-- process_job(job_id): long-running job harness that:
-    * sets job.status -> RUNNING
-    * performs simulated preprocessing/inference (replace with real logic)
-    * writes output_payload and sets status -> SUCCESS or FAILED
-
-Important:
-- Tasks use SQLAlchemy sessions from api.db.SessionLocal to update DB.
-- In production, keep task workers isolated and sized appropriately for models (GPU scheduling etc).
-"""
-import os
-import time
-import json
 import logging
 from datetime import datetime
+from typing import Any, Callable, Optional
 
-from celery import shared_task, current_task
+from celery import current_app, shared_task
+from sqlalchemy import update
 
-# Ensure imports find the api package (celery worker process should run from repo root)
 from api.db import SessionLocal
 from api.models import Job
 
 logger = logging.getLogger("aegis_tasks")
-logging.basicConfig(level=logging.INFO)
 
-# Per-unit simulated work duration (seconds). Kept small by default and
-# configurable via env var so this demo/placeholder loop doesn't needlessly
-# tie up a Celery worker thread/process for multiple seconds per job; replace
-# time.sleep with real (ideally I/O-bound, non-blocking-where-possible) work
-# in production.
-UNIT_WORK_SLEEP_S = float(os.environ.get("AEGIS_TASK_UNIT_SLEEP_S", "0.05"))
+JobHandler = Callable[[dict[str, Any]], Any]
+_HANDLERS: dict[str, tuple[JobHandler, Optional[Callable[[dict[str, Any]], None]]]] = {}
 
 
-def _now():
+def register_job_handler(
+    kind: str,
+    handler: JobHandler,
+    validator: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> None:
+    """Register an application-owned handler; there is deliberately no fake default."""
+    if not kind or not callable(handler):
+        raise ValueError("A job kind and callable handler are required")
+    _HANDLERS[kind] = (handler, validator)
+
+
+def _now() -> datetime:
     return datetime.utcnow()
 
 
-@shared_task(bind=True, name="aegis.process_job")
-def process_job(self, request_id: str):
-    """
-    Long-running job driver.
-    - request_id: Job.request_id (string) used to find DB row
-    """
+def cancel_job(request_id: str) -> bool:
+    """Mark a job cancelled and ask Celery to revoke its queued/running delivery."""
+    session = SessionLocal()
+    task_id = request_id
+    try:
+        job = session.query(Job).filter_by(request_id=request_id).one_or_none()
+        if job is None or job.status in {"SUCCESS", "FAILED", "CANCELLED"}:
+            return False
+        task_id = (job.input_payload or {}).get("_job_meta", {}).get(
+            "celery_task_id", request_id
+        )
+        job.status = "CANCELLED"
+        job.updated_at = _now()
+        session.commit()
+    finally:
+        session.close()
+    current_app.control.revoke(task_id, terminate=True)
+    return True
+
+
+@shared_task(bind=True, name="aegis.process_job", max_retries=3)
+def process_job(self, request_id: str) -> dict[str, Any]:
+    """Validate, execute, and persist the lifecycle for a registered job kind."""
     session = SessionLocal()
     try:
         job = session.query(Job).filter_by(request_id=request_id).one_or_none()
         if job is None:
-            logger.error("process_job: job not found %s", request_id)
-            return {"error": "job not found", "request_id": request_id}
+            return {"status": "FAILED", "error": "job not found", "request_id": request_id}
+        if job.status in {"SUCCESS", "FAILED", "CANCELLED", "RUNNING"}:
+            return {
+                "status": job.status,
+                "request_id": request_id,
+                "output": job.output_payload,
+            }
 
-        # mark as started
-        job.status = "RUNNING"
-        job.updated_at = _now()
-        session.commit()
-        logger.info("Started job %s", request_id)
-
-        # Simulated preprocessing (e.g., download/convert large files, compute embeddings)
-        # In your real task:
-        #  - stream files from object storage
-        #  - call model registry / inference functions
-        #  - write outputs to object store and put references in output_payload
         payload = job.input_payload or {}
-        # Example: if input contains 'batch' emulate longer processing
-        work_units = payload.get("work_units", 1)
-        # simulate per-unit work
-        results = []
-        for i in range(int(work_units)):
-            # check for task revoke (soft cancel support)
-            if self.request.called_directly is False and self.request.is_revoked():
-                job.status = "CANCELLED"
-                job.updated_at = _now()
-                session.commit()
-                logger.info("Job %s revoked/cancelled", request_id)
-                return {"status": "cancelled", "request_id": request_id}
+        kind = payload.get("kind", "default") if isinstance(payload, dict) else None
+        handler_spec = _HANDLERS.get(kind)
+        if handler_spec is None:
+            job.status = "FAILED"
+            job.output_payload = {"error": f"No handler registered for job kind: {kind}"}
+            job.updated_at = _now()
+            session.commit()
+            return {"status": "FAILED", "request_id": request_id, "error": "handler unavailable"}
 
-            logger.info("Processing unit %d/%d for job %s", i + 1, work_units, request_id)
-            # simulate CPU-bound or IO-bound work; replace with real ops.
-            # Uses a small, configurable sleep (see UNIT_WORK_SLEEP_S) instead
-            # of a hardcoded 1s so this demo loop doesn't waste a worker
-            # process/thread for longer than necessary.
-            if UNIT_WORK_SLEEP_S > 0:
-                time.sleep(UNIT_WORK_SLEEP_S)
-            results.append({"unit": i + 1, "label": "demo", "score": 0.9})
-
-        # Simulate postprocessing (aggregating results)
-        output = {"request_id": request_id, "items": results, "summary": {"count": len(results)}}
-
-        # Save output into DB (for small outputs). For large outputs, write to object store and reference path.
-        job.output_payload = output
+        handler, validator = handler_spec
+        if not isinstance(payload, dict):
+            raise ValueError("Job input must be a JSON object")
+        handler_payload = {
+            key: value for key, value in payload.items() if key not in {"kind", "_job_meta"}
+        }
+        if validator:
+            validator(handler_payload)
+        claimed = session.execute(
+            update(Job)
+            .where(
+                Job.request_id == request_id,
+                Job.status.in_(["PENDING", "RETRYING"]),
+            )
+            .values(status="RUNNING", updated_at=_now())
+        )
+        session.commit()
+        if claimed.rowcount != 1:
+            session.refresh(job)
+            return {"status": job.status, "request_id": request_id}
+        session.expire_all()
+        job = session.query(Job).filter_by(request_id=request_id).one()
+        result = handler(handler_payload)
+        if hasattr(result, "__await__"):
+            raise TypeError("Celery job handlers must be synchronous")
+        session.refresh(job)
+        if job.status == "CANCELLED":
+            return {"status": "CANCELLED", "request_id": request_id}
+        job.output_payload = result if isinstance(result, dict) else {"result": result}
         job.status = "SUCCESS"
         job.updated_at = _now()
         session.commit()
-        logger.info("Completed job %s", request_id)
-        return {"status": "success", "request_id": request_id, "output": output}
+        return {"status": "SUCCESS", "request_id": request_id, "output": job.output_payload}
     except Exception as exc:
-        logger.exception("Job %s failed: %s", request_id, exc)
-        # mark as failed
-        try:
-            job = session.query(Job).filter_by(request_id=request_id).one_or_none()
-            if job:
-                job.status = "FAILED"
-                job.updated_at = _now()
-                job.output_payload = {"error": str(exc)}
-                session.commit()
-        except Exception:
-            session.rollback()
+        session.rollback()
+        job = session.query(Job).filter_by(request_id=request_id).one_or_none()
+        if job:
+            job.status = "RETRYING" if self.request.retries < self.max_retries else "FAILED"
+            job.output_payload = {"error": f"{type(exc).__name__}: {str(exc)[:500]}"}
+            job.updated_at = _now()
+            session.commit()
+        logger.exception("Job %s failed", request_id)
+        if self.request.retries < self.max_retries:
+            raise self.retry(exc=exc, countdown=min(60, 2**self.request.retries))
         raise
     finally:
         session.close()

@@ -21,7 +21,8 @@ from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer, SecurityScopes
 from pydantic import BaseModel
-from jose import JWTError, jwt
+import jwt
+from jwt import InvalidTokenError as JWTError
 
 # Configuration (override via env in production)
 SECRET_KEY = os.environ.get("AEGIS_SECRET_KEY", "dev-secret-key-change-me")

@@ -1,57 +1,90 @@
 #!/usr/bin/env python3
-"""
-Minimal governance Flask API to list MLflow runs and promote a run to 'production'.
-Promotion triggers an Argo Workflow (or sets MLflow model stage) and records evidence.
+"""Governance API for inspecting MLflow runs and promoting model versions."""
 
-Usage:
-  pip install flask mlflow requests
-  export MLFLOW_TRACKING_URI=...
-  python3 governance/api.py
-"""
-from flask import Flask, jsonify, request
 import os
-import mlflow
-from mlflow.tracking import MlflowClient
-import sqlite3
-import subprocess
-import json
+
+from flask import Flask, jsonify, request
+
+if __package__:
+    from .promotion import PromotionError, promote_run, resolve_promoted_model
+else:
+    from promotion import PromotionError, promote_run, resolve_promoted_model
 
 app = Flask(__name__)
-MLFLOW_URI = os.environ.get("MLFLOW_TRACKING_URI","http://mlflow.aegis.svc.cluster.local:5000")
-mlflow.set_tracking_uri(MLFLOW_URI)
-client = MlflowClient()
+MLFLOW_URI = os.environ.get(
+    "MLFLOW_TRACKING_URI", "http://mlflow.aegis.svc.cluster.local:5000"
+)
+client = None
 
-DB = os.environ.get("GOV_DB","./governance.db")
-def init_db():
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS promotions (id INTEGER PRIMARY KEY, run_id TEXT, promoted_by TEXT, notes TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-    conn.commit(); conn.close()
-init_db()
+
+def get_mlflow_client():
+    global client
+    if client is None:
+        from mlflow.tracking import MlflowClient
+
+        client = MlflowClient(tracking_uri=MLFLOW_URI)
+    return client
+
 
 @app.route("/runs/<experiment_name>")
 def list_runs(experiment_name):
-    exp = client.get_experiment_by_name(experiment_name)
-    if not exp: return jsonify({"error":"experiment not found"}), 404
-    runs = client.search_runs([exp.experiment_id], max_results=50)
-    out = [{"run_id": r.info.run_id, "status": r.info.status, "metrics": r.data.metrics, "params": r.data.params} for r in runs]
-    return jsonify(out)
+    mlflow_client = get_mlflow_client()
+    experiment = mlflow_client.get_experiment_by_name(experiment_name)
+    if not experiment:
+        return jsonify({"error": "experiment not found"}), 404
+    runs = mlflow_client.search_runs([experiment.experiment_id], max_results=50)
+    output = [
+        {
+            "run_id": run.info.run_id,
+            "status": run.info.status,
+            "metrics": run.data.metrics,
+            "params": run.data.params,
+        }
+        for run in runs
+    ]
+    return jsonify(output)
+
 
 @app.route("/promote", methods=["POST"])
 def promote():
-    payload = request.json or {}
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "request body must be a JSON object"}), 400
     run_id = payload.get("run_id")
-    user = payload.get("user","system")
-    notes = payload.get("notes","")
     if not run_id:
-        return jsonify({"error":"run_id required"}), 400
-    # Example: set MLflow model stage if model saved under artifact path. This is a placeholder.
-    # In production, create a promotion workflow: deploy, or mark registry stage, and attach signature evidence.
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("INSERT INTO promotions (run_id,promoted_by,notes) VALUES (?,?,?)",(run_id,user,notes))
-    conn.commit(); conn.close()
-    return jsonify({"ok":True, "run_id": run_id})
+        return jsonify({"error": "run_id required"}), 400
+    try:
+        result = promote_run(
+            str(run_id),
+            client=get_mlflow_client(),
+            model_name=str(payload.get("model_name") or "") or None,
+            version=str(payload.get("version") or "1"),
+            tenant_id=str(payload.get("tenant_id") or "default"),
+            tenant_name=str(payload.get("tenant_name") or ""),
+            actor=str(payload.get("user") or "system"),
+            notes=str(payload.get("notes") or ""),
+        )
+    except PromotionError as exc:
+        app.logger.info("Promotion request rejected: %s", exc)
+        return (
+            jsonify({"error": "run failed promotion validation", "run_id": run_id}),
+            400,
+        )
+    except Exception:
+        app.logger.exception("Model promotion failed")
+        return jsonify({"error": "promotion could not be persisted"}), 500
+    return jsonify({"ok": True, "run_id": result["run_id"]})
+
+
+@app.route("/models/<model_name>/promoted")
+def promoted_model(model_name):
+    model = resolve_promoted_model(
+        model_name, tenant_id=request.args.get("tenant_id") or None
+    )
+    if model is None:
+        return jsonify({"error": "promoted model not found"}), 404
+    return jsonify(model)
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)

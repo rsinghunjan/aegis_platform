@@ -17,20 +17,22 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from api.db import Base
 from api import models  # noqa: F401 ensure model modules are imported for metadata
+from api.memory import _MemoryBase
+from agentic.runtime import AgentBase
 
 # this is the Alembic Config object, which provides access to the values within the .ini file
 config = context.config
 
 # override sqlalchemy.url from env var if present
-db_url = os.environ.get("DATABASE_URL")
+db_url = config.attributes.get("database_url") or os.environ.get("DATABASE_URL")
 if db_url:
-    config.set_main_option("sqlalchemy.url", db_url)
+    config.set_main_option("sqlalchemy.url", db_url.replace("%", "%%"))
 
 # Interpret the config file for Python logging.
 if config.config_file_name:
     fileConfig(config.config_file_name)
 
-target_metadata = Base.metadata
+target_metadata = [Base.metadata, AgentBase.metadata, _MemoryBase.metadata]
 
 
 def run_migrations_offline():

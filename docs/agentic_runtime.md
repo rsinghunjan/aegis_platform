@@ -3,9 +3,10 @@
 `agentic/runtime.py` is the canonical runtime. `Orchestrator` in the repository
 root exposes it to other services. The runtime uses a separate SQLAlchemy
 metadata registry to avoid importing the optional pgvector model definitions.
-`AgentStore.initialize()` idempotently creates runtime tables in the configured
-database. This is deliberate until the repository's existing Alembic graph is
-reconciled.
+`AgentStore.initialize()` applies the repository's Alembic revisions to the
+configured database before reading or writing runtime tables. Run
+`alembic upgrade head` before deploying, especially when the API, agent, and
+memory stores use separate database URLs.
 
 ## State machine
 

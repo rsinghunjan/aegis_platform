@@ -25,7 +25,7 @@ def upgrade():
         sa.Column('password_hash', sa.Text(), nullable=False),
         sa.Column('scopes', sa.JSON(), nullable=False, server_default=sa.text("'[]'")),
         sa.Column('disabled', sa.Boolean(), nullable=False, server_default=sa.false()),
-        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.now()),
+        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.current_timestamp()),
     )
     op.create_index('ix_users_username', 'users', ['username'])
 
@@ -37,7 +37,7 @@ def upgrade():
         sa.Column('token', sa.Text(), nullable=False, unique=True),
         sa.Column('revoked', sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.Column('expires_at', sa.DateTime(), nullable=False),
-        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.now()),
+        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.current_timestamp()),
     )
     op.create_index('ix_refresh_tokens_token', 'refresh_tokens', ['token'])
 
@@ -59,9 +59,9 @@ def upgrade():
         sa.Column('version', sa.String(length=100), nullable=False),
         sa.Column('metadata', sa.JSON(), nullable=True),
         sa.Column('artifact_path', sa.String(length=1000), nullable=True),
-        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.now()),
+        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.current_timestamp()),
+        sa.UniqueConstraint('model_id', 'version', name='uq_model_version'),
     )
-    op.create_unique_constraint('uq_model_version', 'model_versions', ['model_id', 'version'])
 
     # jobs
     op.create_table(
@@ -73,8 +73,8 @@ def upgrade():
         sa.Column('status', sa.String(length=50), nullable=False, server_default='PENDING'),
         sa.Column('input_payload', sa.JSON(), nullable=True),
         sa.Column('output_payload', sa.JSON(), nullable=True),
-        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.now()),
-        sa.Column('updated_at', sa.DateTime(), nullable=False, server_default=sa.func.now()),
+        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.current_timestamp()),
+        sa.Column('updated_at', sa.DateTime(), nullable=False, server_default=sa.func.current_timestamp()),
     )
     op.create_index('ix_jobs_request_id', 'jobs', ['request_id'])
     op.create_index('ix_jobs_status', 'jobs', ['status'])

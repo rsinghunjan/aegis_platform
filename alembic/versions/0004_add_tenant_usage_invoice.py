@@ -1,76 +1,3 @@
-  1
-  2
-  3
-  4
-  5
-  6
-  7
-  8
-  9
- 10
- 11
- 12
- 13
- 14
- 15
- 16
- 17
- 18
- 19
- 20
- 21
- 22
- 23
- 24
- 25
- 26
- 27
- 28
- 29
- 30
- 31
- 32
- 33
- 34
- 35
- 36
- 37
- 38
- 39
- 40
- 41
- 42
- 43
- 44
- 45
- 46
- 47
- 48
- 49
- 50
- 51
- 52
- 53
- 54
- 55
- 56
- 57
- 58
- 59
- 60
- 61
- 62
- 63
- 64
- 65
- 66
- 67
- 68
- 69
- 70
- 71
- 72
- 73
 """add tenants, tenant_quotas, usage_records, invoices
 
 Revision ID: 0004_add_tenant_usage_invoice
@@ -93,7 +20,7 @@ def upgrade():
         'tenants',
         sa.Column('id', sa.String(length=100), primary_key=True),
         sa.Column('name', sa.String(length=200), nullable=True),
-        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.now())
+        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.current_timestamp())
     )
 
     op.create_table(
@@ -103,7 +30,7 @@ def upgrade():
         sa.Column('rate_per_min', sa.Integer(), nullable=True),
         sa.Column('burst', sa.Integer(), nullable=True),
         sa.Column('daily_quota_units', sa.Integer(), nullable=True),
-        sa.Column('updated_at', sa.DateTime(), nullable=False, server_default=sa.func.now())
+        sa.Column('updated_at', sa.DateTime(), nullable=False, server_default=sa.func.current_timestamp())
     )
     op.create_index('ix_tenant_quotas_tenant_id', 'tenant_quotas', ['tenant_id'])
 
@@ -117,7 +44,7 @@ def upgrade():
         sa.Column('inference_ms', sa.Float(), nullable=True),
         sa.Column('cost_estimate', sa.Float(), nullable=True),
         sa.Column('extra', sa.JSON(), nullable=True),
-        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.now())
+        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.current_timestamp())
     )
     op.create_index('ix_usage_records_tenant', 'usage_records', ['tenant_id'])
 
@@ -131,7 +58,7 @@ def upgrade():
         sa.Column('amount', sa.Float(), nullable=False, server_default='0'),
         sa.Column('currency', sa.String(length=10), nullable=False, server_default='USD'),
         sa.Column('status', sa.String(length=50), nullable=False, server_default='issued'),
-        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.now())
+        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.current_timestamp())
     )
     op.create_index('ix_invoices_tenant', 'invoices', ['tenant_id'])
 

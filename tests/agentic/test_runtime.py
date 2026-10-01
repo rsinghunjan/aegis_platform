@@ -1,8 +1,10 @@
 import asyncio
+import json
 
 import pytest
 from sqlalchemy import select
 
+import agentic.evidence_anchor as evidence_anchor
 from agentic.runtime import (
     AgentPolicyGate,
     AgentRuntime,
@@ -15,10 +17,78 @@ from agentic.runtime import (
     ToolCallRow,
     ToolSpec,
 )
+from agentic.evidence_anchor import HttpTransparencyLogBackend
 
 
 def make_runtime(path, **kwargs):
     return AgentRuntime(store=AgentStore(f"sqlite:///{path}"), **kwargs)
+
+
+class FakeEvidenceAnchorBackend:
+    name = "test-transparency-log"
+
+    def __init__(self):
+        self.anchors = []
+
+    def anchor(self, run_id, tenant_id, head_sha256):
+        proof = {
+            "anchor_id": f"anchor-{len(self.anchors) + 1}",
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "head_sha256": head_sha256,
+        }
+        self.anchors.append(proof)
+        return proof
+
+    def list_anchors(self, run_id, tenant_id):
+        return [
+            proof
+            for proof in self.anchors
+            if proof["run_id"] == run_id and proof["tenant_id"] == tenant_id
+        ]
+
+    def verify(self, proof):
+        return proof in self.anchors
+
+
+def test_http_transparency_log_adapter_round_trip(monkeypatch):
+    receipt = {
+        "anchor_id": "log-entry-1",
+        "run_id": "run-1",
+        "tenant_id": "tenant-a",
+        "head_sha256": "a" * 64,
+    }
+    requests = []
+
+    class Response:
+        def __init__(self, value):
+            self.value = value
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _limit):
+            return json.dumps(self.value).encode()
+
+    def fake_urlopen(request, timeout):
+        requests.append((request.get_method(), request.full_url, timeout))
+        if request.get_method() == "POST":
+            return Response(receipt)
+        if "?" in request.full_url:
+            return Response({"anchors": [receipt]})
+        return Response(receipt)
+
+    monkeypatch.setattr(evidence_anchor, "_open_without_redirects", fake_urlopen)
+    backend = HttpTransparencyLogBackend("https://audit.example")
+
+    assert backend.anchor("run-1", "tenant-a", "a" * 64) == receipt
+    assert backend.list_anchors("run-1", "tenant-a") == [receipt]
+    assert backend.verify(receipt) is True
+    assert len(requests) == 3
+    assert all(url.startswith("https://audit.example/") for _, url, _ in requests)
 
 
 def test_create_plan_execute_verify_and_persist(tmp_path):
@@ -143,6 +213,50 @@ def test_evidence_chain_detects_tampering(tmp_path):
         evidence.metadata_json = {"goal_sha256": "tampered"}
         session.commit()
     assert runtime.verify_evidence_chain(run.run_id, "tenant-a")["valid"] is False
+
+
+def test_external_evidence_anchor_is_persisted_and_verified(tmp_path):
+    backend = FakeEvidenceAnchorBackend()
+    runtime = make_runtime(
+        tmp_path / "external-evidence.db", evidence_anchor_backend=backend
+    )
+    run = runtime.create_run("tenant-a", "goal")
+
+    unanchored = runtime.verify_evidence_chain(run.run_id, "tenant-a")
+    assert unanchored["local_valid"] is True
+    assert unanchored["anchor_status"] == "unanchored"
+    assert unanchored["valid"] is False
+
+    result = runtime.anchor_evidence_chain(run.run_id, "tenant-a")
+    integrity = runtime.verify_evidence_chain(run.run_id, "tenant-a")
+
+    assert result["anchored"] is True
+    assert len(backend.anchors) == 1
+    assert integrity["valid"] is True
+    assert integrity["anchor_status"] == "verified"
+    assert integrity["anchors"] == backend.anchors
+    anchors = runtime.list_evidence_anchors(run.run_id, "tenant-a")
+    assert anchors[0]["proof"] == backend.anchors[0]
+    assert runtime.anchor_pending_evidence() == 0
+
+
+def test_external_anchor_detects_deleted_local_evidence(tmp_path):
+    backend = FakeEvidenceAnchorBackend()
+    runtime = make_runtime(
+        tmp_path / "external-evidence-deletion.db",
+        evidence_anchor_backend=backend,
+    )
+    run = runtime.create_run("tenant-a", "goal")
+    runtime.anchor_evidence_chain(run.run_id, "tenant-a")
+    with runtime.store.sessions() as session:
+        session.query(EvidenceRow).filter_by(run_id=run.run_id).delete()
+        session.commit()
+
+    integrity = runtime.verify_evidence_chain(run.run_id, "tenant-a")
+    assert integrity["local_valid"] is True
+    assert integrity["external_anchor_valid"] is False
+    assert integrity["anchor_status"] == "mismatch"
+    assert integrity["valid"] is False
 
 
 def test_policy_engine_decisions_are_enforced_and_recorded(tmp_path):

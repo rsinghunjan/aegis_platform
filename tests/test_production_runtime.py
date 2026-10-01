@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 from fastapi.testclient import TestClient
 
@@ -19,6 +20,33 @@ class CollectingDispatcher:
     def dispatch(self, message: AgentExecutionMessage):
         self.messages.append(message)
         return f"dispatch-{len(self.messages)}"
+
+
+class CollectingEvidenceAnchorBackend:
+    name = "test-transparency-log"
+
+    def __init__(self):
+        self.anchors = []
+
+    def anchor(self, run_id, tenant_id, head_sha256):
+        proof = {
+            "anchor_id": f"anchor-{len(self.anchors) + 1}",
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "head_sha256": head_sha256,
+        }
+        self.anchors.append(proof)
+        return proof
+
+    def list_anchors(self, run_id, tenant_id):
+        return [
+            proof
+            for proof in self.anchors
+            if proof["run_id"] == run_id and proof["tenant_id"] == tenant_id
+        ]
+
+    def verify(self, proof):
+        return proof in self.anchors
 
 
 def test_celery_dispatcher_sends_run_reference():
@@ -137,6 +165,30 @@ def test_operator_read_models_are_authorized_and_return_summaries(tmp_path):
     assert "must-not-be-returned" not in repr(listing.json())
     assert catalog.json()["items"][0]["name"] == "echo"
     assert summary.json()["count"] >= 1
+    assert summary.json()["anchors"] == []
+
+
+def test_periodic_evidence_anchor_is_visible_in_operator_summary(tmp_path, monkeypatch):
+    monkeypatch.setenv("AEGIS_EVIDENCE_ANCHOR_INTERVAL_SECONDS", "0.01")
+    backend = CollectingEvidenceAnchorBackend()
+    runtime = AgentRuntime(
+        store=AgentStore(f"sqlite:///{tmp_path / 'anchored-operator.db'}"),
+        evidence_anchor_backend=backend,
+    )
+    run = runtime.create_run("tenant-a", "goal")
+    with TestClient(
+        create_app(runtime, tenant_authorizer=lambda *_args: True)
+    ) as client:
+        time.sleep(0.08)
+        summary = client.get(
+            "/operator/agent/evidence-summary",
+            params={"tenant_id": "tenant-a", "run_id": run.run_id},
+        )
+
+    assert summary.status_code == 200
+    data = summary.json()
+    assert data["anchors"][0]["proof"] == backend.anchors[0]
+    assert data["integrity"]["anchor_status"] == "verified"
 
 
 def test_run_can_be_created_then_executed_separately(tmp_path):

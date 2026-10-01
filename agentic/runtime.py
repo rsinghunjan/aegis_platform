@@ -35,6 +35,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from policy.agent_policy import AgentPolicyGate
 from agentic.capabilities import CapabilityCatalog
 from agentic.oci_sandbox import GVisorSandboxExecutor
+from agentic.evidence_anchor import EvidenceAnchorBackend, HttpTransparencyLogBackend
 from agentic.sandbox import SandboxBoundary, SandboxProfile
 
 
@@ -277,6 +278,29 @@ class EvidenceRow(AgentBase):
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     previous_sha256: Mapped[Optional[str]] = mapped_column(String(64))
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class EvidenceAnchorRow(AgentBase):
+    __tablename__ = "agent_evidence_anchors"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "tenant_id",
+            "head_sha256",
+            "backend",
+            name="uq_agent_evidence_anchor_head",
+        ),
+    )
+
+    evidence_anchor_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_runs.run_id"), nullable=False, index=True
+    )
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    head_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    backend: Mapped[str] = mapped_column(String(128), nullable=False)
+    proof_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
@@ -552,6 +576,7 @@ class AgentRuntime:
         sandbox_executor: Optional[Any] = None,
         capability_enforcement: Optional[bool] = None,
         approval_sla_seconds: Optional[int] = None,
+        evidence_anchor_backend: Optional[EvidenceAnchorBackend] = None,
     ):
         self.store = store or AgentStore()
         if planner is None:
@@ -583,6 +608,9 @@ class AgentRuntime:
         except ValueError:
             sla = 3600
         self.approval_sla_seconds = max(1, int(sla))
+        self.evidence_anchor_backend = (
+            evidence_anchor_backend or HttpTransparencyLogBackend.from_environment()
+        )
         self.catalog = CapabilityCatalog()
         self.approval_notifier: Optional[Callable[[Approval], Any]] = None
         self._tools: dict[str, tuple[ToolSpec, Callable[..., Any]]] = {}
@@ -1257,45 +1285,225 @@ class AgentRuntime:
                 for item in rows
             ]
 
+    def list_evidence_anchors(
+        self, run_id: str, tenant_id: str
+    ) -> list[dict[str, Any]]:
+        with self.store.sessions() as session:
+            self._owned_run(session, run_id, tenant_id)
+            rows = session.scalars(
+                select(EvidenceAnchorRow)
+                .where(
+                    EvidenceAnchorRow.run_id == run_id,
+                    EvidenceAnchorRow.tenant_id == tenant_id,
+                )
+                .order_by(EvidenceAnchorRow.created_at)
+            ).all()
+            return [
+                {
+                    "backend": row.backend,
+                    "head_sha256": row.head_sha256,
+                    "proof": row.proof_json,
+                    "created_at": row.created_at,
+                }
+                for row in rows
+            ]
+
+    def anchor_evidence_chain(self, run_id: str, tenant_id: str) -> dict[str, Any]:
+        backend = self.evidence_anchor_backend
+        if backend is None:
+            raise AgentRuntimeError("External evidence anchoring is not configured")
+        if (
+            not isinstance(backend.name, str)
+            or not backend.name
+            or len(backend.name) > 128
+        ):
+            raise AgentRuntimeError(
+                "External evidence anchor backend has an invalid name"
+            )
+        chain = self.verify_evidence_chain(run_id, tenant_id)
+        if not chain["local_valid"] or chain["anchor_status"] in {
+            "mismatch",
+            "unavailable",
+        }:
+            raise AgentRuntimeError(
+                "Evidence chain must verify before it can be anchored"
+            )
+        head_sha256 = chain["head_sha256"]
+        if head_sha256 is None:
+            return {"anchored": False, "head_sha256": None, "proof": None}
+
+        try:
+            created_external = False
+            proofs = backend.list_anchors(run_id, tenant_id)
+            proof = next(
+                (
+                    item
+                    for item in proofs
+                    if item.get("head_sha256") == head_sha256
+                    and backend.verify(item)
+                ),
+                None,
+            )
+            if proof is None:
+                proof = backend.anchor(run_id, tenant_id, head_sha256)
+                created_external = True
+            if (
+                not isinstance(proof, dict)
+                or proof.get("run_id") != run_id
+                or proof.get("tenant_id") != tenant_id
+                or proof.get("head_sha256") != head_sha256
+                or not isinstance(proof.get("anchor_id"), str)
+                or not proof["anchor_id"]
+                or not backend.verify(proof)
+            ):
+                raise AgentRuntimeError(
+                    "External evidence anchor returned an invalid proof"
+                )
+            safe_proof = _persistable(proof)
+            proof_json = json.dumps(safe_proof, allow_nan=False)
+            if len(proof_json.encode("utf-8")) > 65536:
+                raise AgentRuntimeError("External evidence anchor proof is too large")
+        except AgentRuntimeError:
+            raise
+        except Exception as exc:
+            raise AgentRuntimeError("External evidence anchoring failed") from exc
+
+        with self.store.sessions() as session:
+            existing = session.scalar(
+                select(EvidenceAnchorRow).where(
+                    EvidenceAnchorRow.run_id == run_id,
+                    EvidenceAnchorRow.tenant_id == tenant_id,
+                    EvidenceAnchorRow.head_sha256 == head_sha256,
+                    EvidenceAnchorRow.backend == backend.name,
+                )
+            )
+            if existing is None:
+                session.add(
+                    EvidenceAnchorRow(
+                        evidence_anchor_id=str(uuid.uuid4()),
+                        run_id=run_id,
+                        tenant_id=tenant_id,
+                        head_sha256=head_sha256,
+                        backend=backend.name,
+                        proof_json=safe_proof,
+                        created_at=_now(),
+                    )
+                )
+            else:
+                existing.proof_json = safe_proof
+            session.commit()
+        return {
+            "anchored": created_external,
+            "head_sha256": head_sha256,
+            "proof": safe_proof,
+        }
+
+    def anchor_pending_evidence(self) -> int:
+        if self.evidence_anchor_backend is None:
+            return 0
+        self.store.initialize()
+        with self.store.sessions() as session:
+            runs = session.execute(
+                select(AgentRunRow.run_id, AgentRunRow.tenant_id).order_by(
+                    AgentRunRow.created_at
+                )
+            ).all()
+        anchored = 0
+        first_error = None
+        for run_id, tenant_id in runs:
+            try:
+                result = self.anchor_evidence_chain(run_id, tenant_id)
+                anchored += int(result["anchored"])
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise AgentRuntimeError(
+                "One or more run evidence chains could not be anchored"
+            ) from first_error
+        return anchored
+
     def verify_evidence_chain(self, run_id: str, tenant_id: str) -> dict[str, Any]:
         """Verify the run's append-only hash links and return its current chain head."""
         entries = self.list_evidence(run_id, tenant_id)
-        if not entries:
-            return {"valid": True, "count": 0, "head_sha256": None}
         by_hash = {entry.sha256: entry for entry in entries}
-        if len(by_hash) != len(entries):
-            return {"valid": False, "count": len(entries), "head_sha256": None}
-        roots = [entry for entry in entries if entry.previous_sha256 is None]
-        if len(roots) != 1:
-            return {"valid": False, "count": len(entries), "head_sha256": None}
-        current = roots[0]
-        visited: set[str] = set()
-        while True:
-            if current.sha256 in visited:
-                return {"valid": False, "count": len(entries), "head_sha256": None}
-            visited.add(current.sha256)
-            expected = _hash(
-                {
-                    "previous_sha256": current.previous_sha256,
-                    "kind": current.kind,
-                    "metadata": current.metadata,
-                }
-            )
-            if expected != current.sha256:
-                return {"valid": False, "count": len(entries), "head_sha256": None}
-            children = [
-                entry for entry in entries if entry.previous_sha256 == current.sha256
-            ]
-            if not children:
-                break
-            if len(children) != 1:
-                return {"valid": False, "count": len(entries), "head_sha256": None}
-            current = children[0]
-        return {
-            "valid": len(visited) == len(entries),
+        local_valid = len(by_hash) == len(entries)
+        current = None
+        if entries and local_valid:
+            roots = [entry for entry in entries if entry.previous_sha256 is None]
+            local_valid = len(roots) == 1
+            if local_valid:
+                current = roots[0]
+                visited: set[str] = set()
+                while True:
+                    if current.sha256 in visited:
+                        local_valid = False
+                        break
+                    visited.add(current.sha256)
+                    expected = _hash(
+                        {
+                            "previous_sha256": current.previous_sha256,
+                            "kind": current.kind,
+                            "metadata": current.metadata,
+                        }
+                    )
+                    if expected != current.sha256:
+                        local_valid = False
+                        break
+                    children = [
+                        entry
+                        for entry in entries
+                        if entry.previous_sha256 == current.sha256
+                    ]
+                    if not children:
+                        break
+                    if len(children) != 1:
+                        local_valid = False
+                        break
+                    current = children[0]
+                local_valid = local_valid and len(visited) == len(entries)
+
+        head_sha256 = current.sha256 if local_valid and current else None
+        result = {
+            "valid": local_valid,
+            "local_valid": local_valid,
             "count": len(entries),
-            "head_sha256": current.sha256 if len(visited) == len(entries) else None,
+            "head_sha256": head_sha256,
+            "anchor_status": "unconfigured",
+            "external_anchor_valid": None,
+            "anchors": [],
         }
+        backend = self.evidence_anchor_backend
+        if backend is None:
+            return result
+        try:
+            proofs = backend.list_anchors(run_id, tenant_id)
+            result["anchors"] = proofs
+            if not proofs:
+                result["anchor_status"] = "unanchored"
+                result["external_anchor_valid"] = False
+                result["valid"] = False
+                return result
+            anchors_valid = True
+            for proof in proofs:
+                proof_head = proof.get("head_sha256")
+                if (
+                    proof.get("run_id") != run_id
+                    or proof.get("tenant_id") != tenant_id
+                    or proof_head not in by_hash
+                    or not backend.verify(proof)
+                ):
+                    anchors_valid = False
+                    break
+            result["external_anchor_valid"] = anchors_valid
+            result["anchor_status"] = "verified" if anchors_valid else "mismatch"
+            result["valid"] = local_valid and anchors_valid
+        except Exception:
+            result["anchor_status"] = "unavailable"
+            result["external_anchor_valid"] = False
+            result["valid"] = False
+            result["anchors"] = []
+        return result
 
     async def _execute_step(
         self,

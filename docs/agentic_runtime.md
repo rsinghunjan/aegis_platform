@@ -155,10 +155,46 @@ metadata in audit rows. Prompt/context references and final outcome hashes are
 audit evidence; raw prompts and result payloads are not copied into evidence.
 Each evidence row links to the previous evidence digest, and
 `verify_evidence_chain` validates the run's hash chain and returns its head.
-This detects alteration, insertion, and internal deletion when the head is
-known, but does not prevent an attacker with database write access from
-truncating or replacing the entire chain. Export or sign the head in an
-independent audit system for that guarantee.
+Without external anchoring, this detects alteration, insertion, and internal
+deletion but cannot detect deletion or replacement of the entire chain.
+
+### External evidence anchors
+
+`AgentRuntime` accepts an `EvidenceAnchorBackend` adapter. When
+`AEGIS_EVIDENCE_ANCHOR_URL` is set, the runtime uses its built-in HTTPS
+transparency-log adapter; deployments can instead inject an adapter for their
+immutable object store or enterprise audit service. The built-in adapter
+expects:
+
+- `POST /v1/anchors` with `{run_id, tenant_id, head_sha256}`, returning a
+  receipt containing `anchor_id`, `run_id`, `tenant_id`, and `head_sha256`.
+- `GET /v1/anchors?run_id=...&tenant_id=...`, returning
+  `{"anchors": [receipt, ...]}`.
+- `GET /v1/anchors/{anchor_id}`, returning the matching immutable receipt.
+
+Set `AEGIS_EVIDENCE_ANCHOR_TOKEN` for bearer authentication and
+`AEGIS_EVIDENCE_ANCHOR_TIMEOUT` for the request timeout in seconds (default
+`5`). The endpoint must use HTTPS. While an adapter is configured, the API
+lifespan anchors run heads every
+`AEGIS_EVIDENCE_ANCHOR_INTERVAL_SECONDS` seconds (default `60`); the interval
+must be positive. Unchanged heads are not submitted more than once. New anchor
+proofs are also stored in `agent_evidence_anchors`, and are returned as
+`anchors` by the authorized `/operator/agent/evidence-summary` endpoint.
+
+Verification retrieves anchors independently from the backend and checks each
+receipt against the local evidence chain. A missing locally stored proof does
+not hide an external anchor, so whole-chain deletion or replacement is
+reported as a mismatch. The response's `integrity.anchor_status` is
+`unconfigured`, `unanchored`, `verified`, `mismatch`, or `unavailable`; callers
+should treat `unavailable` as unverifiable, not as a valid compliance check.
+
+The adapter contract depends on the external service to enforce append-only
+retention and to return an authoritative receipt. Configure that service with
+independent access controls and immutable/WORM retention appropriate to the
+compliance policy. The anchor proves that a chain head existed by the anchor
+time; data created or changed after the latest successful anchor is only
+covered at the next interval. A backend and database controlled by the same
+administrator do not provide independent tamper resistance.
 
 Configure storage with `AEGIS_AGENT_DATABASE_URL`; `DATABASE_URL` is accepted
 as a fallback. SQLite is the local default. PostgreSQL deployments must install

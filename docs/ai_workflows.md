@@ -52,7 +52,8 @@ curl -X POST http://127.0.0.1:8000/ai/answer \
 
 The answer response includes the provider/model, token and latency signals, and
 document/chunk citations. Requests are bounded (64,000 document characters,
-8,000 query characters, at most 4,096 output tokens). Tenant indexes are
+8,000 query characters, at most 4,096 output tokens, 100 documents and 256,000
+indexed characters per tenant, and 100 in-memory tenants). Tenant indexes are
 separate in the reference service. The default in-memory vector store is
 process-local and volatile; it is intended for local development and a
 single-process demonstration, not production persistence or multi-worker

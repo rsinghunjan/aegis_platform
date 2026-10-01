@@ -56,6 +56,20 @@ def test_ai_workflow_rejects_oversized_document():
     )
     with pytest.raises(ValueError, match="maximum length"):
         workflow.ingest("tenant-a", "x" * (workflow.max_document_chars + 1))
+    for _ in range(workflow.max_indexed_chars_per_tenant // workflow.max_document_chars):
+        workflow.ingest("tenant-a", "x" * workflow.max_document_chars)
+    with pytest.raises(ValueError, match="indexed text limit"):
+        workflow.ingest("tenant-a", "x")
+
+
+def test_ai_workflow_keeps_tenant_indexes_isolated():
+    workflow = AIWorkflow(
+        inference_router=ModelRouter([EchoProvider()]),
+        embedding_provider=LocalHashEmbeddingProvider(dimensions=64),
+    )
+    workflow.ingest("tenant-a", "Private tenant A knowledge.")
+    response = workflow.answer("tenant-b", "What is tenant A knowledge?")
+    assert response["citations"] == []
 
 
 def test_ai_endpoints_fail_closed_without_tenant_authorizer(tmp_path):

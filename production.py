@@ -14,8 +14,7 @@ from pydantic import BaseModel, Field
 
 from agentic.runtime import AgentRuntime, AgentRuntimeError, AgentStore
 from agentic.worker import AgentExecutionMessage, AgentPrincipal
-from services.ai_workflow import AIWorkflow
-from services.inference import NoProviderAvailableError
+from services.ai_workflow import AIWorkflow, AIWorkflowError
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +201,7 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        except NoProviderAvailableError as exc:
+        except AIWorkflowError as exc:
             logger.warning("AI workflow inference unavailable")
             raise HTTPException(
                 status_code=503, detail="configured AI provider is unavailable"

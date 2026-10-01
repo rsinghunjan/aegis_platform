@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from agentic.runtime import AgentRuntime, AgentRuntimeError, AgentStore
 from agentic.worker import AgentExecutionMessage, AgentPrincipal
 from services.ai_workflow import AIWorkflow
+from services.inference import NoProviderAvailableError
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,12 @@ class AskAIRequest(BaseModel):
     tenant_id: str = Field(min_length=1, max_length=128)
     query: str = Field(min_length=1, max_length=8_000)
     max_tokens: int = Field(default=512, ge=1, le=4096)
+
+
+class AgentFeedbackRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=128)
+    rating: int = Field(ge=1, le=5)
+    note: str = Field(default="", max_length=2000)
 
 
 def _run_summary(run: Any) -> dict[str, Any]:
@@ -195,6 +202,32 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except NoProviderAvailableError as exc:
+            logger.warning("AI workflow inference unavailable")
+            raise HTTPException(
+                status_code=503, detail="configured AI provider is unavailable"
+            ) from exc
+
+    @app.post("/agent/runs/{run_id}/feedback", tags=["agentic"])
+    async def record_agent_feedback(
+        request: Request, run_id: str, body: AgentFeedbackRequest
+    ) -> dict[str, Any]:
+        await authorize(request, body.tenant_id, "ai_feedback")
+        try:
+            evidence_id = app.state.agent_runtime.record_evidence(
+                run_id,
+                body.tenant_id,
+                "user_feedback",
+                {
+                    "rating": body.rating,
+                    "note_sha256": hashlib.sha256(body.note.encode()).hexdigest()
+                    if body.note
+                    else None,
+                },
+            )
+            return {"run_id": run_id, "evidence_id": evidence_id}
+        except AgentRuntimeError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/agent/runs", tags=["agentic"])
     async def create_agent_run(

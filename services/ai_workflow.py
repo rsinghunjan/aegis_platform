@@ -43,11 +43,15 @@ class AIWorkflow:
         inference_router: ModelRouter | None = None,
         embedding_provider: Any = None,
     ):
-        self.model = os.getenv("AEGIS_LLM_MODEL", "default")
+        self.model = os.getenv("AEGIS_LLM_MODEL", "gpt-4o-mini")
         if inference_router is None:
             embedding_provider = embedding_provider or self._default_embeddings()
+            provider = OpenAICompatibleProvider(
+                api_key=os.getenv("AEGIS_LLM_API_KEY") or os.getenv("OPENAI_API_KEY"),
+                base_url=os.getenv("AEGIS_LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL"),
+            )
             inference_router = ModelRouter(
-                [OpenAICompatibleProvider(), EchoProvider()]
+                [provider] if provider.is_available() else [EchoProvider()]
             )
         else:
             embedding_provider = embedding_provider or LocalHashEmbeddingProvider()
@@ -58,7 +62,9 @@ class AIWorkflow:
     @staticmethod
     def _default_embeddings():
         if os.getenv("AEGIS_EMBEDDING_PROVIDER", "local-hash").lower() == "openai":
-            provider = OpenAIEmbeddingProvider()
+            provider = OpenAIEmbeddingProvider(
+                api_key=os.getenv("AEGIS_LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+            )
             if provider.is_available():
                 return provider
         return LocalHashEmbeddingProvider()

@@ -3,11 +3,12 @@ import { RunMonitor } from "./components/RunMonitor";
 import { ApprovalQueue } from "./components/ApprovalQueue";
 import { EvidenceExplorer } from "./components/EvidenceExplorer";
 import { AnalyticsPanel } from "./components/AnalyticsPanel";
+import { AIWorkbench } from "./components/AIWorkbench";
 
-type Tab = "runs" | "approvals" | "evidence" | "analytics";
+type Tab = "workflows" | "runs" | "approvals" | "evidence" | "analytics";
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>("runs");
+  const [tab, setTab] = useState<Tab>("workflows");
   const [selectedRunId, setSelectedRunId] = useState("");
 
   return (
@@ -16,11 +17,13 @@ export default function App() {
       <p>Production operations for governed AI, ML, and LLM workflows.</p>
       <nav>
         <button onClick={() => setTab("runs")}>AI Runs</button>
+        <button onClick={() => setTab("workflows")}>AI Workflows</button>
         <button onClick={() => setTab("approvals")}>Governance</button>
         <button onClick={() => setTab("evidence")}>AI Evidence</button>
         <button onClick={() => setTab("analytics")}>Run Analytics</button>
       </nav>
 
+      {tab === "workflows" && <AIWorkbench />}
       {tab === "runs" && <RunMonitor />}
       {tab === "approvals" && <ApprovalQueue />}
       {tab === "evidence" && (

@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from agentic.runtime import AgentRuntime, AgentRuntimeError, AgentStore
 from agentic.worker import AgentExecutionMessage, AgentPrincipal
+from services.ai_workflow import AIWorkflow, AIWorkflowError
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,23 @@ class ResumeAgentRunRequest(BaseModel):
     scopes: list[str] = Field(default_factory=list)
 
 
+class IngestKnowledgeRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=128)
+    document: str = Field(min_length=1, max_length=64_000)
+
+
+class AskAIRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=128)
+    query: str = Field(min_length=1, max_length=8_000)
+    max_tokens: int = Field(default=512, ge=1, le=4096)
+
+
+class AgentFeedbackRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=128)
+    rating: int = Field(ge=1, le=5)
+    note: str = Field(default="", max_length=2000)
+
+
 def _run_summary(run: Any) -> dict[str, Any]:
     return {
         "run_id": run.run_id,
@@ -75,8 +93,10 @@ def create_app(
     approval_notifier: Optional[Callable[[Any], Any]] = None,
     principal_resolver: Optional[Callable[[Request], Any]] = None,
     execution_dispatcher: Any = None,
+    ai_workflow: AIWorkflow | None = None,
 ) -> FastAPI:
     selected_runtime = runtime or AgentRuntime()
+    selected_ai_workflow = ai_workflow or AIWorkflow()
     if approval_notifier is not None:
         selected_runtime.approval_notifier = approval_notifier
 
@@ -99,6 +119,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.agent_runtime = selected_runtime
+    app.state.ai_workflow = selected_ai_workflow
 
     async def resolve_principal(request: Request) -> AgentPrincipal:
         if principal_resolver is None:
@@ -160,6 +181,52 @@ def create_app(
             logger.warning("Aegis readiness check failed: %s", type(exc).__name__)
             raise HTTPException(status_code=503, detail="database unavailable") from exc
         return {"status": "ready"}
+
+    @app.post("/ai/knowledge", tags=["ai-workflows"])
+    async def ingest_knowledge(
+        request: Request, body: IngestKnowledgeRequest
+    ) -> dict[str, Any]:
+        await authorize(request, body.tenant_id, "ai_knowledge_write")
+        try:
+            return app.state.ai_workflow.ingest(body.tenant_id, body.document)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/ai/answer", tags=["ai-workflows"])
+    async def answer_question(request: Request, body: AskAIRequest) -> dict[str, Any]:
+        await authorize(request, body.tenant_id, "ai_generate")
+        try:
+            return app.state.ai_workflow.answer(
+                body.tenant_id, body.query, body.max_tokens
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except AIWorkflowError as exc:
+            logger.warning("AI workflow inference unavailable")
+            raise HTTPException(
+                status_code=503, detail="configured AI provider is unavailable"
+            ) from exc
+
+    @app.post("/agent/runs/{run_id}/feedback", tags=["agentic"])
+    async def record_agent_feedback(
+        request: Request, run_id: str, body: AgentFeedbackRequest
+    ) -> dict[str, Any]:
+        await authorize(request, body.tenant_id, "ai_feedback")
+        try:
+            evidence_id = app.state.agent_runtime.record_evidence(
+                run_id,
+                body.tenant_id,
+                "user_feedback",
+                {
+                    "rating": body.rating,
+                    "note_sha256": hashlib.sha256(body.note.encode()).hexdigest()
+                    if body.note
+                    else None,
+                },
+            )
+            return {"run_id": run_id, "evidence_id": evidence_id}
+        except AgentRuntimeError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/agent/runs", tags=["agentic"])
     async def create_agent_run(

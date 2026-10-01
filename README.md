@@ -1,10 +1,10 @@
 # Aegis: Production Platform for AI Systems
 
 Aegis is an AI-first production platform for building, deploying, and operating
-AI/ML/LLM systems. It brings model and inference workflows, retrieval-augmented
-generation (RAG), multimodal AI, and governed agent execution together with the
-security, governance, observability, and deployment controls needed to run them
-in production.
+AI/ML/LLM systems. Its supported workflow connects tenant-authorized knowledge
+ingestion and retrieval-augmented inference with durable, policy-governed agent
+runs, operator review, and evidence. Model lifecycle, multimodal, evaluation,
+security, observability, and deployment components support this workflow.
 
 The repository includes focused components for model training and registry
 workflows, inference providers, embeddings and RAG, multimodal systems, and
@@ -20,8 +20,11 @@ and legacy API integrations are not required to start it.
   artifact verification, and promotion workflows.
 - **Inference and serving:** provider abstractions and inference routing, with
   optional hosted, local, and accelerator-backed integrations.
-- **RAG and knowledge workflows:** document chunking, embedding, vector
-  retrieval, ranking, and prompt augmentation.
+- **RAG and knowledge workflows:** the canonical app exposes tenant-authorized
+  document ingestion and retrieval-augmented inference through `/ai/knowledge`
+  and `/ai/answer`. Local hash embeddings and an in-process vector store provide
+  a dependency-light reference; configured OpenAI-compatible inference and
+  OpenAI embeddings are supported options.
 - **Agents and multimodal AI:** durable, tool-based agent runs and modular
   multimodal workflows for capabilities such as vision and speech.
 - **Evaluation and operations:** evaluation and drift-monitoring utilities,
@@ -30,11 +33,13 @@ and legacy API integrations are not required to start it.
   safety and policy enforcement, human approvals, auditability, and deployment
   controls apply around AI workloads.
 
-These capabilities are provided by modular components and integrations rather
-than one monolithic service. The canonical runtime below implements durable,
-governed agent orchestration; model serving, vector retrieval, hosted planners,
-and accelerator support are integration points and may require additional
-dependencies or deployment configuration.
+The product is organized around a practical lifecycle: index tenant knowledge
+and query it with an AI provider; create durable agent runs using registered
+capabilities; review approvals and evidence; and operate workloads using the
+existing monitoring, promotion, and deployment integrations. The local
+knowledge index is a development/reference implementation, not durable shared
+production storage. See [`docs/ai_workflows.md`](docs/ai_workflows.md) for setup,
+API examples, and production boundaries.
 
 ## Local quickstart
 
@@ -43,9 +48,12 @@ python -m pip install -r requirements-control-plane.txt
 uvicorn production:app --host 127.0.0.1 --port 8000
 ```
 
+For the OpenAI-compatible inference and embedding adapter, install the
+`ai` extra with `python -m pip install -e '.[ai]'`.
+
 The default agent database is `sqlite:///./aegis_agent.db`. Configure
 `AEGIS_AGENT_DATABASE_URL` to override it. `DATABASE_URL` is used as a
-compatibility fallback. The application provides `/healthz`, `/readyz`,
+compatibility fallback. The application provides `/healthz`, `/readyz`, `/ai/knowledge`, `/ai/answer`,
 `/agent/runs`, and tenant-scoped run/evidence/approval endpoints. A safe tool
 must be registered by the embedding application before an agent plan can call
 it; planner output cannot execute shell or Python code.
@@ -111,18 +119,22 @@ configuration details.
 
 ## Implemented versus optional
 
-**Implemented here:** health/readiness, a durable local agent runtime, registered
-tool execution, deterministic and optional LLM planning, policy and approval
-gates, hash-versioned capabilities, bounded tool payloads, verification, bounded
-idempotent retries, tenant-scoped memory, evidence records, operator read models,
-and pluggable job/remediation adapters.
+**Implemented here:** health/readiness, tenant-authorized knowledge ingestion and
+retrieval-augmented inference, provider and embedding adapters, a durable local
+agent runtime, registered tool execution, deterministic and optional LLM
+planning, policy and approval gates, hash-versioned capabilities, bounded tool
+payloads, verification, bounded idempotent retries, agent feedback evidence,
+tenant-scoped memory, operator read models, and pluggable job/remediation
+adapters.
 
-**Adapter-backed or optional:** cloud deployment, secret managers, hosted LLM
-planning, vector retrieval, model loading/inference, external approval systems,
-promotion/canary systems, and GPU/TPU support. The optional legacy routes are
-mounted only when `AEGIS_MOUNT_LEGACY_API=true`; their dependencies and
-configuration must be installed separately. The default image intentionally
-does not install large model or accelerator packages.
+**Adapter-backed or optional:** hosted LLM planning and inference, semantic
+embeddings, durable/shared vector storage, cloud deployment, secret managers,
+external approval systems, promotion/canary systems, and GPU/TPU support. The
+local inference fallback is an echo provider for smoke testing, not an AI model.
+The optional legacy routes are mounted only when
+`AEGIS_MOUNT_LEGACY_API=true`; their dependencies and configuration must be
+installed separately. The default image intentionally does not install large
+model or accelerator packages.
 
 The pre-existing Alembic history contains multiple roots and an unresolved
 revision reference. Agent and memory tables therefore use idempotent SQLAlchemy

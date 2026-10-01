@@ -28,6 +28,20 @@ export interface EvidenceEntry {
   created_at: string;
 }
 
+export interface AIAnswer {
+  answer: string;
+  model: string;
+  provider: string;
+  input_tokens: number;
+  output_tokens: number;
+  latency_ms: number;
+  citations: Array<{
+    document_id: string;
+    chunk_index: number;
+    score: number;
+  }>;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json" },
@@ -41,6 +55,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const aegisApi = {
+  ingestKnowledge: (tenantId: string, document: string) =>
+    request<{ document_id: string; chunks_indexed: number; embedding_provider: string }>(
+      "/ai/knowledge",
+      { method: "POST", body: JSON.stringify({ tenant_id: tenantId, document }) },
+    ),
+  answerAI: (tenantId: string, query: string) =>
+    request<AIAnswer>("/ai/answer", {
+      method: "POST",
+      body: JSON.stringify({ tenant_id: tenantId, query }),
+    }),
   listRuns: () => request<AgentRunSummary[]>("/operator/agent/runs"),
   getRun: (runId: string) => request<AgentRunSummary>(`/operator/agent/runs/${runId}`),
   listApprovals: () => request<ApprovalSummary[]>("/operator/agent/approvals"),

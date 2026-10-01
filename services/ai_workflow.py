@@ -37,6 +37,7 @@ class AIWorkflow:
     max_document_chars = 64_000
     max_query_chars = 8_000
     max_documents_per_tenant = 100
+    max_tenants = 1000
 
     def __init__(
         self,
@@ -73,6 +74,8 @@ class AIWorkflow:
         if not tenant_id:
             raise ValueError("tenant_id is required")
         if tenant_id not in self._tenants:
+            if len(self._tenants) >= self.max_tenants:
+                raise ValueError("AI workflow tenant limit reached")
             self._tenants[tenant_id] = _TenantKnowledge(
                 pipeline=RAGPipeline(
                     self.embedding_provider,

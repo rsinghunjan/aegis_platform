@@ -67,3 +67,25 @@ def test_ai_endpoints_fail_closed_without_tenant_authorizer(tmp_path):
         )
     assert response.status_code == 503
     assert response.json()["detail"] == "agent API authorization is not configured"
+
+
+def test_agent_feedback_is_authorized_and_added_to_evidence_chain(tmp_path):
+    runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'feedback.db'}"))
+    run = runtime.create_run("tenant-a", '{"tool":"unused","input":{}}')
+    with TestClient(
+        create_app(runtime, tenant_authorizer=lambda *_args: True)
+    ) as client:
+        response = client.post(
+            f"/agent/runs/{run.run_id}/feedback",
+            json={
+                "tenant_id": "tenant-a",
+                "rating": 5,
+                "note": "Helpful",
+            },
+        )
+    assert response.status_code == 200
+    evidence = runtime.list_evidence(run.run_id, "tenant-a")
+    feedback = next(item for item in evidence if item.kind == "user_feedback")
+    assert feedback.metadata["rating"] == 5
+    assert "Helpful" not in repr(feedback.metadata)
+    assert runtime.verify_evidence_chain(run.run_id, "tenant-a")["valid"] is True

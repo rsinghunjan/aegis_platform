@@ -5,6 +5,8 @@ import logging
 import os
 import hashlib
 import json
+import asyncio
+import math
 from contextlib import asynccontextmanager
 import inspect
 from typing import Any, Callable, Optional
@@ -110,7 +112,42 @@ def create_app(
                 "Aegis database is unavailable; configure AEGIS_AGENT_DATABASE_URL "
                 "or DATABASE_URL and install the matching SQLAlchemy database driver"
             ) from exc
-        yield
+        anchor_task = None
+        if selected_runtime.evidence_anchor_backend is not None:
+            try:
+                anchor_interval = float(
+                    os.getenv("AEGIS_EVIDENCE_ANCHOR_INTERVAL_SECONDS", "60")
+                )
+                if not math.isfinite(anchor_interval) or anchor_interval <= 0:
+                    raise ValueError
+            except ValueError as exc:
+                raise RuntimeError(
+                    "AEGIS_EVIDENCE_ANCHOR_INTERVAL_SECONDS must be positive"
+                ) from exc
+
+            async def anchor_periodically() -> None:
+                while True:
+                    await asyncio.sleep(anchor_interval)
+                    try:
+                        await asyncio.to_thread(
+                            selected_runtime.anchor_pending_evidence
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Periodic evidence anchoring failed: %s",
+                            type(exc).__name__,
+                        )
+
+            anchor_task = asyncio.create_task(anchor_periodically())
+        try:
+            yield
+        finally:
+            if anchor_task is not None:
+                anchor_task.cancel()
+                try:
+                    await anchor_task
+                except asyncio.CancelledError:
+                    pass
 
     app = FastAPI(
         title="Aegis Platform",
@@ -449,6 +486,9 @@ def create_app(
                 json.dumps([entry.sha256 for entry in entries]).encode()
             ).hexdigest(),
             "kinds": sorted({entry.kind for entry in entries}),
+            "anchors": app.state.agent_runtime.list_evidence_anchors(
+                run_id, tenant_id
+            ),
             "integrity": chain,
         }
 

@@ -60,7 +60,11 @@ class OpaHttpEngine:
     def _build_decision_record(self, raw_bytes: bytes, latency_ms: int) -> EngineDecisionRecord:
         raw = json.loads(raw_bytes.decode("utf-8"))
         result = raw.get("result")
-        if result is None or not isinstance(result, Mapping):
+        if (
+            result is None
+            or not isinstance(result, Mapping)
+            or not isinstance(result.get("allow"), bool)
+        ):
             # Fail closed.
             decision = PolicyDecision(allow=False, reason="opa_invalid_result")
             return EngineDecisionRecord(
@@ -79,7 +83,7 @@ class OpaHttpEngine:
                 obligations.append(Obligation(type=t, params=params))
 
         decision = PolicyDecision(
-            allow=bool(result.get("allow", False)),
+            allow=result["allow"],
             reason=str(result.get("reason", "")),
             policy_id=(str(result.get("policy_id")) if result.get("policy_id") is not None else None),
             policy_version=(str(result.get("policy_version")) if result.get("policy_version") is not None else None),

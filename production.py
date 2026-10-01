@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from agentic.runtime import AgentRuntime, AgentRuntimeError, AgentStore
+from agentic.worker import AgentExecutionMessage, AgentPrincipal
 
 logger = logging.getLogger(__name__)
 
@@ -29,13 +30,14 @@ class CreateAgentRunRequest(BaseModel):
 
 class ApprovalRequest(BaseModel):
     tenant_id: str
-    actor: str
+    actor: str | None = None
+    approval_id: str | None = None
     reason: str = ""
 
 
 class ApprovalDecisionRequest(BaseModel):
     tenant_id: str
-    actor: str
+    actor: str | None = None
     decision: str
     reason: str = ""
 
@@ -71,6 +73,8 @@ def create_app(
         Callable[[Request, str, str, Optional[str]], Any]
     ] = None,
     approval_notifier: Optional[Callable[[Any], Any]] = None,
+    principal_resolver: Optional[Callable[[Request], Any]] = None,
+    execution_dispatcher: Any = None,
 ) -> FastAPI:
     selected_runtime = runtime or AgentRuntime()
     if approval_notifier is not None:
@@ -96,6 +100,18 @@ def create_app(
     )
     app.state.agent_runtime = selected_runtime
 
+    async def resolve_principal(request: Request) -> AgentPrincipal:
+        if principal_resolver is None:
+            return AgentPrincipal()
+        principal = principal_resolver(request)
+        if inspect.isawaitable(principal):
+            principal = await principal
+        if isinstance(principal, AgentPrincipal):
+            return principal
+        if isinstance(principal, dict):
+            return AgentPrincipal.parse_obj(principal)
+        raise HTTPException(status_code=503, detail="trusted principal is unavailable")
+
     async def authorize(
         request: Request, tenant_id: str, action: str, actor: Optional[str] = None
     ) -> None:
@@ -104,11 +120,32 @@ def create_app(
                 status_code=503,
                 detail="agent API authorization is not configured",
             )
-        allowed = tenant_authorizer(request, tenant_id, action, actor)
+        principal = await resolve_principal(request)
+        allowed = tenant_authorizer(
+            request, tenant_id, action, actor or principal.principal_id
+        )
         if inspect.isawaitable(allowed):
             allowed = await allowed
         if not allowed:
             raise HTTPException(status_code=403, detail="tenant access denied")
+
+    async def dispatch_run(
+        request: Request, run_id: str, tenant_id: str, *, resume: bool = False
+    ) -> dict[str, Any]:
+        principal = await resolve_principal(request)
+        await authorize(request, tenant_id, "execute", principal.principal_id)
+        if execution_dispatcher is None:
+            raise HTTPException(
+                status_code=503, detail="agent execution dispatcher is not configured"
+            )
+        message = AgentExecutionMessage(
+            run_id=run_id, tenant_id=tenant_id, principal=principal, resume=resume
+        )
+        dispatch = getattr(execution_dispatcher, "dispatch", execution_dispatcher)
+        result = dispatch(message)
+        if inspect.isawaitable(result):
+            result = await result
+        return {"status": "QUEUED", "run_id": run_id, "dispatch_id": result}
 
     @app.get("/healthz", tags=["health"])
     def healthz() -> dict[str, str]:
@@ -137,19 +174,7 @@ def create_app(
                 budget=body.budget,
                 idempotency_key=body.idempotency_key,
             )
-            result = await agent_runtime.execute(
-                run.run_id,
-                body.tenant_id,
-                role=body.role,
-                environment=body.environment,
-                scopes=set(body.scopes),
-            )
-            return {
-                "run": _run_summary(
-                    agent_runtime.get_run(run.run_id, body.tenant_id)
-                ),
-                **result,
-            }
+            return _run_summary(run)
         except AgentRuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -173,21 +198,8 @@ def create_app(
     async def execute_agent_run(
         request: Request, run_id: str, body: ResumeAgentRunRequest
     ) -> dict[str, Any]:
-        await authorize(request, body.tenant_id, "execute")
         try:
-            result = await app.state.agent_runtime.execute(
-                run_id,
-                body.tenant_id,
-                role=body.role,
-                environment=body.environment,
-                scopes=set(body.scopes),
-            )
-            return {
-                "run": _run_summary(
-                    app.state.agent_runtime.get_run(run_id, body.tenant_id)
-                ),
-                **result,
-            }
+            return await dispatch_run(request, run_id, body.tenant_id)
         except AgentRuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -207,13 +219,7 @@ def create_app(
     ) -> dict[str, Any]:
         await authorize(request, body.tenant_id, "execute")
         try:
-            return await app.state.agent_runtime.resume(
-                run_id,
-                body.tenant_id,
-                role=body.role,
-                environment=body.environment,
-                scopes=set(body.scopes),
-            )
+            return await dispatch_run(request, run_id, body.tenant_id, resume=True)
         except AgentRuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -221,16 +227,20 @@ def create_app(
     async def approve_agent_run(
         request: Request, run_id: str, body: ApprovalRequest
     ) -> dict[str, Any]:
-        await authorize(request, body.tenant_id, "approve", body.actor)
+        principal = await resolve_principal(request)
+        if not principal.principal_id:
+            raise HTTPException(status_code=503, detail="trusted approver identity is unavailable")
+        await authorize(request, body.tenant_id, "approve", principal.principal_id)
         try:
             agent_runtime = app.state.agent_runtime
             approval = agent_runtime.approve(
-                run_id, body.tenant_id, body.actor, body.reason
+                run_id,
+                body.tenant_id,
+                principal.principal_id,
+                body.reason,
+                approval_id=body.approval_id,
             )
-            result = await agent_runtime.resume(
-                run_id, body.tenant_id, autonomous=False
-            )
-            return {"approval": approval.dict(), **result}
+            return {"approval": approval.dict(), "status": "APPROVED"}
         except AgentRuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -267,7 +277,10 @@ def create_app(
     async def decide_agent_approval(
         request: Request, approval_id: str, body: ApprovalDecisionRequest
     ) -> dict[str, Any]:
-        await authorize(request, body.tenant_id, "approve", body.actor)
+        principal = await resolve_principal(request)
+        if not principal.principal_id:
+            raise HTTPException(status_code=503, detail="trusted approver identity is unavailable")
+        await authorize(request, body.tenant_id, "approve", principal.principal_id)
         runtime = app.state.agent_runtime
         approval = next(
             (
@@ -282,14 +295,20 @@ def create_app(
         try:
             if body.decision == "approve":
                 decision = runtime.approve(
-                    approval.run_id, body.tenant_id, body.actor, body.reason
+                    approval.run_id,
+                    body.tenant_id,
+                    principal.principal_id,
+                    body.reason,
+                    approval_id=approval_id,
                 )
-                result = await runtime.resume(
-                    approval.run_id, body.tenant_id, autonomous=False
-                )
+                result = {"status": "APPROVED", "run_id": approval.run_id}
             elif body.decision == "deny":
                 decision = runtime.deny(
-                    approval.run_id, body.tenant_id, body.actor, body.reason
+                    approval.run_id,
+                    body.tenant_id,
+                    principal.principal_id,
+                    body.reason,
+                    approval_id=approval_id,
                 )
                 result = {"status": "BLOCKED", "run_id": approval.run_id}
             else:
@@ -355,6 +374,7 @@ def create_app(
             entries = app.state.agent_runtime.list_evidence(run_id, tenant_id)
         except AgentRuntimeError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        chain = app.state.agent_runtime.verify_evidence_chain(run_id, tenant_id)
         return {
             "run_id": run_id,
             "count": len(entries),
@@ -362,6 +382,7 @@ def create_app(
                 json.dumps([entry.sha256 for entry in entries]).encode()
             ).hexdigest(),
             "kinds": sorted({entry.kind for entry in entries}),
+            "integrity": chain,
         }
 
     @app.get("/operator/agent/capabilities", tags=["operator"])

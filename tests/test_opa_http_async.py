@@ -69,6 +69,19 @@ def test_evaluate_async_returns_expected_decision(monkeypatch):
     assert record.engine == "opa-central-http"
 
 
+def test_opa_non_boolean_allow_fails_closed():
+    engine = OpaHttpEngine(
+        engine_name="opa-central-http",
+        endpoint_url="http://opa.example/v1/data",
+        bundle_sha256="sha",
+    )
+    record = engine._build_decision_record(
+        b'{"result":{"allow":"false","reason":"malformed"}}', 1
+    )
+    assert record.decision.allow is False
+    assert record.decision.reason == "opa_invalid_result"
+
+
 def test_evaluate_async_does_not_block_event_loop(monkeypatch):
     """
     While a (simulated) slow OPA call is in flight via evaluate_async, a

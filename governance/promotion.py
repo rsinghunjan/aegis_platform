@@ -99,6 +99,7 @@ class PersistedModelRegistry:
                     "version": payload["version"],
                     "run_id": run.id,
                     "artifact_uri": run.artifacts_uri,
+                    "governance_evidence": payload.get("governance_evidence", {}),
                     "tenant_id": job.tenant_id,
                     "job_id": job.id,
                 }
@@ -125,6 +126,7 @@ def _record_decision(
     metrics: dict | None = None,
     started_at=None,
     finished_at=None,
+    governance_evidence: dict[str, Any] | None = None,
 ):
     PersistedModelRegistry.validate_handoff(
         model_name, version, artifact_uri or ("unavailable" if not approved else "")
@@ -136,6 +138,7 @@ def _record_decision(
         "model_name": model_name,
         "version": version,
         "artifact_uri": artifact_uri,
+        "governance_evidence": governance_evidence or {},
     }
 
     with session_factory() as session:
@@ -182,7 +185,13 @@ def _record_decision(
                 resource=f"{model_name}:{version}",
                 decision=status,
                 reason=json.dumps(
-                    {"run_id": run_id, "notes": notes, "artifact_uri": artifact_uri}
+                    {
+                        "run_id": run_id,
+                        "notes": notes,
+                        "artifact_uri": artifact_uri,
+                        "governance_evidence": governance_evidence or {},
+                    },
+                    sort_keys=True,
                 ),
             )
         )
@@ -210,6 +219,7 @@ def promote_run(
     actor: str = "system",
     notes: str = "",
     session_factory=None,
+    governance_evidence: dict[str, Any] | None = None,
 ):
     """Validate a run, record governance metadata, and persist its registry handoff."""
     session_factory = session_factory or get_promotion_sessionmaker()
@@ -231,6 +241,7 @@ def promote_run(
             actor,
             notes,
             False,
+            governance_evidence=governance_evidence,
         )
         raise
 
@@ -248,6 +259,7 @@ def promote_run(
         getattr(run.data, "metrics", {}),
         getattr(run.info, "start_time", None),
         getattr(run.info, "end_time", None),
+        governance_evidence,
     )
 
 

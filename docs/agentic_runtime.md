@@ -74,13 +74,46 @@ async handlers are awaited. Both have a configurable timeout.
   sent to recovery planning instead of being silently replayed or marked
   successful.
 
-`/agent/runs/{run_id}/approve` records the actor and reason, then resumes that
-run. Agent HTTP routes return 503 until `create_app` receives a
+`/agent/runs/{run_id}/approve` records the trusted actor and reason; execution
+must subsequently be queued through the worker boundary. Agent HTTP routes return 503 until `create_app` receives a
 `tenant_authorizer(request, tenant_id, action, actor)` callback; rejected access
 returns 403. The embedding service must derive actor and tenant membership from
 trusted authentication state. A body tenant or actor ID is not a credential.
 The in-process runtime approval method is intended to be called only after the
 embedding service has authorized the human approver.
+
+`principal_resolver` supplies the trusted principal, role, environment, and
+scopes used for execution and approval. Body-supplied role, environment, scopes,
+and actor fields are not used as authorization context. Approval rows additionally
+bind to the immutable plan hash and current policy version, as well as the
+capability version, tenant, run, step, and tool. A capability or policy change
+therefore requires a new approval.
+Approval decisions can include the persisted `approval_id`; the runtime rejects
+an ambiguous run-level decision if more than one pending approval is present.
+
+## Control plane and worker boundary
+
+`POST /agent/runs` creates a durable run and does not execute tools.
+`POST /agent/runs/{run_id}/execute` submits an `AgentExecutionMessage` to the
+injected `execution_dispatcher`; the API returns `QUEUED` and does not call
+`AgentRuntime.execute`. A separate worker process can consume that message using
+`AgentWorker` and an independently configured runtime with the same database,
+policy, and registered trusted handlers. Dispatchers should durably queue and
+preserve the `run_id` as the execution idempotency key. The provided
+`CeleryExecutionDispatcher` and `register_celery_agent_worker` helpers integrate
+with an application-owned Celery instance and broker. Do not expose the worker
+consumer directly to untrusted clients. A missing dispatcher fails closed with
+HTTP 503.
+
+## Unified policy engines
+
+`AgentPolicyGate` keeps its local identity, tenant, scope, environment, budget,
+risk, and autonomy checks, then can evaluate the same action through injected
+typed policy engines such as `aegis_policy` RBAC and OPA. Any engine denial,
+material disagreement, evaluation error, or obligation without a successful
+injected handler blocks execution. The active configuration and engine bundle
+hashes are included in the policy version and decision evidence. With no
+external engines configured, the local gate remains the policy authority.
 
 ## Persistence and evidence
 
@@ -90,6 +123,12 @@ tenant. Stored tool input redacts keys that look like credentials and truncates
 oversized strings; tool results are reduced to hashes and small type/size
 metadata in audit rows. Prompt/context references and final outcome hashes are
 audit evidence; raw prompts and result payloads are not copied into evidence.
+Each evidence row links to the previous evidence digest, and
+`verify_evidence_chain` validates the run's hash chain and returns its head.
+This detects alteration, insertion, and internal deletion when the head is
+known, but does not prevent an attacker with database write access from
+truncating or replacing the entire chain. Export or sign the head in an
+independent audit system for that guarantee.
 
 Configure storage with `AEGIS_AGENT_DATABASE_URL`; `DATABASE_URL` is accepted
 as a fallback. SQLite is the local default. PostgreSQL deployments must install

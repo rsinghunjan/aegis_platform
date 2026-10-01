@@ -9,6 +9,7 @@ from agentic.runtime import (
     AgentRuntimeError,
     AgentStore,
     AgentRunRow,
+    EvidenceRow,
     PlanStepRow,
     PolicyDecisionRow,
     ToolCallRow,
@@ -47,6 +48,10 @@ def test_create_plan_execute_verify_and_persist(tmp_path):
         "tool_result",
         "final_outcome",
     }
+    chain = runtime.verify_evidence_chain(run.run_id, "tenant-a")
+    assert chain["valid"] is True
+    assert chain["count"] == len(evidence)
+    assert chain["head_sha256"]
     with runtime.store.sessions() as session:
         assert len(session.scalars(select(ToolCallRow)).all()) == 1
         assert len(session.scalars(select(PolicyDecisionRow)).all()) == 1
@@ -114,6 +119,159 @@ def test_high_risk_approval_is_bound_to_a_single_plan_step(tmp_path):
         runtime.resume(run.run_id, "tenant-a", autonomous=False)
     )["status"] == "SUCCEEDED"
     assert calls == ["release_a", "release_b"]
+
+
+def test_approval_is_invalidated_when_policy_or_plan_changes(tmp_path):
+    runtime = make_runtime(tmp_path / "approval-context.db")
+    runtime.register_tool(ToolSpec(name="publish", risk_level="high"), lambda _: {})
+    run = runtime.create_run("tenant-a", '{"tool":"publish","input":{}}')
+    assert asyncio.run(runtime.execute(run.run_id, "tenant-a"))["status"] == "WAITING_APPROVAL"
+    approval = runtime.approve(run.run_id, "tenant-a", "reviewer")
+    assert approval.plan_hash
+    assert approval.policy_version == runtime.policy.version
+
+    runtime.policy.autonomy_mode = "supervised"
+    assert asyncio.run(runtime.resume(run.run_id, "tenant-a"))["status"] == "WAITING_APPROVAL"
+
+
+def test_evidence_chain_detects_tampering(tmp_path):
+    runtime = make_runtime(tmp_path / "evidence-tamper.db")
+    run = runtime.create_run("tenant-a", "goal")
+    assert runtime.verify_evidence_chain(run.run_id, "tenant-a")["valid"] is True
+    with runtime.store.sessions() as session:
+        evidence = session.query(EvidenceRow).filter_by(run_id=run.run_id).one()
+        evidence.metadata_json = {"goal_sha256": "tampered"}
+        session.commit()
+    assert runtime.verify_evidence_chain(run.run_id, "tenant-a")["valid"] is False
+
+
+def test_policy_engine_decisions_are_enforced_and_recorded(tmp_path):
+    from aegis_policy.contracts import (
+        EngineDecisionRecord,
+        PolicyDecision,
+    )
+
+    class DenyEngine:
+        engine_name = "opa-central-http"
+        bundle_sha256 = "bundle-v1"
+
+        def evaluate(self, policy_input):
+            assert policy_input.request.action == "agent.run"
+            assert policy_input.request.actor.org_id == "tenant-a"
+            assert policy_input.resource.id == "protected"
+            return EngineDecisionRecord(
+                engine="opa-central-http",
+                decision=PolicyDecision(allow=False, reason="denied_by_test"),
+                bundle_sha256=self.bundle_sha256,
+            )
+
+    runtime = make_runtime(
+        tmp_path / "external-policy.db",
+        policy=AgentPolicyGate(engines=(DenyEngine(),)),
+    )
+    called = []
+    runtime.register_tool(
+        ToolSpec(name="protected"),
+        lambda _payload: called.append(True) or {"ok": True},
+    )
+    run = runtime.create_run("tenant-a", '{"tool":"protected","input":{}}')
+    result = asyncio.run(runtime.execute(run.run_id, "tenant-a"))
+    assert result["status"] == "BLOCKED"
+    assert called == []
+    decision_evidence = [
+        item for item in runtime.list_evidence(run.run_id, "tenant-a")
+        if item.kind == "policy_decision"
+    ][0]
+    assert decision_evidence.metadata["policy_version"] == runtime.policy.version
+    policy_evaluation = decision_evidence.metadata["policy_evaluation"]
+    assert policy_evaluation["engines"][0]["bundle_sha256"] == "bundle-v1"
+    assert policy_evaluation["engines"][0]["decision"] == "deny"
+
+
+def test_policy_obligations_fail_closed_without_handler(tmp_path):
+    from aegis_policy.contracts import (
+        EngineDecisionRecord,
+        Obligation,
+        PolicyDecision,
+    )
+
+    class ObligationEngine:
+        engine_name = "opa-central-http"
+        bundle_sha256 = "bundle-v1"
+
+        def evaluate(self, _policy_input):
+            return EngineDecisionRecord(
+                engine="opa-central-http",
+                decision=PolicyDecision(
+                    allow=True,
+                    obligations=(Obligation(type="change_ticket"),),
+                ),
+                bundle_sha256=self.bundle_sha256,
+            )
+
+    runtime = make_runtime(
+        tmp_path / "obligation-policy.db",
+        policy=AgentPolicyGate(engines=(ObligationEngine(),)),
+    )
+    called = []
+    runtime.register_tool(
+        ToolSpec(name="deploy"),
+        lambda _payload: called.append(True) or {"ok": True},
+    )
+    run = runtime.create_run("tenant-a", '{"tool":"deploy","input":{}}')
+    result = asyncio.run(runtime.execute(run.run_id, "tenant-a"))
+    assert result["status"] == "BLOCKED"
+    assert result["reason"] == "unhandled_obligation:change_ticket"
+    assert called == []
+
+
+def test_policy_obligations_wait_for_required_human_approval(tmp_path):
+    from aegis_policy.contracts import (
+        EngineDecisionRecord,
+        Obligation,
+        PolicyDecision,
+    )
+
+    class ObligationEngine:
+        engine_name = "opa-central-http"
+        bundle_sha256 = "bundle-v1"
+
+        def evaluate(self, _policy_input):
+            return EngineDecisionRecord(
+                engine="opa-central-http",
+                decision=PolicyDecision(
+                    allow=True,
+                    obligations=(Obligation(type="record_ticket"),),
+                ),
+                bundle_sha256=self.bundle_sha256,
+            )
+
+    completed_obligations = []
+    policy = AgentPolicyGate(
+        engines=(ObligationEngine(),),
+        obligation_handler=lambda obligation: (
+            completed_obligations.append(obligation.type) or True
+        ),
+    )
+    runtime = make_runtime(tmp_path / "approval-obligation.db", policy=policy)
+    tool_calls = []
+    runtime.register_tool(
+        ToolSpec(name="publish", risk_level="high"),
+        lambda _payload: tool_calls.append(True) or {"ok": True},
+    )
+    run = runtime.create_run("tenant-a", '{"tool":"publish","input":{}}')
+    waiting = asyncio.run(runtime.execute(run.run_id, "tenant-a"))
+    assert waiting["status"] == "WAITING_APPROVAL"
+    assert completed_obligations == []
+    assert tool_calls == []
+
+    runtime.approve(run.run_id, "tenant-a", "reviewer")
+    result = asyncio.run(
+        runtime.resume(run.run_id, "tenant-a", autonomous=False)
+    )
+    assert result["status"] == "SUCCEEDED"
+    assert completed_obligations == ["record_ticket"]
+    assert tool_calls == [True]
 
 
 def test_global_autonomy_kill_switch_blocks(tmp_path):

@@ -31,6 +31,7 @@ class CreateAgentRunRequest(BaseModel):
 class ApprovalRequest(BaseModel):
     tenant_id: str
     actor: str | None = None
+    approval_id: str | None = None
     reason: str = ""
 
 
@@ -233,7 +234,11 @@ def create_app(
         try:
             agent_runtime = app.state.agent_runtime
             approval = agent_runtime.approve(
-                run_id, body.tenant_id, principal.principal_id, body.reason
+                run_id,
+                body.tenant_id,
+                principal.principal_id,
+                body.reason,
+                approval_id=body.approval_id,
             )
             return {"approval": approval.dict(), "status": "APPROVED"}
         except AgentRuntimeError as exc:
@@ -290,12 +295,20 @@ def create_app(
         try:
             if body.decision == "approve":
                 decision = runtime.approve(
-                    approval.run_id, body.tenant_id, principal.principal_id, body.reason
+                    approval.run_id,
+                    body.tenant_id,
+                    principal.principal_id,
+                    body.reason,
+                    approval_id=approval_id,
                 )
                 result = {"status": "APPROVED", "run_id": approval.run_id}
             elif body.decision == "deny":
                 decision = runtime.deny(
-                    approval.run_id, body.tenant_id, principal.principal_id, body.reason
+                    approval.run_id,
+                    body.tenant_id,
+                    principal.principal_id,
+                    body.reason,
+                    approval_id=approval_id,
                 )
                 result = {"status": "BLOCKED", "run_id": approval.run_id}
             else:
@@ -361,6 +374,7 @@ def create_app(
             entries = app.state.agent_runtime.list_evidence(run_id, tenant_id)
         except AgentRuntimeError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        chain = app.state.agent_runtime.verify_evidence_chain(run_id, tenant_id)
         return {
             "run_id": run_id,
             "count": len(entries),
@@ -368,6 +382,7 @@ def create_app(
                 json.dumps([entry.sha256 for entry in entries]).encode()
             ).hexdigest(),
             "kinds": sorted({entry.kind for entry in entries}),
+            "integrity": chain,
         }
 
     @app.get("/operator/agent/capabilities", tags=["operator"])

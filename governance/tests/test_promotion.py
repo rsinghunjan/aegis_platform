@@ -115,6 +115,15 @@ def test_database_url_builds_local_promotion_sessionmaker(tmp_path, monkeypatch)
     assert (tmp_path / "configured.db").exists()
 
 
+def test_governance_promotion_fails_closed_without_trusted_authorizer(monkeypatch):
+    monkeypatch.delitem(api.app.config, "AEGIS_GOVERNANCE_AUTHORIZER", raising=False)
+    response = api.app.test_client().post(
+        "/promote", json={"run_id": "mlflow-run-1", "user": "forged"}
+    )
+    assert response.status_code == 503
+    assert response.json == {"error": "governance authorization is not configured"}
+
+
 def test_governance_routes_keep_promotion_and_run_listing(monkeypatch, session_factory):
     run = make_run()
 
@@ -139,6 +148,8 @@ def test_governance_routes_keep_promotion_and_run_listing(monkeypatch, session_f
             "decision_evidence_sha256": "a" * 64,
             "artifact_sha256": "b" * 64,
             "signature_verified": True,
+            "action": action,
+            "tenant_id": tenant_id,
         }
         if tenant_id == "default" and action in {"model.read", "model.promote"}
         else None,

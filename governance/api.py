@@ -2,6 +2,7 @@
 """Governance API for inspecting MLflow runs and promoting model versions."""
 
 import os
+import re
 
 from flask import Flask, jsonify, request
 
@@ -27,6 +28,8 @@ def authorize(action: str, tenant_id: str) -> tuple[dict | None, tuple]:
         return None, (jsonify({"error": "governance access denied"}), 403)
     if not isinstance(grant, dict) or not grant.get("actor_id"):
         return None, (jsonify({"error": "trusted actor identity is unavailable"}), 403)
+    if grant.get("action") != action or grant.get("tenant_id") != tenant_id:
+        return None, (jsonify({"error": "governance grant scope mismatch"}), 403)
     return grant, ()
 
 
@@ -37,9 +40,15 @@ def _promotion_evidence_is_complete(grant: dict) -> bool:
         "decision_evidence_sha256",
         "artifact_sha256",
     )
+    valid_hashes = all(
+        isinstance(grant.get(key), str)
+        and re.fullmatch(r"[0-9a-fA-F]{64}", grant[key]) is not None
+        for key in ("decision_evidence_sha256", "artifact_sha256")
+    )
     return (
         all(isinstance(grant.get(key), str) and grant[key] for key in required)
         and grant.get("signature_verified") is True
+        and valid_hashes
     )
 
 

@@ -880,20 +880,33 @@ class AgentRuntime:
                 session.commit()
         return await self.execute(run_id, tenant_id, **kwargs)
 
-    def approve(self, run_id: str, tenant_id: str, actor: str, reason: str = "") -> Approval:
+    def approve(
+        self,
+        run_id: str,
+        tenant_id: str,
+        actor: str,
+        reason: str = "",
+        approval_id: Optional[str] = None,
+    ) -> Approval:
         if not actor:
             raise AgentRuntimeError("Approval actor is required")
         with self.store.sessions() as session:
             row = self._owned_run(session, run_id, tenant_id)
-            pending = session.scalar(
-                select(ApprovalRow).where(
-                    ApprovalRow.run_id == run_id,
-                    ApprovalRow.tenant_id == tenant_id,
-                    ApprovalRow.status == "pending",
-                )
+            pending_query = select(ApprovalRow).where(
+                ApprovalRow.run_id == run_id,
+                ApprovalRow.tenant_id == tenant_id,
+                ApprovalRow.status == "pending",
             )
-            if pending is None:
+            if approval_id:
+                pending_query = pending_query.where(
+                    ApprovalRow.approval_id == approval_id
+                )
+            pending_matches = session.scalars(pending_query.limit(2)).all()
+            if not pending_matches:
                 raise AgentRuntimeError("No pending approval for this run")
+            if len(pending_matches) != 1:
+                raise AgentRuntimeError("Approval ID is required when multiple approvals are pending")
+            pending = pending_matches[0]
             now = _now()
             if pending.expires_at and pending.expires_at <= now:
                 pending.status = "expired"
@@ -948,22 +961,37 @@ class AgentRuntime:
                 escalation_status=pending.escalation_status,
                 denial_reason=pending.denial_reason,
                 capability_version=pending.capability_version,
+                plan_hash=pending.plan_hash,
+                policy_version=pending.policy_version,
             )
 
-    def deny(self, run_id: str, tenant_id: str, actor: str, reason: str) -> Approval:
+    def deny(
+        self,
+        run_id: str,
+        tenant_id: str,
+        actor: str,
+        reason: str,
+        approval_id: Optional[str] = None,
+    ) -> Approval:
         if not actor or not reason:
             raise AgentRuntimeError("Approval actor and denial reason are required")
         with self.store.sessions() as session:
             run = self._owned_run(session, run_id, tenant_id)
-            pending = session.scalar(
-                select(ApprovalRow).where(
-                    ApprovalRow.run_id == run_id,
-                    ApprovalRow.tenant_id == tenant_id,
-                    ApprovalRow.status == "pending",
-                )
+            pending_query = select(ApprovalRow).where(
+                ApprovalRow.run_id == run_id,
+                ApprovalRow.tenant_id == tenant_id,
+                ApprovalRow.status == "pending",
             )
-            if pending is None:
+            if approval_id:
+                pending_query = pending_query.where(
+                    ApprovalRow.approval_id == approval_id
+                )
+            pending_matches = session.scalars(pending_query.limit(2)).all()
+            if not pending_matches:
                 raise AgentRuntimeError("No pending approval for this run")
+            if len(pending_matches) != 1:
+                raise AgentRuntimeError("Approval ID is required when multiple approvals are pending")
+            pending = pending_matches[0]
             now = _now()
             pending.status = "denied"
             pending.actor = actor
@@ -1313,16 +1341,28 @@ class AgentRuntime:
                 )
             )
             effective_autonomous = autonomous and not approved
-            action, reason = self.policy.evaluate(
-                run,
-                spec,
-                role,
-                environment,
-                scopes,
-                approved,
-                effective_autonomous,
-                principal_id,
-            )
+            if hasattr(self.policy, "evaluate_with_evidence"):
+                action, reason, policy_evidence = self.policy.evaluate_with_evidence(
+                    run,
+                    spec,
+                    role,
+                    environment,
+                    scopes,
+                    approved,
+                    effective_autonomous,
+                    principal_id,
+                )
+            else:
+                action, reason = self.policy.evaluate(
+                    run,
+                    spec,
+                    role,
+                    environment,
+                    scopes,
+                    approved,
+                    effective_autonomous,
+                )
+                policy_evidence = {"policy_version": policy_version}
             decision = PolicyDecisionRow(
                 decision_id=str(uuid.uuid4()),
                 run_id=run_id,
@@ -1343,13 +1383,7 @@ class AgentRuntime:
                     "reason": reason,
                     "policy_version": self.policy.version,
                     "principal_id": principal_id,
-                    "engines": [
-                        {
-                            "name": getattr(engine, "engine_name", type(engine).__name__),
-                            "bundle_sha256": getattr(engine, "bundle_sha256", ""),
-                        }
-                        for engine in self.policy.engines
-                    ],
+                    "policy_evaluation": policy_evidence,
                 },
             )
             if action == "block":
@@ -1484,7 +1518,6 @@ class AgentRuntime:
                     created_at=_now(),
                 )
             )
-            return evidence_id
             self._add_evidence(
                 session,
                 run,
@@ -1656,6 +1689,8 @@ class AgentRuntime:
                 created_at=_now(),
             )
         )
+        session.flush()
+        return evidence_id
 
     def _as_run(self, row: AgentRunRow) -> AgentRun:
         plan = Plan.parse_obj(row.plan_json) if row.plan_json else None

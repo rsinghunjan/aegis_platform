@@ -3,7 +3,12 @@ import asyncio
 from fastapi.testclient import TestClient
 
 from agentic.runtime import AgentRuntime, AgentStore, ToolSpec
-from agentic.worker import AgentExecutionMessage, AgentPrincipal, AgentWorker
+from agentic.worker import (
+    AgentExecutionMessage,
+    AgentPrincipal,
+    AgentWorker,
+    CeleryExecutionDispatcher,
+)
 from production import create_app
 
 
@@ -14,6 +19,27 @@ class CollectingDispatcher:
     def dispatch(self, message: AgentExecutionMessage):
         self.messages.append(message)
         return f"dispatch-{len(self.messages)}"
+
+
+def test_celery_dispatcher_sends_run_reference():
+    class FakeCelery:
+        def __init__(self):
+            self.call = None
+
+        def send_task(self, name, args):
+            self.call = (name, args)
+            return type("Result", (), {"id": "celery-task-1"})()
+
+    celery = FakeCelery()
+    message = AgentExecutionMessage(
+        run_id="run-1",
+        tenant_id="tenant-a",
+        principal=AgentPrincipal(principal_id="operator"),
+    )
+    task_id = CeleryExecutionDispatcher(celery).dispatch(message)
+    assert task_id == "celery-task-1"
+    assert celery.call[0] == "aegis.execute_agent_run"
+    assert celery.call[1][0]["run_id"] == "run-1"
 
 
 def test_canonical_health_and_readiness(tmp_path):
@@ -27,9 +53,13 @@ def test_canonical_health_and_readiness(tmp_path):
 
 def test_canonical_agent_endpoint_runs_safe_registered_tool(tmp_path):
     runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'api.db'}"))
+    calls = []
     runtime.register_tool(
         ToolSpec(name="echo", output_schema={"type": "object", "required": ["ok"]}),
-        lambda payload: {"ok": True, "value": payload.get("value")},
+        lambda payload: calls.append(payload) or {
+            "ok": True,
+            "value": payload.get("value"),
+        },
     )
     dispatcher = CollectingDispatcher()
     with TestClient(
@@ -181,10 +211,23 @@ def test_agent_approval_requires_authorized_actor(tmp_path):
         assert queued.status_code == 200
         waiting = asyncio.run(AgentWorker(runtime).execute(dispatcher.messages.pop()))
         assert waiting["status"] == "WAITING_APPROVAL"
+        approval_id = runtime.list_approvals(
+            "tenant-a", status="pending"
+        )[0].approval_id
+        wrong_approval = client.post(
+            f"/agent/runs/{run_id}/approve",
+            json={
+                "tenant_id": "tenant-a",
+                "approval_id": "different-approval",
+                "reason": "should not match",
+            },
+        )
+        assert wrong_approval.status_code == 400
         approved = client.post(
             f"/agent/runs/{run_id}/approve",
             json={
                 "tenant_id": "tenant-a",
+                "approval_id": approval_id,
                 "actor": "attacker-controlled-body-value",
                 "reason": "reviewed",
             },
@@ -198,7 +241,7 @@ def test_agent_approval_requires_authorized_actor(tmp_path):
     assert queued_resume.status_code == 200
     result = asyncio.run(AgentWorker(runtime).execute(dispatcher.messages.pop()))
     assert result["status"] == "SUCCEEDED"
-    assert authorizations[-1] == ("tenant-a", "approve", "release-manager")
+    assert ("tenant-a", "approve", "release-manager") in authorizations
     approval = runtime.list_approvals("tenant-a", status="approved")[0]
     assert approval.actor == "release-manager"
     assert approval.plan_hash and approval.policy_version

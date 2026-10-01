@@ -24,6 +24,14 @@ Agent HTTP routes fail closed until `create_app` is given a
 service must derive identity and tenant membership from its trusted auth
 context; request-body tenant and actor fields are not credentials.
 
+`POST /agent/runs` only creates a durable run. Execution is queued separately
+through `/agent/runs/{run_id}/execute` using the injected
+`execution_dispatcher`; worker processes use `AgentWorker` and register their
+own trusted tool handlers. Dispatch messages carry identity-resolver output,
+not body-supplied role or scope values. Approval routes record decisions using
+the principal returned by `principal_resolver`; the request body's `actor` field
+is ignored.
+
 Run tests with:
 
 ```bash
@@ -61,8 +69,12 @@ planner always validates plans and falls back to deterministic JSON planning.
 The catalog is hash-versioned; signatures require an injected signer. Tool
 handlers are trusted adapters: the sandbox boundary limits payloads/timeouts
 and rejects code-like pure-profile inputs, but is not OS-level isolation.
-Approvals and policy decisions are persisted. Evidence stores hashes and
-redacted metadata, not raw tool results. See
+Approvals bind to the plan hash, policy version, capability version, and
+tenant/run/step/tool. Optional `aegis_policy` engines are composed deny-on-
+disagreement; unknown or unsatisfied obligations fail closed. Evidence hashes
+are linked into a verifiable per-run chain, but the chain head should be
+externally anchored to protect against deletion or wholesale database
+replacement. See
 [`docs/agentic_runtime.md`](docs/agentic_runtime.md) for the state machine and
 configuration details.
 

@@ -74,9 +74,28 @@ do not download models or call external services.
   existing required tables for convenience.
 - Promotion does not copy, download, sign, checksum-verify, or deploy MLflow
   artifacts. The resolve endpoint returns a reference, not a loaded model.
-  Deployment, artifact trust, rollback, caller authentication, and durable
-  audit retention remain operator responsibilities.
+  Deployment, artifact trust, rollback, and durable audit retention remain
+  operator responsibilities; caller authentication and promotion evidence are
+  required through the authorization contract below.
 - `/generate` invokes the existing multimodal system, which loads models lazily.
   The current `SafetyChecker.is_unsafe()` implementation is a no-op placeholder;
   it is wired as an API hook, not a production safety control. The endpoint
   does not automatically load the promoted MLflow artifact.
+
+## Governance API authorization contract
+
+The Flask promotion API is fail-closed unless the host configures
+`AEGIS_GOVERNANCE_AUTHORIZER(request, action, tenant_id)`. The callback must
+authenticate the caller and return a trusted grant scoped to the exact action
+and tenant, including `actor_id`, `action`, and `tenant_id`. Promotion grants
+must additionally include `approval_id`, `policy_version`,
+`decision_evidence_sha256`, `artifact_sha256`, and
+`signature_verified: true`. The API ignores any caller-supplied `user` value
+and persists the grant references with the model promotion and audit record.
+
+The callback is an integration boundary, not an artifact verifier supplied by
+this module: production wiring must verify the actual artifact against a
+trusted signing key and validate the approval/policy evidence before issuing
+the grant. The promoted model reference carries these evidence identifiers so
+deployment automation can verify the same artifact and governance decision
+before rollout.

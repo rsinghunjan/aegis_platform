@@ -1,13 +1,14 @@
-# Aegis Platform Dashboard
+# Aegis AI Operations Dashboard
 
-A minimal React + TypeScript operator dashboard for the Aegis control plane,
-talking to the read-only `/operator/agent/*` API exposed by `production.py`.
+An operator dashboard for production AI/ML/LLM workflows, talking to the
+read-only `/operator/agent/*` API exposed by `production.py`. It surfaces the
+governance, evidence, and operational status surrounding agent runs.
 
 ## Features
-- **Run Monitor** — polls `/operator/agent/runs` and shows live run status.
-- **Approval Queue** — lists pending approvals and lets an operator approve/deny them.
-- **Evidence Explorer** — renders a run's evidence hash chain and flags breaks.
-- **Analytics** — aggregate run counts by status.
+- **AI Run Monitor** — polls `/operator/agent/runs` and shows run status.
+- **Governance Queue** — lists pending approvals for operator decisions.
+- **AI Evidence Explorer** — renders a run's evidence hash chain and flags breaks.
+- **Run Analytics** — aggregates run counts by status.
 
 ## Development
 

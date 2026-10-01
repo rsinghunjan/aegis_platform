@@ -12,12 +12,13 @@ export default function App() {
 
   return (
     <main>
-      <h1>Aegis Platform Dashboard</h1>
+      <h1>Aegis AI Operations</h1>
+      <p>Production operations for governed AI, ML, and LLM workflows.</p>
       <nav>
-        <button onClick={() => setTab("runs")}>Runs</button>
-        <button onClick={() => setTab("approvals")}>Approvals</button>
-        <button onClick={() => setTab("evidence")}>Evidence</button>
-        <button onClick={() => setTab("analytics")}>Analytics</button>
+        <button onClick={() => setTab("runs")}>AI Runs</button>
+        <button onClick={() => setTab("approvals")}>Governance</button>
+        <button onClick={() => setTab("evidence")}>AI Evidence</button>
+        <button onClick={() => setTab("analytics")}>Run Analytics</button>
       </nav>
 
       {tab === "runs" && <RunMonitor />}

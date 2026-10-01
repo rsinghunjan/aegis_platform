@@ -1,0 +1,438 @@
+*** Begin Patch
+*** Add File:services/agent/staged_automation_controller.py
++#!/usr/bin/env python3
++"""
++Staged automation controller for low-risk agentic actions.
++ - Reads a safe_policy (ops/config/safe_policy.json) which lists allowed low-risk tools/actions.
++ - Reads a queue of candidate intents (ops/agent/auto_intents.jsonl) and proposes plans via LLM planner.
++ - Validates via plan_verifier; automatically executes low-risk plans up to a staged ramp (percent).
++ - All executions use execute_plan_safe to ensure pre/post checks, backups and auditing.
++ - Respects circuit breaker and manual approval for medium/high risk.
++
++This is intended to run as a cron or deployment in staging/production with limited rate.
++"""
++import os
++import json
++import time
++from services.agent.llm_planner_enhanced import plan_for_intent
++from services.agent.plan_verifier import plan_verdict
++from services.agent.execute_with_safety import execute_plan_safe
++from services.agent.circuit_breaker import is_allowed as cb_is_allowed, record_failure
++
++SAFE_POLICY_PATH = os.environ.get("SAFE_POLICY_PATH", "ops/config/safe_policy.json")
++INTENTS_FILE = os.environ.get("AUTO_INTENTS_FILE", "ops/agent/auto_intents.jsonl")
++RAMP_PERCENT = float(os.environ.get("STAGED_RAMP_PERCENT", "0.05"))  # fraction of intents to auto-execute
++SLEEP_S = int(os.environ.get("STAGED_CONTROLLER_INTERVAL_S", "30"))
++
++def load_safe_policy(path):
++    if not os.path.exists(path):
++        return {"allowed": []}
++    return json.load(open(path))
++
++def load_intents(path):
++    out=[]
++    if not os.path.exists(path):
++        return out
++    for l in open(path):
++        if not l.strip(): continue
++        out.append(json.loads(l))
++    return out
++
++def intent_allowed_by_policy(plan, policy):
++    # simple check: all tool.action pairs in plan must be in policy.allowed
++    allowed = set(policy.get("allowed", []))
++    for step in plan.get("plan", []):
++        t = f"{step.get('tool')}.{step.get('action')}" if '.' not in step.get('tool') else step.get('tool')
++        if t not in allowed:
++            return False
++    return True
++
++def run_once():
++    if not cb_is_allowed("default"):
++        print("Circuit breaker tripped; not executing")
++        return
++    policy = load_safe_policy(SAFE_POLICY_PATH)
++    intents = load_intents(INTENTS_FILE)
++    if not intents:
++        print("No auto intents found")
++        return
++    # pick a subset according to ramp percent
++    limit = max(1, int(len(intents) * RAMP_PERCENT))
++    selected = intents[:limit]
++    for it in selected:
++        intent_text = it.get("intent")
++        try:
++            plan = plan_for_intent(intent_text, {})
++            verdict = plan_verdict(plan)
++            if not verdict.get("allow", False):
++                print("Plan vetoed by automatic verifier for intent:", intent_text)
++                continue
++            # only auto-execute if risk low and policy allows
++            if plan.get("risk_level","low") != "low":
++                print("Plan risk not low -> requires human:", plan.get("risk_level"))
++                continue
++            if not intent_allowed_by_policy(plan, policy):
++                print("Plan contains non-allowed actions; skipping")
++                continue
++            # execute safely (dry_run False)
++            res = execute_plan_safe(f"staged-{int(time.time())}", plan, requester="automation", dry_run=False)
++            print("Execution result:", res)
++            if res.get("state") == "failed":
++                record_failure("default")
++        except Exception as e:
++            print("Error processing intent", intent_text, e)
++
++def main_loop():
++    print("Starting staged automation controller with ramp", RAMP_PERCENT)
++    while True:
++        run_once()
++        time.sleep(SLEEP_S)
++
++if __name__=="__main__":
++    main_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/config/safe_policy.json
++{
++  "allowed": [
++    "k8s.scale_deployment",
++    "k8s.get_status",
++    "k8s.read_configmap"
++  ],
++  "notes": "Low-risk actions allowed to be automated without human approval. Add more entries only after risk review."
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/agent/auto_intents.jsonl
++{"intent": "scale verifier to 2", "meta": {"tenant": "safety"}}
++{"intent": "scale tracer to 3", "meta": {"tenant": "infra"}}
++{"intent": "scale cpu-monitor to 4", "meta": {"tenant": "infra"}}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/tool_adapters/k8s_adapter.py
++#!/usr/bin/env python3
++"""
++Basic k8s adapter utilities used by wrappers.
++ - set_image, scale_deployment, get_deployment_replicas, get_deployment_status
++ - For production, replace with proper client-go/pykube implementations and RBAC principles.
++"""
++import subprocess, json
++
++def run_cmd(cmd):
++    return subprocess.check_output(cmd).decode("utf-8")
++
++def set_image(namespace, deployment, image):
++    subprocess.check_call(["kubectl","-n",namespace,"set","image","deployment/"+deployment, f"{deployment}={image}"])
++    return {"status":"ok","image":image}
++
++def scale_deployment(namespace, deployment, replicas):
++    subprocess.check_call(["kubectl","-n",namespace,"scale","deployment",deployment,"--replicas="+str(replicas)])
++    return {"status":"ok","replicas":replicas}
++
++def get_deployment_replicas(namespace, deployment):
++    out = run_cmd(["kubectl","-n",namespace,"get","deployment",deployment,"-o","jsonpath={.spec.replicas}"])
++    return int(out.strip())
++
++def get_deployment_status(namespace, deployment):
++    out = run_cmd(["kubectl","-n",namespace,"get","deployment",deployment,"-o","json"])
++    return json.loads(out)
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/tool_adapters/policy_adapter.py
++#!/usr/bin/env python3
++"""
++Policy adapter used by generated wrappers (completing earlier scaffold).
++ - Exposes apply_policy(namespace, name, data, dry_run)
++"""
++import subprocess, json, tempfile
++from services.agent.backup_store import store_backup
++
++def apply_policy(namespace, name, data, dry_run=False):
++    prev = None
++    try:
++        prev_raw = subprocess.check_output(["kubectl","-n",namespace,"get","configmap",name,"-o","json"])
++        prev = json.loads(prev_raw.decode("utf-8"))
++    except Exception:
++        prev = None
++    if dry_run:
++        return {"status":"dry_run","would_apply": data, "previous_present": bool(prev)}
++    cm = {"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":namespace},"data":{k:str(v) for k,v in data.items()}}
++    tf = tempfile.NamedTemporaryFile(delete=False, mode="w")
++    json.dump(cm, tf); tf.close()
++    subprocess.check_call(["kubectl","apply","-f", tf.name])
++    if prev:
++        store_backup(f"policy_{name}_{int(time.time())}", prev)
++    return {"status":"applied"}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/tool_adapters/storage_adapter.py
++#!/usr/bin/env python3
++"""
++Storage adapter completion (wraps S3 ops).
++ - Provides safe_copy, safe_delete (moves to tombstone) and get_object_head.
++"""
++import boto3, os
++from urllib.parse import urlparse
++
++S3_REGION = os.environ.get("AWS_REGION", "us-west-2")
++
++def s3_client():
++    return boto3.client("s3", region_name=S3_REGION)
++
++def parse_s3(uri):
++    p = urlparse(uri)
++    return p.netloc, p.path.lstrip("/")
++
++def safe_copy(src, dst):
++    sb, sk = parse_s3(src)
++    db, dk = parse_s3(dst)
++    c = s3_client()
++    c.copy_object(Bucket=db, CopySource={"Bucket": sb, "Key": sk}, Key=dk)
++    return {"status":"copied", "dst": dst}
++
++def safe_delete(uri):
++    b,k = parse_s3(uri)
++    c = s3_client()
++    tomb = f".tombstone/{k}.{int(time.time())}"
++    c.copy_object(Bucket=b, CopySource={"Bucket":b,"Key":k}, Key=tomb)
++    c.delete_object(Bucket=b, Key=k)
++    return {"status":"tombstoned", "tomb": f"s3://{b}/{tomb}"}
++
++def get_head(uri):
++    b,k = parse_s3(uri)
++    c = s3_client()
++    return c.head_object(Bucket=b, Key=k)
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/agent_long_dryrun_2000.yml
++name: Agent Long Dry-run 2000
++on:
++  workflow_dispatch:
++
++jobs:
++  long-dryrun:
++    runs-on: ubuntu-latest
++    timeout-minutes: 720
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.10'
++      - name: Install deps
++        run: pip install boto3 jsonschema requests || true
++      - name: Run long dry-run
++        env:
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++          DRYRUN_WORKERS: 40
++          DRYRUN_ITERATIONS: 2000
++        run: python services/agent/long_dryrun_runner.py
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/ingest_stress_ci.yml
++name: Ingest Stress CI
++on:
++  workflow_dispatch:
++
++jobs:
++  ingest-stress:
++    runs-on: ubuntu-latest
++    timeout-minutes: 120
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.10'
++      - name: Install deps
++        run: pip install boto3 requests || true
++      - name: Run ingest stress (sample)
++        env:
++          INGEST_SERVER: ${{ secrets.INGEST_SERVER }}
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++        run: |
++          python services/ingest/ingest_stress_runner.py --server "${INGEST_SERVER:-http://localhost:8080}" --files ops/multimodal/sample_images/* --parallel 50 --total 1000
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/jobs/kernel-tuner-job.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: kernel-tuner-vision
++  namespace: inference
++spec:
++  template:
++    spec:
++      restartPolicy: OnFailure
++      containers:
++        - name: tuner
++          image: us.gcr.io/aegis/kernel-tuner:latest
++          command: ["/bin/sh", "-c"]
++          args:
++            - python services/triton/kernel_opt/opt_tuner.py --workload vision --out /workspace/kernel_best_config_vision.json && \
++              python services/triton/validate_and_bake_kernel.py
++          volumeMounts:
++            - name: workspace
++              mountPath: /workspace
++      volumes:
++        - name: workspace
++          emptyDir: {}
++      nodeSelector:
++        accelerator: nvidia
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/triton/pack_and_publish_model.py
++#!/usr/bin/env python3
++"""
++Pack, upload and validate Triton model; optionally trigger reload and run a validation inference.
++ - Wraps packaging, uploading to MODEL_STORE_PREFIX (s3://...), and calls Triton reload + validate.
++ - Produces an evidence report uploaded to EVIDENCE_BUCKET.
++"""
++import os, sys, json, subprocess, time
++from services.agent.audit_logger import s3_put
++
++MODEL_STORE = os.environ.get("MODEL_STORE_PREFIX", "")
++TRITON_HOST = os.environ.get("TRITON_HOST", "")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++
++def package_model(src_dir, model_name):
++    subprocess.check_call(["./scripts/package_triton_model.sh", src_dir, model_name, "/tmp/model_store"])
++    return "/tmp/triton_repo_" + str(int(time.time()))
++
++def upload_to_store(local_path, store_prefix, model_name):
++    if store_prefix.startswith("s3://"):
++        subprocess.check_call(["aws","s3","cp","--recursive", local_path, f"{store_prefix.rstrip('/')}/{model_name}/"])
++        return f"{store_prefix.rstrip('/')}/{model_name}/"
++    else:
++        # fallback: copy to local path
++        target = os.path.join(store_prefix, model_name)
++        subprocess.check_call(["mkdir","-p", target])
++        subprocess.check_call(["cp","-r", local_path, target])
++        return target
++
++def reload_triton(server):
++    subprocess.check_call(["python","scripts/triton_model_control.py","--server", server, "--reload"])
++
++def validate_inference(server, model_name, sample_input):
++    subprocess.check_call(["python","services/triton/validate_and_test_model.py", server, model_name, sample_input])
++
++def main():
++    if len(sys.argv) < 4:
++        print("Usage: pack_and_publish_model.py <src_dir> <model_name> <sample_input.json>")
++        sys.exit(2)
++    src = sys.argv[1]; name = sys.argv[2]; sample = sys.argv[3]
++    repo = package_model(src, name)
++    store = upload_to_store(repo, MODEL_STORE, name) if MODEL_STORE else repo
++    if TRITON_HOST:
++        reload_triton(TRITON_HOST)
++        try:
++            validate_inference(TRITON_HOST, name, sample)
++            ok = True
++        except Exception as e:
++            ok = False
++    else:
++        ok = None
++    report = {"model": name, "store": store, "validated": ok, "ts": int(time.time())}
++    if EVIDENCE_BUCKET:
++        s3_put(f"model_publish/{name}_{int(time.time())}.json", report)
++    print("Publish report:", json.dumps(report, indent=2))
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/long_shadow_campaign/run_long_shadow_campaign.py
++#!/usr/bin/env python3
++"""
++Orchestrates a long-duration shadow campaign.
++ - Runs a continuous shadow proxy/daemon for a specified number of days (by default 30).
++ - Periodically aggregates reports via shadow_aggregator and uploads daily summaries to EVIDENCE_BUCKET.
++ - After the campaign ends, invokes SME signoff orchestration (prints instructions for human SME).
++
++This is a coordinator script: in production, deploy long_shadow_daemon as a Deployment and run aggregator as CronWorkflow.
++"""
++import os, time, subprocess, json
++from datetime import datetime, timedelta
++
++CAMPAIGN_DAYS = int(os.environ.get("LONG_SHADOW_DAYS", "30"))
++AGG_INTERVAL_HOURS = int(os.environ.get("LONG_SHADOW_AGG_INTERVAL_HOURS", "24"))
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++
++def run_aggregator():
++    subprocess.check_call(["python","services/generative/shadow_aggregator.py","--window-hours", "24","--out","/tmp/shadow_daily.json"])
++    if EVIDENCE_BUCKET:
++        subprocess.check_call(["aws","s3","cp","/tmp/shadow_daily.json", f"s3://{EVIDENCE_BUCKET}/gen_shadow_reports/{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}_daily.json"])
++
++def main():
++    start = datetime.utcnow()
++    end = start + timedelta(days=CAMPAIGN_DAYS)
++    print(f"Starting long-shadow campaign from {start} to {end}")
++    # Recommend operator ensures long_shadow_daemon is running in cluster
++    while datetime.utcnow() < end:
++        run_aggregator()
++        time.sleep(AGG_INTERVAL_HOURS * 3600)
++    # Final aggregation
++    run_aggregator()
++    # After campaign, print SME signoff instructions
++    print("Long-shadow campaign completed. Please run SME signoff for verifier thresholds:")
++    print("  python services/factuality/sme_signoff.py --sme <SME_NAME> --thresholds out/calib/thresholds.json --notes '30-day shadow campaign review'")
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/hardening_execute.yml
++name: Execute Hardening Plan (agentic/multimodal/generative)
++on:
++  workflow_dispatch:
++
++jobs:
++  execute:
++    runs-on: ubuntu-latest
++    timeout-minutes: 1440
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.10'
++      - name: Generate wrappers and audit
++        run: |
++          python services/agent/tool_wrapper_generator.py
++          python services/agent/wrapper_audit_runner.py
++      - name: Run long dry-run (2000)
++        env:
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++          DRYRUN_WORKERS: 40
++          DRYRUN_ITERATIONS: 2000
++        run: python services/agent/long_dryrun_runner.py
++      - name: Run ingest stress (1000 uploads)
++        env:
++          INGEST_SERVER: ${{ secrets.INGEST_SERVER }}
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++        run: python services/ingest/ingest_stress_runner.py --server "${INGEST_SERVER:-http://localhost:8080}" --files ops/multimodal/sample_images/* --parallel 50 --total 1000
++      - name: Trigger kernel tuner job (cluster)
++        run: echo "Please apply k8s/jobs/kernel-tuner-job.yaml to a GPU node in-cluster to run kernel tuner and bake configmap."
++      - name: Pack & publish model
++        env:
++          MODEL_STORE_PREFIX: ${{ secrets.MODEL_STORE_PREFIX }}
++          TRITON_HOST: ${{ secrets.TRITON_HOST }}
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++        run: |
++          python services/triton/pack_and_publish_model.py models/vision_sample vision_encoder ops/triton/sample_inference_input.json || true
++      - name: Start long-shadow campaign (operator-run)
++        run: echo "To run a 30-day long-shadow campaign, deploy services/generative/long_shadow_daemon in-cluster and run ops/long_shadow_campaign/run_long_shadow_campaign.py locally or as a cronjob."
++
+*** End Patch
+*** End Patch

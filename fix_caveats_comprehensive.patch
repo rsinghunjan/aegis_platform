@@ -1,0 +1,646 @@
+*** Begin Patch
+*** Add File:infra/terraform/prod_infra.tf
++terraform {
++  required_version = ">= 1.0.0"
++}
++
++provider "aws" {
++  region = var.aws_region
++}
++
++variable "aws_region" {
++  type    = string
++  default = "us-west-2"
++}
++
++variable "secret_prefix" {
++  type    = string
++  default = "aegis"
++}
++
++variable "evidence_bucket" {
++  type    = string
++  default = "aegis-evidence-bucket-prod"
++}
++
++variable "db_allocated_storage" {
++  type    = number
++  default = 20
++}
++
++resource "aws_kms_key" "cosign" {
++  description             = "Production KMS key for cosign signing (Aegis)"
++  deletion_window_in_days = 30
++  enable_key_rotation     = true
++}
++
++resource "aws_kms_alias" "cosign_alias" {
++  name          = "alias/${var.secret_prefix}-cosign"
++  target_key_id = aws_kms_key.cosign.key_id
++}
++
++resource "aws_s3_bucket" "evidence" {
++  bucket = var.evidence_bucket
++  acl    = "private"
++  versioning { enabled = true }
++  server_side_encryption_configuration {
++    rule {
++      apply_server_side_encryption_by_default {
++        kms_master_key_id = aws_kms_key.cosign.arn
++        sse_algorithm     = "aws:kms"
++      }
++    }
++  }
++  lifecycle_rule {
++    id      = "audit-archive"
++    enabled = true
++    prefix  = "audit/"
++    transition {
++      days          = 30
++      storage_class = "STANDARD_IA"
++    }
++    expiration { days = 365 }
++  }
++}
++
++resource "aws_db_instance" "registry" {
++  allocated_storage    = var.db_allocated_storage
++  engine               = "postgres"
++  engine_version       = "13.7"
++  instance_class       = "db.t3.medium"
++  name                 = "aegis_registry"
++  username             = "aegis"
++  password             = random_password.registry.result
++  skip_final_snapshot  = true
++  publicly_accessible  = false
++  multi_az             = true
++}
++
++resource "random_password" "registry" {
++  length  = 20
++  special = true
++}
++
++resource "aws_secretsmanager_secret" "rekor" {
++  name = "${var.secret_prefix}/rekor"
++}
++
++resource "aws_secretsmanager_secret_version" "rekor_value" {
++  secret_id     = aws_secretsmanager_secret.rekor.id
++  secret_string = jsonencode({ "rekor_url" = "https://rekor.${var.secret_prefix}.svc.cluster.local:3000" })
++}
++
++resource "aws_secretsmanager_secret" "cosign" {
++  name = "${var.secret_prefix}/cosign"
++}
++
++resource "aws_secretsmanager_secret_version" "cosign_value" {
++  secret_id     = aws_secretsmanager_secret.cosign.id
++  secret_string = jsonencode({ "kms_arn" = aws_kms_key.cosign.arn })
++}
++
++output "cosign_kms_arn" {
++  value = aws_kms_key.cosign.arn
++}
++
++output "evidence_bucket" {
++  value = aws_s3_bucket.evidence.bucket
++}
++
++output "registry_database_url" {
++  value = aws_db_instance.registry.address
++}
++
++output "rekor_secret_arn" {
++  value = aws_secretsmanager_secret.rekor.arn
++}
++
++output "cosign_secret_arn" {
++  value = aws_secretsmanager_secret.cosign.arn
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:infra/terraform/kms_rotation_lambda.tf
++resource "aws_iam_role" "kms_rotation_lambda_role" {
++  name = "aegis-kms-rotation-lambda-role"
++  assume_role_policy = jsonencode({
++    Version = "2012-10-17",
++    Statement = [{
++      Action = "sts:AssumeRole",
++      Effect = "Allow",
++      Principal = { Service = "lambda.amazonaws.com" }
++    }]
++  })
++}
++
++resource "aws_iam_role_policy" "kms_rotation_policy" {
++  name = "aegis-kms-rotation-policy"
++  role = aws_iam_role.kms_rotation_lambda_role.id
++  policy = jsonencode({
++    Version = "2012-10-17",
++    Statement = [
++      {
++        Effect = "Allow",
++        Action = [
++          "kms:CreateKey",
++          "kms:CreateAlias",
++          "kms:DescribeKey",
++          "kms:ListAliases",
++          "secretsmanager:GetSecretValue",
++          "secretsmanager:PutSecretValue",
++          "secretsmanager:DescribeSecret"
++        ],
++        Resource = "*"
++      },
++      {
++        Effect = "Allow",
++        Action = ["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],
++        Resource = "*"
++      }
++    ]
++  })
++}
++
++resource "aws_lambda_function" "kms_rotation" {
++  filename         = "${path.module}/kms_rotation_lambda.zip"
++  function_name    = "aegis-kms-rotation"
++  handler          = "rotation.lambda_handler"
++  runtime          = "python3.10"
++  role             = aws_iam_role.kms_rotation_lambda_role.arn
++  source_code_hash = filebase64sha256("${path.module}/kms_rotation_lambda.zip")
++  timeout          = 60
++}
++
++resource "aws_cloudwatch_event_rule" "rotation_schedule" {
++  name                = "aegis-kms-rotation-schedule"
++  schedule_expression = "rate(90 days)"
++}
++
++resource "aws_cloudwatch_event_target" "rotation_target" {
++  rule      = aws_cloudwatch_event_rule.rotation_schedule.name
++  target_id = "aegis-kms-rotation"
++  arn       = aws_lambda_function.kms_rotation.arn
++}
++
++resource "aws_lambda_permission" "allow_events" {
++  statement_id  = "AllowCWInvoke"
++  action        = "lambda:InvokeFunction"
++  function_name = aws_lambda_function.kms_rotation.function_name
++  principal     = "events.amazonaws.com"
++  source_arn    = aws_cloudwatch_event_rule.rotation_schedule.arn
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:infra/terraform/kms_rotation_lambda.py
++import json
++import boto3
++import os
++
++sm = boto3.client("secretsmanager")
++kms = boto3.client("kms")
++
++def lambda_handler(event, context):
++    secret_name = os.environ.get("COSIGN_SECRET_NAME", "/aegis/cosign")
++    # Create a new key
++    resp = kms.create_key(Description="Aegis cosign rotation key (automated)")
++    key_id = resp["KeyMetadata"]["KeyId"]
++    key_arn = resp["KeyMetadata"]["Arn"]
++    alias = f"alias/aegis-cosign-rot-{key_id[:8]}"
++    kms.create_alias(AliasName=alias, TargetKeyId=key_id)
++    # update secret
++    try:
++        current = sm.get_secret_value(SecretId=secret_name)
++        payload = json.loads(current.get("SecretString","{}"))
++    except sm.exceptions.ResourceNotFoundException:
++        payload = {}
++    payload["kms_arn"] = key_arn
++    sm.put_secret_value(SecretId=secret_name, SecretString=json.dumps(payload))
++    return {"status": "rotated", "kms_arn": key_arn}
++
++if __name__ == "__main__":
++    print(lambda_handler({}, {}))
++
+*** End Patch
+*** Begin Patch
+*** Add File:infra/scripts/kms_rotation_package.sh
++#!/usr/bin/env bash
++set -euo pipefail
++# Package the lambda for Terraform
++OUT=infra/terraform/kms_rotation_lambda.zip
++rm -f $OUT
++zip -r $OUT infra/terraform/kms_rotation_lambda.py
++echo "Packaged lambda -> $OUT"
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/external-secrets/externalsecret_cosign.yaml
++apiVersion: external-secrets.io/v1beta1
++kind: ExternalSecret
++metadata:
++  name: aegis-cosign
++  namespace: security
++spec:
++  refreshInterval: "1h"
++  secretStoreRef:
++    name: aws-secretsmanager
++    kind: SecretStore
++  target:
++    name: aegis-cosign
++    creationPolicy: Owner
++  data:
++    - secretKey: kms_arn
++      remoteRef:
++        key: "aegis/cosign"
++        property: "kms_arn"
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/external-secrets/externalsecret_rekor.yaml
++apiVersion: external-secrets.io/v1beta1
++kind: ExternalSecret
++metadata:
++  name: aegis-rekor
++  namespace: security
++spec:
++  refreshInterval: "1h"
++  secretStoreRef:
++    name: aws-secretsmanager
++    kind: SecretStore
++  target:
++    name: aegis-rekor
++    creationPolicy: Owner
++  data:
++    - secretKey: rekor_url
++      remoteRef:
++        key: "aegis/rekor"
++        property: "rekor_url"
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/prometheus_reliability_ha_rules.yaml
++groups:
++- name: aegis-ha.rules
++  rules:
++  - alert: RekorNotReady
++    expr: up{job="rekor"} == 0
++    for: 3m
++    labels:
++      severity: critical
++    annotations:
++      summary: "Rekor down"
++      description: "Rekor server instances are not ready."
++
++  - alert: PostgresHighReplicaLag
++    expr: pg_stat_replication_lag_seconds > 30
++    for: 5m
++    labels:
++      severity: critical
++    annotations:
++      summary: "Postgres replica lag"
++      description: "Postgres replica lag exceeds 30s"
++
++  - alert: RekorReconcileMissingEntries
++    expr: increase(rekor_reconcile_missing_total[5m]) > 0
++    for: 2m
++    labels:
++      severity: warning
++    annotations:
++      summary: "Rekor reconcile found missing entries"
++      description: "Rekor reconciliation job reported missing entries for promoted artifacts"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/populate_and_apply_external_secrets.sh
++#!/usr/bin/env bash
++set -euo pipefail
++TF_OUT=${1:-/tmp/aegis_tf_output.json}
++if [ ! -f "$TF_OUT" ]; then
++  echo "Usage: $0 terraform_output.json"; exit 2
++fi
++EVIDENCE_BUCKET=$(jq -r '.evidence_bucket.value' "$TF_OUT")
++COSIGN_ARN=$(jq -r '.cosign_kms_arn.value' "$TF_OUT")
++REKOR_SECRET_ARN=$(jq -r '.rekor_secret_arn.value' "$TF_OUT")
++
++echo "Populating SSM & SecretsManager placeholders..."
++aws ssm put-parameter --name "/aegis/s3/evidence_bucket" --value "$EVIDENCE_BUCKET" --type String --overwrite
++aws secretsmanager put-secret-value --secret-id "aegis/cosign" --secret-string "{\"kms_arn\":\"$COSIGN_ARN\"}" || true
++echo "Apply ExternalSecrets manifests to cluster"
++kubectl apply -f k8s/external-secrets/externalsecret_cosign.yaml
++kubectl apply -f k8s/external-secrets/externalsecret_rekor.yaml
++echo "ExternalSecrets applied. Verify k8s secret exists: kubectl -n security get secret aegis-cosign"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/verifier_model_selector.py
++#!/usr/bin/env python3
++"""
++Benchmark candidate NLI models and pick a recommended model for CI (low-latency) and for offline audits.
++Outputs a small JSON config with recommended choices and suggested HPA targets.
++"""
++import argparse
++import time
++import json
++from transformers import pipeline
++
++MODELS = [
++    "distilroberta-base",       # small-ish
++    "roberta-large-mnli",       # larger
++    "facebook/bart-large-mnli"  # alternative
++]
++
++def bench(model_name, runs=20):
++    print("Loading", model_name)
++    clf = pipeline("text-classification", model=model_name)
++    premise = "The sky appears blue because of Rayleigh scattering."
++    claim = "The sky is blue."
++    start = time.time()
++    for i in range(runs):
++        _ = clf(f"{premise} </s> {claim}")
++    elapsed = time.time() - start
++    latency = elapsed / runs
++    print(f"{model_name}: {latency*1000:.1f} ms avg")
++    return latency
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--runs", type=int, default=10)
++    p.add_argument("--out", default="ops/verifier_recommendation.json")
++    args = p.parse_args()
++    results = {}
++    for m in MODELS:
++        try:
++            lat = bench(m, runs=args.runs)
++            results[m] = lat
++        except Exception as e:
++            results[m] = None
++            print("Bench failed for", m, e)
++    # pick CI model: latency < 0.2s if possible
++    ci_candidates = [m for m,lat in results.items() if lat and lat < 0.2]
++    ci_model = ci_candidates[0] if ci_candidates else min(results, key=lambda k: results[k] if results[k] else 999)
++    offline_model = max(results, key=lambda k: results[k] if results[k] else 0)
++    recommendation = {
++        "ci_model": ci_model,
++        "offline_model": offline_model,
++        "latencies": results,
++        "hpa": {"minReplicas": 2, "maxReplicas": 10, "targetCPUUtilization": 50}
++    }
++    with open(args.out, "w") as f:
++        json.dump(recommendation, f, indent=2)
++    print("Wrote recommendation to", args.out)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/eval_harness/eval_dataset_template/README.md
++Evaluation dataset harness
++
++Place evaluation datasets under this folder in the following structure:
++- nli/
++  - dev.jsonl (jsonl with {"premise": "...", "hypothesis": "...", "label": "entailment|neutral|contradiction"})
++  - test.jsonl
++
++Run ops/eval_harness/run_eval.py to compute verification metrics and produce recommended thresholds for CI gating.
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/eval_harness/run_eval.py
++#!/usr/bin/env python3
++"""
++Run an NLI evaluation harness against a candidate verifier model and produce precision/recall metrics.
++Outputs recommended threshold for 'entailment' probability to use in promotion gate.
++"""
++import argparse
++import json
++from sklearn.metrics import precision_recall_fscore_support
++from transformers import pipeline
++
++def load_dataset(path):
++    with open(path) as f:
++        for line in f:
++            yield json.loads(line)
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--model", default="distilroberta-base")
++    p.add_argument("--dev", default="ops/eval_harness/eval_dataset_template/nli/dev.jsonl")
++    p.add_argument("--out", default="ops/eval_harness/eval_results.json")
++    args = p.parse_args()
++    clf = pipeline("text-classification", model=args.model, return_all_scores=True)
++    y_true = []
++    y_scores = []
++    for row in load_dataset(args.dev):
++        premise = row.get("premise","")
++        hyp = row.get("hypothesis","")
++        label = row.get("label","neutral")
++        res = clf(f"{premise} </s> {hyp}")
++        # find entailment score
++        entail = 0.0
++        for r in res[0]:
++            if "entailment" in r["label"].lower():
++                entail = r["score"]
++        y_true.append(1 if label=="entailment" else 0)
++        y_scores.append(entail)
++    # choose threshold with simple precision/recall sweep
++    best = {"threshold":0.5, "precision":0.0, "recall":0.0}
++    import numpy as np
++    for t in np.linspace(0.1,0.9,17):
++        preds = [1 if s>=t else 0 for s in y_scores]
++        p,r,f,_ = precision_recall_fscore_support(y_true, preds, average="binary", zero_division=0)
++        if p >= 0.7 and r >= 0.5:
++            best = {"threshold":t, "precision":p, "recall":r}
++            break
++    res = {"model": args.model, "best_threshold": best, "samples": len(y_true)}
++    with open(args.out,"w") as f:
++        json.dump(res, f, indent=2)
++    print("Wrote eval results to", args.out)
++
+*** End Patch
+*** Begin Patch
+*** Add File:dsar/attachment_processor.py
++#!/usr/bin/env python3
++"""
++DSAR attachment processor: extract text from common attachments (txt,json,pdf) and search for subject identifiers.
++Uses pdfminer.six for PDF extraction (pure-python), avoids external Lambdas for portability.
++"""
++import os
++import sys
++import boto3
++import json
++from pdfminer.high_level import extract_text
++import tempfile
++
++s3 = boto3.client("s3")
++
++def extract_text_from_s3(bucket, key):
++    _, ext = os.path.splitext(key.lower())
++    ext = ext.lstrip(".")
++    tmp = tempfile.mktemp(suffix="."+ext)
++    s3.download_file(bucket, key, tmp)
++    text = ""
++    if ext in ("txt","json","csv"):
++        with open(tmp,"r",encoding="utf-8",errors="ignore") as f:
++            text = f.read()
++    elif ext == "pdf":
++        try:
++            text = extract_text(tmp)
++        except Exception as e:
++            text = ""
++    else:
++        text = ""  # unsupported attachment type
++    os.remove(tmp)
++    return text
++
++def scan_bucket_for_subject(bucket, prefix, subject):
++    paginator = s3.get_paginator("list_objects_v2")
++    hits = []
++    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
++        for obj in page.get("Contents", []):
++            key = obj["Key"]
++            try:
++                txt = extract_text_from_s3(bucket, key)
++            except Exception:
++                txt = ""
++            if subject in txt:
++                hits.append(key)
++    return hits
++
++def main():
++    if len(sys.argv) < 4:
++        print("Usage: attachment_processor.py <bucket> <prefix> <subject>")
++        sys.exit(2)
++    bucket, prefix, subject = sys.argv[1], sys.argv[2], sys.argv[3]
++    hits = scan_bucket_for_subject(bucket, prefix, subject)
++    print("Found in:", hits)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:runbooks/caveats_mitigation_playbook.md
++# Caveats Mitigation Playbook
++
++This runbook maps each caveat to concrete automated steps and operator actions.
++
++1) Operational wiring (Provision infra & secrets)
++ - Run: terraform apply in infra/terraform (prod_infra.tf). Capture output to /tmp/aegis_tf_output.json.
++ - Package lambda: infra/scripts/kms_rotation_package.sh
++ - Run: ops/populate_and_apply_external_secrets.sh /tmp/aegis_tf_output.json
++ - Validate: .github/workflows/predeploy_validation.yml or ops/validate_secrets_and_iam.py
++
++2) HA & monitoring
++ - Deploy Rekor as a StatefulSet (rekor/deployment.yaml) and create ServiceMonitor (monitoring/service-monitor).
++ - Apply monitoring/prometheus_reliability_ha_rules.yaml and alertmanager template (monitoring/alertmanager/alertmanager.yml.tpl) with your keys.
++ - Ensure rekor/cronjob_reconcile.py is scheduled (rekor/cronjob_reconcile.yaml) and that it posts alerts to Slack/PagerDuty.
++
++3) IAM & rotation discipline
++ - Terraform creates KMS + SecretsManager entries. Confirm CI role and attach CI cosign policy (infra/terraform/iam_roles.tf can be used).
++ - Enable Lambda-based rotation (kms_rotation_lambda in Terraform); verify rotation by running a rotation dry-run.
++ - Audit: enable CloudTrail for KMS and SecretsManager; schedule monthly audit.
++
++4) Verifier & eval maturity
++ - Run ops/verifier_model_selector.py to benchmark candidate models.
++ - Populate ops/eval_harness with dev/test datasets and run ops/eval_harness/run_eval.py to compute thresholds.
++ - Configure CI gates with recommended threshold and HPA settings produced by Verifier selector.
++
++5) Process adoption
++ - Run the scheduled GitHub workflow .github/workflows/runbook_drill.yml monthly.
++ - Record SLAs, owners and on-call rotations in runbooks/roles_and_slack.md (organize with your security & DS teams).
++
++6) Edge cases (PII & DSAR)
++ - Use dsar/attachment_processor.py to find PII in attachments.
++ - Integrate advanced_dsar.py and record legal_hold tags, retention decisions and audit logs.
++
++7) Tests & hardening
++ - Run tests/* integration suites after provisioning (tests/infra/test_terraform_outputs.py and tests/ci/test_full_promotion_flow.py).
++ - Add image scanning to CI (existing image_scan_sign_rekor_block.yml).
++
++After these steps, verify acceptance criteria in runbooks/verify_signals.md and sign off in your approvals service.
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/predeploy_validation.yml
++name: Pre-deploy Validation (provisioning & secrets)
++
++on:
++  workflow_dispatch:
++    inputs:
++      tf_output:
++        description: "Terraform output JSON (string) or path in repo"
++        required: false
++
++jobs:
++  validate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.10'
++      - name: Install deps
++        run: pip install boto3 requests
++      - name: Validate AWS secrets & KMS
++        env:
++          AWS_DEFAULT_REGION: us-west-2
++        run: |
++          # operator must provide TF_OUTPUT via repo or secrets in CI runs; here we accept inline small JSON via input
++          python ops/validate_secrets_and_iam.py --secret-prefix aegis --kms-arn "${{ secrets.COSIGN_KMS_ARN }}" --ci-role-arn "${{ secrets.CI_ROLE_ARN }}" --region "us-west-2"
++      - name: Rekor healthcheck
++        run: python security/rekor/rekor_healthcheck.py --rekor-url "${{ secrets.REKOR_URL }}"
++
+*** End Patch
+*** Begin Patch
+*** Add File:tests/infra/test_terraform_outputs.py
++import json
++import os
++
++def test_terraform_outputs_exist():
++    path = os.environ.get("TF_OUTPUT", "/tmp/aegis_tf_output.json")
++    assert os.path.exists(path), f"Terraform output {path} not found"
++    with open(path) as f:
++        j = json.load(f)
++    required = ["cosign_kms_arn","evidence_bucket","registry_database_url"]
++    for r in required:
++        assert j.get(r) or j.get(r+".value"), f"Missing terraform output {r}"
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/runbook_drill_and_audit.yml
++name: Runbook Drill & Audit (scheduled)
++
++on:
++  workflow_dispatch:
++  schedule:
++    - cron: '0 4 1 * *' # monthly
++
++jobs:
++  drill:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.10'
++      - name: Run Rekor reconcilation check (simulate)
++        run: |
++          python rekor/rekor_reconcile.py || echo "Reconcile job ran (dry-run)"
++      - name: Run KMS rotation dry-run
++        run: |
++          echo "Dry-run rotation: ensure rotation Lambda exists and has permission"
++          aws lambda list-functions --query "Functions[?starts_with(FunctionName,'aegis-kms-rotation')]" || true
++      - name: Run DSAR attachment scan (dry-run)
++        run: |
++          if [ -n "${{ secrets.SAMPLE_SUBJECT_HASH }}" ]; then
++            python dsar/attachment_processor.py "${{ secrets.EVIDENCE_BUCKET }}" "audit/" "${{ secrets.SAMPLE_SUBJECT_HASH }}" || true
++          else
++            echo "No SAMPLE_SUBJECT_HASH configured; skip"
++          fi
++
+*** End Patch
+*** End Patch

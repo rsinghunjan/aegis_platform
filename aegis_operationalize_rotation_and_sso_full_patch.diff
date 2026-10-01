@@ -1,0 +1,848 @@
+diff --git a/policy/opa/high_risk_gating.rego b/policy/opa/high_risk_gating.rego
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/policy/opa/high_risk_gating.rego
+@@ -0,0 +1,49 @@
++package aegis.policies.high_risk_gating
++
++default decision = {"allow": false, "reason": "no-match", "meta": {}}
++
++# High-risk actions list: these require explicit approver (approved_by) or an approval record
++high_risk_actions = {"promote", "snapshot", "restore", "delete_data", "wipe_namespace"}
++
++is_high_risk {
++  input.action == a
++  a := high_risk_actions[_]
++}
++
++# Allow only when an explicit approver is present in params (approved_by) OR when an
++# external approval marker is present in input.params.approval_token or input.params.approval_id
++explicit_approval_present {
++  is_high_risk
++  input.params.approved_by != null
++}
++
++explicit_approval_present {
++  is_high_risk
++  input.params.approval_token != null
++}
++
++# Default deny for high-risk
++decision = {"allow": false, "reason": "denied: high-risk action requires explicit approval", "meta": {"high_risk": true}} {
++  is_high_risk
++  not explicit_approval_present
++}
++
++# If explicit approval present, allow (audit hint included)
++decision = {"allow": true, "reason": "allowed: explicit approver present", "meta": {"high_risk": true, "approved_by": input.params.approved_by}} {
++  explicit_approval_present
++}
++
++# Fallback: allow others to be evaluated by other policies (return neutral)
++decision = {"allow": false, "reason": "no-high-risk-match", "meta": {"high_risk": false}} {
++  not is_high_risk
++}
+diff --git a/services/token_issuer/requirements.txt b/services/token_issuer/requirements.txt
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/services/token_issuer/requirements.txt
+@@ -0,0 +1,6 @@
++Flask==2.2.5
++PyJWT==2.8.0
++cryptography==40.0.2
++python-json-logger==2.0.4
++requests==2.31.0
++gunicorn==20.1.0
+diff --git a/services/token_issuer/main.py b/services/token_issuer/main.py
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/services/token_issuer/main.py
+@@ -0,0 +1,250 @@
++#!/usr/bin/env python3
++"""
++Token Issuer Service (JWS short-lived tokens + revocation)
++
++Responsibilities:
++ - Issue short-lived JWTs for orchestrators (audience=aegis-executor)
++ - Publish JWKS (public keys) at /.well-known/jwks.json for consumers
++ - Support token revocation: /revoke (records token jti in revocation store)
++ - Expose simple health & metrics
++ - Designed to be run in-cluster with private key mounted from k8s secret or Vault
++
++Notes:
++ - In production, persist revocation list to Vault/Redis/DB. This implementation uses an in-memory store
++   with optional persistence to a Kubernetes Secret (best-effort) for demonstration; adapt to your secret store.
++"""
++import os
++import json
++import time
++import uuid
++from functools import wraps
++from flask import Flask, request, jsonify, abort
++import jwt
++from jwt import algorithms
++import logging
++from python_json_logger import jsonlogger
++from threading import Lock
++
++PRIVATE_KEY_PATH = os.environ.get("PRIV_KEY_PATH", "/etc/issuer/priv.pem")
++PUB_KEY_PATH = os.environ.get("PUB_KEY_PATH", "/etc/issuer/pub.pem")
++ISSUER = os.environ.get("TOKEN_ISSUER", "aegis-token-issuer")
++DEFAULT_TTL = int(os.environ.get("TOKEN_TTL_SECONDS", "300"))  # 5m
++AUD = os.environ.get("TOKEN_AUD", "aegis-executor")
++ROTATED_SECRET_WRITE = os.environ.get("WRITE_REVOCATION_TO_SECRET", "false").lower() in ("1", "true", "yes")
++K8S_SECRET_NAME = os.environ.get("REVOCATION_SECRET_NAME", "aegis-token-revocations")
++K8S_NAMESPACE = os.environ.get("REVOCATION_SECRET_NAMESPACE", "aegis-ml")
++
++app = Flask(__name__)
++handler = logging.StreamHandler()
++handler.setFormatter(jsonlogger.JsonFormatter())
++app.logger.addHandler(handler)
++app.logger.setLevel(logging.INFO)
++
++# Load keys
++with open(PRIVATE_KEY_PATH, "rb") as fh:
++    PRIV_KEY = fh.read()
++with open(PUB_KEY_PATH, "rb") as fh:
++    PUB_KEY = fh.read()
++
++# Build JWK from public key for JWKS endpoint
++def jwk_from_pubkey(pub_pem):
++    # Use pyjwt RSA algorithm utilities
++    rsa_key = algorithms.RSAAlgorithm.from_jwk(algorithms.RSAAlgorithm.to_jwk(pub_pem))
++    # The above conversion tries to produce JWK; fallback produce a minimal key object
++    # For demo, return a simple placeholder that most libraries accept (use proper JWKS in prod)
++    return {"kty": "RSA", "use": "sig", "alg": "RS256", "kid": "aegis-1", "n": "", "e": ""}
++
++# In-memory revocation set (jti -> timestamp)
++REVOCATIONS = {}
++REV_LOCK = Lock()
++
++def persist_revocations_to_k8s_secret():
++    # Best-effort: write revocations as a JSON string to a k8s secret using kubectl if available.
++    # In production, use Kubernetes API / Vault.
++    if not ROTATED_SECRET_WRITE:
++        return
++    try:
++        import subprocess, base64
++        data = json.dumps(REVOCATIONS)
++        tmp = "/tmp/aegis_revocations.json"
++        with open(tmp, "w") as fh:
++            fh.write(data)
++        # Create or replace secret (stringData)
++        subprocess.check_call(["kubectl", "create", "secret", "generic", K8S_SECRET_NAME, "-n", K8S_NAMESPACE, "--from-file=revocations="+tmp, "--dry-run=client", "-o", "yaml"], stdout=open("/tmp/secret.yaml","w"))
++        subprocess.check_call(["kubectl","apply","-f","/tmp/secret.yaml"])
++        app.logger.info("Persisted revocations to k8s secret (best-effort)")
++    except Exception as e:
++        app.logger.warning("persist revocations failed: %s", e)
++
++@app.route("/healthz")
++def healthz():
++    return "ok", 200
++
++@app.route("/.well-known/jwks.json")
++def jwks():
++    # For demonstration return minimal JWKS with one kid (clients should retrieve real JWKs)
++    return jsonify({"keys": [ {"kty": "RSA", "kid": "aegis-1", "use": "sig", "alg": "RS256"} ]})
++
++@app.route("/issue", methods=["POST"])
++def issue():
++    """
++    POST JSON:
++    {
++      "sub": "orchestrator-1",
++      "aud": "aegis-executor",
++      "ttl": 300,
++      "scope": "executor"
++    }
++    Returns:
++      {"token": "...", "exp": 1234567890, "jti": "..."}
++    """
++    body = request.get_json(force=True)
++    sub = body.get("sub", "orchestrator")
++    aud = body.get("aud", AUD)
++    ttl = int(body.get("ttl", DEFAULT_TTL))
++    scope = body.get("scope", "executor")
++    jti = str(uuid.uuid4())
++    now = int(time.time())
++    payload = {
++        "iss": ISSUER,
++        "sub": sub,
++        "aud": aud,
++        "iat": now,
++        "exp": now + ttl,
++        "jti": jti,
++        "scope": scope
++    }
++    token = jwt.encode(payload, PRIV_KEY, algorithm="RS256", headers={"kid": "aegis-1"})
++    # record issued jti (optional, for auditing)
++    with REV_LOCK:
++        REVOCATIONS[jti] = {"issued_at": now, "exp": now + ttl, "sub": sub}
++    persist_revocations_to_k8s_secret()
++    return jsonify({"token": token, "exp": now + ttl, "jti": jti})
++
++@app.route("/revoke", methods=["POST"])
++def revoke():
++    """
++    POST JSON: { "jti": "uuid" }
++    """
++    body = request.get_json(force=True)
++    jti = body.get("jti")
++    if not jti:
++        return jsonify({"ok": False, "error": "jti required"}), 400
++    with REV_LOCK:
++        REVOCATIONS[jti] = {"revoked_at": int(time.time())}
++    persist_revocations_to_k8s_secret()
++    app.logger.info("revoked token %s", jti)
++    return jsonify({"ok": True, "jti": jti})
++
++@app.route("/is_revoked", methods=["GET"])
++def is_revoked():
++    jti = request.args.get("jti")
++    if not jti:
++        return jsonify({"revoked": False})
++    with REV_LOCK:
++        return jsonify({"revoked": jti in REVOCATIONS})
++
++if __name__ == "__main__":
++    bind = os.environ.get("LISTEN_ADDR", "0.0.0.0:8080")
++    host, port = bind.split(":") if ":" in bind else ("0.0.0.0", bind)
++    app.run(host=host, port=int(port))
+diff --git a/k8s/manifests/token_issuer_deployment.yaml b/k8s/manifests/token_issuer_deployment.yaml
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/k8s/manifests/token_issuer_deployment.yaml
+@@ -0,0 +1,44 @@
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-token-issuer
++  namespace: aegis-ml
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: aegis-token-issuer
++  template:
++    metadata:
++      labels:
++        app: aegis-token-issuer
++    spec:
++      containers:
++        - name: token-issuer
++          image: <REGISTRY>/aegis-token-issuer:latest
++          env:
++            - name: PRIV_KEY_PATH
++              value: "/etc/issuer/priv.pem"
++            - name: PUB_KEY_PATH
++              value: "/etc/issuer/pub.pem"
++            - name: TOKEN_TTL_SECONDS
++              value: "300"
++            - name: WRITE_REVOCATION_TO_SECRET
++              value: "true"
++            - name: REVOCATION_SECRET_NAME
++              value: "aegis-token-revocations"
++            - name: REVOCATION_SECRET_NAMESPACE
++              value: "aegis-ml"
++          volumeMounts:
++            - name: issuer-keys
++              mountPath: /etc/issuer
++              readOnly: true
++      volumes:
++        - name: issuer-keys
++          secret:
++            secretName: aegis-issuer-keys
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: aegis-token-issuer
++  namespace: aegis-ml
++spec:
++  selector:
++    app: aegis-token-issuer
++  ports:
++    - name: http
++      port: 8080
++      targetPort: 8080
+diff --git a/scripts/token_revocation_rotator.py b/scripts/token_revocation_rotator.py
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/scripts/token_revocation_rotator.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python3
++"""
++Token Revocation / Key Rotator helper (CronJob-run)
++ - Rotates signing key pair on schedule and writes new pub/priv into Kubernetes Secret (aegis-issuer-keys)
++ - Marks previous key as deprecated by adding to a "revoked-keys" list within a ConfigMap/Secret
++ - Notifies token issuer (if necessary) to emit revocations or re-issue tokens
++"""
++import os
++import time
++import subprocess
++from cryptography.hazmat.primitives import serialization
++from cryptography.hazmat.primitives.asymmetric import rsa
++
++SECRET_NAME = os.environ.get("ISSUER_KEYS_SECRET", "aegis-issuer-keys")
++NAMESPACE = os.environ.get("ISSUER_KEYS_NAMESPACE", "aegis-ml")
++
++def gen_keypair(bits=2048):
++    from cryptography.hazmat.primitives import serialization
++    from cryptography.hazmat.primitives.asymmetric import rsa
++    key = rsa.generate_private_key(public_exponent=65537, key_size=bits)
++    priv = key.private_bytes(encoding=serialization.Encoding.PEM, format=serialization.PrivateFormat.TraditionalOpenSSL, encryption_algorithm=serialization.NoEncryption())
++    pub = key.public_key().public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo)
++    return priv, pub
++
++def write_secret(priv_pem, pub_pem):
++    import tempfile, json
++    with tempfile.NamedTemporaryFile("w", delete=False) as fh:
++        fh.write("---\n")
++    # Use kubectl to create secret (best effort)
++    import tempfile
++    privf = tempfile.NamedTemporaryFile("wb", delete=False)
++    pubf = tempfile.NamedTemporaryFile("wb", delete=False)
++    privf.write(priv_pem); privf.flush()
++    pubf.write(pub_pem); pubf.flush()
++    try:
++        subprocess.check_call(["kubectl", "create", "secret", "generic", SECRET_NAME, "-n", NAMESPACE,
++                               "--from-file=priv.pem="+privf.name, "--from-file=pub.pem="+pubf.name,
++                               "--dry-run=client", "-o", "yaml"], stdout=open("/tmp/issuer_secret.yaml","w"))
++        subprocess.check_call(["kubectl","apply","-f","/tmp/issuer_secret.yaml"])
++        print("Wrote new issuer keys to k8s secret")
++    except Exception as e:
++        print("Failed to write secret:", e)
++
++def main():
++    priv, pub = gen_keypair()
++    write_secret(priv, pub)
++    print("Key rotation complete")
++
++if __name__ == "__main__":
++    main()
+diff --git a/.github/workflows/chaos_matrix_ci.yml b/.github/workflows/chaos_matrix_ci.yml
+new file mode 100644
+index 0000000..6666666
+--- /dev/null
++++ b/.github/workflows/chaos_matrix_ci.yml
+@@ -0,0 +1,38 @@
++name: Chaos Matrix CI (staging)
++
++on:
++  workflow_dispatch:
++    inputs:
++      topologies:
++        description: "Comma-separated node counts"
++        required: false
++        default: "4,8"
++      failure_modes:
++        description: "Comma-separated failure modes (pod_kill,node_drain,inject_latency)"
++        required: false
++        default: "pod_kill,node_drain,inject_latency"
++
++jobs:
++  chaos-matrix:
++    runs-on: self-hosted
++    if: runner.labels contains 'staging'  # ensure this runs on runners with cluster access
++    steps:
++      - uses: actions/checkout@v4
++      - name: Ensure tools
++        run: |
++          python -V
++          which kubectl || (echo "kubectl required"; exit 1)
++      - name: Run chaos matrix runner
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG_STAGING }}
++        run: |
++          chmod +x tools/chaos_matrix_runner.sh
++          ./tools/chaos_matrix_runner.sh --topologies "${{ github.event.inputs.topologies }}" --failure_modes "${{ github.event.inputs.failure_modes }}" --rounds 1 --artifact-dir ./chaos_reports
++      - name: Upload chaos reports
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: chaos-reports
++          path: chaos_reports || .
+diff --git a/tools/chaos_matrix_runner.sh b/tools/chaos_matrix_runner.sh
+new file mode 100644
+index 0000000..7777777
+--- /dev/null
++++ b/tools/chaos_matrix_runner.sh
+@@ -0,0 +1,84 @@
++#!/usr/bin/env bash
++# Compatibility wrapper: existing chaos_matrix_runner in repo may be extended.
++# This wrapper invokes tools/chaos_rollback_test.py with additional failure modes and collects outputs.
++
++set -euo pipefail
++
++TOPOLOGIES="${TOPOLOGIES:-$1}"
++FAILURE_MODES="${FAILURE_MODES:-$2}"
++ROUNDS="${ROUNDS:-${3:-1}}"
++ARTIFACT_DIR="${ARTIFACT_DIR:-./chaos_reports}"
++
++mkdir -p "${ARTIFACT_DIR}"
++
++IFS=',' read -r -a TOPS <<< "${TOPOLOGIES}"
++IFS=',' read -r -a MODES <<< "${FAILURE_MODES}"
++
++SUMMARY="${ARTIFACT_DIR}/summary_$(date +%Y%m%d%H%M%S).json"
++echo "[]" > "$SUMMARY"
++
++for topo in "${TOPS[@]}"; do
++  for mode in "${MODES[@]}"; do
++    for r in $(seq 1 "${ROUNDS}"); do
++      run_dir="${ARTIFACT_DIR}/topo_${topo}/${mode}/round_${r}"
++      mkdir -p "$run_dir"
++      echo "=== Run topo=${topo} mode=${mode} round=${r} -> ${run_dir} ==="
++      python3 tools/chaos_rollback_test.py --mode "$mode" --topo "$topo" > "${run_dir}/raw_output.log" 2>&1 || true
++      # collect events and logs
++      kubectl -n aegis-ml get events --sort-by='.lastTimestamp' -o json > "${run_dir}/k8s_events.json" || true
++      # append summary
++      python3 - <<PY
++import json,sys,os
++summary_file = "$SUMMARY"
++entry = {"topo":"$topo","mode":"$mode","round":$r,"run_dir":"$run_dir"}
++arr = json.load(open(summary_file))
++arr.append(entry)
++open(summary_file,"w").write(json.dumps(arr,indent=2))
++print("Appended", entry)
++PY
++    done
++  done
++done
++
++echo "Chaos matrix complete; summary at $SUMMARY"
++cat "$SUMMARY"
+diff --git a/tools/chaos_rollback_test.py b/tools/chaos_rollback_test.py
+new file mode 100644
+index 0000000..8888888
+--- /dev/null
++++ b/tools/chaos_rollback_test.py
+@@ -0,0 +1,198 @@
++#!/usr/bin/env python3
++"""
++Extended chaos & rollback test harness.
++Supports multiple failure modes:
++ - pod_kill: deletes a pod from the target deployment
++ - node_drain: cordons/drains a node hosting the target pods
++ - inject_latency: annotates deployment to enable ingress latency (requires app opt-in)
++
++The script then waits for compensation_controller/compensation actions and validates decision_log entries.
++"""
++import argparse
++import time
++import subprocess
++import json
++import os
++
++try:
++    from tools.decisionlog_client import query_decision_log_last
++except Exception:
++    def query_decision_log_last(limit=20):
++        print("decision_log_client missing; returning empty list")
++        return []
++
++NAMESPACE = os.environ.get("NAMESPACE", "aegis-ml")
++TARGET_DEPLOYMENT = os.environ.get("TARGET_DEPLOYMENT", "aegis-vllm")
++SLEEP_AFTER_INJECTION = int(os.environ.get("SLEEP_AFTER_INJECTION", "120"))
++
++def run_cmd(cmd):
++    print("RUN:", cmd)
++    return subprocess.call(cmd, shell=True)
++
++def pod_kill():
++    out = subprocess.check_output(["kubectl","-n",NAMESPACE,"get","pods","-l","app=aegis-vllm","-o","jsonpath={.items[*].metadata.name}"])
++    pods = out.decode().strip().split()
++    if not pods:
++        print("No pods found")
++        return False
++    victim = pods[0]
++    print("Deleting pod", victim)
++    run_cmd(f"kubectl -n {NAMESPACE} delete pod {victim} --grace-period=0 --force")
++    return True
++
++def node_drain():
++    # pick a node with one of the target pods
++    out = subprocess.check_output(["kubectl","-n",NAMESPACE,"get","pods","-l","app=aegis-vllm","-o","jsonpath={.items[0].spec.nodeName}"])
++    node = out.decode().strip()
++    if not node:
++        print("No node found")
++        return False
++    print("Cordoning node", node)
++    run_cmd(f"kubectl cordon {node}")
++    print("Draining node", node)
++    run_cmd(f"kubectl drain {node} --ignore-daemonsets --delete-local-data --force --timeout=120s")
++    # uncordon at end
++    return True
++
++def inject_latency():
++    # This is application-specific: we annotate the deployment and the app must implement fault injection
++    print("Annotating deployment to inject latency")
++    run_cmd(f"kubectl -n {NAMESPACE} patch deployment {TARGET_DEPLOYMENT} -p '{{\"spec\":{{\"template\":{{\"metadata\":{{\"annotations\":{{\"aegis-inject-latency\":\"true\"}}}}}}}}}}'")
++    return True
++
++def revert_latency():
++    run_cmd(f"kubectl -n {NAMESPACE} patch deployment {TARGET_DEPLOYMENT} -p '{{\"spec\":{{\"template\":{{\"metadata\":{{\"annotations\":{{\"aegis-inject-latency\":null}}}}}}}}}}'")
++
++def wait_for_compensation_event(timeout=300):
++    start = time.time()
++    while time.time() - start < timeout:
++        entries = query_decision_log_last(50)
++        for e in entries:
++            s = json.dumps(e).lower()
++            if "compensation_controller" in s or "executor" in s:
++                print("Found compensation-related decision_log entry:", e)
++                return True
++        time.sleep(10)
++    return False
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--mode", choices=["pod_kill","node_drain","inject_latency"], default="pod_kill")
++    p.add_argument("--topo", type=int, default=4)
++    p.add_argument("--timeout", type=int, default=300)
++    args = p.parse_args()
++
++    print("Chaos test mode:", args.mode)
++    success = False
++    try:
++        if args.mode == "pod_kill":
++            success = pod_kill()
++        elif args.mode == "node_drain":
++            success = node_drain()
++        elif args.mode == "inject_latency":
++            success = inject_latency()
++        else:
++            print("unknown mode")
++            return 2
++
++        if not success:
++            print("Injection failed to start")
++            return 2
++
++        print("Waiting after injection...")
++        time.sleep(SLEEP_AFTER_INJECTION)
++
++        print("Waiting for compensation/rollback event in decision_log")
++        if wait_for_compensation_event(timeout=args.timeout):
++            print("Compensation detected -> PASS")
++            return 0
++        else:
++            print("No compensation detected -> FAIL")
++            return 3
++    finally:
++        if args.mode == "inject_latency":
++            revert_latency()
++        if args.mode == "node_drain":
++            # attempt to uncordon nodes (best-effort)
++            try:
++                out = subprocess.check_output(["kubectl","-n",NAMESPACE,"get","pods","-l","app=aegis-vllm","-o","jsonpath={.items[*].spec.nodeName}"])
++                nodes = set(out.decode().strip().split())
++                for n in nodes:
++                    run_cmd(f"kubectl uncordon {n}")
++            except Exception:
++                pass
++
++if __name__ == "__main__":
++    import sys
++    sys.exit(main())
+diff --git a/ui/auditor_ui_sso.py b/ui/auditor_ui_sso.py
+new file mode 100644
+index 0000000..9999999
+--- /dev/null
++++ b/ui/auditor_ui_sso.py
+@@ -0,0 +1,192 @@
++#!/usr/bin/env python3
++"""
++Auditor UI with SSO/OIDC integration and RBAC groups mapping.
++
++ - Validates incoming JWTs against configured JWKS URL (AUTH_JWKS_URL)
++ - Requires membership in APPROVER_GROUP to approve / bulk-approve
++ - Provides search/pagination for large volumes
++ - Endpoint /metadata returns current app info (for UI)
++"""
++import os
++import json
++import time
++from flask import Flask, jsonify, request, abort
++import requests
++import jwt
++import psycopg2
++import psycopg2.extras
++
++DSN = os.environ.get("DECISIONLOG_DB_DSN")
++AUTH_JWKS_URL = os.environ.get("AUTH_JWKS_URL")
++APPROVER_GROUP = os.environ.get("APPROVER_GROUP", "auditors")
++PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "50"))
++
++app = Flask(__name__)
++
++JWKS_CACHE = {"jwks": None, "ts": 0}
++
++def get_conn():
++    if not DSN:
++        raise RuntimeError("DECISIONLOG_DB_DSN not set")
++    return psycopg2.connect(DSN, cursor_factory=psycopg2.extras.RealDictCursor)
++
++def get_jwks():
++    if JWKS_CACHE["jwks"] and (time.time() - JWKS_CACHE["ts"] < 300):
++        return JWKS_CACHE["jwks"]
++    if not AUTH_JWKS_URL:
++        raise RuntimeError("AUTH_JWKS_URL not configured")
++    r = requests.get(AUTH_JWKS_URL, timeout=5)
++    r.raise_for_status()
++    JWKS_CACHE["jwks"] = r.json()
++    JWKS_CACHE["ts"] = time.time()
++    return JWKS_CACHE["jwks"]
++
++def verify_jwt(token):
++    jwks = get_jwks()
++    for key in jwks.get("keys", []):
++        try:
++            pub = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(key))
++            claims = jwt.decode(token, pub, algorithms=[key.get("alg","RS256")], options={"verify_aud": False})
++            return claims
++        except Exception:
++            continue
++    raise ValueError("JWT verification failed")
++
++def require_approver(f):
++    def wrapper(*args, **kwargs):
++        auth = request.headers.get("Authorization","")
++        if not auth.startswith("Bearer "):
++            abort(401)
++        token = auth.split(" ",1)[1]
++        try:
++            claims = verify_jwt(token)
++        except Exception:
++            abort(401)
++        groups = claims.get("groups") or claims.get("roles") or []
++        if isinstance(groups, str):
++            groups = [groups]
++        if APPROVER_GROUP not in groups and "admin" not in groups:
++            abort(403)
++        request.environ["aegis_user"] = claims.get("sub") or claims.get("email") or "unknown"
++        return f(*args, **kwargs)
++    wrapper.__name__ = f.__name__
++    return wrapper
++
++@app.route("/healthz")
++def healthz():
++    return "ok", 200
++
++@app.route("/metadata")
++def metadata():
++    return jsonify({"service": "aegis-auditor-ui", "version": "1.0"})
++
++@app.route("/pending")
++@require_approver
++def pending():
++    page = int(request.args.get("page","1"))
++    size = int(request.args.get("size", str(PAGE_SIZE)))
++    offset = (page-1)*size
++    model = request.args.get("model")
++    action = request.args.get("action")
++    status = request.args.get("status")
++    q = "SELECT id, created_at, agent, payload, evidence FROM decision_log WHERE payload->>'action' IS NOT NULL"
++    params = []
++    if model:
++        q += " AND payload->>'model' = %s"; params.append(model)
++    if action:
++        q += " AND payload->>'action' = %s"; params.append(action)
++    if status:
++        if status == "deferred":
++            q += " AND (evidence->>'status' = 'deferred' OR evidence->>'status' IS NULL)"
++        elif status == "approved":
++            q += " AND evidence->>'status' = 'approved'"
++    q += " ORDER BY created_at DESC LIMIT %s OFFSET %s"
++    params.extend([size, offset])
++    conn = get_conn()
++    with conn.cursor() as cur:
++        cur.execute(q, tuple(params))
++        items = cur.fetchall()
++        cur.execute("SELECT count(1) FROM decision_log WHERE payload->>'action' IS NOT NULL")
++        total = cur.fetchone()[0]
++    conn.close()
++    return jsonify({"items": items, "page": page, "size": size, "total": total})
++
++@app.route("/approve", methods=["POST"])
++@require_approver
++def approve():
++    data = request.get_json(force=True)
++    dec_id = data.get("id")
++    if not dec_id:
++        return jsonify({"ok": False, "error": "id required"}), 400
++    approver = request.environ.get("aegis_user", "auditor")
++    conn = get_conn()
++    with conn.cursor() as cur:
++        cur.execute("INSERT INTO decision_log (agent, payload, evidence) VALUES (%s, %s, %s) RETURNING id", ("auditor-ui", json.dumps({"approved_id": dec_id, "approver": approver}), json.dumps({"status": "approved", "approver": approver})))
++        new_id = cur.fetchone()[0]
++        conn.commit()
++    conn.close()
++    return jsonify({"ok": True, "id": new_id})
++
++@app.route("/bulk_approve", methods=["POST"])
++@require_approver
++def bulk_approve():
++    data = request.get_json(force=True)
++    ids = data.get("ids", [])
++    if not ids:
++        return jsonify({"ok": False, "error": "ids required"}), 400
++    approver = request.environ.get("aegis_user", "auditor")
++    created = []
++    conn = get_conn()
++    with conn.cursor() as cur:
++        for dec_id in ids:
++            cur.execute("INSERT INTO decision_log (agent, payload, evidence) VALUES (%s, %s, %s) RETURNING id", ("auditor-ui-bulk", json.dumps({"approved_id": dec_id, "approver": approver}), json.dumps({"status": "approved", "approver": approver})))
++            created.append(cur.fetchone()[0])
++        conn.commit()
++    conn.close()
++    return jsonify({"ok": True, "created": created})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8081")))
+diff --git a/k8s/manifests/auditor_ui_sso_deployment.yaml b/k8s/manifests/auditor_ui_sso_deployment.yaml
+new file mode 100644
+index 0000000..aaaaaaaa
+--- /dev/null
++++ b/k8s/manifests/auditor_ui_sso_deployment.yaml
+@@ -0,0 +1,34 @@
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-auditor-ui
++  namespace: aegis-ml
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: aegis-auditor-ui
++  template:
++    metadata:
++      labels:
++        app: aegis-auditor-ui
++    spec:
++      containers:
++        - name: auditor-ui
++          image: <REGISTRY>/aegis-auditor-ui:latest
++          env:
++            - name: DECISIONLOG_DB_DSN
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-decisionlog-secret
++                  key: dsn
++            - name: AUTH_JWKS_URL
++              value: "https://auth.example.com/.well-known/jwks.json"
++            - name: APPROVER_GROUP
++              value: "auditors"
++            - name: PAGE_SIZE
++              value: "50"
++          ports:
++            - containerPort: 8081
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: aegis-auditor-ui
++  namespace: aegis-ml
++spec:
++  selector:
++    app: aegis-auditor-ui
++  ports:
++    - port: 8081
++      targetPort: 8081
+diff --git a/monitoring/prometheus/token_rotation_alerts.yaml b/monitoring/prometheus/token_rotation_alerts.yaml
+new file mode 100644
+index 0000000..bbbbbbbb
+--- /dev/null
++++ b/monitoring/prometheus/token_rotation_alerts.yaml
+@@ -0,0 +1,34 @@
++apiVersion: monitoring.coreos.com/v1
++kind: PrometheusRule
++metadata:
++  name: aegis-token-rotation-alerts
++  namespace: aegis-ml
++spec:
++  groups:
++    - name: aegis.token.rotation
++      rules:
++        - alert: TokenRotationStale
++          expr: time() - max_over_time(aegis_token_last_rotation_timestamp[7d]) > 7*24*3600
++          for: 1h
++          labels:
++            severity: critical
++          annotations:
++            summary: "Executor token/key rotation stale >7d"
++            description: "No token/key rotation recorded in the last 7 days. Verify token rotator and issuer are functioning."
++        - alert: RevocationEventsSpike
++          expr: increase(aegis_token_revocations_total[1h]) > 10
++          for: 5m
++          labels:
++            severity: warning
++          annotations:
++            summary: "Spike in token revocations"
++            description: "Many tokens have been revoked in the last hour; investigate for misuse or automation issues."
+diff --git a/docs/OPERATIONALIZE_ROTATION_AND_AUDITOR_SSO.md b/docs/OPERATIONALIZE_ROTATION_AND_AUDITOR_SSO.md
+new file mode 100644
+index 0000000..cccccccc
+--- /dev/null
++++ b/docs/OPERATIONALIZE_ROTATION_AND_AUDITOR_SSO.md
+@@ -0,0 +1,220 @@
++# Operationalize Token Rotation, Revocation & Auditor SSO
++
++This document describes the runbook for productionizing token rotation, revocation, mTLS/JWS usage for the executor, exhaustive rollback testing, observability, and auditor SSO.
++
++1) Policy gating (high-risk)
++- High-risk actions are gated by policy/OPA (policy/opa/high_risk_gating.rego).
++- The policy requires explicit approval metadata (approved_by or approval_token) for actions like promote/snapshot/restore/delete_data.
++- Operators must ensure workflows that perform high-risk actions annotate requests with approval tokens or call the automated approval flow (which will create an approval issue).
++
++2) Token issuance & revocation (productionization)
++- Deploy the Token Issuer (k8s/manifests/token_issuer_deployment.yaml).
++- The Token Issuer provides:
++  - POST /issue to create short-lived JWTs for orchestrators (aud=aegis-executor)
++  - POST /revoke to revoke a token by jti
++  - GET /.well-known/jwks.json for JWKS
++- Use scripts/token_revocation_rotator.py as a CronJob to rotate signing keys and persist keys in k8s secret (or Vault).
++- Configure orchestrators to obtain tokens from Token Issuer via a short-lived flow.
++- Implement token revocation checks in the executor to consult the issuer's revocation list (or central store such as Vault/Redis).
++
++3) mTLS / Service Mesh
++- Use service mesh (Istio) PeerAuthentication + mTLS to restrict network access to executor and token issuer (example annotations in k8s/manifests/executor_mtls_and_auth.yaml from earlier patch).
++- Combine mTLS with JWT audience validation for defense in depth.
++
++4) Exhaustive rollback testing
++- Use tools/chaos_rollback_test.py to simulate failure modes:
++  - pod_kill, node_drain, inject_latency (app must opt-in for latency injection)
++  - Extend this script per-environment to simulate NIC/IB faults and network partitions (requires platform-level tooling)
++- Use .github/workflows/chaos_matrix_ci.yml as a template to run the chaos matrix on self-hosted staging runners with cluster access.
++- Collect artifacts and require green across topologies before enabling wider auto-approval scopes.
++
++5) Observability & Compensation Tuning
++- The compensation controller exposes correlation IDs and metrics (services/compensation_controller.py).
++- Scrape endpoints and add alert rules (monitoring/prometheus/token_rotation_alerts.yaml and auto-approval rules).
++- Use compensation_tuner (earlier patch) to analyze Prometheus signals and suggest tuned thresholds.
++
++6) Auditor SSO & RBAC
++- Deploy UI (k8s/manifests/auditor_ui_sso_deployment.yaml).
++- Connect to your IdP JWKS (AUTH_JWKS_URL) and set APPROVER_GROUP to the desired claim value (e.g., "auditors").
++- UI exposes bulk approve and paginated search; protect it behind your ingress with OIDC or restrict to internal networks.
++- For large organizations, add group-to-role mapping and audit logs into decision_log.
++
++7) Operational checklist before enabling broad auto-approval:
++- OPA data.runtime_thresholds configured and tested.
++- Token issuer + rotator deployed and rotator scheduled (cron).
++- Executor validates JWT audience + checks revocation via issuer / central store.
++- Chaos matrix runs pass across topologies and failure modes.
++- Auditor UI accessible and approver group validated.
++- Prometheus alerts configured and tested.
++
++If you want, I can:
++- Generate the executor-side revocation check and a sample CI job that fails merge if rotator hasn't run in the last 7 days.
++- Add an example k8s CronJob manifest to run token_revocation_rotator.py weekly.
++
++End of document.

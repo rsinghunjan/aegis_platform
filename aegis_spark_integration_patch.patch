@@ -1,0 +1,378 @@
+*** Begin Patch
+*** Add File:spark/full/README_SPARK_INTEGRATION.md
++# Spark on Aegis — Full Integration (Spark Operator + Argo + PySpark job + signing)
++
++This directory contains a runnable example to run PySpark jobs on Kubernetes using the Spark Operator,
++orchestrated by Argo, writing a trained model artifact to S3, and then signing the artifact using the
++sign_with_retry helper (HSM-first, cosign fallback).
++
++What is included:
++- spark/full/Dockerfile — container image for PySpark job (includes pyspark, mlflow, boto3)
++- spark/full/requirements.txt — Python deps for the container
++- spark/full/pyspark_train.py — example PySpark application (reads CSV from S3, trains a simple model using spark.ml, writes model locally)
++- spark/full/sparkapplication.yaml — SparkApplication CR to run the job (Spark Operator)
++- argo/argo_spark_full.yaml — Argo workflow: submit SparkApplication then postprocess (download & sign artifact)
++- tools/sign_artifact.py — helper used in Argo post-step to download artifact and sign via sign_with_retry/cosign fallback
++- spark/full/install_sparkoperator.md — instructions to install Spark Operator (helm)
++
++Defaults used:
++- Namespace: aegis
++- Registry: registry.example.com/aegis
++- S3 bucket: read from env MODEL_ARTIFACT_BUCKET at runtime
++- MLflow: read from env MLFLOW_URL at runtime
++
++How it runs (high-level):
++1. Install Spark Operator into the cluster (see install_sparkoperator.md).
++2. Build and push the PySpark image defined by Dockerfile / requirements.txt (or use a public image).
++3. Apply the SparkApplication CR (or let Argo apply it).
++4. On completion, Argo runs tools/sign_artifact.py to fetch the produced model artifact and sign it.
++
++Notes:
++- The SparkOperator must be v1beta2-compatible with the SparkApplication CR shown.
++- Production: configure Hadoop/S3 credentials securely (ExternalSecrets + Vault or IAM roles).
++- This example uses a local save + boto3 upload from within the Spark driver. For better integration use s3a:// paths and cluster credentials.
++
+*** End Patch
+*** Begin Patch
+*** Add File:spark/full/Dockerfile
++FROM python:3.10-slim
++ENV PYTHONUNBUFFERED=1
++WORKDIR /app
++COPY spark/full/requirements.txt /app/requirements.txt
++RUN apt-get update && apt-get install -y openjdk-11-jre-headless build-essential netcat && rm -rf /var/lib/apt/lists/*
++RUN pip install --no-cache-dir -r /app/requirements.txt
++COPY spark/full/pyspark_train.py /app/pyspark_train.py
++COPY tools/sign_artifact.py /app/tools/sign_artifact.py
++CMD ["python3","/app/pyspark_train.py"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:spark/full/requirements.txt
++pyspark==3.3.2
++mlflow
++boto3
++joblib
++scikit-learn
++
+*** End Patch
+*** Begin Patch
+*** Add File:spark/full/pyspark_train.py
++#!/usr/bin/env python3
++"""
++PySpark training job
++ - Reads CSV from S3 (MODEL_INPUT_S3_URI)
++ - Trains a simple logistic regression using spark.ml
++ - Saves model to local path and uploads to S3 (MODEL_OUTPUT_S3_URI)
++ - Logs basic metrics to MLflow (if MLFLOW_URL provided)
++
++This job is intended to run as a Spark driver (SparkApplication CR) with proper cluster config.
++"""
++import os, sys, tempfile, json, time
++from pyspark.sql import SparkSession
++from pyspark.ml.feature import VectorAssembler, StandardScaler
++from pyspark.ml.classification import LogisticRegression
++import boto3
++import mlflow
++
++def main():
++    MODEL_INPUT = os.environ.get("MODEL_INPUT_S3_URI", "")
++    MODEL_OUTPUT = os.environ.get("MODEL_OUTPUT_S3_URI", "")
++    MLFLOW_URL = os.environ.get("MLFLOW_URL", "")
++    if MLFLOW_URL:
++        mlflow.set_tracking_uri(MLFLOW_URL)
++
++    spark = SparkSession.builder.appName("aegis-pyspark-train").getOrCreate()
++
++    if MODEL_INPUT.startswith("s3://"):
++        # Example: read CSV directly from s3 if cluster and Hadoop conf allow
++        try:
++            df = spark.read.option("header","true").option("inferSchema","true").csv(MODEL_INPUT)
++        except Exception:
++            # fallback: download with boto3 to local and read
++            import boto3, tempfile
++            s3 = boto3.client("s3")
++            # parse s3 path
++            _, _, bucket_and_key = MODEL_INPUT.partition("s3://")
++            bucket, _, key = bucket_and_key.partition("/")
++            tmp = tempfile.NamedTemporaryFile(delete=False,suffix=".csv")
++            s3.download_file(bucket, key, tmp.name)
++            df = spark.read.option("header","true").option("inferSchema","true").csv(tmp.name)
++    else:
++        df = spark.read.csv(MODEL_INPUT, header=True, inferSchema=True)
++
++    # basic preprocessing: assume label column named 'label', numeric features are numeric
++    feature_cols = [c for c,t in df.dtypes if t in ("int","double","float","long") and c!="label"]
++    if not feature_cols:
++        # fallback: try to select first N cols aside from label
++        cols = df.columns
++        feature_cols = [c for c in cols if c!="label"][:5]
++
++    assembler = VectorAssembler(inputCols=feature_cols, outputCol="features_raw")
++    df2 = assembler.transform(df.na.fill(0.0))
++    scaler = StandardScaler(inputCol="features_raw", outputCol="features")
++    scaler_model = scaler.fit(df2)
++    df3 = scaler_model.transform(df2)
++
++    lr = LogisticRegression(featuresCol="features", labelCol="label", maxIter=10)
++    model = lr.fit(df3)
++
++    # save model to local dir
++    outdir = "/tmp/model_out"
++    try:
++        model.write().overwrite().save(outdir)
++    except Exception:
++        # fallback: write basic metadata
++        with open(outdir + "/metadata.json","w") as f:
++            json.dump({"model":"logreg","trained_at": time.time()}, f)
++
++    # upload to S3 if MODEL_OUTPUT provided
++    if MODEL_OUTPUT.startswith("s3://"):
++        _, _, bo = MODEL_OUTPUT.partition("s3://")
++        bucket, _, prefix = bo.partition("/")
++        s3 = boto3.client("s3")
++        # upload all files under outdir
++        for root, dirs, files in os.walk(outdir):
++            for fn in files:
++                path = os.path.join(root, fn)
++                key = (prefix.rstrip("/") + "/" + fn).lstrip("/")
++                s3.upload_file(path, bucket, key)
++        artifact_uri = f"s3://{bucket}/{prefix.rstrip('/')}/"
++    else:
++        artifact_uri = outdir
++
++    # log a simple mlflow metric
++    if MLFLOW_URL:
++        with mlflow.start_run(nested=True):
++            mlflow.log_param("feature_count", len(feature_cols))
++            mlflow.log_metric("rows", df.count())
++            mlflow.log_artifacts(outdir, artifact_path="model_artifacts")
++
++    print("Training complete. Artifact at:", artifact_uri)
++    # write artifact uri to sentinel file so downstream step can find it
++    with open("/tmp/artifact_uri.txt","w") as f:
++        f.write(artifact_uri)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:spark/full/sparkapplication.yaml
++apiVersion: "sparkoperator.k8s.io/v1beta2"
++kind: SparkApplication
++metadata:
++  name: aegis-pyspark-train
++  namespace: aegis
++spec:
++  type: Python
++  pythonVersion: "3"
++  mode: cluster
++  image: registry.example.com/aegis/pyspark-job:latest
++  imagePullPolicy: Always
++  mainApplicationFile: local:///app/pyspark_train.py
++  sparkVersion: "3.3.2"
++  restartPolicy:
++    type: Never
++  driver:
++    cores: 1
++    memory: "1g"
++    serviceAccount: aegis-agent
++    labels:
++      version: 3.3.2
++  executor:
++    cores: 1
++    memory: "1g"
++    instances: 2
++  deps:
++    jars: []
++  volumes: []
++  sparkConf:
++    "spark.kubernetes.driver.label": "aegis-spark"
++    "spark.kubernetes.executor.label": "aegis-spark"
++
+*** End Patch
+*** Begin Patch
+*** Add File:argo/argo_spark_full.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: aegis-spark-workflow-
++spec:
++  entrypoint: spark-pipeline
++  templates:
++    - name: spark-pipeline
++      steps:
++        - - name: submit-spark
++            template: submit-spark
++        - - name: wait-spark
++            template: wait-spark
++        - - name: postprocess-sign
++            template: sign-artifact
++
++    - name: submit-spark
++      container:
++        image: bitnami/kubectl:1.27
++        command: [sh, -c]
++        args:
++          - |
++            echo "Applying SparkApplication..."
++            kubectl apply -f spark/full/sparkapplication.yaml -n aegis
++
++    - name: wait-spark
++      container:
++        image: bitnami/kubectl:1.27
++        command: [sh, -c]
++        args:
++          - |
++            echo "Waiting for SparkApplication completion..."
++            for i in $(seq 1 120); do
++              phase=$(kubectl -n aegis get sparkapplication aegis-pyspark-train -o jsonpath='{.status.applicationState.state}' 2>/dev/null || echo "")
++              echo "Phase: $phase"
++              if [ "$phase" = "COMPLETED" ]; then exit 0; fi
++              if [ "$phase" = "FAILED" ]; then exit 2; fi
++              sleep 10
++            done
++            echo "Timed out waiting for SparkApplication" && exit 1
++
++    - name: sign-artifact
++      container:
++        image: python:3.10-slim
++        command: [sh, -c]
++        args:
++          - |
++            set -euo pipefail
++            pip install boto3
++            # determine artifact URI (example reads from /tmp/artifact_uri.txt on driver via kubectl cp)
++            POD=$(kubectl -n aegis get pods -l spark-role=driver -o jsonpath='{.items[0].metadata.name}')
++            echo "Driver pod: $POD"
++            kubectl -n aegis cp $POD:/tmp/artifact_uri.txt /tmp/artifact_uri.txt || true
++            ART_URI=$(cat /tmp/artifact_uri.txt || echo "")
++            echo "Artifact URI: $ART_URI"
++            if [ -z "$ART_URI" ]; then echo "No artifact URI; failing"; exit 1; fi
++            # download artifact (assuming s3://)
++            if echo "$ART_URI" | grep -q '^s3://'; then
++              pip install awscli
++              tmpdir=$(mktemp -d)
++              aws s3 cp --recursive "$ART_URI" "$tmpdir/"
++              # sign each file and upload signature
++              for f in $(find $tmpdir -type f); do
++                python3 tools/sign_artifact.py --file "$f" --out "$f.sig" || true
++                # upload signature if exists
++                if [ -f "$f.sig" ]; then
++                  aws s3 cp "$f.sig" "${ART_URI%/}/$(basename $f).sig"
++                fi
++              done
++            else
++              echo "Unsupported artifact URI: $ART_URI"; exit 1
++            fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:tools/sign_artifact.py
++#!/usr/bin/env python3
++"""
++Download (if needed) and sign a local file using sign_with_retry helper.
++This script is intended to run in a container that has access to the repository code
++or has the sign_with_retry module available.
++
++Usage:
++  python3 tools/sign_artifact.py --file /tmp/model_out/metadata.json --out /tmp/model_out/metadata.json.sig
++"""
++import argparse, os, sys, json
++from production.policy.signing.sign_with_retry import sign_payload
++
++def sign_local(path, outpath=None):
++    with open(path, "rb") as f:
++        data = f.read()
++    sighex, meta = sign_payload(data, path)
++    if not sighex:
++        print("Signing failed, meta:", meta, file=sys.stderr)
++        return 2
++    out = outpath or (path + ".sig")
++    with open(out, "w") as f:
++        f.write(sighex)
++    print("Wrote signature to", out)
++    return 0
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--file", required=True)
++    p.add_argument("--out", required=False)
++    args = p.parse_args()
++    sys.exit(sign_local(args.file, args.out))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:spark/full/install_sparkoperator.md
++# Install Spark Operator (staging)
++
++Recommended: use the community Helm chart for spark-operator (https://github.com/GoogleCloudPlatform/spark-on-k8s-operator).
++
++Example:
++  kubectl create ns spark-operator || true
++  helm repo add spark-operator https://googlecloudplatform.github.io/spark-on-k8s-operator
++  helm repo update
++  helm install spark-operator spark-operator/spark-operator --namespace spark-operator --set webhook.enable=true --set rbac.create=true
++
++Verify:
++  kubectl get pods -n spark-operator
++  kubectl get crd | grep sparkapplications
++
++Notes:
++- Use the spark operator image compatible with your sparkVersion (3.3.x).
++- In production configure admission webhooks and RBAC per your security posture.
++
+*** End Patch
+*** Begin Patch
+*** Add File:spark/simple/SparkApplication_minimal.yaml
++apiVersion: "sparkoperator.k8s.io/v1beta2"
++kind: SparkApplication
++metadata:
++  name: aegis-pyspark-minimal
++  namespace: aegis
++spec:
++  type: Python
++  mode: cluster
++  image: registry.example.com/aegis/pyspark-job:latest
++  mainApplicationFile: local:///app/pyspark_train.py
++  sparkVersion: "3.3.2"
++  driver:
++    cores: 1
++    memory: "1g"
++    serviceAccount: aegis-agent
++  executor:
++    cores: 1
++    memory: "1g"
++    instances: 1
++
+*** End Patch
+*** Begin Patch
+*** Add File:spark/simple/argo_spark_minimal.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: aegis-spark-minimal-
++spec:
++  entrypoint: submit-spark
++  templates:
++    - name: submit-spark
++      container:
++        image: bitnami/kubectl:1.27
++        command: [sh, -c]
++        args: ["kubectl apply -f spark/simple/SparkApplication_minimal.yaml -n aegis; sleep 5; kubectl get sparkapplication -n aegis"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:spark/full/notes_credentials.md
++# Credentials guidance for Spark jobs
++
++- Use ExternalSecrets or Kubernetes Secrets (populated from Vault) to pass AWS credentials for S3 access.
++- For AWS: prefer IRSA (IAM Roles for Service Accounts) when on EKS. For GCP use Workload Identity.
++- Ensure the Spark driver pod's ServiceAccount has permission to read Secrets if you must mount them.
++- Do NOT bake secret keys into images or YAML files.
++
+*** End Patch
+*** End Patch

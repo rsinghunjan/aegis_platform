@@ -1,0 +1,264 @@
+*** Begin Patch
+*** Add File:ops/scripts/staging_full_run.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Orchestrator script to provision secrets, deploy stack to staging, run verification, tuning,
++# wrapper audits, long-dry runs, start long-shadow campaign, enable S3 object lock, harden registry auth,
++# wire Alertmanager receiver config, and rehearse MTTR drill.
++#
++# Usage (example):
++#   export EVIDENCE_BUCKET=my-evidence-bucket \
++#     ELECTRICITYMAP_API_KEY=... \
++#     WATTTIME_API_TOKEN=... \
++#     MODEL_STORE_PREFIX=s3://my-models \
++#     KEYCLOAK_URL=https://keycloak.example.com \
++#     KEYCLOAK_REALM=aegis \
++#     KEYCLOAK_CLIENT_ID=aegis-service \
++#     KEYCLOAK_CLIENT_SECRET=... \
++#     AWS_REGION=us-east-1 \
++#   ./ops/scripts/staging_full_run.sh
++
++SCRIPTDIR="$(cd "$(dirname "$0")" && pwd)"
++
++echo "=== 1) Validate environment ==="
++: "${EVIDENCE_BUCKET:?EVIDENCE_BUCKET must be set (name of S3 bucket for evidence)}"
++: "${MODEL_STORE_PREFIX:?MODEL_STORE_PREFIX must be set (e.g. s3://my-model-bucket/models)}"
++# Keycloak creds are optional for dev but required for hardening
++if [ -z "${KEYCLOAK_CLIENT_SECRET:-}" ] || [ -z "${KEYCLOAK_URL:-}" ]; then
++  echo "Warning: Keycloak credentials not fully set; registry will be deployed without strict auth. Set KEYCLOAK_* envs to enable."
++fi
++
++echo "AWS region: ${AWS_REGION:-not-set}"
++
++echo "=== 2) Create production secrets in cluster ==="
++chmod +x "${SCRIPTDIR}/create_prod_secrets.sh"
++"${SCRIPTDIR}/create_prod_secrets.sh"
++
++echo "=== 3) Create evidence S3 bucket with Object Lock (if not exists) ==="
++if command -v aws >/dev/null 2>&1; then
++  chmod +x "${SCRIPTDIR}/create_evidence_bucket_with_object_lock.sh"
++  "${SCRIPTDIR}/create_evidence_bucket_with_object_lock.sh" || echo "Bucket creation/lock step returned non-zero; ensure bucket exists with object lock enabled"
++else
++  echo "aws CLI not found; skipping bucket creation. Ensure bucket ${EVIDENCE_BUCKET} exists and was created with Object Lock enabled."
++fi
++
++echo "=== 4) Bootstrap staging (Postgres + registry + stack) ==="
++chmod +x "${SCRIPTDIR}/setup_staging.sh"
++${SCRIPTDIR}/setup_staging.sh
++
++echo "=== 5) Deploy & verify stack, run promql probe & tune templates ==="
++chmod +x "${SCRIPTDIR}/deploy_and_verify_stack.sh"
++${SCRIPTDIR}/deploy_and_verify_stack.sh || { echo "deploy_and_verify_stack failed"; exit 2; }
++
++echo "Run interactive PromQL tuner helper (auto-check)..."
++chmod +x "${SCRIPTDIR}/tune_promql_apply.sh"
++${SCRIPTDIR}/tune_promql_apply.sh || echo "PromQL tuning helper completed (inspect ops/promql/tuned_promql_templates.json)."
++
++echo "=== 6) Run wrapper audit, wrapper audit checker and acceptance dry-run ==="
++chmod +x "${SCRIPTDIR}/run_wrapper_audit_and_dryrun.sh"
++${SCRIPTDIR}/run_wrapper_audit_and_dryrun.sh || echo "Wrapper audit/dry-run had non-zero exit; inspect logs/artifacts in /tmp and evidence bucket"
++
++echo "=== 7) Start long-shadow campaign & supervisor ==="
++chmod +x "${SCRIPTDIR}/run_long_shadow_campaign.sh"
++# default sample rate and days can be overridden via env
++${SCRIPTDIR}/run_long_shadow_campaign.sh || echo "Long-shadow start attempted; verify long-shadow pods and cronjob in 'monitoring' ns"
++
++echo "=== 8) Verify S3 object lock and evidence writeability ==="
++chmod +x "${SCRIPTDIR}/check_s3_object_lock.sh"
++${SCRIPTDIR}/check_s3_object_lock.sh || echo "S3 Object Lock check failed or requires manual verification"
++
++echo "=== 9) Harden registry behind Keycloak (patch deployment with secret refs) ==="
++kubectl apply -f k8s/manifests/registry-enable-auth.yaml || echo "Applied registry auth patch (if cluster resources present)"
++
++echo "=== Optional: Migrate SQLite registry to Postgres (if applicable) ==="
++if [ -f "services/registry/models.db" ]; then
++  echo "Local SQLite registry detected; running migration script to Postgres (operator must ensure DATABASE_URL points to staging Postgres)"
++  chmod +x ops/scripts/migrate_sqlite_to_postgres.sh
++  # user must set --pg param as DATABASE_URL; try to use manifest value
++  PGURL="${DATABASE_URL:-postgresql://aegis:password@aegis-postgres.monitoring.svc:5432/aegis_registry}"
++  ./ops/scripts/migrate_sqlite_to_postgres.sh --sqlite services/registry/models.db --pg "${PGURL}" || echo "Migration script attempted; verify results manually."
++else
++  echo "No local SQLite registry found; skipping migration."
++fi
++
++echo "=== 10) Wire Alertmanager receivers (Slack/PagerDuty) ==="
++if [ -f monitoring/alertmanager/alertmanager-config.yaml.template ]; then
++  chmod +x ops/scripts/apply_alertmanager_config.sh || true
++  if [ -f ops/scripts/apply_alertmanager_config.sh ]; then
++    ops/scripts/apply_alertmanager_config.sh || echo "apply_alertmanager_config.sh returned non-zero; verify Alertmanager config"
++  else
++    echo "apply_alertmanager_config.sh missing; you can apply monitoring/alertmanager/alertmanager-config.yaml.template with proper secrets"
++  fi
++else
++  echo "No Alertmanager template found; skip wiring."
++fi
++
++echo "=== 11) Rehearse MTTR drill ==="
++python -m pip install requests || true
++python services/agent/mttr_drill.py || echo "MTTR drill ran; if failure, inspect logs and transaction evidence"
++
++echo "=== 12) Done: staging provisioning & initial checks complete ==="
++echo "Next: monitor long-shadow supervisor daily, run acceptance flows (30-day long-shadow), collect SME signoffs (ops/scripts/collect_sme_signoff.sh) and finalize production readiness."
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/scripts/create_evidence_bucket_with_object_lock.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Create an S3 bucket with Object Lock enabled and set a default retention policy.
++# NOTE: For AWS S3, Object Lock must be enabled at bucket creation time. This script is best-effort:
++# - If bucket exists, it will attempt to read object-lock config.
++# - If not, it will create bucket with --object-lock-enabled-for-bucket and then put a default retention config.
++#
++# Usage:
++#   EVIDENCE_BUCKET=<bucket> AWS_REGION=<region> ./ops/scripts/create_evidence_bucket_with_object_lock.sh
++
++: "${EVIDENCE_BUCKET:?EVIDENCE_BUCKET must be set}"
++: "${AWS_REGION:?AWS_REGION must be set (e.g. us-east-1)}"
++
++if ! command -v aws >/dev/null 2>&1; then
++  echo "aws CLI not found. Install and configure AWS CLI before running this script."
++  exit 2
++fi
++
++exists=$(aws s3api head-bucket --bucket "${EVIDENCE_BUCKET}" 2>/dev/null || true)
++if [ -n "$exists" ]; then
++  echo "Bucket ${EVIDENCE_BUCKET} already exists. Checking object lock configuration..."
++  cfg=$(aws s3api get-bucket-object-lock-configuration --bucket "${EVIDENCE_BUCKET}" 2>/dev/null || true)
++  if [ -z "$cfg" ]; then
++    echo "Bucket exists but does not show object lock configuration (or you lack permission)."
++    echo "You cannot enable object lock on an existing bucket after creation. Create a new bucket with object-lock enabled if required."
++    exit 1
++  else
++    echo "Bucket has object lock config:"
++    echo "$cfg"
++    exit 0
++  fi
++else
++  echo "Creating bucket ${EVIDENCE_BUCKET} with object lock enabled in region ${AWS_REGION}..."
++  # Create bucket (note: S3 CreateBucket behavior varies by region; use location constraint when required)
++  if [ "${AWS_REGION}" = "us-east-1" ]; then
++    aws s3api create-bucket --bucket "${EVIDENCE_BUCKET}" --object-lock-enabled-for-bucket
++  else
++    aws s3api create-bucket --bucket "${EVIDENCE_BUCKET}" --region "${AWS_REGION}" --create-bucket-configuration LocationConstraint="${AWS_REGION}" --object-lock-enabled-for-bucket
++  fi
++  echo "Applying default retention (GOVERNANCE, 365 days) as a template (operator should adapt)..."
++  aws s3api put-bucket-object-lock-configuration --bucket "${EVIDENCE_BUCKET}" --object-lock-configuration '{
++    "ObjectLockEnabled": "Enabled",
++    "Rule": {
++      "DefaultRetention": { "Mode": "GOVERNANCE", "Days": 365 }
++    }
++  }'
++  echo "Bucket created and default retention applied. Verify with ops/scripts/check_s3_object_lock.sh"
++fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/manifests/registry-enable-auth.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-model-registry
++  namespace: monitoring
++spec:
++  template:
++    metadata:
++      labels:
++        app: aegis-model-registry
++      annotations:
++        aegis/registry-auth: "enabled"
++    spec:
++      containers:
++        - name: registry
++          env:
++            - name: KEYCLOAK_URL
++              valueFrom:
++                secretKeyRef:
++                  name: keycloak-credentials
++                  key: KEYCLOAK_URL
++            - name: KEYCLOAK_REALM
++              valueFrom:
++                secretKeyRef:
++                  name: keycloak-credentials
++                  key: KEYCLOAK_REALM
++            - name: KEYCLOAK_CLIENT_ID
++              valueFrom:
++                secretKeyRef:
++                  name: keycloak-credentials
++                  key: KEYCLOAK_CLIENT_ID
++
++# Apply this manifest to patch the existing aegis-model-registry deployment (it uses server-side apply semantics).
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/scripts/apply_alertmanager_config.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Apply Alertmanager config template (monitoring/alertmanager/alertmanager-config.yaml.template).
++# The operator must replace the PagerDuty and Slack webhook placeholders via environment variables or editing the template.
++#
++TEMPLATE=monitoring/alertmanager/alertmanager-config.yaml.template
++NS=${NAMESPACE:-monitoring}
++
++if [ ! -f "${TEMPLATE}" ]; then
++  echo "Alertmanager template not found: ${TEMPLATE}"
++  exit 2
++fi
++
++echo "Applying Alertmanager config as kubernetes secret (best-effort). Ensure Alertmanager reads this config from the secret or ConfigMap as per your setup."
++kubectl create configmap alertmanager-config -n "${NS}" --from-file=alertmanager.yaml="${TEMPLATE}" --dry-run=client -o yaml | kubectl apply -f -
++echo "ConfigMap alertmanager-config applied in namespace ${NS}. Update your Alertmanager deployment to use this config if not already configured."
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/staging_provision.yml
++name: Staging Provision & Run
++on:
++  workflow_dispatch:
++    inputs:
++      evidence_bucket:
++        required: true
++        description: S3 evidence bucket name
++      aws_region:
++        required: true
++        description: AWS region for bucket creation
++      model_registry_url:
++        required: false
++        description: Model registry URL (optional)
++
++jobs:
++  provision:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up AWS credentials
++        uses: aws-actions/configure-aws-credentials@v2
++        with:
++          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
++          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
++          aws-region: ${{ github.event.inputs.aws_region }}
++      - name: Set up kubectl
++        uses: azure/setup-kubectl@v3
++        with:
++          version: 'latest'
++      - name: Run staging full run orchestrator
++        env:
++          EVIDENCE_BUCKET: ${{ github.event.inputs.evidence_bucket }}
++          AWS_REGION: ${{ github.event.inputs.aws_region }}
++          ELECTRICITYMAP_API_KEY: ${{ secrets.ELECTRICITYMAP_API_KEY }}
++          WATTTIME_API_TOKEN: ${{ secrets.WATTTIME_API_TOKEN }}
++          MODEL_STORE_PREFIX: ${{ secrets.MODEL_STORE_PREFIX }}
++          KEYCLOAK_URL: ${{ secrets.KEYCLOAK_URL }}
++          KEYCLOAK_REALM: ${{ secrets.KEYCLOAK_REALM }}
++          KEYCLOAK_CLIENT_ID: ${{ secrets.KEYCLOAK_CLIENT_ID }}
++          KEYCLOAK_CLIENT_SECRET: ${{ secrets.KEYCLOAK_CLIENT_SECRET }}
++          DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
++        run: |
++          chmod +x ops/scripts/staging_full_run.sh
++          ./ops/scripts/staging_full_run.sh
++
+*** End Patch
+*** End Patch

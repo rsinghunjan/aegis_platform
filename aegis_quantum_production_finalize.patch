@@ -1,0 +1,592 @@
+*** Begin Patch
+*** Add File:cloud/hsm/aws_cloudhsm.tf
++/*
++Terraform example to provision an AWS CloudHSM cluster and KMS custom key store placeholder.
++This is an operator template — adapt networking (subnet_ids, vpc_id), IAM roles and lifecycle to your environment.
++*/
++provider "aws" {
++  region = var.aws_region
++}
++
++resource "aws_cloudhsm_v2_cluster" "aegis_hsm" {
++  hsm_type = "hsm1.medium"
++  subnet_ids = var.hsm_subnet_ids
++  // for production, set appropriate deletion_protection, tags, etc.
++  tags = var.common_tags
++}
++
++resource "aws_cloudhsm_v2_hsm" "aegis_hsm_nodes" {
++  count   = length(var.hsm_subnet_ids)
++  cluster_id = aws_cloudhsm_v2_cluster.aegis_hsm.id
++  subnet_id  = element(var.hsm_subnet_ids, count.index)
++  availability_zone = element(var.hsm_azs, count.index)
++}
++
++# Example: create a KMS key in a custom key store backed by CloudHSM (optional)
++resource "aws_kms_key" "aegis_kms_hsm" {
++  description = "KMS key backed by CloudHSM custom key store for PQ/private key escrow"
++  deletion_window_in_days = 30
++  customer_master_key_spec = "SYMMETRIC_DEFAULT"
++  key_usage = "ENCRYPT_DECRYPT"
++}
++
++output "cloudhsm_cluster_id" {
++  value = aws_cloudhsm_v2_cluster.aegis_hsm.id
++}
++
++variable "aws_region" { type = string }
++variable "hsm_subnet_ids" { type = list(string) }
++variable "hsm_azs" { type = list(string) }
++variable "common_tags" { type = map(string) default = {} }
++
+*** End Patch
+*** Begin Patch
+*** Add File:quantum/crypto/hsm_service.py
++#!/usr/bin/env python3
++"""
++HSM service helper for operator workflows and for programmatic signing.
++ - Uses PKCS#11 via python-pkcs11 for vendor HSM or SoftHSM in staging.
++ - Integrates with Vault to publish verification public keys.
++ - Emits audit events (S3 upload) for HSM operations.
++
++This module is used by hybrid_signer_hsm and operator runbooks.
++"""
++import os, base64, hashlib, json, time, subprocess
++from pkcs11 import PKCS11Lib, Attribute, ObjectClass, Mechanism
++import hvac
++
++class HSMService:
++    def __init__(self, pkcs11_module, token_label=None, slot=None, vault_addr=None, vault_token=None):
++        self.pkcs11_module = pkcs11_module
++        self.token_label = token_label
++        self.slot = slot
++        self.lib = PKCS11Lib(pkcs11_module)
++        self.vault_addr = vault_addr or os.environ.get("VAULT_ADDR")
++        self.vault_token = vault_token or os.environ.get("VAULT_TOKEN")
++        self.vault_client = None
++        if self.vault_addr and self.vault_token:
++            self.vault_client = hvac.Client(url=self.vault_addr, token=self.vault_token)
++
++    def _get_token(self):
++        if self.slot is not None:
++            return self.lib.get_token(slot=int(self.slot))
++        for t in self.lib.get_tokens():
++            if self.token_label and t.label == self.token_label:
++                return t
++        return next(iter(self.lib.get_tokens()))
++
++    def list_keys(self, pin):
++        token = self._get_token()
++        with token.open(user_pin=pin) as sess:
++            objs = sess.get_objects({Attribute.CLASS: ObjectClass.PRIVATE_KEY})
++            keys = []
++            for o in objs:
++                keys.append({"label": o.get(Attribute.LABEL), "id": o.get(Attribute.ID)})
++            return keys
++
++    def sign(self, pin, key_label, data, mechanism=Mechanism.SHA256_RSA_PKCS):
++        token = self._get_token()
++        with token.open(user_pin=pin) as sess:
++            privs = list(sess.get_objects({Attribute.LABEL: key_label, Attribute.CLASS: ObjectClass.PRIVATE_KEY}))
++            if not privs:
++                raise RuntimeError("Key label not found in HSM: " + key_label)
++            priv = privs[0]
++            digest = hashlib.sha256(data).digest()
++            sig = sess.sign(priv, digest, mechanism=mechanism)
++            sig_b64 = base64.b64encode(sig).decode("ascii")
++            self._emit_audit_event({"action":"sign","key_label":key_label,"ts":int(time.time())})
++            return sig_b64
++
++    def publish_public_key_to_vault(self, public_key_pem, vault_path):
++        if not self.vault_client:
++            raise RuntimeError("Vault not configured")
++        self.vault_client.secrets.kv.v2.create_or_update_secret(path=vault_path, secret={"public_key": public_key_pem, "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
++        return True
++
++    def _emit_audit_event(self, event):
++        # write small events log locally and optionally upload to S3 via aws cli (operator must configure)
++        logdir = os.environ.get("HSM_AUDIT_DIR", "/var/log/aegis/hsm")
++        os.makedirs(logdir, exist_ok=True)
++        fname = os.path.join(logdir, f"aegis_hsm_audit_{int(time.time())}.json")
++        with open(fname, "w") as f:
++            f.write(json.dumps(event))
++        # optionally upload
++        s3bucket = os.environ.get("HSM_AUDIT_BUCKET")
++        if s3bucket:
++            subprocess.Popen(["aws","s3","cp", fname, f"s3://{s3bucket}/hsm-audit/"])
++
++if __name__ == "__main__":
++    print("HSMService helper — intended to be imported by operator scripts.")
++
+*** End Patch
+*** Begin Patch
+*** Add File:quantum/rekor/rekor_programmatic.py
++#!/usr/bin/env python3
++"""
++Programmatic Rekor integration (production-ready flow):
++ - Signs artifact with cosign (CLI) and submits signature+artifact to Rekor via rekor-cli.
++ - Parses rekor-cli JSON output to return entry UUID & index info.
++ - Attaches Rekor info to an MLflow run (optional).
++
++This script assumes cosign and rekor-cli are installed on the runner (CI or operator machine).
++For full native integration use Sigstore libraries when available.
++"""
++import subprocess, json, tempfile, os, mlflow
++
++def cosign_sign(artifact_path, key_path=None):
++    out_sig = tempfile.mktemp(suffix=".sig")
++    cmd = ["cosign", "sign-blob", "--output-signature", out_sig]
++    if key_path:
++        cmd += ["--key", key_path]
++    cmd += [artifact_path]
++    subprocess.check_call(cmd)
++    return out_sig
++
++def rekor_upload(artifact_path, signature_path=None, public_key=None):
++    cmd = ["rekor-cli", "upload", "--artifact", artifact_path, "--output", "json"]
++    if signature_path:
++        cmd += ["--signature", signature_path]
++    if public_key:
++        cmd += ["--public-key", public_key]
++    out = subprocess.check_output(cmd)
++    try:
++        return json.loads(out)
++    except:
++        return {"raw": out.decode("utf-8")}
++
++def sign_and_record(artifact_path, cosign_key=None, public_key=None, mlflow_run_id=None):
++    sig = cosign_sign(artifact_path, cosign_key)
++    entry = rekor_upload(artifact_path, signature_path=sig, public_key=public_key)
++    if mlflow_run_id:
++        client = mlflow.tracking.MlflowClient()
++        client.set_tag(mlflow_run_id, "rekor.entry", json.dumps(entry))
++    return {"signature": sig, "rekor_entry": entry}
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--artifact", required=True)
++    p.add_argument("--cosign-key", default=None)
++    p.add_argument("--public-key", default=None)
++    p.add_argument("--mlflow-run-id", default=None)
++    args = p.parse_args()
++    print(sign_and_record(args.artifact, args.cosign_key, args.public_key, args.mlflow_run_id))
++
+*** End Patch
+*** Begin Patch
+*** Add File:providers/pilot/braket_pilot.py
++#!/usr/bin/env python3
++"""
++AWS Braket pilot runner:
++ - Reads credentials (AWS) and target device (device ARN)
++ - Uploads program to S3, creates a quantum task, polls for completion
++ - Captures raw S3 artifacts + any calibration/noise metadata if available
++ - Stores artifacts to lakeFS/S3 and signs metadata via rekor_programmatic
++ - Attaches Rekor info into MLflow run
++"""
++import os, time, json, uuid, boto3, subprocess
++import mlflow
++from quantum.rekor.rekor_programmatic import sign_and_record
++
++def run_braket_pilot(program_str, device_arn, s3_bucket, shots=100):
++    s3 = boto3.client("s3")
++    braket = boto3.client("braket")
++    job_id = str(uuid.uuid4())
++    prog_key = f"braket/programs/{job_id}.json"
++    s3.put_object(Bucket=s3_bucket, Key=prog_key, Body=program_str.encode("utf-8"))
++    s3_uri = f"s3://{s3_bucket}/{prog_key}"
++    resp = braket.create_quantum_task(action={"content": program_str}, deviceArn=device_arn, shots=shots, outputS3Bucket=s3_bucket, outputS3KeyPrefix=f"braket/results/{job_id}")
++    task_arn = resp.get("quantumTaskArn")
++    # poll until completed
++    for _ in range(60):
++        detail = braket.get_quantum_task(quantumTaskArn=task_arn)
++        if detail.get("status") in ("COMPLETED","SUCCEEDED","FAILED"):
++            break
++        time.sleep(10)
++    # fetch result objects
++    prefix = f"braket/results/{job_id}/"
++    objs = s3.list_objects_v2(Bucket=s3_bucket, Prefix=prefix)
++    artifacts = []
++    if objs.get("Contents"):
++        for o in objs["Contents"]:
++            key = o["Key"]
++            tmp = f"/tmp/{os.path.basename(key)}"
++            s3.download_file(s3_bucket, key, tmp)
++            artifacts.append({"s3": f"s3://{s3_bucket}/{key}", "local": tmp})
++    # Capture optional calibration / metadata if available via API or returned artifacts
++    meta = {"job_id": job_id, "task_arn": task_arn, "artifacts": [a["s3"] for a in artifacts], "polled_status": detail.get("status")}
++    meta_file = f"/tmp/{job_id}_meta.json"
++    with open(meta_file,"w") as f:
++        json.dump(meta, f, indent=2)
++    # Sign metadata and upload Rekor entry
++    rekor_info = sign_and_record(meta_file, cosign_key=os.environ.get("COSIGN_KEY"), public_key=None)
++    # Log to MLflow
++    mlflow.set_experiment("quantum-pilots")
++    with mlflow.start_run(run_name=f"braket-{job_id}") as run:
++        mlflow.log_param("device", device_arn)
++        mlflow.log_param("task_arn", task_arn)
++        mlflow.log_artifact(meta_file, artifact_path="meta")
++        mlflow.log_param("rekor_entry", json.dumps(rekor_info.get("rekor_entry")))
++    return {"job_id": job_id, "rekor_entry": rekor_info}
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--program", required=True)
++    p.add_argument("--device", required=True)
++    p.add_argument("--s3-bucket", required=True)
++    args = p.parse_args()
++    with open(args.program) as f:
++        prog = f.read()
++    print(run_braket_pilot(prog, args.device, args.s3_bucket))
++
+*** End Patch
+*** Begin Patch
+*** Add File:providers/pilot/ibm_pilot.py
++#!/usr/bin/env python3
++"""
++IBM Quantum pilot runner using qiskit-ibm-runtime:
++ - Submits program to IBM backend (via Qiskit Runtime), waits for result,
++ - Captures backend properties (calibration snapshot) and writes artifacts to S3/lakeFS
++ - Signs metadata with Rekor & records MLflow tags
++"""
++import os, json, time, uuid
++from qiskit_ibm_runtime import IBMQRuntimeService, Session, Sampler
++import boto3, mlflow
++from quantum.rekor.rekor_programmatic import sign_and_record
++
++def run_ibm_pilot(qasm_str, backend_name, s3_bucket, shots=1024):
++    token = os.environ.get("QISKIT_IBM_TOKEN")
++    if not token:
++        raise RuntimeError("QISKIT_IBM_TOKEN not set")
++    service = IBMQRuntimeService(channel="ibm_cloud", token=token)
++    job_id = str(uuid.uuid4())
++    with Session(service=service, backend=backend_name) as session:
++        sampler = Sampler(session=session)
++        result = sampler.run(qasm_str, shots=shots)
++        counts = result.shots_counts()
++        # backend properties calibration snapshot
++        try:
++            backend_props = session.backend.properties()
++            backend_meta = backend_props.to_dict() if backend_props else None
++        except Exception:
++            backend_meta = None
++    # store metadata and artifacts
++    meta = {"job_id": job_id, "backend": backend_name, "counts": counts, "backend_meta": backend_meta}
++    meta_file = f"/tmp/{job_id}_ibm_meta.json"
++    with open(meta_file,"w") as f:
++        json.dump(meta, f, indent=2)
++    # upload to S3
++    s3 = boto3.client("s3")
++    key = f"ibm/results/{job_id}/meta.json"
++    s3.upload_file(meta_file, s3_bucket, key)
++    s3uri = f"s3://{s3_bucket}/{key}"
++    # sign and rekor
++    rekor_info = sign_and_record(meta_file, cosign_key=os.environ.get("COSIGN_KEY"), public_key=None)
++    # MLflow log
++    mlflow.set_experiment("quantum-pilots")
++    with mlflow.start_run(run_name=f"ibm-{job_id}") as run:
++        mlflow.log_param("backend", backend_name)
++        mlflow.log_artifact(meta_file, artifact_path="meta")
++        mlflow.log_param("rekor_entry", json.dumps(rekor_info.get("rekor_entry")))
++    return {"job_id": job_id, "s3_meta": s3uri, "rekor": rekor_info}
++
++if __name__ == "__main__":
++    import argparse
++    p=argparse.ArgumentParser()
++    p.add_argument("--qasm", required=True)
++    p.add_argument("--backend", required=True)
++    p.add_argument("--s3-bucket", required=True)
++    args = p.parse_args()
++    qasm = open(args.qasm).read()
++    print(run_ibm_pilot(qasm, args.backend, args.s3_bucket))
++
+*** End Patch
+*** Begin Patch
+*** Add File:broker/k8s/cert-manager-issuer.yaml
++apiVersion: cert-manager.io/v1
++kind: ClusterIssuer
++metadata:
++  name: aegis-selfsigned
++spec:
++  selfSigned: {}
++
++---
++apiVersion: cert-manager.io/v1
++kind: Certificate
++metadata:
++  name: aegis-broker-tls
++  namespace: aegis
++spec:
++  secretName: aegis-broker-tls-secret
++  commonName: aegis-quantum-broker.aegis.svc.cluster.local
++  dnsNames:
++    - aegis-quantum-broker.aegis.svc.cluster.local
++  issuerRef:
++    name: aegis-selfsigned
++    kind: ClusterIssuer
++
+*** End Patch
+*** Begin Patch
+*** Add File:broker/terraform/rds_multi_az.tf
++/*
++Terraform example for provisioning a managed AWS RDS Postgres Multi-AZ instance.
++Use provider credentials and networking according to your cloud governance.
++*/
++provider "aws" {
++  region = var.aws_region
++}
++
++resource "aws_db_subnet_group" "aegis" {
++  name       = "aegis-db-subnet-group"
++  subnet_ids = var.db_subnet_ids
++}
++
++resource "aws_db_instance" "aegis_postgres" {
++  allocated_storage    = 100
++  engine               = "postgres"
++  engine_version       = "13.7"
++  instance_class       = "db.m6g.large"
++  name                 = "aegis_jobs"
++  username             = var.db_username
++  password             = var.db_password
++  parameter_group_name = "default.postgres13"
++  multi_az             = true
++  storage_type         = "gp2"
++  db_subnet_group_name = aws_db_subnet_group.aegis.name
++  skip_final_snapshot  = true
++}
++
++output "db_endpoint" {
++  value = aws_db_instance.aegis_postgres.address
++}
++
++variable "aws_region" { type = string }
++variable "db_subnet_ids" { type = list(string) }
++variable "db_username" { type = string }
++variable "db_password" { type = string, sensitive = true }
++
+*** End Patch
+*** Begin Patch
+*** Add File:broker/helm/values-production.yaml
++replicaCount: 2
++image:
++  repository: <registry>/aegis-quantum-broker
++  tag: production
++  pullPolicy: IfNotPresent
++env:
++  JOB_DATABASE_URL: "postgresql://aegis:REPLACE_PASSWORD@<rds-endpoint>:5432/aegis_jobs"
++  BROKER_API_JWT_SECRET: "REPLACE_WITH_SECRET_FROM_VAULT"
++  BROKER_API_JWT_ALGO: "HS256"
++resources:
++  limits:
++    cpu: 1000m
++    memory: 1Gi
++  requests:
++    cpu: 200m
++    memory: 256Mi
++
+*** End Patch
+*** Begin Patch
+*** Add File:broker/k8s/worker-deployment-autoscale.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-quantum-worker
++  namespace: aegis
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: aegis-quantum-worker
++  template:
++    metadata:
++      labels:
++        app: aegis-quantum-worker
++    spec:
++      containers:
++        - name: worker
++          image: <registry>/aegis-quantum-broker:production
++          command: ["python3","quantum/job_broker/worker_postgres_enhanced.py"]
++          resources:
++            requests:
++              cpu: "200m"
++              memory: "256Mi"
++            limits:
++              cpu: "1000m"
++              memory: "1Gi"
++          env:
++            - name: JOB_DATABASE_URL
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-db-secret
++                  key: JOB_DATABASE_URL
++            - name: BROKER_API_JWT_SECRET
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-broker-secret
++                  key: BROKER_API_JWT_SECRET
++
++---
++apiVersion: autoscaling/v2
++kind: HorizontalPodAutoscaler
++metadata:
++  name: aegis-quantum-worker-hpa
++  namespace: aegis
++spec:
++  scaleTargetRef:
++    apiVersion: apps/v1
++    kind: Deployment
++    name: aegis-quantum-worker
++  minReplicas: 2
++  maxReplicas: 10
++  metrics:
++    - type: Resource
++      resource:
++        name: cpu
++        target:
++          type: Utilization
++          averageUtilization: 60
++
+*** End Patch
+*** Begin Patch
+*** Add File:broker/quotas/cost_enforcer.py
++#!/usr/bin/env python3
++"""
++Cost enforcer service:
++ - Periodically calculates job costs from the billing table and enforces per-tenant quotas.
++ - When quota is exceeded, toggles 'fallback' mode in job broker via its admin API so new jobs run on simulator.
++ - Emits Prometheus metrics and logs actions to compliance evidence.
++"""
++import os, time, requests, psycopg2, json
++
++DB_URL = os.environ.get("JOB_DATABASE_URL")
++BROKER_ADMIN = os.environ.get("BROKER_ADMIN_URL","http://aegis-quantum-broker.aegis.svc.cluster.local/admin")
++QUOTA_THRESHOLD = float(os.environ.get("AEGIS_JOB_QUOTA_THRESHOLD", "1000.0"))  # currency units
++
++def get_total_monthly_cost():
++    with psycopg2.connect(DB_URL) as conn:
++        cur = conn.cursor()
++        cur.execute("SELECT COALESCE(SUM(cost),0) FROM billing WHERE recorded_at >= date_trunc('month', current_date);")
++        r = cur.fetchone()
++        return float(r[0] or 0.0)
++
++def set_broker_fallback(enabled=True):
++    url = BROKER_ADMIN + "/set-fallback"
++    resp = requests.post(url, json={"fallback": enabled}, timeout=10)
++    return resp.status_code, resp.text
++
++if __name__ == "__main__":
++    while True:
++        total = get_total_monthly_cost()
++        print("Current month cost:", total)
++        if total > QUOTA_THRESHOLD:
++            print("Quota exceeded; enabling fallback mode")
++            set_broker_fallback(True)
++        else:
++            set_broker_fallback(False)
++        time.sleep(300)
++
+*** End Patch
+*** Begin Patch
+*** Add File:observability/alertmanager/fallback_webhook_handler.py
++#!/usr/bin/env python3
++"""
++Simple Alertmanager webhook receiver that triggers broker fallback actions when cost or queue alerts fire.
++Deploy behind a service and configure Alertmanager webhook to point here.
++"""
++from flask import Flask, request, jsonify
++import requests, os, json
++
++BROKER_ADMIN = os.environ.get("BROKER_ADMIN_URL","http://aegis-quantum-broker.aegis.svc.cluster.local/admin")
++
++app = Flask(__name__)
++
++@app.route("/webhook", methods=["POST"])
++def webhook():
++    data = request.get_json()
++    # Basic logic: if alert name is QuantumBrokerHighQueue or cost related, enable fallback
++    alerts = data.get("alerts", [])
++    for a in alerts:
++        name = a.get("labels",{}).get("alertname","")
++        if name in ("QuantumBrokerHighQueue","CostBudgetExceeded"):
++            requests.post(f"{BROKER_ADMIN}/set-fallback", json={"fallback": True}, timeout=5)
++    return jsonify({"ok": True})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=8085)
++
+*** End Patch
+*** Begin Patch
+*** Add File:repro/noise_capture_standard.py
++#!/usr/bin/env python3
++"""
++Standardized noise capture for hardware runs:
++ - For IBM: use backend.properties() and map to a normalized JSON schema
++ - For Braket: parse returned calibration artifacts (if present) and normalize
++ - Store to S3/lakeFS with path: quantum/noise/{provider}/{backend}/{date}/{job_id}.json
++"""
++import json, time, os, boto3
++
++def store_noise(provider, backend, job_id, noise_json, s3_bucket, prefix="quantum/noise"):
++    path = f"{prefix}/{provider}/{backend}/{time.strftime('%Y%m%d')}/{job_id}.json"
++    s3 = boto3.client("s3")
++    s3.put_object(Bucket=s3_bucket, Key=path, Body=json.dumps(noise_json).encode("utf-8"))
++    return f"s3://{s3_bucket}/{path}"
++
+*** End Patch
+*** Begin Patch
+*** Add File:compliance/vendor_onboarding/README_VENDORS.md
++Vendor onboarding checklist (quantum / HSM)
++=========================================
++1. Collect vendor PKI/HSM capabilities and PKCS#11 module information
++2. Confirm audit log access (syslog/S3 export) and retention policy
++3. Request vendor security evidence & certifications (SOC2, ISO)
++4. Negotiate export-control and data residency clauses
++5. Provision staging HSM / cloud HSM instance and perform test sign/verify
++6. Create production runbook and rotate sample keys into Vault
++
++Keep completed items in compliance/evidence/.
++
+*** End Patch
+*** Begin Patch
+*** Add File:compliance/soc2/update_evidence_for_pq.sh
++#!/usr/bin/env bash
++set -euo pipefail
++OUTDIR=${1:-/tmp/aegis-soc2-pq-evidence}
++mkdir -p "$OUTDIR"
++echo "Gathering copious evidence for PQ/HSM flows..."
++kubectl get secret aegis-pkcs11-config -n aegis -o yaml > "$OUTDIR/pkcs11_secret.yaml" || true
++vault kv get -format=json secret/pq-keys/customer1 > "$OUTDIR/pq_keys.json" || true
++kubectl logs -n aegis deployment/aegis-quantum-broker > "$OUTDIR/broker.log" || true
++aws s3 ls s3://$HSM_AUDIT_BUCKET/hsm-audit/ > "$OUTDIR/hsm_audit_list.txt" || true
++tar czf "${OUTDIR}.tar.gz" -C "$(dirname "$OUTDIR")" "$(basename "$OUTDIR")"
++echo "Evidence bundle: ${OUTDIR}.tar.gz"
++
+*** End Patch
+*** Begin Patch
+*** Add File:runbooks/e2e_staging_pilot_runbook.md
++# End-to-end Staging Pilot Runbook — HSM sign → QPU job → Rekor → Audit
++
++Prereqs:
++ - Staging HSM (SoftHSM or vendor HSM) accessible to signing service
++ - Broker deployed in staging with Postgres and worker autoscaling enabled
++ - Braket and/or IBM provider credentials in Vault
++ - cosign & rekor-cli installed in runner
++
++Steps:
++1. Provision test key in HSM and export public key; store public key in Vault at secret/pq-keys/test-customer
++2. Create demo QASM program and upload to staging S3 bucket
++3. Run pilot script (providers/pilot/braket_pilot.py or providers/pilot/ibm_pilot.py)
++4. Confirm MLflow run was created and has Rekor entry tag
++5. Verify Rekor entry via rekor-cli and include entry in compliance bundle
++6. Check HSM audit logs uploaded to S3 and include in evidence bundle
++
++Acceptance:
++ - Signed metadata present in Rekor and MLflow
++ - Raw job artifacts stored and accessible in lakeFS/S3
++ - HSM audit logs present and readable
++ - Alerts & fallback behavior tested (simulate quota exceed)
++
+*** End Patch
+*** End Patch

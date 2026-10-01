@@ -1,0 +1,399 @@
+*** Begin Patch
+*** Add File: vault/scripts/store_real_provider_creds.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Operator helper: store real quantum provider credentials in Vault KV (KV v2)
++#
++# Usage:
++#   VAULT_ADDR=https://vault.example VAULT_TOKEN=... ./store_real_provider_creds.sh
++
++: "${VAULT_ADDR:?Please set VAULT_ADDR}"
++: "${VAULT_TOKEN:?Please set VAULT_TOKEN}"
++
++echo "Logging into Vault..."
++vault login "${VAULT_TOKEN}" >/dev/null
++
++read -p "IBM Quantum API key (paste, or leave empty to skip): " IBM_KEY
++if [ -n "$IBM_KEY" ]; then
++  vault kv put secret/aegis/quantum/ibm api_key="${IBM_KEY}"
++  echo "Stored IBM API key at secret/aegis/quantum/ibm"
++else
++  echo "Skipping IBM"
++fi
++
++read -p "AWS Access Key ID for Braket (or leave empty): " AWS_KEY
++if [ -n "$AWS_KEY" ]; then
++  read -s -p "AWS Secret Access Key: " AWS_SECRET
++  echo
++  vault kv put secret/aegis/quantum/braket aws_access_key_id="${AWS_KEY}" aws_secret_access_key="${AWS_SECRET}"
++  echo "Stored Braket credentials at secret/aegis/quantum/braket"
++else
++  echo "Skipping Braket"
++fi
++
++echo "Operator note: rotate credentials via Vault UI or CLI and update CI/staging roles to read only."
++
+*** End Patch
+*** Begin Patch
+*** Add File: quantum/submit_service.py
++#!/usr/bin/env python3
++"""
++HTTP submit service for quantum jobs (staging).
++ - POST /submit  -> enqueues a job in the job DB and returns a local job id
++ - GET  /status/{local_id} -> returns job status and provider job id if available
++ - Requires no direct direct provider credentials; workers pull creds from Vault
++
++This service is intended to run in staging and be reachable by CI/operator components.
++"""
++import os, json, time
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++from quantum.job_queue import enqueue_job, conn
++from observability.audit_indexer import write_record
++
++app = FastAPI(title="Quantum Submit Service")
++
++class SubmitIn(BaseModel):
++    backend: str = "simulator"   # simulator | ibm | braket
++    qasm: str = None
++    qiskit_json: dict = None
++    shots: int = 1024
++    tenant: str = "staging"
++    require_approval: bool = False
++
++@app.post("/submit")
++def submit(j: SubmitIn):
++    payload = {"backend": j.backend, "qasm": j.qasm, "qiskit_json": j.qiskit_json, "shots": j.shots, "tenant": j.tenant, "require_approval": j.require_approval}
++    local_id = enqueue_job(payload)
++    write_record("quantum_submit_service", {"local_id": local_id, "payload": payload})
++    return {"local_id": local_id}
++
++@app.get("/status/{local_id}")
++def status(local_id: int):
++    c = conn(); cur = c.cursor()
++    cur.execute("SELECT id,job_id,status,tenant,backend,created_at,updated_at FROM jobs WHERE id=?", (local_id,))
++    r = cur.fetchone()
++    if not r:
++        raise HTTPException(status_code=404, detail="job not found")
++    id, job_id, status, tenant, backend, created_at, updated_at = r
++    return {"local_id": id, "provider_job_id": job_id, "status": status, "tenant": tenant, "backend": backend, "created_at": created_at, "updated_at": updated_at}
++
++@app.get("/health")
++def health():
++    return {"ok": True}
++
++if __name__=="__main__":
++    import uvicorn
++    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT","8312")))
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/quantum/submit-service-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: quantum-submit-service
++  namespace: aegis
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: quantum-submit-service
++  template:
++    metadata:
++      labels:
++        app: quantum-submit-service
++    spec:
++      containers:
++        - name: submit
++          image: aegis/quantum-submit:latest
++          ports:
++            - containerPort: 8312
++          env:
++            - name: REDIS_URL
++              value: "redis://redis:6379/9"
++            - name: QUANTUM_JOB_DB
++              value: "/data/quantum_jobs.sqlite"
++          volumeMounts:
++            - name: data
++              mountPath: /data
++      volumes:
++        - name: data
++          emptyDir: {}
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: quantum-submit-service
++  namespace: aegis
++spec:
++  selector:
++    app: quantum-submit-service
++  ports:
++    - port: 8312
++      targetPort: 8312
++
+*** End Patch
+*** Begin Patch
+*** Add File: quantum/staging/submit_and_wait.py
++#!/usr/bin/env python3
++"""
++CLI to submit an audited QPU job in staging:
++ - Creates an approval request in the Approval Orchestrator
++ - Waits for operator approval (polls /pending)
++ - When approved, calls quantum submit service to enqueue job
++ - Polls job status until provider job id assigned and returns it
++ - Logs audit info (writes a local report and prints URLs to audit index / compliance bucket)
++
++Usage:
++  APPROVAL_API=http://approval-orchestrator.aegis.svc:8207 \
++  SUBMIT_API=http://quantum-submit-service.aegis.svc:8312 \
++  python quantum/staging/submit_and_wait.py --backend ibm --qasm ./tests/bell.qasm --tenant staging-team
++"""
++import os, time, json, requests, sys, argparse
++
++APPROVAL_API = os.environ.get("APPROVAL_API", "http://approval-orchestrator.aegis.svc:8207")
++SUBMIT_API = os.environ.get("SUBMIT_API", "http://quantum-submit-service.aegis.svc:8312")
++
++def create_approval(plan):
++    r = requests.post(f"{APPROVAL_API}/submit", json={"plan": plan, "tenant": plan.get("tenant","staging")}, timeout=10)
++    r.raise_for_status()
++    resp = r.json()
++    return resp.get("id")
++
++def wait_for_approval(aid, timeout=3600, poll=10):
++    print("Waiting for approval id", aid)
++    deadline = time.time() + timeout
++    while time.time() < deadline:
++        r = requests.get(f"{APPROVAL_API}/pending", timeout=10)
++        r.raise_for_status()
++        pending = r.json()
++        for p in pending:
++            if p.get("id") == aid:
++                if p.get("status") == "approved":
++                    print("Approved")
++                    return True
++                if p.get("status") == "rejected":
++                    raise RuntimeError("Approval rejected")
++                # still pending
++                break
++        print("Still pending... sleeping", poll)
++        time.sleep(poll)
++    raise RuntimeError("Approval timed out")
++
++def submit_job(payload):
++    r = requests.post(f"{SUBMIT_API}/submit", json=payload, timeout=10)
++    r.raise_for_status()
++    return r.json().get("local_id")
++
++def wait_for_job(local_id, timeout=3600, poll=10):
++    print("Polling job status for local_id", local_id)
++    deadline = time.time() + timeout
++    while time.time() < deadline:
++        r = requests.get(f"{SUBMIT_API}/status/{local_id}", timeout=10)
++        r.raise_for_status()
++        s = r.json()
++        print("Status:", s)
++        if s.get("status") in ("submitted","completed","failed","throttled"):
++            return s
++        time.sleep(poll)
++    raise RuntimeError("Job status timed out")
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--backend", default="ibm")
++    p.add_argument("--qasm", default=None)
++    p.add_argument("--shots", type=int, default=1024)
++    p.add_argument("--tenant", default="staging")
++    args = p.parse_args()
++    plan = {"type":"qpu_run", "backend": args.backend, "qasm": None if not args.qasm else open(args.qasm).read(), "shots": args.shots, "tenant": args.tenant}
++    print("Submitting approval request...")
++    aid = create_approval(plan)
++    print("Approval id:", aid)
++    print("Waiting for operator to approve in Approval UI...")
++    try:
++        wait_for_approval(aid, timeout=7200, poll=15)
++    except Exception as e:
++        print("Approval failed or timed out:", e); sys.exit(2)
++    print("Submitting job to submit service...")
++    local = submit_job({"backend": args.backend, "qasm": plan["qasm"], "shots": args.shots, "tenant": args.tenant})
++    print("Local job id:", local)
++    status = wait_for_job(local, timeout=7200, poll=20)
++    print("Final status:", json.dumps(status, indent=2))
++    # produce local report
++    out = {"approval_id": aid, "local_job": status}
++    fn = f"/tmp/quantum_run_report_{int(time.time())}.json"
++    open(fn,"w").write(json.dumps(out, indent=2))
++    print("Wrote report to", fn)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: .github/workflows/quantum_staging_approval_and_run.yml
++name: Quantum Staging Approval & Run
++on:
++  workflow_dispatch:
++    inputs:
++      backend:
++        required: true
++      qasm_path:
++        required: false
++      tenant:
++        required: false
++
++jobs:
++  request-and-run:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Submit approval request and print id (CI -> operator)
++        env:
++          APPROVAL_API: ${{ secrets.APPROVAL_API }}
++        run: |
++          python - <<'PY'
++import os,sys,json,requests
++plan = {"type":"qpu_run","backend":"${{ github.event.inputs.backend }}","tenant":"${{ github.event.inputs.tenant or 'staging' }}"}
++if "${{ github.event.inputs.qasm_path }}" != "":
++    plan["qasm"] = open("${{ github.event.inputs.qasm_path }}").read()
++r = requests.post(os.environ["APPROVAL_API"] + "/submit", json={"plan": plan, "tenant": plan["tenant"]})
++print("Approval response:", r.text)
++PY
++      - name: WAIT_FOR_OPERATOR (manual)
++        run: |
++          echo "Operator must approve via Approval UI. After approval, run the 'run-quantum-job' workflow with same params to proceed."
++
+*** End Patch
+*** Begin Patch
+*** Add File: quantum/reconcile_provider_billing.py
++#!/usr/bin/env python3
++"""
++Reconcile provider invoices (IBM, Braket) against recorded quantum jobs and runtime.
++ - Uses Vault to fetch provider API credentials (operators must provision)
++ - Queries provider billing or cost APIs (stubs/fallbacks provided)
++ - Queries local audit (OpenSearch) for quantum_job_submitted records and sums estimated runtime/cost
++ - Produces a reconciliation report and writes to COMPLIANCE_BUCKET (S3) and audit_indexer
++
++Note: provider billing APIs vary; this script contains placeholders that must be adapted for your provider account(s).
++"""
++import os, json, time
++from observability.audit_indexer import write_record
++try:
++    from elasticsearch import Elasticsearch
++except Exception:
++    Elasticsearch = None
++try:
++    import boto3
++except Exception:
++    boto3 = None
++try:
++    from secrets.vault_client import get_secret
++except Exception:
++    def get_secret(path, key=None):
++        return None
++
++ES_HOST = os.environ.get("ES_HOST")
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++S3 = boto3.client("s3") if boto3 and COMPLIANCE_BUCKET else None
++
++def fetch_audit_jobs(index="aegis-audit*"):
++    if not Elasticsearch or not ES_HOST:
++        print("ES not configured; cannot fetch audit jobs")
++        return []
++    es = Elasticsearch([ES_HOST])
++    q = {"query": {"term": {"kind": "quantum_job_submitted"}} , "size": 10000}
++    res = es.search(index=index, body=q)
++    hits = res.get("hits",{}).get("hits",[])
++    jobs = [h["_source"]["record"] for h in hits]
++    return jobs
++
++def fetch_ibm_invoices_stub():
++    # Placeholder: operator must implement API calls to IBM billing
++    # For the stub, return an empty list or a mocked invoice
++    return [{"tenant":"staging","cost": 0.5, "period":"2025-01"}]
++
++def reconcile():
++    jobs = fetch_audit_jobs()
++    summary = {}
++    for j in jobs:
++        t = j.get("tenant","unknown")
++        summary.setdefault(t, {"jobs":0,"est_cost":0.0})
++        summary[t]["jobs"] += 1
++        # naive cost estimation: shots/1000 * 0.001
++        est = (j.get("shots",1024)/1000.0) * 0.001
++        summary[t]["est_cost"] += est
++    provider_invoices = fetch_ibm_invoices_stub()
++    # assemble report
++    report = {"ts": int(time.time()), "summary": summary, "invoices": provider_invoices}
++    write_record("quantum_billing_reconcile", report)
++    if S3:
++        key = f"quantum/reconcile/{int(time.time())}.json"
++        S3.put_object(Bucket=COMPLIANCE_BUCKET, Key=key, Body=json.dumps(report))
++    print("Wrote reconciliation report")
++    return report
++
++if __name__=="__main__":
++    reconcile()
++
+*** End Patch
+*** Begin Patch
+*** Add File: tests/quantum_end_to_end_staging.sh
++#!/usr/bin/env bash
++#
++# Minimal end-to-end staging smoke script:
++# 1) Submit approval (manual operator approval required)
++# 2) After approval, submit job via submit_service
++# 3) Poll job status until dispatched or failed
++# 4) Run reconciliation script to produce report
++
++set -euo pipefail
++: "${APPROVAL_API:?Please set APPROVAL_API env var}"
++: "${SUBMIT_API:?Please set SUBMIT_API env var}"
++
++QASM_PATH=${QASM_PATH:-tests/bell.qasm}
++TENANT=${TENANT:-staging}
++
++echo "Submitting approval request..."
++PAYLOAD=$(jq -n --arg b "ibm" --arg t "$TENANT" --arg q "$(sed ':a;N;$!ba;s/\n/\\n/g' $QASM_PATH)" '{type:"qpu_run", backend:$b, tenant:$t, qasm:$q}')
++APPR_ID=$(curl -s -X POST "${APPROVAL_API}/submit" -H "Content-Type: application/json" -d "{\"plan\": $PAYLOAD}" | jq -r '.id')
++echo "Approval id: $APPR_ID"
++echo "Operator must approve via Approval UI. Exiting; resume after approval by running the next steps."
++echo "After approval, run: ./tests/quantum_end_to_end_staging_continue.sh $APPR_ID"
++
+*** End Patch
+*** Begin Patch
+*** Add File: tests/quantum_end_to_end_staging_continue.sh
++#!/usr/bin/env bash
++#
++# Continue after operator approval:
++# Usage: ./tests/quantum_end_to_end_staging_continue.sh <approval_id>
++set -euo pipefail
++: "${SUBMIT_API:?Please set SUBMIT_API env var}"
++APPR_ID=${1:?approval id required}
++QASM_PATH=${QASM_PATH:-tests/bell.qasm}
++TENANT=${TENANT:-staging}
++
++echo "Submitting job to submit-service..."
++QASM_CONTENT=$(sed ':a;N;$!ba;s/\n/\\n/g' $QASM_PATH)
++LOCAL_ID=$(curl -s -X POST "${SUBMIT_API}/submit" -H "Content-Type: application/json" -d "{\"backend\":\"ibm\",\"qasm\":\"${QASM_CONTENT}\",\"shots\":1024,\"tenant\":\"${TENANT}\",\"require_approval\":false}" | jq -r '.local_id')
++echo "Local job id: $LOCAL_ID"
++
++echo "Polling status..."
++for i in $(seq 1 120); do
++  STATUS=$(curl -s "${SUBMIT_API}/status/${LOCAL_ID}")
++  echo "$STATUS"
++  JOB_STATUS=$(echo "$STATUS" | jq -r '.status')
++  if [ "$JOB_STATUS" = "submitted" ] || [ "$JOB_STATUS" = "failed" ] || [ "$JOB_STATUS" = "throttled" ]; then
++    echo "Final: $STATUS"
++    break
++  fi
++  sleep 10
++done
++
++echo "Running basic reconciliation (local stub)"
++python quantum/reconcile_provider_billing.py
++
+*** End Patch
+*** End Patch

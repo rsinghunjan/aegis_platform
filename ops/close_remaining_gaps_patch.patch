@@ -1,0 +1,509 @@
+*** Begin Patch
+*** Add File:ops/carbon/dcgm_prometheus_mapper.py
++#!/usr/bin/env python3
++"""
++Map DCGM/Prometheus GPU metrics to pods/workflows.
++This script queries Prometheus for DCGM metrics that have pod/container labels (device-plugin or dcgm-exporter must be configured to expose these),
++aggregates per-pod GPU power/utilization and writes per-workflow attribution records for downstream processing.
++
++Requirements: PROM_URL env set to Prometheus (e.g., http://prometheus:9090)
++
++Usage: run as a cron or short-lived job to produce attribution JSONL into CARBON_ATTR_OUT
++"""
++import os
++import time
++import json
++import requests
++from collections import defaultdict
++
++PROM_URL = os.environ.get("PROM_URL", "http://prometheus:9090")
++CARBON_ATTR_OUT = os.environ.get("CARBON_ATTR_OUT", "/var/lib/aegis/carbon_by_workflow")
++EMISSIONS_FACTOR = float(os.environ.get("EMISSIONS_FACTOR_KGCO2_PER_KWH", "0.475"))
++
++def query_prom(query: str):
++    r = requests.get(f"{PROM_URL}/api/v1/query", params={"query": query}, timeout=10)
++    r.raise_for_status()
++    return r.json().get("data", {}).get("result", [])
++
++def collect_gpu_metrics():
++    # metrics names depend on exporter; common ones: dcgm_gpu_power, dcgm_gpu_utilization
++    res_power = query_prom("dcgm_gpu_power_watts")
++    res_util = query_prom("dcgm_gpu_utilization")
++    # map (namespace,pod) -> power/util
++    pod_stats = defaultdict(lambda: {"power_w":0.0, "util":0.0, "samples":0})
++    for item in res_power:
++        metric = item.get("metric", {})
++        value = float(item.get("value",[0,0])[1])
++        pod = metric.get("pod") or metric.get("kubernetes_pod_name") or metric.get("container_label_io_kubernetes_pod_name")
++        ns = metric.get("namespace") or metric.get("kubernetes_namespace")
++        if pod:
++            key = f"{ns}/{pod}"
++            pod_stats[key]["power_w"] += value
++            pod_stats[key]["samples"] += 1
++    for item in res_util:
++        metric = item.get("metric", {})
++        value = float(item.get("value",[0,0])[1])
++        pod = metric.get("pod") or metric.get("kubernetes_pod_name") or metric.get("container_label_io_kubernetes_pod_name")
++        ns = metric.get("namespace") or metric.get("kubernetes_namespace")
++        if pod:
++            key = f"{ns}/{pod}"
++            pod_stats[key]["util"] += value
++    # finalize averages
++    out = {}
++    for k,v in pod_stats.items():
++        s = max(1, v["samples"])
++        out[k] = {"avg_power_w": v["power_w"]/s, "avg_util": v["util"]/s}
++    return out
++
++def map_pod_to_workflow(ns_pod: str):
++    # ns_pod format ns/pod
++    ns, pod = ns_pod.split("/",1)
++    # best-effort: read local cache injected by node reporter, fallback to label fetch via K8s (not implemented here)
++    # For now derive workflow name from pod label convention: pod names for Argo workflows include workflow name as prefix
++    # e.g., aegis-carla-xyz-123 -> workflow name aegis-carla-xyz
++    parts = pod.split("-")
++    if len(parts) >= 3 and parts[-2].isdigit():
++        return "-".join(parts[:-2])
++    # fallback
++    return "<unknown>"
++
++def write_attributes(attrs):
++    os.makedirs(CARBON_ATTR_OUT, exist_ok=True)
++    fname = os.path.join(CARBON_ATTR_OUT, f"prom_attr_{int(time.time())}.jsonl")
++    with open(fname, "w") as fh:
++        for wf, rec in attrs.items():
++            fh.write(json.dumps({"workflow":wf, "avg_power_w":rec["avg_power_w"], "avg_util":rec["avg_util"], "ts":int(time.time())}) + "\n")
++    return fname
++
++def main():
++    pod_stats = collect_gpu_metrics()
++    # aggregate per-workflow
++    wf_agg = defaultdict(lambda: {"avg_power_w":0.0, "avg_util":0.0, "count":0})
++    for ns_pod, stats in pod_stats.items():
++        wf = map_pod_to_workflow(ns_pod)
++        wf_agg[wf]["avg_power_w"] += stats["avg_power_w"]
++        wf_agg[wf]["avg_util"] += stats["avg_util"]
++        wf_agg[wf]["count"] += 1
++    # average per-workflow
++    attrs={}
++    for wf,v in wf_agg.items():
++        c = max(1,v["count"])
++        attrs[wf] = {"avg_power_w": v["avg_power_w"]/c, "avg_util": v["avg_util"]/c}
++    out = write_attributes(attrs)
++    print("wrote", out)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/aws_cost_calibrator.py
++#!/usr/bin/env python3
++"""
++Calibrate cost -> kWh conversion factor using AWS Cost Explorer and observed energy telemetry.
++Operator workflow:
++  - Provide start/end ISO dates and an observed energy_kwh number (from telemetry/attribution)
++  - Script computes implied kWh per $ and writes to a small calibration file used by provider integrations.
++"""
++import os
++import boto3
++import argparse
++import json
++
++OUT_FILE = os.environ.get("COST_CAL_FILE", "/var/lib/aegis/carbon_cost_cal.json")
++
++def query_cost(start, end):
++    ce = boto3.client("ce")
++    res = ce.get_cost_and_usage(TimePeriod={"Start":start,"End":end}, Granularity="DAILY", Metrics=["BlendedCost"])
++    total = 0.0
++    for d in res.get("ResultsByTime", []):
++        total += float(d.get("Total", {}).get("BlendedCost", {}).get("Amount", 0.0))
++    return total
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--start", required=True)
++    p.add_argument("--end", required=True)
++    p.add_argument("--observed_kwh", required=True, type=float, help="Observed energy usage (kWh) for period")
++    args = p.parse_args()
++    cost = query_cost(args.start, args.end)
++    conv = args.observed_kwh / max(1e-6, cost)
++    out = {"start":args.start, "end":args.end, "cost_usd": cost, "observed_kwh": args.observed_kwh, "kwh_per_usd": conv}
++    os.makedirs(os.path.dirname(OUT_FILE), exist_ok=True)
++    with open(OUT_FILE, "w") as fh:
++        json.dump(out, fh)
++    print("wrote calibration:", OUT_FILE, out)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/gatekeeper/gatekeeper_apply_budget.py
++#!/usr/bin/env python3
++"""
++Utility to create/patch Gatekeeper ConstraintConfig or ConfigMap used by admission constraints.
++This small helper toggles the aegis-carbon-status ConfigMap that Gatekeeper policies consult.
++"""
++import os
++import sys
++from kubernetes import client, config
++
++def ensure_configmap(status="ok"):
++    try:
++        config.load_kube_config()
++    except Exception:
++        config.load_incluster_config()
++    core = client.CoreV1Api()
++    name="aegis-carbon-status"
++    ns="kube-system"
++    body = client.V1ConfigMap(metadata=client.V1ObjectMeta(name=name), data={"status":status})
++    try:
++        core.replace_namespaced_config_map(name, ns, body)
++    except client.exceptions.ApiException:
++        core.create_namespaced_config_map(ns, body)
++    print("set aegis-carbon-status to", status)
++
++if __name__=="__main__":
++    s = sys.argv[1] if len(sys.argv)>1 else "exceeded"
++    ensure_configmap(s)
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/milvus/service-monitor.yaml
++apiVersion: monitoring.coreos.com/v1
++kind: ServiceMonitor
++metadata:
++  name: milvus-monitor
++  namespace: milvus
++  labels:
++    release: prometheus
++spec:
++  selector:
++    matchLabels:
++      app.kubernetes.io/instance: milvus
++  endpoints:
++    - port: http
++      interval: 30s
++      path: /metrics
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/vector/milvus/backup_cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: milvus-backup
++  namespace: default
++spec:
++  schedule: "0 3 * * *"
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          containers:
++            - name: backup
++              image: python:3.11-slim
++              command: ["sh","-c","pip install pymilvus numpy && python /opt/aegis/milvus_ha_backup.py"]
++              volumeMounts:
++                - name: code
++                  mountPath: /opt/aegis
++          restartPolicy: OnFailure
++          volumes:
++            - name: code
++              hostPath:
++                path: ./ops/multimodal
++                type: Directory
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/multimodal/ingest_queue_worker.py
++#!/usr/bin/env python3
++"""
++Redis-backed ingest queue worker to add backpressure and scale ingestion.
++Producer pushes file paths to 'aegis:ingest:queue' list.
++Worker pops items, processes (video->frames / pcd->voxel) and writes Parquet shards.
++
++Requires redis-py: pip install redis
++"""
++import os
++import time
++import json
++import redis
++from ops.multimodal.stream_ingest import extract_frames, voxel_downsample_bin, write_manifest
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
++QUEUE_KEY = os.environ.get("INGEST_QUEUE_KEY", "aegis:ingest:queue")
++OUT_ROOT = os.environ.get("FEATURESTORE_ROOT", "/var/lib/aegis/featurestore")
++
++r = redis.from_url(REDIS_URL)
++
++def process_item(item):
++    try:
++        job = json.loads(item)
++        path = job.get("path")
++        if path.endswith((".mp4",".mov",".mkv")):
++            frames = extract_frames(path, f"/tmp/{os.path.basename(path)}", fps=1)
++            rows = [{"type":"video_frame","file":f["file"], "ts": f["ts"]} for f in frames]
++        else:
++            out, cnt = voxel_downsample_bin(path)
++            rows = [{"type":"pcd_voxel","file": out, "count": cnt, "ts": int(time.time())}]
++        # write a shard
++        write_manifest(rows, f"queue_manifest_{int(time.time())}.parquet")
++        return True
++    except Exception as e:
++        print("process error", e)
++        return False
++
++def main():
++    while True:
++        item = r.blpop(QUEUE_KEY, timeout=10)
++        if not item:
++            continue
++        _, payload = item
++        if isinstance(payload, bytes):
++            payload = payload.decode()
++        ok = process_item(payload)
++        if not ok:
++            # push to dead-letter or sleep
++            print("failed processing", payload)
++            time.sleep(5)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/multimodal/s3_apply_tiering.py
++#!/usr/bin/env python3
++"""
++Apply S3 lifecycle/tiering policy to a bucket (uses boto3).
++"""
++import os
++import boto3
++import json
++
++POLICY_FILE = os.environ.get("S3_TIER_POLICY_FILE", "ops/multimodal/s3_tiering_policy.json")
++BUCKET = os.environ.get("FEATURESTORE_S3", "")
++
++def apply_policy(bucket, policy_file):
++    s3 = boto3.client("s3")
++    with open(policy_file) as fh:
++        policy = json.load(fh)
++    s3.put_bucket_lifecycle_configuration(Bucket=bucket, LifecycleConfiguration=policy)
++    print("applied lifecycle policy to", bucket)
++
++if __name__ == "__main__":
++    if not BUCKET:
++        print("FEATURESTORE_S3 not set")
++    else:
++        apply_policy(BUCKET, POLICY_FILE)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/generative/nli_verifier.py
++#!/usr/bin/env python3
++"""
++NLI-based hallucination verifier:
++ - Uses a HuggingFace Inference API (HF_API_URL + HF_API_TOKEN) to run an entailment model or a local endpoint.
++ - verify_entailment(premise, hypothesis) returns score/probability that hypothesis is entailed by premise.
++"""
++import os
++import requests
++
++HF_API_URL = os.environ.get("HF_API_URL", "")  # e.g., https://api-inference.huggingface.co/models/roberta-large-mnli
++HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "")
++
++def verify_entailment(premise: str, hypothesis: str):
++    if not HF_API_URL:
++        # fallback: naive substring check
++        return {"score": 0.0, "entailment": premise.lower() in hypothesis.lower()}
++    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"} if HF_API_TOKEN else {}
++    payload = {"inputs": {"premise": premise, "hypothesis": hypothesis}}
++    r = requests.post(HF_API_URL, json=payload, headers=headers, timeout=10)
++    r.raise_for_status()
++    # HF returns labels/scores; normalize
++    resp = r.json()
++    # Expect classification scores; return as-is
++    return resp
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/generative/hallucination_verifier_integration.py
++#!/usr/bin/env python3
++"""
++Wrap hallucination_checker to include NLI verifier for stronger signals.
++"""
++from ops.generative.hallucination_checker import verify as simple_verify
++from ops.generative.nli_verifier import verify_entailment
++
++def verify_with_nli(answer: str, docs: list, threshold: float = 0.35):
++    base = simple_verify(answer, docs, threshold=threshold)
++    # For each doc, run entailment check; if any doc strongly entails answer, pass
++    for d in docs:
++        text = d.get("text", d.get("source",""))
++        try:
++            ent = verify_entailment(text, answer)
++            # simple heuristic: if API returns a label 'ENTAILMENT' high score -> pass
++            if isinstance(ent, dict) and ent.get("label") in ("ENTAILMENT","entailment") or ent.get("entailment_score",0) > 0.7:
++                return {"pass": True, "method":"nli", "details": ent}
++        except Exception:
++            continue
++    return {"pass": base.get("pass", False), "method":"basic", "details": base}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/generative/rlhf/reward_trainer.py
++#!/usr/bin/env python3
++"""
++Minimal reward model trainer skeleton that loads preference JSONL from RLHF_PREF_DIR
++and trains a tiny Transformer-based classifier using Hugging Face Trainer (placeholder).
++Operators must supply proper training infra for production-scale training.
++"""
++import os
++import json
++
++RLHF_PREF_DIR = os.environ.get("RLHF_PREF_DIR", "/var/lib/aegis/rlhf/prefs")
++OUT_DIR = os.environ.get("RLHF_MODEL_OUT", "/var/lib/aegis/rlhf/out")
++
++def load_prefs():
++    prefs = []
++    for f in os.listdir(RLHF_PREF_DIR) if os.path.exists(RLHF_PREF_DIR) else []:
++        if not f.endswith(".jsonl"):
++            continue
++        with open(os.path.join(RLHF_PREF_DIR, f)) as fh:
++            for line in fh:
++                prefs.append(json.loads(line))
++    return prefs
++
++def train_reward_model(prefs):
++    # Placeholder: operator should implement HF model training here.
++    os.makedirs(OUT_DIR, exist_ok=True)
++    ckpt = os.path.join(OUT_DIR, "reward_model.mock")
++    with open(ckpt, "w") as fh:
++        fh.write("mock reward model")
++    print("wrote mock reward model to", ckpt)
++    return ckpt
++
++if __name__ == "__main__":
++    prefs = load_prefs()
++    train_reward_model(prefs)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/agentic/train_historical_success.py
++#!/usr/bin/env python3
++"""
++Train a historical-success predictor from agent audit logs.
++ - Reads AGENT_AUDIT_DIR JSON files (each step contains result.ok true/false)
++ - Produces a simple sklearn logistic regression model saved to VERIFIER_MODEL_OUT
++"""
++import os
++import json
++import numpy as np
++from sklearn.linear_model import LogisticRegression
++import joblib
++
++AUDIT_DIR = os.environ.get("AGENT_AUDIT_DIR", "/var/lib/aegis/agent_audit")
++MODEL_OUT = os.environ.get("VERIFIER_MODEL_OUT", "/var/lib/aegis/verifier/model.pkl")
++
++def featurize_step(step):
++    # features: length of cmd, number of kubectl occurrences, whether dryrun passed
++    cmd = step.get("cmd","") or step.get("params",{}).get("cmd","")
++    kubectl = 1 if "kubectl" in (cmd or "") else 0
++    length = len(cmd)
++    ok = 1 if step.get("result",{}).get("ok", False) else 0
++    return [length, kubectl], ok
++
++def load_examples():
++    X=[]
++    y=[]
++    if not os.path.exists(AUDIT_DIR):
++        return X,y
++    for fname in os.listdir(AUDIT_DIR):
++        if not fname.endswith(".json"):
++            continue
++        with open(os.path.join(AUDIT_DIR,fname)) as fh:
++            try:
++                rec = json.load(fh)
++                if "cmd" in rec:
++                    fx, ok = featurize_step(rec)
++                    X.append(fx)
++                    y.append(ok)
++            except Exception:
++                continue
++    return X,y
++
++def train():
++    X,y = load_examples()
++    if not X:
++        print("no training data")
++        return
++    X = np.array(X)
++    y = np.array(y)
++    mdl = LogisticRegression()
++    mdl.fit(X,y)
++    os.makedirs(os.path.dirname(MODEL_OUT), exist_ok=True)
++    joblib.dump(mdl, MODEL_OUT)
++    print("trained model saved to", MODEL_OUT)
++
++if __name__ == "__main__":
++    train()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/agentic/hil_runner.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Simple HIL runner template:
++# - Runs a programmable sequence of tests on hardware-in-the-loop (or simulated HIL)
++# - Collects logs and uploads to S3 evidence bucket for audit
++#
++EVIDENCE_BUCKET=${EVIDENCE_BUCKET:-}
++TEST_SCRIPT=${1:-ops/agentic/hil_tests/test_sequence.sh}
++OUTDIR=/tmp/aegis_hil_$(date +%s)
++mkdir -p "${OUTDIR}"
++bash "${TEST_SCRIPT}" > "${OUTDIR}/hil_stdout.log" 2> "${OUTDIR}/hil_stderr.log" || true
++tar czf "${OUTDIR}.tgz" -C /tmp "$(basename ${OUTDIR})"
++if [ -n "${EVIDENCE_BUCKET}" ]; then
++  aws s3 cp "${OUTDIR}.tgz" "s3://${EVIDENCE_BUCKET}/hil_evidence/$(basename ${OUTDIR}).tgz"
++  echo "uploaded evidence to s3://${EVIDENCE_BUCKET}/hil_evidence/"
++else
++  echo "HIL evidence saved at ${OUTDIR}.tgz"
++fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/agentic/invariants.json
++{
++  "forbid": [
++    "kubectl delete",
++    "rm -rf /",
++    "dd if="
++  ],
++  "require": []
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/runbooks/productionify_gaps.md
++# Runbook: Productionify remaining gaps
++
++This document lists step-by-step actions to validate and promote the above components into production staging.
++
++1) Deploy DCGM & Prometheus exporter, ensure metrics per-container are exposed.
++2) Deploy ops/carbon/dcgm_prometheus_mapper.py as a CronJob; compare outputs with node reporter and expected energy use.
++3) Run calibration using AWS Cost Explorer (ops/carbon/aws_cost_calibrator.py) to compute kWh_per_usd and store result.
++4) Deploy close-loop scheduler and Gatekeeper (use scripts in ops/gatekeeper) and validate budget flag toggles under simulated high load.
++5) Install Milvus with production values (ops/vector/milvus/prod_values.yaml), configure ServiceMonitor and backup CronJob, run load tests.
++6) Replace LLM local stubs with LLM adapter (k8s/generative/llm-adapter-deployment.yaml) and point HF/OPENAI keys in staging.
++7) Integrate NLI verifier (ops/generative/nli_verifier.py) into RAG post-checks and validate on a held-out dataset.
++8) Run RLHF Argo workflow; collect preferences and run reward_trainer; validate reward model artifact.
++9) Train historical-success predictor from agent audit logs (ops/agentic/train_historical_success.py).
++10) Run HIL tests (ops/agentic/hil_runner.sh) and store evidence to EVIDENCE_BUCKET.
++
++Safety notice: do not enable any actuator-capable agentic promotion until HIL evidence and operator sign-off are complete.
++
+*** End Patch
+*** End Patch

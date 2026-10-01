@@ -1,0 +1,358 @@
+*** Begin Patch
+*** Add File: model_registry/policy_schema.json
++{
++  "$schema": "http://json-schema.org/draft-07/schema#",
++  "title": "Aegis Model Promotion Policy",
++  "type": "object",
++  "properties": {
++    "model_id": { "type": "string" },
++    "sensitive": { "type": "boolean", "description": "If true, requires compliance signoff before promotion" },
++    "thresholds": {
++      "type": "object",
++      "properties": {
++        "hallucination_rate": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
++        "latency_p95_seconds": { "type": "number", "minimum": 0.0 },
++        "cost_per_minute_usd": { "type": "number", "minimum": 0.0 }
++      },
++      "required": ["hallucination_rate","latency_p95_seconds","cost_per_minute_usd"]
++    },
++    "adversarial": {
++      "type": "object",
++      "properties": {
++        "manifest_path": { "type": "string", "description": "Path to adversarial prompts manifest" },
++        "required_pass": { "type": "boolean", "default": true }
++      }
++    },
++    "promotion": {
++      "type": "object",
++      "properties": {
++        "auto": { "type": "boolean", "description": "Allow automated promotion if thresholds pass" },
++        "notify_webhook": { "type": "string" }
++      }
++    }
++  },
++  "required": ["model_id","thresholds"]
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File: model_registry/sample_model_metadata.json
++{
++  "model_id": "example-model-v1",
++  "sensitive": true,
++  "thresholds": {
++    "hallucination_rate": 0.02,
++    "latency_p95_seconds": 1.5,
++    "cost_per_minute_usd": 5.0
++  },
++  "adversarial": {
++    "manifest_path": "tests/adversarial_prompts.jsonl",
++    "required_pass": true
++  },
++  "promotion": {
++    "auto": true,
++    "notify_webhook": "https://ops.example/notify"
++  }
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File: model_registry/client.py
++#!/usr/bin/env python3
++"""
++Minimal Model Registry client interactions used by the canary gate.
++Assumes a model registry HTTP API with endpoints:
++ - GET  /models/{model_id}/metadata
++ - POST /models/promote {model: <id>}
++ - POST /models/rollback {model: <id>}
++
++If a real registry is not available, this client falls back to local sample metadata file.
++"""
++import os
++import requests
++import json
++
++MODEL_REGISTRY_API = os.environ.get("MODEL_REGISTRY_API")
++SAMPLE_METADATA = os.path.join(os.path.dirname(__file__), "sample_model_metadata.json")
++
++def get_model_metadata(model_id):
++    if MODEL_REGISTRY_API:
++        try:
++            r = requests.get(f"{MODEL_REGISTRY_API}/models/{model_id}/metadata", timeout=10)
++            if r.ok:
++                return r.json()
++        except Exception:
++            pass
++    # fallback: load sample if it matches
++    try:
++        with open(SAMPLE_METADATA) as fh:
++            md = json.load(fh)
++            if md.get("model_id") == model_id:
++                return md
++    except Exception:
++        pass
++    # default conservative policy
++    return {
++        "model_id": model_id,
++        "sensitive": True,
++        "thresholds": {
++            "hallucination_rate": 0.01,
++            "latency_p95_seconds": 2.0,
++            "cost_per_minute_usd": 10.0
++        },
++        "adversarial": {"manifest_path": "tests/adversarial_prompts.jsonl", "required_pass": True},
++        "promotion": {"auto": False}
++    }
++
++def promote_model(model_id):
++    if MODEL_REGISTRY_API:
++        try:
++            r = requests.post(f"{MODEL_REGISTRY_API}/models/promote", json={"model": model_id}, timeout=10)
++            return r.ok, r.text
++        except Exception as e:
++            return False, str(e)
++    return False, "no_model_registry"
++
++def rollback_model(model_id):
++    if MODEL_REGISTRY_API:
++        try:
++            r = requests.post(f"{MODEL_REGISTRY_API}/models/rollback", json={"model": model_id}, timeout=10)
++            return r.ok, r.text
++        except Exception as e:
++            return False, str(e)
++    return False, "no_model_registry"
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/canary_gate_runner.py
++#!/usr/bin/env python3
++"""
++Canary Gate Runner
++ - Runs adversarial harness
++ - Queries OpenSearch and Prometheus for hallucination rate, latency and cost
++ - Checks compliance signoffs for sensitive models
++ - Calls model registry to promote or rollback
++ - Writes decision evidence to COMPLIANCE_BUCKET
++
++Exit codes:
++ 0 -> promoted (or no-op if already promoted)
++ 2 -> blocked / rolled back (adversarial fail, threshold breach, or missing signoff)
++ """
++import os
++import sys
++import time
++import json
++import subprocess
++import requests
++from urllib.parse import urljoin
++
++from model_registry.client import get_model_metadata, promote_model, rollback_model
++
++ES_HOST = os.environ.get("ES_HOST")
++PROM_URL = os.environ.get("PROM_URL")
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++OPERATOR_SIGNOFF_API = os.environ.get("SIGNOFF_API")  # e.g., http://compliance-signoff.svc:8315
++ADV_SCRIPT = os.environ.get("ADV_SCRIPT", "python safety/adversarial_harness.py")
++
++def run_adversarial(manifest):
++    if not os.path.exists(manifest):
++        print("Adversarial manifest not found:", manifest)
++        return False, "manifest_missing"
++    cmd = ADV_SCRIPT.split() + ["--manifest", manifest] if "--manifest" not in ADV_SCRIPT else ADV_SCRIPT.split()
++    try:
++        print("Running adversarial harness:", " ".join(cmd))
++        res = subprocess.run(cmd, check=False)
++        return res.returncode == 0, f"exit={res.returncode}"
++    except Exception as e:
++        return False, str(e)
++
++def query_opensearch_hallu(model_id, minutes=30):
++    if not ES_HOST:
++        print("ES_HOST not configured; skipping ES hallucination query")
++        return 0.0, 0
++    q = {
++      "query": {
++        "bool": {
++          "must": [
++            {"range": {"ts": {"gte": f"now-{minutes}m"}}},
++            {"term": {"kind": "hallu_check"}},
++            {"term": {"record.model_id": model_id}}
++          ]
++        }
++      },
++      "size": 1000
++    }
++    try:
++        r = requests.post(f"{ES_HOST.rstrip('/')}/aegis-audit/_search", json=q, timeout=10)
++        r.raise_for_status()
++        hits = r.json().get("hits", {}).get("hits", [])
++        total = len(hits)
++        hallu = sum(1 for h in hits if h.get("_source", {}).get("record", {}).get("is_hallucination"))
++        rate = (hallu / total) if total else 0.0
++        return rate, total
++    except Exception as e:
++        print("ES query failed:", e)
++        return 0.0, 0
++
++def query_prometheus(expr):
++    if not PROM_URL:
++        print("PROM_URL not configured; skipping Prometheus query")
++        return 0.0
++    try:
++        r = requests.get(f"{PROM_URL.rstrip('/')}/api/v1/query", params={"query": expr}, timeout=10)
++        r.raise_for_status()
++        data = r.json().get("data", {}).get("result", [])
++        if not data:
++            return 0.0
++        return float(data[0]["value"][1])
++    except Exception as e:
++        print("Prometheus query failed:", e)
++        return 0.0
++
++def check_signoffs(model_id):
++    if not OPERATOR_SIGNOFF_API:
++        print("No signoff API configured; assuming signoff present (operator must ensure policy)")
++        return True, []
++    try:
++        r = requests.get(f"{OPERATOR_SIGNOFF_API}/signoffs/{model_id}", timeout=10)
++        if not r.ok:
++            return False, []
++        items = r.json()
++        # require at least one signoff
++        return len(items) > 0, items
++    except Exception as e:
++        print("Signoff check failed:", e)
++        return False, []
++
++def record_evidence(model_id, decision, details):
++    evidence = {"model": model_id, "decision": decision, "details": details, "ts": int(time.time())}
++    if COMPLIANCE_BUCKET:
++        try:
++            import boto3, tempfile
++            s3 = boto3.client("s3")
++            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
++            tmp.write(json.dumps(evidence).encode()); tmp.flush(); tmp.close()
++            key = f"canary/actions/{model_id}_{int(time.time())}.json"
++            s3.upload_file(tmp.name, COMPLIANCE_BUCKET, key)
++            print("Uploaded evidence to s3://{}/{}".format(COMPLIANCE_BUCKET, key))
++            os.unlink(tmp.name)
++        except Exception as e:
++            print("Failed to upload evidence:", e)
++    else:
++        print("Evidence:", json.dumps(evidence, indent=2))
++
++def main():
++    if len(sys.argv) < 2:
++        print("usage: canary_gate_runner.py <model_id>")
++        sys.exit(2)
++    model_id = sys.argv[1]
++    md = get_model_metadata(model_id)
++    thresholds = md.get("thresholds", {})
++    adv_manifest = md.get("adversarial", {}).get("manifest_path", "tests/adversarial_prompts.jsonl")
++
++    adv_pass, adv_out = run_adversarial(adv_manifest)
++    print("Adversarial pass:", adv_pass, adv_out)
++    if not adv_pass and md.get("adversarial", {}).get("required_pass", True):
++        record_evidence(model_id, "blocked_adversarial_fail", {"adv_out": adv_out})
++        rollback_model(model_id)
++        sys.exit(2)
++
++    hallu_rate, hallu_total = query_opensearch_hallu(model_id, minutes=30)
++    latency = query_prometheus(f'histogram_quantile(0.95, sum(rate(llm_request_duration_seconds_bucket{{model="{model_id}"}}[5m])) by (le))')
++    cost_per_min = query_prometheus(f'rate(aegis_llm_cost_total{{model="{model_id}"}}[5m])') * 60.0
++
++    details = {"hallu_rate": hallu_rate, "hallu_samples": hallu_total, "latency_p95": latency, "cost_per_min": cost_per_min}
++    print("Metric details:", details)
++
++    breaches = []
++    if hallu_rate > thresholds.get("hallucination_rate", 1.0):
++        breaches.append("hallucination_rate")
++    if latency > thresholds.get("latency_p95_seconds", 1e9):
++        breaches.append("latency_p95_seconds")
++    if cost_per_min > thresholds.get("cost_per_minute_usd", 1e9):
++        breaches.append("cost_per_minute_usd")
++
++    if breaches:
++        record_evidence(model_id, "blocked_metric_breach", {"breaches": breaches, "metrics": details})
++        rollback_model(model_id)
++        sys.exit(2)
++
++    # check signoffs for sensitive models
++    if md.get("sensitive", False):
++        signed, signoffs = check_signoffs(model_id)
++        if not signed:
++            record_evidence(model_id, "blocked_missing_signoff", {"required": True})
++            rollback_model(model_id)
++            sys.exit(2)
++    # all checks passed: promote
++    ok, resp = promote_model(model_id)
++    record_evidence(model_id, "promote" if ok else "promote_failed", {"resp": resp})
++    if ok:
++        print("Promotion succeeded for", model_id)
++        sys.exit(0)
++    else:
++        print("Promotion failed:", resp)
++        sys.exit(2)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: .github/workflows/canary_promotion_gate.yml
++name: Canary Promotion Gate
++on:
++  workflow_dispatch:
++    inputs:
++      model_id:
++        required: true
++
++jobs:
++  gate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python deps
++        run: |
++          python -m pip install --upgrade pip
++          pip install requests boto3 elasticsearch
++      - name: Run canary gate runner
++        env:
++          ES_HOST: ${{ secrets.ES_HOST }}
++          PROM_URL: ${{ secrets.PROM_URL }}
++          COMPLIANCE_BUCKET: ${{ secrets.COMPLIANCE_BUCKET }}
++          MODEL_REGISTRY_API: ${{ secrets.MODEL_REGISTRY_API }}
++          SIGNOFF_API: ${{ secrets.SIGNOFF_API }}
++          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
++          ADV_MANIFEST: tests/adversarial_prompts.jsonl
++        run: |
++          python scripts/canary_gate_runner.py "${{ github.event.inputs.model_id }}"
++
+*** End Patch
+*** Begin Patch
+*** Add File: docs/promotion_policy.md
++# Model Promotion Policy (Aegis)
++
++Overview
++- The promotion policy defines objective thresholds and controls used by the canary automation gate to promote or rollback models.
++ - policy schema: model_registry/policy_schema.json
++ - example metadata: model_registry/sample_model_metadata.json
++
++Fields
++- model_id: model identifier in registry.
++- sensitive: when true, promotions require one or more compliance signoffs (auditor/manager).
++- thresholds:
++  - hallucination_rate: fraction (0..1) of hallucination checks allowed in the lookback window.
++  - latency_p95_seconds: 95th percentile latency SLO.
++  - cost_per_minute_usd: estimated cost threshold per minute.
++- adversarial: path to adversarial manifest; if required_pass is true and adversarial harness fails, promotion is blocked.
++- promotion.auto: if false, CI will still run gate but will not auto-promote (operator manual step needed).
++
++How the gate works
++1. CI triggers scripts/canary_gate_runner.py with a model_id.
++2. Runner executes adversarial harness, queries OpenSearch for hallucination checks, and Prometheus for latency & cost.
++3. If any check fails or signoff is missing for sensitive models, runner rolls back the model and exits non-zero, blocking promotion.
++4. If all conditions pass and model_registry allows auto-promotion, the runner calls /models/promote and records evidence to COMPLIANCE_BUCKET.
++
+*** End Patch
+*** End Patch

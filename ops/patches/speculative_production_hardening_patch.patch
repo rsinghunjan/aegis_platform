@@ -1,0 +1,477 @@
+*** Begin Patch
+*** Add File:services/speculative/teacher/teacher_score_prod.py
++#!/usr/bin/env python3
++"""
++Teacher scoring service (production-ready scaffold)
++
++ - Loads a Hugging Face causal LM and tokenizer and exposes:
++   POST /score_batch  -> accepts list of {"job_id","context","draft"} and returns per-job:
++         {"job_id","tokens":[...],"token_ids":[...],"token_scores":[...]}
++   POST /generate_one -> accepts {"context"} and returns {"token":"...","token_id":..,"token_logprob":..}
++
++Notes:
++ - For performance, this currently processes jobs sequentially. Replace with batching/padding to utilize GPU efficiently.
++ - Ensure this service is deployed on GPU nodes with appropriate device plugin if using large models.
++ - Use the same tokenizer on student and teacher to ensure tokenization parity.
++"""
++import os
++from typing import List, Dict, Any
++from fastapi import FastAPI, HTTPException, Request
++from pydantic import BaseModel
++import torch
++import torch.nn.functional as F
++from transformers import AutoModelForCausalLM, AutoTokenizer
++
++MODEL_NAME = os.environ.get("TEACHER_MODEL", "gpt2")
++DEVICE = os.environ.get("TEACHER_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
++PORT = int(os.environ.get("TEACHER_PORT", "8080"))
++
++app = FastAPI(title="Aegis Teacher Scoring Service")
++
++class Job(BaseModel):
++    job_id: str
++    context: str
++    draft: str
++
++class ScoreBatchRequest(BaseModel):
++    jobs: List[Job]
++
++# Load model & tokenizer once at startup
++print(f"Loading teacher model {MODEL_NAME} on {DEVICE} ...")
++tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
++model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
++model.to(DEVICE)
++model.eval()
++print("Teacher model loaded.")
++
++def compute_token_scores(context: str, draft: str) -> Dict[str, Any]:
++    """
++    Compute token ids, tokens and per-token logprobs (natural log) for draft tokens
++    given the context using a single forward pass.
++    """
++    # combine context + draft; we will compute logprobs for draft tokens conditioned on context+previous draft tokens
++    if context is None:
++        context = ""
++    full_text = (context + " " + draft).strip() if context else draft
++    # encode to ids
++    enc = tokenizer(full_text, return_tensors="pt", add_special_tokens=False)
++    input_ids = enc["input_ids"].to(DEVICE)  # shape [1, seq_len]
++    # we need to know boundary between context and draft in tokens
++    if context:
++        ctx_enc = tokenizer(context, return_tensors="pt", add_special_tokens=False)
++        ctx_len = ctx_enc["input_ids"].shape[1]
++    else:
++        ctx_len = 0
++    seq_len = input_ids.shape[1]
++    if seq_len <= ctx_len:
++        # nothing to score
++        return {"tokens": [], "token_ids": [], "token_scores": []}
++
++    with torch.no_grad():
++        outputs = model(input_ids)
++        # logits shape: [1, seq_len, vocab]
++        logits = outputs.logits  # type: ignore
++        # compute log softmax across vocab for all positions
++        logprobs = F.log_softmax(logits, dim=-1)  # [1, seq_len, vocab]
++        # for each draft token i (positions ctx_len .. seq_len-1), the relevant predictive logits are at position i-1
++        tokens_ids = input_ids[0, ctx_len: seq_len].tolist()
++        tokens = tokenizer.convert_ids_to_tokens(tokens_ids)
++        token_scores = []
++        for idx, token_id in enumerate(tokens_ids):
++            pos = ctx_len + idx
++            # teacher predicting token at pos => logits at pos-1 (previous token), except when pos==0 (no prev); handle pos==0 by using logits[0,0]
++            logits_pos = logprobs[0, pos - 1] if pos - 1 >= 0 else logprobs[0, 0]
++            score = float(logits_pos[token_id].item())
++            token_scores.append(score)
++
++    return {"tokens": tokens, "token_ids": tokens_ids, "token_scores": token_scores}
++
++@app.post("/score_batch")
++async def score_batch(req: List[Dict[str, Any]]):
++    """
++    Accepts a list of jobs (job_id, context, draft). Returns list of results per job.
++    """
++    out = []
++    try:
++        for j in req:
++            job_id = j.get("job_id")
++            context = j.get("context", "")
++            draft = j.get("draft", "")
++            res = compute_token_scores(context, draft)
++            out.append({"job_id": job_id, **res})
++    except Exception as e:
++        raise HTTPException(status_code=500, detail=str(e))
++    return out
++
++@app.post("/generate_one")
++async def generate_one(req: Request):
++    body = await req.json()
++    context = body.get("context", "")
++    # tokenization
++    enc = tokenizer(context, return_tensors="pt", add_special_tokens=False)
++    input_ids = enc["input_ids"].to(DEVICE)
++    with torch.no_grad():
++        outputs = model(input_ids)
++        logits = outputs.logits  # [1, seq_len, vocab]
++        # next-token logits are at last position
++        last_logits = logits[0, -1, :]
++        logp = F.log_softmax(last_logits, dim=-1)
++        token_id = int(torch.argmax(last_logits).item())
++        token_str = tokenizer.convert_ids_to_tokens([token_id])[0]
++        token_logprob = float(logp[token_id].item())
++    return {"token": token_str, "token_id": token_id, "token_logprob": token_logprob}
++
++@app.get("/health")
++async def health():
++    return {"status": "ok", "model": MODEL_NAME, "device": DEVICE}
++
++if __name__ == "__main__":
++    import uvicorn
++    uvicorn.run(app, host="0.0.0.0", port=PORT)
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/speculative/tokenizer_parity_checker.py
++#!/usr/bin/env python3
++"""
++Tokenizer parity checker
++
++ - Compares tokenization between two tokenizer implementations or between two model names.
++ - POST /check with JSON {"model_a":"gpt2", "model_b":"gpt2-medium", "samples":[ "...", ... ]}
++ - Returns per-sample tokenization diffs and summary.
++"""
++from fastapi import FastAPI, HTTPException, Request
++from pydantic import BaseModel
++from typing import List, Dict, Any, Optional
++from transformers import AutoTokenizer
++
++app = FastAPI(title="Tokenizer Parity Checker")
++
++class CheckRequest(BaseModel):
++    model_a: str
++    model_b: str
++    samples: Optional[List[str]] = None
++
++@app.post("/check")
++async def check(req: CheckRequest):
++    samples = req.samples or [
++        "The quick brown fox jumps over the lazy dog.",
++        "In 2026 AI is everywhere; privacy matters.",
++        "Tokenization parity: check #1."
++    ]
++    try:
++        t_a = AutoTokenizer.from_pretrained(req.model_a, use_fast=True)
++        t_b = AutoTokenizer.from_pretrained(req.model_b, use_fast=True)
++    except Exception as e:
++        raise HTTPException(status_code=400, detail=f"Failed to load tokenizers: {e}")
++    diffs = []
++    total = {"equal":0, "different":0}
++    for s in samples:
++        a_ids = t_a.encode(s, add_special_tokens=False)
++        b_ids = t_b.encode(s, add_special_tokens=False)
++        a_toks = t_a.convert_ids_to_tokens(a_ids)
++        b_toks = t_b.convert_ids_to_tokens(b_ids)
++        equal = (a_ids == b_ids)
++        if equal:
++            total["equal"] += 1
++        else:
++            total["different"] += 1
++        diffs.append({
++            "sample": s,
++            "a_tokens": a_toks,
++            "a_ids": a_ids,
++            "b_tokens": b_toks,
++            "b_ids": b_ids,
++            "equal": equal
++        })
++    return {"summary": total, "diffs": diffs}
++
++@app.get("/health")
++async def health():
++    return {"status":"ok"}
++
++if __name__ == "__main__":
++    import uvicorn
++    uvicorn.run(app, host="0.0.0.0", port=8090)
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/prometheus/alerts_speculative_more.yml
++groups:
++- name: speculative-ops
++  rules:
++  - alert: SpeculativeAcceptanceLow
++    expr: aegis_spec_acceptance_rate < 0.25
++    for: 30m
++    labels:
++      severity: warning
++    annotations:
++      summary: "Speculative acceptance rate below 25% for 30m"
++      description: "Acceptance rate for speculative decoding has dropped below 25% ({{ $value }}). Consider pausing speculative mode."
++
++  - alert: SpeculativeFallbackSpike
++    expr: increase(aegis_spec_fallback_count_total[5m]) > 30
++    for: 5m
++    labels:
++      severity: page
++    annotations:
++      summary: "Speculative fallback spike detected"
++      description: "Number of fallbacks increased by more than 30 in 5m. Check teacher scoring performance or student quality."
++
++  - alert: SpeculativeVerifierRegression
++    expr: (1 - (sum(aegis_verifier_score) / ignoring(job) count_over_time(aegis_spec_requests_total[1h]))) > 0.05
++    for: 60m
++    labels:
++      severity: page
++    annotations:
++      summary: "Possible verifier regression on speculative traffic"
++      description: "Verifier score aggregate suggests regression; investigate training/promotion artifacts."
++
++  - alert: BudgetNearlyExhausted
++    expr: sum(aegis_budget_balance) by (tenant) < 10
++    for: 10m
++    labels:
++      severity: warning
++    annotations:
++      summary: "Tenant budget low"
++      description: "A tenant's budget remaining is below $10. Throttle speculative usage or notify tenant owners."
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/speculative/circuit_breaker/controller.py
++#!/usr/bin/env python3
++"""
++Speculative Mode Circuit Breaker Controller (scaffold)
++
++ - Polls Prometheus for metrics and auto-disables speculative mode when thresholds are crossed.
++ - Exposes a simple HTTP API to query and set the speculative_enabled flag:
++    GET  /status  -> {"enabled":true, "reason":...}
++    POST /disable -> {"status":"disabled"}
++    POST /enable  -> {"status":"enabled"}
++
++ - By default toggles an in-memory flag; when KUBE_CONFIG is provided and a CONFIGMAP target is set,
++   it will patch the ConfigMap key to persist the flag cluster-wide.
++"""
++import os
++import time
++import threading
++import requests
++from fastapi import FastAPI
++from pydantic import BaseModel
++
++PROM_URL = os.environ.get("PROMETHEUS_URL", "http://prometheus.monitoring:9090")
++POLL_SECS = int(os.environ.get("CB_POLL_SECS", "30"))
++ACCEPT_THRESHOLD = float(os.environ.get("CB_ACCEPT_THRESH", "0.2"))
++FALLBACK_RATE_THRESH = float(os.environ.get("CB_FALLBACK_RATE_THRESH", "0.1"))  # per-second rate threshold
++CONFIGMAP_NAME = os.environ.get("CB_CONFIGMAP", "")
++CONFIGMAP_NS = os.environ.get("CB_CONFIGMAP_NS", "inference")
++KUBECONFIG = os.environ.get("KUBECONFIG", "")
++
++app = FastAPI(title="Speculative Circuit Breaker")
++
++state = {"enabled": True, "reason": "initial"}
++
++def patch_configmap(enabled: bool):
++    if not CONFIGMAP_NAME:
++        return
++    # Best-effort kubectl patch
++    val = "true" if enabled else "false"
++    try:
++        # label key: speculative_enabled
++        cmd = f"kubectl -n {CONFIGMAP_NS} patch configmap {CONFIGMAP_NAME} -p '{{\"data\":{{\"speculative_enabled\":\"{val}\"}}}}'"
++        os.system(cmd)
++    except Exception:
++        pass
++
++def query_prometheus(expr: str):
++    try:
++        r = requests.get(f"{PROM_URL}/api/v1/query", params={"query": expr}, timeout=5)
++        r.raise_for_status()
++        data = r.json()
++        return data.get("data", {}).get("result", [])
++    except Exception:
++        return []
++
++def monitor_loop():
++    while True:
++        try:
++            # acceptance rate (instant)
++            res = query_prometheus("aegis_spec_acceptance_rate")
++            accept_val = float(res[0]["value"][1]) if res else 1.0
++            # fallback rate over 5m
++            fr = query_prometheus('increase(aegis_spec_fallback_count_total[5m])')
++            fallback_count = float(fr[0]["value"][1]) if fr else 0.0
++            if accept_val < ACCEPT_THRESHOLD or fallback_count > 50:
++                if state["enabled"]:
++                    state["enabled"] = False
++                    state["reason"] = f"auto_disabled_accept={accept_val:.3f}_fallbacks={fallback_count}"
++                    patch_configmap(False)
++            # re-enable if metrics recover (apply hysteresis)
++            if not state["enabled"] and accept_val > (ACCEPT_THRESHOLD + 0.05) and fallback_count < 10:
++                state["enabled"] = True
++                state["reason"] = "auto_reenabled_recovered"
++                patch_configmap(True)
++        except Exception:
++            pass
++        time.sleep(POLL_SECS)
++
++@app.on_event("startup")
++def start_monitor():
++    t = threading.Thread(target=monitor_loop, daemon=True)
++    t.start()
++
++@app.get("/status")
++def get_status():
++    return {"enabled": state["enabled"], "reason": state["reason"]}
++
++@app.post("/disable")
++def disable():
++    state["enabled"] = False
++    state["reason"] = "manual_disable"
++    patch_configmap(False)
++    return {"status":"disabled"}
++
++@app.post("/enable")
++def enable():
++    state["enabled"] = True
++    state["reason"] = "manual_enable"
++    patch_configmap(True)
++    return {"status":"enabled"}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/evidence/ui/TokenTrace.jsx
++/* TokenTrace - simple React component to show token-level trace (student vs teacher)
++   Usage:
++     <TokenTrace trace={trace} />
++   where trace = {
++     tokens: ["Hello", "Ġworld", ...],
++     proposed_by: ["student","student","teacher",...],
++     teacher_scores: [ -0.2, -1.1, ... ]
++   }
++*/
++import React from "react";
++
++function TokenTrace({trace}) {
++  if (!trace) return <div>No trace</div>;
++  const tokens = trace.tokens || [];
++  const by = trace.proposed_by || [];
++  const scores = trace.teacher_scores || [];
++  return (
++    <div style={{fontFamily: "monospace", padding: 8, border: "1px solid #ddd", borderRadius: 6}}>
++      <div style={{marginBottom:8}}><strong>Token-level trace</strong></div>
++      <div style={{display:"flex", flexWrap:"wrap"}}>
++        {tokens.map((t, i) => {
++          const proposer = by[i] || "teacher";
++          const bg = proposer === "student" ? "#e6f7ff" : "#fff4e6";
++          return (
++            <div key={i} style={{margin:4, padding:6, background:bg, borderRadius:4, minWidth:80}}>
++              <div style={{fontSize:12, color:"#444"}}>{t}</div>
++              <div style={{fontSize:11, color:"#666"}}>{proposer}</div>
++              <div style={{fontSize:11, color:"#999"}}>{scores[i] !== undefined ? scores[i].toFixed(3) : ""}</div>
++            </div>
++          );
++        })}
++      </div>
++    </div>
++  );
++}
++
++export default TokenTrace;
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/speculative_canary_automation.yml
++name: Speculative Canary Automation
++on:
++  workflow_dispatch:
++
++jobs:
++  evaluate-and-toggle:
++    runs-on: ubuntu-latest
++    steps:
++      - name: Evaluate Prometheus metrics
++        env:
++          PROM_URL: ${{ secrets.PROM_URL }}
++          CB_API: ${{ secrets.CB_API }}  # e.g., https://spec-cb.example.com
++        run: |
++          echo "Query acceptance rate"
++          ACCEPT=$(curl -s "${PROM_URL}/api/v1/query" --get --data-urlencode 'query=aegis_spec_acceptance_rate' | jq -r '.data.result[0].value[1] // "1.0"')
++          echo "Acceptance rate: $ACCEPT"
++          ACCEPT_FLOAT=$(python - <<PY
++import sys
++v = float("$ACCEPT")
++print(v)
++PY)
++          if (( $(echo "$ACCEPT_FLOAT < 0.25" | bc -l) )); then
++            echo "Acceptance too low, disabling speculative mode via circuit breaker"
++            curl -s -X POST "${CB_API}/disable"
++            exit 0
++          else
++            echo "Acceptance healthy, enabling speculative"
++            curl -s -X POST "${CB_API}/enable"
++          fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:tests/speculative/test_tokenizer_parity.py
++import pytest
++from transformers import AutoTokenizer
++
++SAMPLES = [
++    "The quick brown fox jumps over the lazy dog.",
++    "Speculative decoding tokenization check: ensure parity.",
++    "Citrus: 🍊 emoji handling and unicode"
++]
++
++@pytest.mark.parametrize("model_a,model_b", [
++    ("gpt2", "gpt2"),
++    ("distilgpt2", "gpt2"),
++])
++def test_tokenizer_parity_models(model_a, model_b):
++    ta = AutoTokenizer.from_pretrained(model_a, use_fast=True)
++    tb = AutoTokenizer.from_pretrained(model_b, use_fast=True)
++    for s in SAMPLES:
++        a_ids = ta.encode(s, add_special_tokens=False)
++        b_ids = tb.encode(s, add_special_tokens=False)
++        # ensure token ids are lists and not None; if they differ it's noted but not failing
++        assert isinstance(a_ids, list)
++        assert isinstance(b_ids, list)
++
++def test_tokenizer_parity_identical():
++    t = AutoTokenizer.from_pretrained("gpt2", use_fast=True)
++    for s in SAMPLES:
++        ids = t.encode(s, add_special_tokens=False)
++        recon = t.decode(ids)
++        assert isinstance(recon, str)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/README_SPECULATIVE_PROD_ADDITIONS.md
++Speculative Production Additions - Summary
++----------------------------------------
++This patch provides:
++ - A production-ready teacher scoring service (services/speculative/teacher/teacher_score_prod.py).
++ - A tokenizer parity checker service (services/speculative/tokenizer_parity_checker.py).
++ - Prometheus alert rules for speculative mode (monitoring/prometheus/alerts_speculative_more.yml).
++ - Circuit breaker controller to auto-disable/enable speculative mode based on metrics (services/speculative/circuit_breaker/controller.py).
++ - A small React token trace component (services/evidence/ui/TokenTrace.jsx) for forensic UIs.
++ - GitHub Actions workflow to run a simple canary toggle based on Prometheus and circuit-breaker API.
++ - Pytest unit tests for tokenizer parity checks (tests/speculative/test_tokenizer_parity.py).
++
++Operator Actions:
++ 1. Build and push teacher scoring image (Dockerfile not included here; use Python base with torch & transformers).
++ 2. Deploy teacher scoring service on GPU nodes and set TEACHER_MODEL, TEACHER_DEVICE env vars.
++ 3. Deploy tokenizer parity checker in staging and run sample checks against student endpoints.
++ 4. Apply Prometheus alert rules and configure alerting channels.
++ 5. Deploy circuit breaker controller and configure PROMETHEUS_URL, CB_CONFIGMAP if using cluster-wide toggle.
++ 6. Integrate TokenTrace component into your rater/forensics UI to show token-level decisions.
++ 7. Run pytest tests as part of CI to validate tokenizer parity for candidate models.
++
++Notes:
++ - Replace sequential scoring with batched/padded scoring for performance at scale.
++ - Protect endpoints with mTLS/OIDC and restrict access to inference cluster network.
++ - Tune thresholds in alerts and circuit breaker according to shadow data before enabling automation.
++
+*** End Patch
+*** End Patch

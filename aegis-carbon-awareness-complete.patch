@@ -1,0 +1,447 @@
+*** Begin Patch
+*** Add File:services/requirements-carbon.txt
++codecarbon>=2.2.0
++prometheus_client
++requests
++kubernetes
++mlflow
++
+*** End File
+*** Add File:services/carbon/codecarbon_mlflow.py
++#!/usr/bin/env python3
++"""
++Run a shell command (training/inference job) under CodeCarbon EmissionsTracker,
++capture energy/CO2 estimates and persist metrics to MLflow and a local JSON record.
++
++Usage:
++  python3 services/carbon/codecarbon_mlflow.py --cmd "python3 services/train/finetune_transformer.py --config cfg" --model-name my-model --outdir /tmp/carbon_runs
++
++Notes:
++ - Requires CodeCarbon to be installed (see services/requirements-carbon.txt).
++ - MLflow: set MLFLOW_TRACKING_URI env var if you want results recorded in MLflow.
++ - The underlying job is executed as a subprocess; exit code is returned.
++"""
++import argparse
++import subprocess
++import time
++import json
++import os
++from codecarbon import EmissionsTracker
++
++def run_and_track(cmd, outdir="/tmp/carbon_runs", mlflow_experiment=None):
++    os.makedirs(outdir, exist_ok=True)
++    run_id = f"run-{int(time.time())}"
++
++    tracker = EmissionsTracker()
++    tracker.start()
++    start_ts = time.time()
++    proc = subprocess.run(cmd, shell=True)
++    end_ts = time.time()
++    emissions = tracker.stop()
++
++    record = {
++        "run_id": run_id,
++        "cmd": cmd,
++        "returncode": proc.returncode,
++        "start_ts": int(start_ts),
++        "end_ts": int(end_ts),
++        "duration_s": end_ts - start_ts,
++        "energy_kwh": emissions.energy_consumed,
++        "co2_kg": emissions.emissions,
++        "emissions_provider": str(emissions.emissions_data_provider) if hasattr(emissions,"emissions_data_provider") else None
++    }
++
++    outpath = os.path.join(outdir, f"{run_id}.json")
++    with open(outpath, "w") as fh:
++        json.dump(record, fh, indent=2)
++    print("Wrote carbon record to", outpath)
++
++    try:
++        import mlflow
++        mlflow_uri = os.environ.get("MLFLOW_TRACKING_URI")
++        if mlflow_uri:
++            mlflow.set_tracking_uri(mlflow_uri)
++        exp = mlflow_experiment or os.environ.get("MLFLOW_EXPERIMENT","carbon-tracking")
++        mlflow.set_experiment(exp)
++        with mlflow.start_run(run_name=run_id):
++            mlflow.log_param("cmd", cmd)
++            mlflow.log_metric("duration_s", record["duration_s"])
++            mlflow.log_metric("energy_kwh", record["energy_kwh"])
++            mlflow.log_metric("co2_kg", record["co2_kg"])
++            mlflow.log_artifact(outpath, artifact_path="carbon_records")
++    except Exception as e:
++        print("MLflow logging failed:", e)
++
++    return proc.returncode, outpath
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--cmd", required=True, help="Shell command to run")
++    p.add_argument("--outdir", default="/tmp/carbon_runs")
++    p.add_argument("--mlflow-experiment", default=None)
++    args = p.parse_args()
++    rc, path = run_and_track(args.cmd, outdir=args.outdir, mlflow_experiment=args.mlflow_experiment)
++    if rc != 0:
++        print("Command failed with rc", rc)
++    else:
++        print("Command completed successfully")
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:ops/carbon/run_training_with_carbon.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Wrapper to run a training script under CodeCarbon and register in MLflow.
++# Usage: ops/carbon/run_training_with_carbon.sh "python3 services/train/finetune_transformer.py --cfg cfg.yaml" my-model
++CMD="${1:-}"
++MODEL_NAME="${2:-aegis-model}"
++OUTDIR="${3:-/tmp/carbon_runs}"
++if [ -z "$CMD" ]; then
++  echo "Usage: $0 \"<cmd>\" <model-name> [outdir]"
++  exit 2
++fi
++python3 services/carbon/codecarbon_mlflow.py --cmd "$CMD" --outdir "$OUTDIR" --mlflow-experiment "$MODEL_NAME"
++echo "Done. Carbon run records in $OUTDIR"
++
+*** End File
+*** Add File:ops/carbon/job_template.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: carbon-sensitive-job
++  labels:
++    app: carbon-job
++spec:
++  backoffLimit: 2
++  template:
++    metadata:
++      annotations:
++        carbon/sensitivity: "high"   # annotate jobs that are carbon-heavy
++    spec:
++      containers:
++        - name: worker
++          image: your-image:latest
++          command: ["/bin/sh","-c","echo 'replace with training command' && sleep 10"]
++          resources:
++            limits:
++              cpu: "4"
++              memory: "8Gi"
++      restartPolicy: Never
++
+*** End File
+*** Add File:ops/carbon/carbon_scheduler.py
++#!/usr/bin/env python3
++"""
++Carbon-aware scheduler (simple prototype):
++ - Queries electricityMap or WattTime (if API key present) for current grid carbon intensity (gCO2/kWh)
++ - If intensity <= threshold (gCO2/kWh) schedules a provided k8s job manifest via kubectl
++ - Otherwise delays scheduling until next check interval
++
++Usage:
++  python3 ops/carbon/carbon_scheduler.py --job job_manifest.yaml --threshold 200 --poll-interval 300
++
++Notes:
++ - Requires kubectl in PATH and access to target cluster.
++ - Set ELECTRICITYMAP_API_KEY or WATTTIME_ZONE credentials if available.
++"""
++import argparse
++import time
++import requests
++import subprocess
++import os
++import sys
++
++EM_API = os.environ.get("ELECTRICITYMAP_API_KEY","")
++WATTTIME_ZONE = os.environ.get("WATTTIME_ZONE","")
++
++def query_electricitymap(lat=0, lon=0):
++    if not EM_API:
++        return None
++    url = f"https://api.electricitymap.org/v3/carbon-intensity/locations/coords?lat={lat}&lon={lon}"
++    hdr = {"Authorization": f"Bearer {EM_API}"}
++    r = requests.get(url, headers=hdr, timeout=10)
++    r.raise_for_status()
++    j = r.json()
++    # returns gCO2eq_per_kwh
++    return j.get("data",{}).get("carbonIntensity")
++
++def query_wattime(zone):
++    if not zone:
++        return None
++    url = f"https://api2.watttime.org/v2/point?zone={zone}"
++    # Assumes WATTTIME_USERNAME and WATTTIME_PASSWORD are set in env if needed (not implemented here)
++    try:
++        r = requests.get(url, timeout=10)
++        r.raise_for_status()
++        j = r.json()
++        return j.get("data",{}).get("carbon_intensity")
++    except Exception:
++        return None
++
++def schedule_job(manifest_path):
++    print("Applying kubectl manifest:", manifest_path)
++    subprocess.check_call(["kubectl","apply","-f", manifest_path])
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--job", required=True)
++    p.add_argument("--threshold", type=float, default=250.0, help="gCO2/kWh threshold to allow scheduling")
++    p.add_argument("--poll-interval", type=int, default=300, help="seconds between checks")
++    p.add_argument("--lat", type=float, default=0.0)
++    p.add_argument("--lon", type=float, default=0.0)
++    args = p.parse_args()
++
++    print("Starting carbon-aware scheduler for job:", args.job)
++    while True:
++        intensity = None
++        try:
++            intensity = query_electricitymap(args.lat, args.lon)
++            if intensity is None:
++                intensity = query_wattime(WATTTIME_ZONE)
++        except Exception as e:
++            print("Carbon API query failed:", e)
++        if intensity is None:
++            print("No carbon intensity available; defaulting to schedule immediately")
++            schedule_job(args.job)
++            return
++        print("Current carbon intensity (gCO2/kWh):", intensity)
++        if intensity <= args.threshold:
++            print("Intensity below threshold; scheduling job")
++            schedule_job(args.job)
++            return
++        else:
++            print(f"Intensity {intensity} > threshold {args.threshold}; sleeping {args.poll_interval}s")
++            time.sleep(args.poll_interval)
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:services/observability/carbon_exporter.py
++#!/usr/bin/env python3
++"""
++Prometheus exporter that exposes CO2/energy metrics per run.
++ - Reads JSON records written by services/carbon/codecarbon_mlflow.py (default /tmp/carbon_runs)
++ - Exposes metrics:
++     aegis_carbon_co2_kg{run_id="..."} -> gauge (latest)
++     aegis_carbon_energy_kwh{run_id="..."} -> gauge (latest)
++
++Run:
++  python3 services/observability/carbon_exporter.py --dir /tmp/carbon_runs --port 9095
++"""
++import argparse
++import time
++import os
++import json
++from prometheus_client import start_http_server, Gauge
++
++GAUGE_CO2 = Gauge('aegis_carbon_co2_kg', 'Estimated CO2 kg for a run', ['run_id'])
++GAUGE_ENERGY = Gauge('aegis_carbon_energy_kwh', 'Estimated energy (kWh) for a run', ['run_id'])
++
++def load_and_expose(dirpath):
++    for fn in os.listdir(dirpath):
++        if not fn.endswith(".json"):
++            continue
++        try:
++            path = os.path.join(dirpath, fn)
++            j = json.load(open(path))
++            run_id = j.get("run_id")
++            if run_id:
++                GAUGE_CO2.labels(run_id=run_id).set(float(j.get("co2_kg", 0.0) or 0.0))
++                GAUGE_ENERGY.labels(run_id=run_id).set(float(j.get("energy_kwh", 0.0) or 0.0))
++        except Exception as e:
++            print("Failed to load", fn, e)
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--dir", default="/tmp/carbon_runs")
++    p.add_argument("--port", type=int, default=9095)
++    p.add_argument("--interval", type=int, default=30)
++    args = p.parse_args()
++    os.makedirs(args.dir, exist_ok=True)
++    start_http_server(args.port)
++    print("Carbon exporter listening on port", args.port, "scanning", args.dir)
++    while True:
++        load_and_expose(args.dir)
++        time.sleep(args.interval)
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:ops/carbon/grafana_dashboard.json
++{
++  "annotations": {
++    "list": []
++  },
++  "panels": [
++    {
++      "datasource": null,
++      "fieldConfig": {
++        "defaults": {},
++        "overrides": []
++      },
++      "gridPos": {
++        "h": 8,
++        "w": 24,
++        "x": 0,
++        "y": 0
++      },
++      "id": 1,
++      "options": {},
++      "targets": [
++        {
++          "expr": "aegis_carbon_co2_kg",
++          "legendFormat": "{{ run_id }}",
++          "refId": "A"
++        }
++      ],
++      "title": "Per-run CO2 (kg)",
++      "type": "timeseries"
++    }
++  ],
++  "schemaVersion": 30,
++  "title": "Aegis Carbon Dashboard",
++  "version": 1
++}
++
+*** End File
+*** Add File:ops/k8s/label_nodepool.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Label nodes as carbon=green or carbon=standard to enable scheduling policies.
++# Usage: ops/k8s/label_nodepool.sh node-name carbon=green
++NODE=${1:-}
++LABEL=${2:-carbon=green}
++if [ -z "$NODE" ]; then
++  echo "Usage: $0 <node-name> <key=value>"
++  exit 2
++fi
++kubectl label node "$NODE" "$LABEL" --overwrite
++echo "Labeled node $NODE with $LABEL"
++
+*** End File
+*** Add File:ops/carbon/admission_webhook.py
++#!/usr/bin/env python3
++"""
++Prototype Admission Webhook that inspects Job manifests and rejects scheduling
++if the job is carbon-heavy and not annotated to allow scheduling outside green nodes.
++
++This is a skeleton / PoC. A production webhook must:
++ - Run as Deployment in cluster
++ - Be registered as ValidatingWebhookConfiguration with proper CA bundle
++ - Handle AdmissionReview requests and replies exactly per k8s API
++
++Here we implement a simple HTTP endpoint that expects a JSON with 'job' key (the Job manifest)
++and returns {"allowed": true/false, "reason": "..."} for integration testing.
++"""
++from flask import Flask, request, jsonify
++import os
++
++app = Flask(__name__)
++GREEN_LABEL = os.environ.get("GREEN_LABEL","carbon=green")
++
++def is_job_carbon_heavy(job):
++    # Heuristic: annotation carbon/sensitivity == "high" OR resources > cpu 8
++    ann = job.get("metadata",{}).get("annotations",{})
++    if ann.get("carbon/sensitivity","") == "high":
++        return True
++    # check container resources
++    spec = job.get("spec",{}).get("template",{}).get("spec",{})
++    for c in spec.get("containers",[]):
++        resources = c.get("resources",{})
++        limits = resources.get("limits",{})
++        cpu = limits.get("cpu")
++        try:
++            if cpu:
++                cpu_v = float(str(cpu).replace("m","")) if "m" in str(cpu) else float(cpu)
++                if cpu_v >= 8:
++                    return True
++        except Exception:
++            pass
++    return False
++
++@app.route("/validate-job", methods=["POST"])
++def validate_job():
++    body = request.json or {}
++    job = body.get("job") or {}
++    # If job annotated to allow-schedule-anywhere, permit
++    ann = job.get("metadata",{}).get("annotations",{})
++    if ann.get("carbon/allow_anywhere","false").lower() in ("1","true","yes"):
++        return jsonify({"allowed": True, "reason": "explicit allow annotation"})
++    heavy = is_job_carbon_heavy(job)
++    if not heavy:
++        return jsonify({"allowed": True, "reason": "not carbon-heavy"})
++    # If heavy, require nodeSelector with carbon=green
++    spec = job.get("spec",{}).get("template",{}).get("spec",{})
++    node_sel = spec.get("nodeSelector",{}) or {}
++    if node_sel.get("carbon") == "green":
++        return jsonify({"allowed": True, "reason": "targeting green nodepool"})
++    return jsonify({"allowed": False, "reason": "carbon-heavy job must target carbon=green nodepool or set carbon/allow_anywhere"})
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8443")))
++
+*** End File
+*** Add File:.github/workflows/codecarbon_ci.yml
++name: CodeCarbon Instrumentation CI
++on:
++  workflow_dispatch:
++jobs:
++  carbon-ci:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Install carbon deps
++        run: pip install -r services/requirements-carbon.txt
++      - name: Run sample training under CodeCarbon and log to MLflow
++        env:
++          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
++        run: |
++          python3 services/carbon/codecarbon_mlflow.py --cmd "python3 services/fl/examples/local_train.py" --outdir /tmp/carbon_runs --mlflow-experiment "ci-carbon-test"
++      - name: Upload carbon records
++        uses: actions/upload-artifact@v4
++        with:
++          name: carbon-records
++          path: /tmp/carbon_runs || true
++
+*** End File
+*** Add File:docs/carbon/README.md
++````markdown name=docs/carbon/README.md
++```text
++Aegis Carbon Awareness — Overview & Quickstart
++
++This patch adds:
++ - CodeCarbon instrumentation helper (services/carbon/codecarbon_mlflow.py)
++ - Wrapper to run training under CodeCarbon (ops/carbon/run_training_with_carbon.sh)
++ - Simple carbon-aware scheduler that waits for low grid intensity (ops/carbon/carbon_scheduler.py)
++ - Kubernetes job template for heavy jobs (ops/carbon/job_template.yaml)
++ - Prometheus exporter exposing per-run CO2/energy metrics (services/observability/carbon_exporter.py)
++ - Grafana dashboard JSON (ops/carbon/grafana_dashboard.json)
++ - Node labeling helper (ops/k8s/label_nodepool.sh)
++ - Prototype admission webhook to validate jobs (ops/carbon/admission_webhook.py)
++ - CI workflow to run sample training and capture carbon records (.github/workflows/codecarbon_ci.yml)
++
++Quickstart
++1) Install Python deps:
++   pip install -r services/requirements-carbon.txt
++2) Run a training job under CodeCarbon:
++   ops/carbon/run_training_with_carbon.sh "python3 services/fl/examples/local_train.py" my-demo-model
++3) Start carbon exporter (optional):
++   python3 services/observability/carbon_exporter.py --dir /tmp/carbon_runs --port 9095
++4) Use carbon-aware scheduler:
++   python3 ops/carbon/carbon_scheduler.py --job ops/carbon/job_template.yaml --threshold 200
++
++Notes & production considerations
++- CodeCarbon provides an estimate; for higher fidelity correlate with GPU/DC power telemetry (nvidia-smi/DCGM).
++- Admission webhook is a prototype and needs to be converted to a k8s ValidatingWebhookConfiguration with proper TLS/CA handling before production use.
++- The scheduler assumes you have kubectl access; in production replace with a controller or scheduler extender.
++
++````
++
+*** End File
+*** End Patch

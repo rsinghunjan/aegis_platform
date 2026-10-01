@@ -1,0 +1,609 @@
+*** Begin Patch
+*** Add File:ops/carbon/dcgm_attributor.py
++#!/usr/bin/env python3
++"""
++DCGM / NVML-based GPU -> Pod -> Workflow attributor.
++
++Runs on a control-plane pod (needs access to kube API and to read /proc on nodes via
++the node-reporter DaemonSet which should expose per-process GPU assignment).
++
++Approach:
++ - Use node-level reporter files produced by node_gpu_reporter.py (node_gpu_report_<node>_*.jsonl)
++ - Use pynvml (or nvidia-smi output) to map GPU -> process PIDs; map PIDs -> containers by inspecting /proc/<pid>/cgroup on same node
++ - For cluster-run, we rely on the node-reporter DaemonSet to dump per-node PID->GPU info into TELEMETRY_DIR with node name included.
++ - Map pod -> workflow via pod labels "workflows.argoproj.io/workflow"
++
++Note: This is best-effort. For production accuracy use DCGM exporter + device-plugin telemetry which exposes container-level metrics.
++"""
++import os
++import json
++import time
++from typing import Dict, List
++
++TELEMETRY_DIR = os.environ.get("TELEMETRY_DIR", "/var/lib/aegis/telemetry")
++OUTPUT_DIR = os.environ.get("CARBON_ATTR_OUT", "/var/lib/aegis/carbon_by_workflow")
++POLL_S = int(os.environ.get("DCGM_ATTR_POLL_S", "60"))
++
++try:
++    import pynvml
++    pynvml.nvmlInit()
++    NVML = True
++except Exception:
++    NVML = False
++
++try:
++    from kubernetes import client, config
++    config.load_incluster_config()
++    core = client.CoreV1Api()
++except Exception:
++    core = None
++
++def read_node_reports(limit=200):
++    files = sorted([os.path.join(TELEMETRY_DIR,f) for f in os.listdir(TELEMETRY_DIR) if f.startswith("node_gpu_report_")])[-limit:]
++    evs=[]
++    for f in files:
++        try:
++            with open(f) as fh:
++                for line in fh:
++                    evs.append(json.loads(line))
++        except Exception:
++            continue
++    return evs
++
++def map_pid_to_pod(node: str, pid: int):
++    """
++    Attempt to map pid -> pod by inspecting the pod list on node and reading /proc/<pid>/cgroup.
++    Since this runs off-node, use the node-reporter to include a mapping file; fallback to None.
++    """
++    # If node reporter included pid->pod mapping in reports, we may find it there.
++    # For now, try to query pods on that node and heuristically match by process owner (not implemented).
++    return None
++
++def nvml_processes_for_gpu(gpu_index: int):
++    if not NVML:
++        return []
++    try:
++        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
++        procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
++        # procs: list of nvmlProcessInfo_t with .pid and .usedGpuMemory
++        return [p.pid for p in procs]
++    except Exception:
++        return []
++
++def attribute():
++    evs = read_node_reports(limit=500)
++    per_wf = {}
++    for ev in evs:
++        node = ev.get("node")
++        gpus = ev.get("gpus", [])
++        # For each GPU, try to get pids (if NVML available) or use reporter-provided processes
++        for gpu in gpus:
++            idx = int(gpu.get("index", 0))
++            power = float(gpu.get("power_w", 0.0))
++            pids = gpu.get("processes", []) or nvml_processes_for_gpu(idx)
++            if not pids:
++                # attribute to node
++                per_wf.setdefault("<unattributed>", {"power_w":0.0, "samples":0}).update({
++                    "power_w": per_wf.get("<unattributed>",{}).get("power_w",0.0)+power,
++                    "samples": per_wf.get("<unattributed>",{}).get("samples",0)+1
++                })
++                continue
++            # map PIDs to pods and then to workflows
++            wf_counts = {}
++            for pid in pids:
++                pod = map_pid_to_pod(node, pid) or "<unknown>"
++                # Try to get workflow label from pod
++                wf = "<unknown>"
++                try:
++                    if core and pod and pod != "<unknown>":
++                        p = core.read_namespaced_pod(name=pod["name"], namespace=pod["namespace"])
++                        wf = p.metadata.labels.get("workflows.argoproj.io/workflow") or p.metadata.labels.get("workflow") or "<no-wf>"
++                except Exception:
++                    wf = "<no-wf>"
++                wf_counts[wf] = wf_counts.get(wf,0)+1
++            total = sum(wf_counts.values())
++            for wf, cnt in wf_counts.items():
++                per_wf.setdefault(wf, {"power_w":0.0,"samples":0})
++                per_wf[wf]["power_w"] += (cnt/total)*power
++                per_wf[wf]["samples"] += 1
++    # write attribution records
++    os.makedirs(OUTPUT_DIR, exist_ok=True)
++    fname = os.path.join(OUTPUT_DIR, f"dcgm_attr_{int(time.time())}.jsonl")
++    with open(fname, "w") as fh:
++        for wf, v in per_wf.items():
++            rec = {"workflow": wf, "avg_power_w": (v["power_w"]/max(1,v["samples"])), "samples": v["samples"], "ts": int(time.time())}
++            fh.write(json.dumps(rec)+"\n")
++    return fname
++
++if __name__ == "__main__":
++    print(attribute())
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/aws_gcp_integration.py
++#!/usr/bin/env python3
++"""
++Integrate provider carbon APIs or fallback to per-region coefficients.
++ - AWS: Customer Carbon Footprint (stub using CostExplorer as approximate)
++ - GCP: stub for Carbon Insights
++
++These functions are best-effort placeholders. Operators must supply correct credentials and map cost -> kWh appropriately.
++"""
++import os
++import boto3
++import datetime
++import logging
++import json
++
++REGION_DEFAULTS = {"us-east-1": 0.4, "us-west-2": 0.35, "eu-west-1": 0.2}
++
++def get_region_coefficient(region: str) -> float:
++    return float(os.environ.get("EMISSIONS_FACTOR_KGCO2_PER_KWH", REGION_DEFAULTS.get(region, 0.475)))
++
++def aws_estimate_kwh_from_cost(account_id: str, start: str, end: str):
++    """
++    Use AWS Cost Explorer to estimate cost and map to kWh by a conversion factor.
++    This is a heuristic fallback. Replace with precise provider API if available.
++    start/end are ISO dates.
++    """
++    if os.environ.get("AWS_ACCESS_KEY_ID") is None:
++        return None
++    ce = boto3.client("ce")
++    res = ce.get_cost_and_usage(TimePeriod={"Start":start,"End":end}, Granularity="DAILY", Metrics=["BlendedCost"])
++    total = 0.0
++    for d in res.get("ResultsByTime", []):
++        amt = float(d.get("Total", {}).get("BlendedCost", {}).get("Amount", 0.0))
++        total += amt
++    # Conversion heuristic: $1 -> X kWh (operator should calibrate). Use env var or default 2.5 kWh per $ (placeholder).
++    conv = float(os.environ.get("COST_TO_KWH", "2.5"))
++    return total * conv
++
++def gcp_carbon_insights_stub(project_id: str):
++    # Placeholder: implement calls to GCP Carbon Insights / billing export
++    return None
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/close_loop_scheduler.py
++#!/usr/bin/env python3
++"""
++Close-loop carbon scheduler:
++ - Reads recent per-workflow carbon usage (CARBON_ATTR_OUT)
++ - If budget exceeded for a namespace or globally, it will:
++   * annotate new workflows to prefer low-carbon nodes
++   * scale down low-priority deployments/workflows to free capacity
++   * create a Gatekeeper ConfigMap label to mark budget exceeded (Gatekeeper Constraint will block new high-carbon workflows)
++
++This is an operator script to run as a Deployment with RBAC for Argo and Deployments.
++"""
++import os
++import time
++import json
++import glob
++from kubernetes import client, config
++
++CARBON_ATTR_OUT = os.environ.get("CARBON_ATTR_OUT", "/var/lib/aegis/carbon_by_workflow")
++GLOBAL_BUDGET_KG = float(os.environ.get("GLOBAL_CARBON_BUDGET_KG", "100.0"))
++NAMESPACE = os.environ.get("ARGO_NS", "argo")
++CHECK_S = int(os.environ.get("CLOSE_LOOP_POLL_S", "60"))
++
++try:
++    config.load_incluster_config()
++except Exception:
++    config.load_kube_config()
++api = client.CustomObjectsApi()
++apps = client.AppsV1Api()
++core = client.CoreV1Api()
++
++def recent_consumption(window_files=50):
++    tot = 0.0
++    files = sorted(glob.glob(os.path.join(CARBON_ATTR_OUT, "carbon_by_wf_*.jsonl")))[-window_files:]
++    for f in files:
++        with open(f) as fh:
++            for line in fh:
++                try:
++                    rec = json.loads(line)
++                    tot += float(rec.get("carbon_kg", rec.get("energy_kwh",0.0)*float(os.environ.get("EMISSIONS_FACTOR_KGCO2_PER_KWH",0.475))))
++                except Exception:
++                    continue
++    return tot
++
++def mark_budget_exceeded():
++    # create or patch ConfigMap aegis-carbon-status in kube-system
++    name="aegis-carbon-status"
++    ns="kube-system"
++    body = client.V1ConfigMap(metadata=client.V1ObjectMeta(name=name), data={"status":"exceeded"})
++    try:
++        core.replace_namespaced_config_map(name, ns, body)
++    except client.exceptions.ApiException:
++        try:
++            core.create_namespaced_config_map(ns, body)
++        except Exception:
++            pass
++
++def clear_budget_flag():
++    name="aegis-carbon-status"
++    ns="kube-system"
++    try:
++        core.delete_namespaced_config_map(name, ns)
++    except Exception:
++        pass
++
++def scale_down_low_priority():
++    # list deployments with label aegis.priority=low and scale them down
++    deps = apps.list_deployment_for_all_namespaces(label_selector="aegis.priority=low").items
++    for d in deps:
++        ns = d.metadata.namespace
++        name = d.metadata.name
++        try:
++            apps.patch_namespaced_deployment_scale(name, ns, {"spec":{"replicas": 0}})
++            print("scaled down", ns, name)
++        except Exception as e:
++            print("scale down failed", e)
++
++def annotate_pending_low_carbon():
++    # list argo workflows and add label aegis.carbon_placement=low if not present
++    try:
++        wfs = api.list_namespaced_custom_object(group="argoproj.io", version="v1alpha1", namespace=NAMESPACE, plural="workflows")
++        for wf in wfs.get("items", []):
++            meta = wf.get("metadata",{})
++            name = meta.get("name")
++            labels = meta.get("labels",{})
++            if labels.get("aegis.carbon_placement") is None:
++                api.patch_namespaced_custom_object(group="argoproj.io", version="v1alpha1", namespace=NAMESPACE, plural="workflows", name=name, body={"metadata":{"labels":{"aegis.carbon_placement":"low"}}})
++    except Exception as e:
++        print("annotate pending failed", e)
++
++def main_loop():
++    while True:
++        tot = recent_consumption()
++        print("recent carbon (kg):", tot, "budget", GLOBAL_BUDGET_KG)
++        if tot > GLOBAL_BUDGET_KG:
++            print("budget exceeded: taking action")
++            mark_budget_exceeded()
++            scale_down_low_priority()
++            annotate_pending_low_carbon()
++        else:
++            clear_budget_flag()
++        time.sleep(CHECK_S)
++
++if __name__ == "__main__":
++    main_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/gatekeeper/carbon_constraint_template.yaml
++apiVersion: templates.gatekeeper.sh/v1beta1
++kind: ConstraintTemplate
++metadata:
++  name: k8srequiredcarbon
++spec:
++  crd:
++    spec:
++      names:
++        kind: RequiredCarbon
++  targets:
++    - target: admission.k8s.gatekeeper.sh
++      rego: |
++        package k8srequiredcarbon
++
++        violation[{"msg": msg}] {
++          input.review.object.kind == "Workflow"
++          # If namespace has ConfigMap aegis-carbon-status=exceeded then deny creation of high-carbon workflows
++          ns := input.review.object.metadata.namespace
++          cm := data.kubernetes.config_map["kube-system"]["aegis-carbon-status"]
++          cm.data.status == "exceeded"
++          ann := input.review.object.metadata.annotations
++          ann["aegis.carbon_sensitive"] == "true"
++          msg := sprintf("Creation denied: carbon budget exceeded in cluster, workflow is carbon-sensitive", [])
++        }
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/gatekeeper/carbon_constraint.yaml
++apiVersion: constraints.gatekeeper.sh/v1beta1
++kind: RequiredCarbon
++metadata:
++  name: require-carbon-check
++spec:
++  match:
++    kinds:
++      - apiGroups: ["argoproj.io"]
++        kinds: ["Workflow"]
++    namespaces: ["*"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/multimodal/milvus_ha_backup.py
++#!/usr/bin/env python3
++"""
++Milvus HA backup/restore helper (best-effort).
++ - Exports collection vectors and meta to local disk (npy + meta.json) for backup.
++ - Uses pymilvus to iterate collection and dump entities (may be slow for large collections; use snapshot tools in prod).
++"""
++import os
++import json
++import numpy as np
++from pymilvus import Collection, utility, connections
++
++MILVUS_HOST = os.environ.get("MILVUS_HOST", "127.0.0.1")
++MILVUS_PORT = os.environ.get("MILVUS_PORT", "19530")
++COLLECTION = os.environ.get("MILVUS_COLLECTION", "aegis_vectors")
++OUT_DIR = os.environ.get("MILVUS_BACKUP_DIR", "/var/lib/aegis/milvus_backups")
++
++def connect():
++    connections.connect(host=MILVUS_HOST, port=MILVUS_PORT)
++
++def backup_collection():
++    connect()
++    if not utility.has_collection(COLLECTION):
++        print("no collection", COLLECTION)
++        return
++    col = Collection(COLLECTION)
++    os.makedirs(OUT_DIR, exist_ok=True)
++    # read entities in batches using query (retrieve returns fields)
++    # Here we assume id and meta fields exist
++    results = col.query(expr="", output_fields=["embedding","meta"], _async=False)
++    embs = []
++    metas = []
++    for r in results:
++        emb = r.get("embedding")
++        meta = r.get("meta")
++        embs.append(emb)
++        metas.append(meta)
++    embs = np.array(embs, dtype=np.float32)
++    np.save(os.path.join(OUT_DIR, f"{COLLECTION}_embs.npy"), embs)
++    with open(os.path.join(OUT_DIR, f"{COLLECTION}_meta.json"), "w") as fh:
++        json.dump(metas, fh)
++    print("backup saved to", OUT_DIR)
++
++if __name__ == "__main__":
++    backup_collection()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/multimodal/clock_sync_check.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Check NTP/chrony sync and optionally resync using ntpdate (requires permissions)
++#
++if ! command -v chronyc >/dev/null 2>&1 && ! command -v ntpdate >/dev/null 2>&1; then
++  echo "chronyc or ntpdate not found; install or ignore"
++  exit 0
++fi
++if command -v chronyc >/dev/null 2>&1; then
++  chronyc sourcestats
++  chronyc tracking
++else
++  sudo ntpdate -q pool.ntp.org
++fi
++echo "clock sync check complete"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/multimodal/s3_tiering_policy.json
++{
++  "Rules": [
++    {
++      "ID": "multimodal-archive",
++      "Filter": {"Prefix": "featurestore/"},
++      "Status": "Enabled",
++      "Transitions": [
++        {"Days": 30, "StorageClass": "STANDARD_IA"},
++        {"Days": 90, "StorageClass": "GLACIER"}
++      ],
++      "NoncurrentVersionTransitions": []
++    }
++  ]
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/generative/token_retention.py
++#!/usr/bin/env python3
++"""
++Token/audit retention manager.
++ - Deletes token log files older than RETENTION_DAYS
++ - Runs as a CronJob in cluster
++"""
++import os
++import time
++
++TOKEN_DIR = os.environ.get("LLM_TOKEN_LOG_DIR", "/var/lib/aegis/llm_tokens")
++RETENTION_DAYS = int(os.environ.get("LLM_TOKEN_RETENTION_DAYS", "90"))
++
++def cleanup():
++    cutoff = time.time() - RETENTION_DAYS*24*3600
++    if not os.path.exists(TOKEN_DIR):
++        return
++    for fname in os.listdir(TOKEN_DIR):
++        path = os.path.join(TOKEN_DIR, fname)
++        try:
++            if os.path.getmtime(path) < cutoff:
++                os.remove(path)
++                print("removed", path)
++        except Exception:
++            continue
++
++if __name__ == "__main__":
++    cleanup()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/generative/rlhf/argo_rlhf_workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: aegis-rlhf-
++spec:
++  entrypoint: rlfh-pipeline
++  templates:
++    - name: rlfh-pipeline
++      steps:
++        - - name: collect-prefs
++            template: collect-prefs
++        - - name: train-reward
++            template: train-reward
++        - - name: train-policy
++            template: train-policy
++        - - name: validate-policy
++            template: validate-policy
++        - - name: promote-policy
++            template: promote-policy
++
++    - name: collect-prefs
++      container:
++        image: python:3.11-slim
++        command: [sh,-c]
++        args: ["pip install flask && python ops/generative/rlhf/collect_ui_stub.py & sleep 5 && echo prefs-collected"]
++
++    - name: train-reward
++      container:
++        image: ghcr.io/yourorg/aegis-train:prod
++        command: [sh,-c]
++        args: ["python ops/generative/rlhf/train_rlhf.py"]
++      resources:
++        limits:
++          nvidia.com/gpu: 0
++
++    - name: train-policy
++      container:
++        image: ghcr.io/yourorg/aegis-train:prod
++        command: [sh,-c]
++        args: ["python -u ops/agentic/offline_rl_pipeline.py"]
++      resources:
++        limits:
++          nvidia.com/gpu: 1
++          memory: 64Gi
++
++    - name: validate-policy
++      container:
++        image: python:3.11-slim
++        command: [sh,-c]
++        args: ["python -u ops/agentic/sim_harness.py && echo validated"]
++
++    - name: promote-policy
++      container:
++        image: python:3.11-slim
++        command: [sh,-c]
++        args: ["echo promote placeholder (requires approval)"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/agentic/invariants.py
++#!/usr/bin/env python3
++"""
++Simple invariants engine for plans.
++ - Load invariants (JSON) that describe forbidden actions or required preconditions
++ - check_plan(plan) returns list of violations
++"""
++import json
++import os
++from typing import List, Dict
++
++INVARIANTS_FILE = os.environ.get("AGENT_INVARIANTS", "ops/agentic/invariants.json")
++
++def load_invariants():
++    if not os.path.exists(INVARIANTS_FILE):
++        return {"forbid": [], "require": []}
++    with open(INVARIANTS_FILE) as fh:
++        return json.load(fh)
++
++def check_plan(plan: List[Dict]) -> List[str]:
++    inv = load_invariants()
++    violations = []
++    for step in plan:
++        cmd = step.get("params",{}).get("cmd","")
++        for f in inv.get("forbid", []):
++            if f in cmd:
++                violations.append(f"forbidden:{f}")
++    return violations
++
++if __name__ == "__main__":
++    print(load_invariants())
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/agentic/offline_to_online_workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: aegis-offline-to-online-
++spec:
++  entrypoint: offline-to-online
++  templates:
++    - name: offline-to-online
++      steps:
++        - - name: gather-episodes
++            template: gather-episodes
++        - - name: train-offline-policy
++            template: train-offline-policy
++        - - name: shadow-deploy
++            template: shadow-deploy
++        - - name: evaluation
++            template: evaluate
++        - - name: gated-promote
++            template: gated-promote
++
++    - name: gather-episodes
++      container:
++        image: python:3.11-slim
++        command: [sh,-c]
++        args: ["python ops/agentic/sim_harness.py"]
++
++    - name: train-offline-policy
++      container:
++        image: ghcr.io/yourorg/aegis-train:prod
++        command: [sh,-c]
++        args: ["python ops/agentic/offline_rl_pipeline.py"]
++      resources:
++        limits:
++          nvidia.com/gpu: 1
++
++    - name: shadow-deploy
++      container:
++        image: python:3.11-slim
++        command: [sh,-c]
++        args: ["echo 'deploying policy to shadow mode (no actuation)'; sleep 2"]
++
++    - name: evaluate
++      container:
++        image: python:3.11-slim
++        command: [sh,-c]
++        args: ["python ops/agentic/sim_harness.py"]
++
++    - name: gated-promote
++      container:
++        image: python:3.11-slim
++        command: [sh,-c]
++        args: ["echo 'requires human approval: promote via ops/approval/approval_slack_notify.py'"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/runbooks/close_gaps_validation.md
++# Validation runbook: close-the-gap items (what to run & expected outputs)
++
++1) Attribution accuracy validation
++ - Deploy node-reporter DaemonSet (k8s/carbon/node-reporter-daemonset.yaml)
++ - Run ops/carbon/dcgm_attributor.py as a one-off:
++     python ops/carbon/dcgm_attributor.py
++ - Inspect the output file in CARBON_ATTR_OUT; cross-check with provider estimates.
++
++2) Provider carbon APIs
++ - Configure AWS creds and run aws_estimate_kwh_from_cost in ops/carbon/aws_gcp_integration.py with real start/end
++ - Compare delta vs attribution reports
++
++3) Close-loop scheduler
++ - Deploy ops/carbon/close_loop_scheduler.py as a Deployment (mount CARBON_ATTR_OUT)
++ - Simulate high usage (create test workflows) and confirm Gatekeeper ConfigMap "aegis-carbon-status" appears.
++
++4) Milvus HA backup
++ - Deploy Milvus (prod_values.yaml) and run ops/multimodal/milvus_ha_backup.py to see export files.
++
++5) RLHF and Agentic
++ - Submit Argo workflow ops/generative/rlhf/argo_rlhf_workflow.yaml and ops/agentic/offline_to_online_workflow.yaml
++ - Validate that preference UI writes to RLHF_PREF_DIR and that offline policy artifact is produced.
++
+*** End Patch
+*** End Patch

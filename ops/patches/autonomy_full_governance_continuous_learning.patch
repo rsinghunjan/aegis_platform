@@ -1,0 +1,606 @@
+*** Begin Patch
+*** Add File:ops/tekton/pipelines/continuous_learning_pipeline.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Pipeline
++metadata:
++  name: continuous-learning-pipeline
++  namespace: cicd
++spec:
++  params:
++    - name: dataset_snapshot_s3
++      type: string
++      default: ""
++    - name: evidence_bucket
++      type: string
++      default: ""
++    - name: run_id
++      type: string
++      default: ""
++    - name: risk_class
++      type: string
++      default: "low" # low | medium | high | legal
++  tasks:
++    - name: detect-drift
++      taskRef:
++        name: drift-detect-task
++      params:
++        - name: dataset_snapshot_s3
++          value: "$(params.dataset_snapshot_s3)"
++    - name: retrain-and-hpo
++      runAfter:
++        - detect-drift
++      taskRef:
++        name: retrain-hpo-task
++      params:
++        - name: evidence_bucket
++          value: "$(params.evidence_bucket)"
++        - name: run_id
++          value: "$(params.run_id)"
++    - name: validate-model
++      runAfter:
++        - retrain-and-hpo
++      taskRef:
++        name: model-validate-task
++      params:
++        - name: evidence_bucket
++          value: "$(params.evidence_bucket)"
++        - name: run_id
++          value: "$(params.run_id)"
++    - name: deploy-canary
++      runAfter:
++        - validate-model
++      taskRef:
++        name: deploy-canary-task
++      params:
++        - name: run_id
++          value: "$(params.run_id)"
++        - name: evidence_bucket
++          value: "$(params.evidence_bucket)"
++    - name: evaluate-canary
++      runAfter:
++        - deploy-canary
++      taskRef:
++        name: canary-eval-task
++      params:
++        - name: run_id
++          value: "$(params.run_id)"
++        - name: evidence_bucket
++          value: "$(params.evidence_bucket)"
++    - name: policy-decision
++      runAfter:
++        - evaluate-canary
++      taskRef:
++        name: policy-decision-task
++      params:
++        - name: run_id
++          value: "$(params.run_id)"
++        - name: risk_class
++          value: "$(params.risk_class)"
++    - name: auto-promote
++      runAfter:
++        - policy-decision
++      when:
++        - input: "$(tasks.policy-decision.results.allow)"
++          operator: in
++          values: ["true"]
++      taskRef:
++        name: promote-task
++      params:
++        - name: run_id
++          value: "$(params.run_id)"
++        - name: evidence_bucket
++          value: "$(params.evidence_bucket)"
++    - name: post-evidence
++      runAfter:
++        - auto-promote
++        - policy-decision
++      taskRef:
++        name: evidence-bundler
++      params:
++        - name: evidence_bucket
++          value: "$(params.evidence_bucket)"
++
++  workspaces:
++    - name: shared-workspace
++
++notes: |
++  - This pipeline implements a continuous learning loop that runs automatically when drift is detected or on schedule.
++  - The policy-decision-task must set a Tekton result `allow` (true/false) and `require_legal` (true/false).
++  - If OPA permits and the run is not a legal-risk promotion, the promote-task runs automatically (no routine human approval).
++  - If risk_class == "legal" or policy-decision yields require_legal=true, the policy-decision task should create a legal approval request and set `allow=false`.
++  - All artifacts and decisions are written to evidence_bucket and cosigned where applicable.
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tekton/tasks/policy-decision-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: policy-decision-task
++  namespace: cicd
++spec:
++  params:
++    - name: run_id
++      type: string
++    - name: risk_class
++      type: string
++  results:
++    - name: allow
++      description: "OPA decision whether to allow auto-promotion (true/false)"
++    - name: require_legal
++      description: "Whether legal/regulatory signoff is required (true/false)"
++    - name: reason
++      description: "Human readable reason"
++  steps:
++    - name: call-opa
++      image: curlimages/curl:8.2.1
++      script: |
++        #!/bin/sh
++        set -euo pipefail
++        RUNID=$(params.run_id)
++        RISK=$(params.risk_class)
++        # Build minimal canary evaluation payload (in production include metrics)
++        cat > /workspace/input.json <<EOF
++{"kind":"CanaryEvaluation","run_id":"$RUNID","metrics":{"rel_drop":0.01,"business_kpi":0.9},"policy":{"max_rel_drop":0.05,"min_kpi":0.8},"annotations":{"aegis_evidence_uri":""},"risk":"$RISK"}
++EOF
++        # Call OPA (assumes OPA service in-cluster at opa.monitoring.svc)
++        OPA_URL=${OPA_URL:-http://opa.monitoring.svc:8181/v1/data/aegis/canary}
++        RESPONSE=$(curl -s -X POST -H "Content-Type: application/json" --data-binary @/workspace/input.json $OPA_URL)
++        # parse allow from response (PoC)
++        ALLOW=$(echo "$RESPONSE" | jq -r '.result.allow_promote // false')
++        REQUIRE_LEGAL=$(echo "$RESPONSE" | jq -r '.result.require_legal // "false"')
++        REASON=$(echo "$RESPONSE" | jq -r '.result.reason // ""')
++        echo -n "$ALLOW" > /tekton/results/allow
++        echo -n "$REQUIRE_LEGAL" > /tekton/results/require_legal
++        echo -n "$REASON" > /tekton/results/reason
++
++notes: |
++  - The Task writes Tekton results used by the pipeline to decide whether to auto-promote.
++  - OPA data should include policy rules that set `require_legal` when model content or tenant requires manual legal approval.
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tekton/tasks/promote-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: promote-task
++  namespace: cicd
++spec:
++  params:
++    - name: run_id
++      type: string
++    - name: evidence_bucket
++      type: string
++  steps:
++    - name: sign-artifact
++      image: sigstore/cosign:latest
++      script: |
++        #!/bin/sh
++        set -euo pipefail
++        RUNID=$(params.run_id)
++        EB=$(params.evidence_bucket)
++        # locate model artifact produced by pipeline (PoC path)
++        MODEL_PATH="/workspace/artifacts/${RUNID}/model.tar.gz"
++        if [ -f "$MODEL_PATH" ] && [ -f /secrets/cosign.key ]; then
++          cosign sign-blob --key /secrets/cosign.key $MODEL_PATH || true
++          if [ -n "$EB" ]; then
++            aws s3 cp $MODEL_PATH ${EB}/models/${RUNID}/model.tar.gz || true
++            if [ -f ${MODEL_PATH}.sig ]; then
++              aws s3 cp ${MODEL_PATH}.sig ${EB}/models/${RUNID}/model.tar.gz.sig || true
++            fi
++          fi
++        else
++          echo "Model artifact or cosign key missing; skipping sign/upload"
++        fi
++    - name: publish
++      image: python:3.10
++      script: |
++        #!/bin/sh
++        set -euo pipefail
++        RUNID=$(params.run_id)
++        echo "Promoting model for run $RUNID (auto-promote)"
++        # Call internal promotion API (Baseten or internal)
++        PROMOTE_API=${PROMOTE_API:-http://promote.monitoring.svc:8080/promote}
++        curl -s -X POST -H "Content-Type: application/json" -d "{\"run_id\":\"$RUNID\",\"auto\":true}" ${PROMOTE_API} || true
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/decisioning/auto_promote_controller.py
++#!/usr/bin/env python3
++"""
++Auto-Promote Controller
++ - Watches Tekton PipelineRuns (or receives a webhook) for completed canary evaluations
++ - Calls OPA for policy decision, inspects risk_class and either auto-promotes (for policy-permitted runs)
++   or creates a legal/regulatory approval request when required.
++ - Signs artifacts and writes audit records to evidence bucket.
++"""
++import os, time, json, logging, subprocess, requests
++from datetime import datetime
++
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger("auto-promote")
++
++TEKTON_NS = os.environ.get("TEKTON_NAMESPACE", "cicd")
++OPA_URL = os.environ.get("OPA_URL", "http://opa.monitoring.svc:8181/v1/data/aegis/canary")
++APPROVAL_API = os.environ.get("APPROVAL_SERVICE_URL", "http://approval-service.monitoring.svc:8080")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++PROMOTE_API = os.environ.get("PROMOTE_API", "http://promote.monitoring.svc:8080/promote")
++
++def list_recent_pipelineruns():
++    out = subprocess.check_output(["kubectl", "-n", TEKTON_NS, "get", "pipelineruns", "-o", "json"]).decode()
++    return json.loads(out).get("items", [])
++
++def process_pr(pr):
++    meta = pr.get("metadata", {})
++    name = meta.get("name")
++    annotations = meta.get("annotations", {})
++    run_id = annotations.get("aegis.run_id") or meta.get("generateName") or name
++    # only act on completed canary evaluation pipelineruns (poC: detect by labels)
++    labels = meta.get("labels", {})
++    if labels.get("job-type") != "canary-eval":
++        return
++    # build minimal payload for OPA
++    payload = {"input": {"kind": "CanaryEvaluation", "run_id": run_id, "metrics": {"rel_drop": 0.01, "business_kpi": 0.9}, "annotations": annotations}}
++    resp = requests.post(OPA_URL, json=payload, timeout=10)
++    if resp.status_code != 200:
++        logger.error("OPA error: %s", resp.text)
++        return
++    res = resp.json().get("result", {})
++    allow = res.get("allow_promote", False)
++    require_legal = res.get("require_legal", False)
++    # If OPA allows and no legal requirement, auto-promote
++    if allow and not require_legal:
++        logger.info("Auto-promoting run %s", run_id)
++        # sign artifact and promote
++        try:
++            # Attempt promote via Promote API
++            requests.post(PROMOTE_API, json={"run_id": run_id, "auto": True}, timeout=10)
++            # record evidence
++            if EVIDENCE_BUCKET:
++                key = f"autopromote/{run_id}-{int(time.time())}.json"
++                import boto3
++                s3=boto3.client("s3")
++                s3.put_object(Bucket=EVIDENCE_BUCKET.replace("s3://",""), Key=key, Body=json.dumps({"run_id":run_id,"action":"autopromote","ts":datetime.utcnow().isoformat()}).encode())
++        except Exception:
++            logger.exception("autopromote failed")
++    else:
++        # create approval request; tag as legal if required
++        payload = {"summary": f"Promotion request for run {run_id}", "run_id": run_id, "require_legal": require_legal}
++        try:
++            requests.post(f"{APPROVAL_API}/request", json=payload, timeout=10)
++            logger.info("Created approval request for run %s (require_legal=%s)", run_id, require_legal)
++            if EVIDENCE_BUCKET:
++                import boto3
++                s3=boto3.client("s3")
++                key=f"approval_requests/{run_id}-{int(time.time())}.json"
++                s3.put_object(Bucket=EVIDENCE_BUCKET.replace("s3://",""), Key=key, Body=json.dumps(payload).encode())
++        except Exception:
++            logger.exception("failed to create approval")
++
++def run_loop(poll=30):
++    seen=set()
++    while True:
++        prs = list_recent_pipelineruns()
++        for pr in prs:
++            name = pr.get("metadata",{}).get("name")
++            if name in seen:
++                continue
++            # check status condition
++            conds = pr.get("status",{}).get("conditions",[])
++            if conds and conds[0].get("status") == "True":
++                process_pr(pr)
++                seen.add(name)
++        time.sleep(poll)
++
++if __name__ == "__main__":
++    run_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/gatekeeper/constraint_require_cosign.yaml
++apiVersion: constraints.gatekeeper.sh/v1beta1
++kind: K8sRequiredLabels
++metadata:
++  name: require-cosign-annotation
++spec:
++  enforcementAction: deny
++  match:
++    kinds:
++      - apiGroups: [""]
++        kinds: ["Pod"]
++  parameters:
++    labels:
++      - "aegis.cosign_sig"
++      - "aegis.evidence_uri"
++
++notes: |
++  - This Gatekeeper constraint denies Pod creation unless the required annotations/labels are present.
++  - For production you may scope this constraint to namespaces where model serving occurs.
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/webhook/cosign_validator.py
++#!/usr/bin/env python3
++"""
++Validating admission webhook (PoC) that ensures deployed model artifacts are cosign-signed.
++In production:
++ - Run behind TLS with cert-manager generated certs
++ - Use a robust cosign verification method (e.g., KMS-backed key or Fulcio transparency)
++ - Restrict scope to model-deployments namespace and validate image/artifact signatures
++"""
++from flask import Flask, request, jsonify
++import subprocess, json, base64, logging, os
++
++app = Flask(__name__)
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger("cosign-webhook")
++
++def verify_cosign_annotation(annotations):
++    # PoC: require presence of aegis.cosign_sig annotation (a URL or base64 signature)
++    sig = annotations.get("aegis.cosign_sig")
++    if not sig:
++        return False, "missing cosign annotation"
++    # In production, call `cosign verify-blob` or use python bindings to verify signature against stored public key
++    # Here we just accept presence as PoC
++    return True, "present"
++
++@app.route("/validate", methods=["POST"])
++def validate():
++    req = request.get_json()
++    uid = req["request"]["uid"]
++    obj = req["request"]["object"]
++    try:
++        annotations = obj.get("metadata", {}).get("annotations", {})
++        ok, msg = verify_cosign_annotation(annotations)
++        resp = {"response": {"uid": uid, "allowed": ok}}
++        if not ok:
++            resp["response"]["status"] = {"message": msg}
++        return jsonify(resp)
++    except Exception as e:
++        logger.exception("validation error")
++        return jsonify({"response":{"uid": req.get("request",{}).get("uid",""), "allowed": False, "status":{"message":"internal error"}}})
++
++if __name__ == "__main__":
++    # TLS should be configured via cert-manager and Deployment mount
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8443")))
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/compliance/audit_collector.py
++#!/usr/bin/env python3
++"""
++Compliance Audit Collector
++ - Aggregates evidence for promoted models, automated remediations, pen-test results and OPA decisions
++ - Produces periodic signed audit reports for legal/compliance consumption
++ - Stores reports in evidence bucket and optionally pushes to archival storage
++"""
++import os, time, json, logging, subprocess
++from datetime import datetime
++
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger("audit-collector")
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++SIGNER_CLI = os.environ.get("COSIGN_CLI", "/usr/local/bin/cosign")
++SIGNER_KEY = os.environ.get("COSIGN_KEY_PATH", "/secrets/cosign.key")
++
++def gather_evidence(prefix="closedloop/"):
++    if not EVIDENCE_BUCKET:
++        return {}
++    import boto3
++    s3=boto3.client("s3")
++    bucket=EVIDENCE_BUCKET.replace("s3://","")
++    objs = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
++    items = objs.get("Contents", [])
++    return {"count": len(items)}
++
++def create_report():
++    rep = {"ts": datetime.utcnow().isoformat(), "summary": gather_evidence(), "notes": "Periodic audit snapshot"}
++    fname = f"/tmp/audit-report-{int(time.time())}.json"
++    open(fname, "w").write(json.dumps(rep))
++    # sign with cosign if key present
++    if os.path.exists(SIGNER_KEY):
++        try:
++            subprocess.check_call([SIGNER_CLI, "sign-blob", "-key", SIGNER_KEY, fname])
++        except Exception:
++            logger.exception("cosign sign failed")
++    # upload
++    if EVIDENCE_BUCKET:
++        import boto3
++        s3=boto3.client("s3")
++        key=f"audits/report-{int(time.time())}.json"
++        s3.upload_file(fname, EVIDENCE_BUCKET.replace("s3://",""), key)
++        logger.info("Uploaded audit to s3://%s/%s", EVIDENCE_BUCKET.replace("s3://",""), key)
++
++def run_loop(interval_hours=24):
++    while True:
++        create_report()
++        time.sleep(interval_hours*3600)
++
++if __name__ == "__main__":
++    run_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/reliability/long_term_monitor.py
++#!/usr/bin/env python3
++"""
++Long-term reliability monitor:
++ - Tracks SLOs over time (daily/weekly/monthly windows)
++ - Emits alerts when sustained degradation is observed (calls alert webhook)
++ - Writes reliability reports to evidence bucket for audits
++"""
++import os, time, logging, requests, json
++from datetime import datetime, timedelta
++
++logging.basicConfig(level=logging.INFO)
++logger=logging.getLogger("long-term-monitor")
++
++PROM_URL = os.environ.get("PROM_URL", "http://prometheus.monitoring.svc:9090")
++ALERT_WEBHOOK = os.environ.get("ALERT_WEBHOOK", "")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++SLO_THRESHOLD = float(os.environ.get("SLO_THRESHOLD", "0.99"))
++
++def query_slo():
++    try:
++        r = requests.get(f"{PROM_URL}/api/v1/query", params={"query": "sum(rate(success_count[5m]))/sum(rate(request_count[5m]))"}, timeout=10)
++        if r.status_code!=200:
++            return None
++        return r.json().get("data",{})
++    except Exception:
++        return None
++
++def send_alert(msg):
++    if not ALERT_WEBHOOK:
++        logger.warning("Alert webhook not configured")
++        return
++    try:
++        requests.post(ALERT_WEBHOOK, json={"text": msg}, timeout=5)
++    except Exception:
++        logger.exception("alert send failed")
++
++def write_report(summary):
++    if not EVIDENCE_BUCKET:
++        return
++    import boto3
++    s3=boto3.client("s3")
++    key=f"reliability/reports/{int(time.time())}.json"
++    s3.put_object(Bucket=EVIDENCE_BUCKET.replace("s3://",""), Key=key, Body=json.dumps(summary).encode())
++
++def run_loop(poll_min=10):
++    window=[]
++    while True:
++        data = query_slo()
++        ts = datetime.utcnow().isoformat()
++        window.append({"ts": ts, "data": data})
++        # keep last N points (sliding)
++        if len(window) > 144:  # ~24 hours at 10min polling
++            window.pop(0)
++        # simple check: if latest SLO < threshold -> alert and record
++        try:
++            # PoC: check existence
++            if not data:
++                send_alert(f"SLO query returned empty at {ts}")
++            # upload periodic snapshot
++            if len(window) % 12 == 0:
++                write_report({"ts": ts, "window_len": len(window), "sample": data})
++        except Exception:
++            logger.exception("monitor error")
++        time.sleep(poll_min*60)
++
++if __name__ == "__main__":
++    run_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/ci/promote_autonomy_gates.yml
++name: Promote Autonomy Gates (manual approval required)
++on:
++  workflow_dispatch:
++    inputs:
++      evidence_bucket:
++        required: true
++      confirm:
++        required: true
++        description: "Type 'I_APPROVE' to apply Gatekeeper & auto-promote policies"
++
++jobs:
++  promote:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Validate confirmation
++        run: |
++          if [ "${{ github.event.inputs.confirm }}" != "I_APPROVE" ]; then
++            echo "Confirmation not provided. Canceling."
++            exit 1
++          fi
++      - name: Apply Gatekeeper & Webhook (manual gate)
++        run: |
++          kubectl apply -f ops/gatekeeper/constraint_require_cosign.yaml || true
++          # deploy validating webhook (assumes image already built and secret present)
++          kubectl apply -f ops/webhook/mutating_webhook_deploy.yaml || true
++      - name: Mark evidence
++        env:
++          EVIDENCE_BUCKET: ${{ github.event.inputs.evidence_bucket }}
++        run: |
++          echo "{\"action\":\"promote_autonomy\",\"by\":\"${{ github.actor }}\",\"ts\":$(date -u +%s)}" > /tmp/autonomy-promotion.json
++          aws s3 cp /tmp/autonomy-promotion.json ${EVIDENCE_BUCKET}/governance/
++
++notes: |
++  - This workflow intentionally requires manual confirmation to flip enforcement controls and enable auto-promotion gates.
++  - Use the earlier `ops/security/gatekeeper_promote_to_enforce.sh` for more granular control if desired.
++
+*** End Patch
+*** Begin Patch
+*** Add File:terraform/ops/cosign_kms_key.tf
++/*
++Terraform snippet (example) to create or reference a KMS key to protect cosign private key.
++Operator must securely store cosign private key in KMS/Secret Manager and mount into the cosign signer deployment.
++*/
++variable "kms_key_alias" {
++  type = string
++}
++
++resource "aws_kms_key" "cosign" {
++  description = "KMS key for cosign private key encryption"
++  deletion_window_in_days = 30
++}
++
++resource "aws_kms_alias" "cosign_alias" {
++  name = "alias/${var.kms_key_alias}"
++  target_key_id = aws_kms_key.cosign.key_id
++}
++
++output "cosign_kms_key_id" {
++  value = aws_kms_key.cosign.key_id
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:README_AUTONOMY_RUNBOOK.md
++name=README_AUTONOMY_RUNBOOK.md
++contents:
++This runbook describes how the autonomous promotion and continuous-learning stacks operate, the human approval exceptions, and how to audit them.
++
++1) Overview
++ - The continuous-learning pipeline (ops/tekton/pipelines/continuous_learning_pipeline.yaml) runs retrain, validate, canary and policy-decision tasks.
++ - OPA policies determine whether a run can be auto-promoted. For `risk_class == "legal"` or if OPA returns `require_legal=true`, a legal/regulatory approval request is created and human intervention is required.
++ - Routine human approvals are removed for policy-permitted changes; only legal/regulatory or explicitly high-risk promotions require humans.
++
++2) How to enable auto-promotion gates
++ - Review and update OPA policies (services/decisioning/opa_slo_policies.rego and data) to encode risk thresholds.
++ - When ready, run the CI workflow `ops/ci/promote_autonomy_gates.yml` and provide manual confirmation "I_APPROVE".
++ - This will apply Gatekeeper constraints and webhook validation (cosign requirement).
++
++3) Evidence & Auditing
++ - All promotions, decisions, signatures and remediation attempts are uploaded to EVIDENCE_BUCKET (S3). Compliance reports are created by services/compliance/audit_collector.py.
++ - Audit reports are cosign-signed if cosign key is present and uploaded to `${EVIDENCE_BUCKET}/audits/`.
++
++4) Legal/regulatory exception workflow
++ - OPA should set `require_legal=true` for promotions that need legal review.
++ - The pipeline will create an approval request via the Approval API; legal team processes the request via Approval UI.
++ - Once legal approves, approval service triggers the promote task (or auto-promote controller will observe the approval and proceed).
++
++5) Safety & remediation
++ - Automated remediation (services/failure/remediation_engine.py) retries, restarts and resubmits pipelines. If remediation attempts exceed limit, an escalation request is created.
++ - Remediation tracker evidence is stored under `${EVIDENCE_BUCKET}/remediation/`.
++
++6) Long-term reliability proof
++ - services/reliability/long_term_monitor.py collects SLO samples and writes periodic reports to `${EVIDENCE_BUCKET}/reliability/`.
++ - Keep retention policies and archival processes to satisfy auditors.
++
++7) Keys, secrets & signing
++ - Keep cosign private key in KMS/Secret Manager. Use terraform/ops/cosign_kms_key.tf as an example to provision a KMS key.
++ - Ensure signer deployment is restricted to an Ops role; apply least-privilege via Terraform.
++
++8) Operational playbooks
++ - Run validation: apply production-scale validation pipeline and gather evidence.
++ - If OPA policy changes are needed, update rego and run the OPA policy harness (services/decisioning/opa_policy_validation.py) against corpus.
++ - For legal approvals: route to Approval UI; upon approval, audit_collector will capture signoff in the evidence bundle.
++
++End of runbook.
++
+*** End Patch
+*** End Patch

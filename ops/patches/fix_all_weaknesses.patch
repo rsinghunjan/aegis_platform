@@ -1,0 +1,643 @@
+*** Begin Patch
+*** Add File:ops/hil/vendor_adapter_rest.py
++#!/usr/bin/env python3
++"""
++REST-based Vendor Adapter for HIL racks.
++ - Implements prepare_replay, start_run, poll_status, fetch_artifacts against a RESTful vendor API.
++ - Designed to be swapped in for a real vendor once credentials and endpoint are available.
++ - Expects vendor to support endpoints:
++     POST /api/racks/{rack}/prepare
++     POST /api/racks/{rack}/runs
++     GET  /api/runs/{job_id}/status
++     GET  /api/runs/{job_id}/artifacts
++ - Uses requests; in CI falls back to local simulator if VENDOR_URL not set.
++"""
++import os
++import json
++import time
++from typing import Dict, Any, List
++
++VENDOR_URL = os.environ.get("HIL_VENDOR_URL", "")
++VENDOR_RACK = os.environ.get("HIL_VENDOR_RACK", "default-rack")
++VENDOR_TOKEN = os.environ.get("HIL_VENDOR_TOKEN", "")
++
++try:
++    import requests
++except Exception:
++    requests = None
++
++class RESTVendorAdapter:
++    def __init__(self, url: str = None, token: str = None):
++        self.url = url or VENDOR_URL
++        self.token = token or VENDOR_TOKEN
++
++    def _headers(self):
++        h = {"Content-Type": "application/json"}
++        if self.token:
++            h["Authorization"] = f"Bearer {self.token}"
++        return h
++
++    def list_backends(self) -> List[Dict[str,Any]]:
++        if not self.url or not requests:
++            return [{"rack_id": VENDOR_RACK, "slot": 1, "status": "idle", "simulated": True}]
++        r = requests.get(f"{self.url}/api/racks", headers=self._headers(), timeout=10)
++        r.raise_for_status()
++        return r.json()
++
++    def prepare_replay(self, payload: Dict[str,Any]) -> Dict[str,Any]:
++        if not self.url or not requests:
++            return {"mounted": payload.get("manifest",{}).get("bag","local"), "ok": True, "simulated": True}
++        manifest = payload.get("manifest",{})
++        r = requests.post(f"{self.url}/api/racks/{VENDOR_RACK}/prepare", headers=self._headers(), json={"manifest": manifest}, timeout=30)
++        r.raise_for_status()
++        return r.json()
++
++    def start_run(self, payload: Dict[str,Any]) -> Dict[str,Any]:
++        if not self.url or not requests:
++            jid = f"sim-{int(time.time()*1000)}"
++            return {"job_id": jid}
++        manifest = payload.get("manifest",{})
++        r = requests.post(f"{self.url}/api/racks/{VENDOR_RACK}/runs", headers=self._headers(), json={"manifest": manifest}, timeout=30)
++        r.raise_for_status()
++        return r.json()
++
++    def poll_status(self, job_id: str) -> Dict[str,Any]:
++        if not self.url or not requests:
++            # heuristics for simulated job
++            return {"state":"succeeded"}
++        r = requests.get(f"{self.url}/api/runs/{job_id}/status", headers=self._headers(), timeout=10)
++        r.raise_for_status()
++        return r.json()
++
++    def fetch_artifacts(self, job_id: str, out_dir: str) -> List[str]:
++        if not self.url or not requests:
++            # simulated artifact
++            os.makedirs(out_dir, exist_ok=True)
++            p = os.path.join(out_dir, f"{job_id}_hil_log.json")
++            json.dump({"job_id": job_id, "status":"simulated_complete"}, open(p,"w"))
++            return [p]
++        r = requests.get(f"{self.url}/api/runs/{job_id}/artifacts", headers=self._headers(), timeout=30)
++        r.raise_for_status()
++        artifacts = r.json().get("artifacts", [])
++        os.makedirs(out_dir, exist_ok=True)
++        local_paths = []
++        for a in artifacts:
++            try:
++                rr = requests.get(a, headers=self._headers(), timeout=60)
++                rr.raise_for_status()
++                fname = os.path.join(out_dir, a.split("/")[-1])
++                open(fname,"wb").write(rr.content)
++                local_paths.append(fname)
++            except Exception:
++                continue
++        return local_paths
++
++if __name__ == "__main__":
++    print("RESTVendorAdapter demo")
++    a = RESTVendorAdapter()
++    print(a.list_backends())
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/hil/multi_rack_scheduler.py
++#!/usr/bin/env python3
++"""
++Multi-rack HIL scheduler:
++ - Picks manifests from queue directory and schedules them across multiple vendor racks.
++ - Balances load, limits concurrent runs per rack, supports retries and records job metadata.
++ - Produces /tmp/hil_jobs/*.json records with determinism report paths attached when available.
++"""
++import os
++import json
++import time
++import importlib
++from glob import glob
++from datetime import datetime
++from threading import Lock, Thread
++
++QUEUE_DIR = os.environ.get("HIL_QUEUE_DIR", "/tmp/hil_queue")
++JOB_DIR = os.environ.get("HIL_JOB_DIR", "/tmp/hil_jobs")
++ADAPTERS = os.environ.get("HIL_ADAPTERS", "ops.hil.vendor_adapter_rest.RESTVendorAdapter").split(",")
++MAX_CONCURRENT = int(os.environ.get("HIL_MAX_CONCURRENT", "2"))
++
++os.makedirs(QUEUE_DIR, exist_ok=True)
++os.makedirs(JOB_DIR, exist_ok=True)
++
++_locks = {}
++
++def load_adapter(path):
++    modname, clsname = path.rsplit(".",1)
++    mod = importlib.import_module(modname)
++    cls = getattr(mod, clsname)
++    return cls()
++
++def pick_adapter_round_robin(idx):
++    return load_adapter(ADAPTERS[idx % len(ADAPTERS)])
++
++def worker_thread(idx):
++    adapter = pick_adapter_round_robin(idx)
++    while True:
++        files = sorted(glob(os.path.join(QUEUE_DIR, "*.json")))
++        if not files:
++            time.sleep(2); continue
++        f = files[0]
++        try:
++            manifest = json.load(open(f))
++        except Exception:
++            os.rename(f, f + ".bad")
++            continue
++        # attempt to schedule
++        try:
++            prep = adapter.prepare_replay({"manifest": manifest})
++            job = adapter.start_run({"manifest": manifest})
++            job_id = job.get("job_id")
++            job_record = {"job_id": job_id, "manifest": f, "started": datetime.utcnow().isoformat()+"Z", "adapter": ADAPTERS[idx % len(ADAPTERS)], "state": "running"}
++            job_path = os.path.join(JOB_DIR, f"{job_id}.json")
++            open(job_path,"w").write(json.dumps(job_record, indent=2))
++            # poll until done
++            while True:
++                st = adapter.poll_status(job_id)
++                if st.get("state") in ("succeeded","done","completed"):
++                    arts = adapter.fetch_artifacts(job_id, "/tmp/hil_artifacts")
++                    job_record.update({"state":"succeeded","finished": datetime.utcnow().isoformat()+"Z","artifacts": arts})
++                    open(job_path,"w").write(json.dumps(job_record, indent=2))
++                    break
++                if st.get("state") in ("failed","error"):
++                    job_record.update({"state":"failed","status":st})
++                    open(job_path,"w").write(json.dumps(job_record, indent=2))
++                    break
++                time.sleep(2)
++        except Exception as e:
++            print("Scheduling error:", e)
++        try:
++            os.rename(f, f + ".processed")
++        except Exception:
++            pass
++        time.sleep(1)
++
++def run(n_workers=2):
++    threads = []
++    for i in range(n_workers):
++        t = Thread(target=worker_thread, args=(i,), daemon=True)
++        t.start(); threads.append(t)
++    while True:
++        time.sleep(10)
++
++if __name__ == "__main__":
++    run(n_workers=MAX_CONCURRENT)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/rt/remote_wcet_runner.py
++#!/usr/bin/env python3
++"""
++Run WCET analyzer on remote RT nodes via SSH and collect reports.
++ - Reads a JSON config with entries: [{"name":"...", "host":"user@host", "cmd":"..."}]
++ - SSHs into host, copies wcet_analyzer (or invokes remote runner), runs samples and fetches /tmp/wcet_report.json
++ - Aggregates reports locally and signs them if configured.
++"""
++import os
++import json
++import subprocess
++from datetime import datetime
++
++def run_remote(entry, samples=200):
++    host = entry["host"]
++    remote_cmd = f"python3 ~/aegis/ops/rt/wcet_analyzer.py --cmd '{entry['cmd']}' --samples {samples} --rt"
++    ssh_cmd = ["ssh", host, remote_cmd]
++    subprocess.check_call(ssh_cmd)
++    # scp back report
++    local = f"/tmp/wcet_{entry['name']}.json"
++    scp_cmd = ["scp", f"{host}:/tmp/wcet_report.json", local]
++    subprocess.check_call(scp_cmd)
++    return local
++
++def aggregate(reports, out="/tmp/wcet_aggregate_remote.json"):
++    agg = {"ts": datetime.utcnow().isoformat()+"Z", "reports": []}
++    for r in reports:
++        agg["reports"].append(json.load(open(r)))
++    with open(out,"w") as fh:
++        json.dump(agg, fh, indent=2)
++    # sign if backend
++    if os.environ.get("EVIDENCE_SIGN_BACKEND"):
++        try:
++            subprocess.check_call(["python","ops/evidence/sign_with_kms_or_vault.py", out])
++        except Exception:
++            pass
++    return out
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--config", required=True)
++    args = p.parse_args()
++    cfg = json.load(open(args.config))
++    rep_files = []
++    for e in cfg.get("entries", []):
++        rep_files.append(run_remote(e))
++    print(aggregate(rep_files))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/rt/label_nodes.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Label a set of Kubernetes nodes for RT workloads based on selectors or heuristics.
++#
++SEL=${1:-"gpu=true"}
++LABEL=${2:-"aegis/rt=true"}
++
++for n in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
++  if kubectl get node "$n" -o json | jq -e ".metadata.labels | has(\"$SEL\" )" >/dev/null 2>&1; then
++    kubectl label node "$n" "$LABEL" --overwrite || true
++  else
++    # heuristic: label nodes that have "vehicle" in name
++    if echo "$n" | grep -q "vehicle"; then
++      kubectl label node "$n" "$LABEL" --overwrite || true
++    fi
++  fi
++done
++echo "Labeling complete."
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/perception/annotation_api_client.py
++#!/usr/bin/env python3
++"""
++Annotation vendor API client (pluggable).
++ - upload_bundle(path) -> returns task_id
++ - poll_task(task_id) -> returns status and annotated dataset location
++ - This client supports a local mock when ANNOTATION_URL is not configured.
++"""
++import os
++import json
++import time
++
++ANNOTATION_URL = os.environ.get("ANNOTATION_URL", "")
++
++def upload_bundle(path):
++    if not ANNOTATION_URL:
++        # local mock: create a task file
++        tid = f"local-{int(time.time()*1000)}"
++        task = {"id": tid, "bundle": path, "status": "queued"}
++        os.makedirs("/tmp/annotation_tasks", exist_ok=True)
++        json.dump(task, open(f"/tmp/annotation_tasks/{tid}.json","w"))
++        return tid
++    # implement real HTTP multipart upload for vendor
++    import requests
++    files = {"file": open(path,"rb")}
++    r = requests.post(f"{ANNOTATION_URL}/tasks", files=files, timeout=60)
++    r.raise_for_status()
++    return r.json().get("task_id")
++
++def poll_task(tid, timeout=3600, poll_interval=30):
++    if not ANNOTATION_URL:
++        # wait for a local file to be marked 'done' by operator
++        p = f"/tmp/annotation_tasks/{tid}.json"
++        waited = 0
++        while waited < timeout:
++            if os.path.exists(p):
++                j = json.load(open(p))
++                if j.get("status") == "done":
++                    return {"status":"done","result": j.get("result")}
++            time.sleep(poll_interval); waited += poll_interval
++        return {"status":"timeout"}
++    import requests
++    waited = 0
++    while waited < timeout:
++        r = requests.get(f"{ANNOTATION_URL}/tasks/{tid}", timeout=10)
++        r.raise_for_status()
++        data = r.json()
++        if data.get("status") == "done":
++            return {"status":"done","result": data.get("result")}
++        time.sleep(poll_interval); waited += poll_interval
++    return {"status":"timeout"}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/perception/promote_model_ci.py
++#!/usr/bin/env python3
++"""
++Promotion helper used by CI to validate a detector before promotion:
++ - Validates signed evaluation_summary exists
++ - Validates model artifact hash & registers model into model_registry with provenance
++ - Ensures release board roles exist (safety owner, approver)
++"""
++import os
++import json
++import hashlib
++import subprocess
++
++MODEL_REG = os.environ.get("MODEL_REGISTRY_PATH","ops/models/model_registry.json")
++
++def sha(path):
++    h = hashlib.sha256()
++    with open(path,"rb") as fh:
++        for chunk in iter(lambda: fh.read(8192), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++def promote(model_path, eval_summary):
++    if not os.path.exists(eval_summary):
++        raise SystemExit("Missing eval summary")
++    if not os.path.exists(eval_summary + ".sig"):
++        raise SystemExit("Evaluation summary not signed")
++    mhash = sha(model_path)
++    reg = {}
++    if os.path.exists(MODEL_REG):
++        reg = json.load(open(MODEL_REG))
++    name = os.environ.get("PROMOTE_MODEL_NAME","detector-ci")
++    reg[name] = {"path": model_path, "hash": mhash, "eval": eval_summary, "registered_at": __import__("datetime").datetime.utcnow().isoformat()+"Z"}
++    with open(MODEL_REG,"w") as fh:
++        json.dump(reg, fh, indent=2)
++    # call release board check
++    try:
++        subprocess.check_call(["python","ops/governance/enforce_release_board.py", name])
++    except Exception as e:
++        print("Release board check failed:", e)
++        raise
++    print("Model promoted:", name)
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--model", required=True)
++    p.add_argument("--eval", required=True)
++    args = p.parse_args()
++    promote(args.model, args.eval)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/formal/sme_onboard_cli.py
++#!/usr/bin/env python3
++"""
++CLI to assist SMEs in onboarding invariants:
++ - Creates a PR-ready directory with an invariant metadata JSON and SMT2 template
++ - Validates minimal SMT syntax (presence of check-sat)
++"""
++import os
++import json
++from datetime import datetime
++
++OUT_DIR = os.environ.get("SMT_ONBOARD_DIR", "ops/formal/onboard_submissions")
++os.makedirs(OUT_DIR, exist_ok=True)
++
++TEMPLATE = """;; SMT2 template for {id}
++;; description: {desc}
++(declare-const ...)
++
++;; add property
++(assert (not ...))
++
++(check-sat)
++"""
++
++def create_onboard(id, desc):
++    smt_file = os.path.join(OUT_DIR, f"{id}.smt2")
++    meta_file = os.path.join(OUT_DIR, f"{id}.json")
++    open(smt_file,"w").write(TEMPLATE.format(id=id, desc=desc))
++    meta = {"id": id, "description": desc, "smt_file": smt_file, "submitted_at": datetime.utcnow().isoformat()+"Z"}
++    open(meta_file,"w").write(json.dumps(meta, indent=2))
++    return meta_file, smt_file
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--id", required=True)
++    p.add_argument("--desc", required=True)
++    args = p.parse_args()
++    print(create_onboard(args.id, args.desc))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/governance/oidc_assume_role_example.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Example: exchange GitHub OIDC id_token for AWS creds using aws-actions/configure-aws-credentials pattern.
++# This script demonstrates the required environment; it is not a complete automation.
++#
++ROLE_ARN=${ROLE_ARN:-"arn:aws:iam::123456789012:role/github-actions-oidc"}
++AWS_REGION=${AWS_REGION:-"us-east-1"}
++
++echo "Assuming role: $ROLE_ARN"
++aws sts assume-role-with-web-identity --role-arn "$ROLE_ARN" --role-session-name aegis-ci-session --web-identity-token "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" --duration-seconds 900 --region "$AWS_REGION" > /tmp/assume.json
++cat /tmp/assume.json
++echo "You would export AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN from the result in CI."
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/infra/helm_hpa_template.yaml
++apiVersion: autoscaling/v2
++kind: HorizontalPodAutoscaler
++metadata:
++  name: aegis-model-server-hpa
++spec:
++  scaleTargetRef:
++    apiVersion: apps/v1
++    kind: Deployment
++    name: aegis-model-server
++  minReplicas: 2
++  maxReplicas: 10
++  metrics:
++    - type: Resource
++      resource:
++        name: cpu
++        target:
++          type: Utilization
++          averageUtilization: 60
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/evidence/index_db.py
++#!/usr/bin/env python3
++"""
++SQLite index for evidence artifacts.
++ - When evidence is uploaded, register an index record with path, s3 URL, sha256 and metadata
++ - Supports simple queries for retention checks and legal holds
++"""
++import os
++import sqlite3
++from datetime import datetime
++
++DB = os.environ.get("EVIDENCE_INDEX_DB", "/tmp/evidence_index.db")
++
++def init_db():
++    conn = sqlite3.connect(DB)
++    c = conn.cursor()
++    c.execute("CREATE TABLE IF NOT EXISTS evidence (id INTEGER PRIMARY KEY AUTOINCREMENT, file TEXT, s3 TEXT, sha256 TEXT, ts TEXT, metadata TEXT)")
++    conn.commit(); conn.close()
++
++def add(file, s3, sha, metadata="{}"):
++    conn = sqlite3.connect(DB)
++    c = conn.cursor()
++    c.execute("INSERT INTO evidence (file,s3,sha256,ts,metadata) VALUES (?,?,?,?,?)", (file, s3, sha, datetime.utcnow().isoformat()+"Z", metadata))
++    conn.commit(); conn.close()
++
++def query_all():
++    conn = sqlite3.connect(DB)
++    c = conn.cursor()
++    for row in c.execute("SELECT id,file,s3,sha256,ts FROM evidence ORDER BY ts DESC"):
++        print(row)
++    conn.close()
++
++if __name__ == "__main__":
++    init_db()
++    print("DB initialized at", DB)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/evidence/s3_retention_uploader.py
+*** End Patch
+*** Begin Patch
+*** Add File:ops/evidence/s3_retention_uploader.py
++#!/usr/bin/env python3
++"""
++Upload evidence bundles to S3 with lifecycle policy and index them into sqlite for retention.
++ - Wraps earlier uploader and records index entries.
++"""
++import os
++import json
++import hashlib
++from glob import glob
++from datetime import datetime
++
++def sha256(path):
++    h = hashlib.sha256()
++    with open(path,"rb") as fh:
++        for chunk in iter(lambda: fh.read(8192), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++def upload(pattern, bucket, prefix="evidence"):
++    try:
++        import boto3
++    except Exception:
++        raise RuntimeError("boto3 required")
++    s3 = boto3.client("s3")
++    idx = []
++    from ops.evidence.index_db import init_db, add
++    init_db()
++    for p in glob(pattern):
++        key = f"{prefix}/{os.path.basename(p)}"
++        s3.upload_file(p, bucket, key)
++        s3url = f"s3://{bucket}/{key}"
++        entry = {"file": p, "s3": s3url, "ts": datetime.utcnow().isoformat()+"Z", "sha256": sha256(p)}
++        idx.append(entry)
++        # index into sqlite
++        add(p, s3url, entry["sha256"], metadata=json.dumps({"uploaded_by":"uploader"}))
++    # write index locally and return s3 path of index if desired
++    index_key = f"{prefix}/index_{int(time.time())}.json"
++    tmp = "/tmp/evidence_index.json"
++    with open(tmp,"w") as fh:
++        json.dump(idx, fh, indent=2)
++    s3.upload_file(tmp, bucket, index_key)
++    return f"s3://{bucket}/{index_key}"
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--pattern", required=True)
++    p.add_argument("--bucket", required=True)
++    p.add_argument("--prefix", default="evidence")
++    args = p.parse_args()
++    print(upload(args.pattern, args.bucket, prefix=args.prefix))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/evidence/retention_enforcer.py
++#!/usr/bin/env python3
++"""
++Enforce retention policies by querying the evidence index and applying lifecycle or legal holds.
++ - For local demo, will list items older than RETENTION_YEARS and print them for operator action.
++"""
++import os
++import sqlite3
++from datetime import datetime, timedelta
++
++DB = os.environ.get("EVIDENCE_INDEX_DB", "/tmp/evidence_index.db")
++RETENTION_YEARS = int(os.environ.get("EVIDENCE_RETENTION_YEARS", "7"))
++
++def list_old():
++    conn = sqlite3.connect(DB)
++    c = conn.cursor()
++    cutoff = datetime.utcnow() - timedelta(days=365*RETENTION_YEARS)
++    rows = c.execute("SELECT id,file,s3,sha256,ts FROM evidence").fetchall()
++    old = []
++    for r in rows:
++        ts = datetime.fromisoformat(r[4].replace("Z",""))
++        if ts < cutoff:
++            old.append(r)
++    conn.close()
++    return old
++
++if __name__ == "__main__":
++    os.makedirs("/tmp", exist_ok=True)
++    old = list_old()
++    if not old:
++        print("No artifacts past retention found.")
++    else:
++        print("Artifacts past retention:", old)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tests/integration/ci_gate_check.py
++#!/usr/bin/env python3
++"""
++CI gate: ensure no demo stubs and that critical signed artifacts exist before allowing merge to safety branch.
++ - Checks for stub patterns and ensures at least one determinism report is signed.
++"""
++import os
++import sys
++from glob import glob
++import json
++
++bad_patterns = ["REPLACE_WITH_SHA256", "simulated", "demo-job", "PENNYLANE_AVAILABLE = False"]
++issues = []
++for f in glob("ops/**/*.py", recursive=True) + glob("k8s/**/*.yaml", recursive=True):
++    try:
++        t = open(f).read()
++    except Exception:
++        continue
++    for p in bad_patterns:
++        if p in t:
++            issues.append(f"{f} contains pattern {p}")
++
++if issues:
++    print("Found demo/stub patterns:")
++    for i in issues:
++        print(i)
++    sys.exit(2)
++
++# check for at least one signed determinism report in /tmp
++found = False
++for p in glob("/tmp/determinism_*.json.sig") + glob("/tmp/hil_replay_summary.json.sig"):
++    found = True; break
++if not found:
++    print("No signed HIL determinism summary found in /tmp; failing gate.")
++    sys.exit(2)
++print("CI gate checks passed.")
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/production_gates.yml
++name: Production Promotion Gates
++on:
++  workflow_dispatch:
++
++jobs:
++  gate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.11'
++      - name: Run CI gate checks
++        run: |
++          python ops/tests/integration/ci_gate_check.py
++
+*** End Patch
+*** End Patch

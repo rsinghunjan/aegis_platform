@@ -1,0 +1,491 @@
+diff --git a/policy/opa/auto_approval.rego b/policy/opa/auto_approval.rego
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/policy/opa/auto_approval.rego
+@@ -0,0 +1,140 @@
++package aegis.policies.auto_approval
++
++import data.models
++
++default result = {"allow": false, "defer": false, "reason": "no policy matched", "timeout_seconds": 0}
++
++# Actions that are eligible for automated approval (subject to checks)
++eligible_actions = {"scale", "retrain_non_critical", "snapshot_non_critical"}
++
++budget_for_model[m] = b {
++  bm := data.models.models[m]
++  b := bm.budget_usd_per_month
++}
++budget_for_model[m] = 1000 {
++  not data.models.models[m]
++}
++
++is_action_eligible {
++  input.action == a
++  a := eligible_actions[_]
++}
++
++# Safety checks must be provided in the input.metrics payload by the orchestrator:
++# input.metrics = {"safety_checks_ok": true, "canary_passed": true, "estimated_cost_usd": 12.3}
++
++auto_approve {
++  is_action_eligible
++  # must have model
++  input.model
++  # must have metrics
++  input.metrics.safety_checks_ok == true
++  # budget check: estimated cost not too large (<= 10% of monthly budget as a quick guard)
++  estimated := input.params.estimated_cost_usd
++  estimated != null
++  b := budget_for_model[input.model]
++  estimated <= (b * 0.10)
++}
++
++# If auto_approve true -> allow immediately
++result = {"allow": true, "defer": false, "reason": "auto-approved per auto_approval policy", "timeout_seconds": 0} {
++  auto_approve
++}
++
++# If eligible but missing metrics, defer approval: open signoff workflow (defer)
++result = {"allow": false, "defer": true, "reason": "deferred: missing or failing safety checks", "timeout_seconds": 3600} {
++  is_action_eligible
++  not auto_approve
++}
++
++# Otherwise explicit deny for high-risk or unknown actions
++result = {"allow": false, "defer": false, "reason": "denied by auto_approval policy", "timeout_seconds": 0} {
++  not is_action_eligible
++}
++
+diff --git a/policy/opa/tests/auto_approval_tests.rego b/policy/opa/tests/auto_approval_tests.rego
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/policy/opa/tests/auto_approval_tests.rego
+@@ -0,0 +1,160 @@
++package aegis.policies.tests
++
++import data.aegis.policies.auto_approval
++
++test_auto_approve_low_cost_ok {
++  input := {"action":"scale","model":"low-demo-model","env":"production","params":{"estimated_cost_usd":50},"metrics":{"safety_checks_ok":true}}
++  result := data.aegis.policies.auto_approval.result with input as input
++  result.allow == true
++}
++
++test_defer_missing_metrics {
++  input := {"action":"scale","model":"low-demo-model","env":"production","params":{"estimated_cost_usd":50}}
++  result := data.aegis.policies.auto_approval.result with input as input
++  result.defer == true
++}
++
++test_deny_high_cost {
++  # large estimated cost should be denied (budget guard)
++  input := {"action":"scale","model":"expensive-model","env":"production","params":{"estimated_cost_usd":20000},"metrics":{"safety_checks_ok":true}}
++  result := data.aegis.policies.auto_approval.result with input as input
++  result.allow == false
++  result.defer == false
++}
++
+diff --git a/scripts/auto_approve_execute.py b/scripts/auto_approve_execute.py
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/scripts/auto_approve_execute.py
+@@ -0,0 +1,360 @@
++#!/usr/bin/env python3
++"""
++Automated approval executor + signoff workflow.
++
++Behavior:
++ - Accepts an action payload (JSON) describing the proposed agent action.
++ - Queries OPA auto_approval policy to determine allow / defer / deny.
++ - If allow -> execute the action (call an executor command or API).
++ - If defer -> create a GitHub issue for auditor/SRE signoff, poll for label "auditor-approved" until timeout_seconds,
++             auto-approve after timeout (configurable) and record decision in decision_log.
++ - If deny -> exit with non-zero and record decision.
++
++Environment:
++ - OPA_URL (e.g., http://opa:8181)
++ - GITHUB_TOKEN (optional, used to open issues)
++ - GITHUB_REPO (owner/repo)
++ - DECISION_LOG_CLIENT: optional module tools.decisionlog_client.insert_decision will be used if available
++
++Usage:
++  echo '{"action":"scale","model":"low-demo-model","params":{"estimated_cost_usd":10},"metrics":{"safety_checks_ok":true}}' | python3 scripts/auto_approve_execute.py --execute-cmd "kubectl scale deployment aegis-vllm --replicas=2"
++"""
++import os
++import sys
++import argparse
++import json
++import requests
++import subprocess
++import time
++
++OPA_URL = os.environ.get("OPA_URL", "http://opa:8181")
++GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
++GITHUB_REPO = os.environ.get("GITHUB_REPO")
++
++try:
++    from tools.decisionlog_client import insert_decision
++except Exception:
++    def insert_decision(agent, action, payload, evidence):
++        print("[decision_log stub]", agent, action, payload, evidence)
++        return None
++
++def opa_eval(input_obj):
++    url = f"{OPA_URL}/v1/data/aegis/policies/auto_approval/result"
++    try:
++        r = requests.post(url, json={"input": input_obj}, timeout=10)
++        r.raise_for_status()
++        return r.json().get("result")
++    except Exception as e:
++        print("OPA eval failed:", e)
++        return None
++
++def create_github_issue(title, body):
++    if not (GITHUB_TOKEN and GITHUB_REPO):
++        print("GITHUB_TOKEN or GITHUB_REPO not set; cannot create issue")
++        return None
++    url = f"https://api.github.com/repos/{GITHUB_REPO}/issues"
++    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
++    payload = {"title": title, "body": body}
++    r = requests.post(url, headers=headers, json=payload, timeout=10)
++    r.raise_for_status()
++    return r.json()
++
++def issue_has_label(issue_number, label):
++    url = f"https://api.github.com/repos/{GITHUB_REPO}/issues/{issue_number}"
++    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
++    r = requests.get(url, headers=headers, timeout=10)
++    r.raise_for_status()
++    labels = [l["name"] for l in r.json().get("labels",[])]
++    return label in labels
++
++def post_issue_comment(issue_number, comment):
++    url = f"https://api.github.com/repos/{GITHUB_REPO}/issues/{issue_number}/comments"
++    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
++    r = requests.post(url, headers=headers, json={"body": comment}, timeout=10)
++    r.raise_for_status()
++    return r.json()
++
++def execute_command(cmd):
++    # Very small helper to execute operator-provided command; in production this would be an API call to orchestrator
++    print("Executing:", cmd)
++    try:
++        out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode()
++        print("Command output:", out)
++        return True, out
++    except subprocess.CalledProcessError as e:
++        print("Command failed:", e.output.decode() if e.output else str(e))
++        return False, e.output.decode() if e.output else str(e)
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--input-file", help="JSON file with input payload; if omitted, reads stdin")
++    p.add_argument("--execute-cmd", help="Shell command to run if approved (for demo/testing)", required=False)
++    p.add_argument("--auto-approve-label", default="auditor-approved", help="Label name auditors apply to approve")
++    p.add_argument("--poll-interval", type=int, default=15)
++    args = p.parse_args()
++
++    if args.input_file:
++        with open(args.input_file) as fh:
++            payload = json.load(fh)
++    else:
++        payload = json.load(sys.stdin)
++
++    print("[auto-approve] Input payload:", json.dumps(payload))
++    opa_res = opa_eval(payload)
++    if opa_res is None:
++        print("OPA unreachable or error; failing safe")
++        insert_decision("auto_approval_agent","evaluate_failed",payload,{"error":"opa_unreachable"})
++        sys.exit(2)
++
++    allow = opa_res.get("allow", False)
++    defer = opa_res.get("defer", False)
++    reason = opa_res.get("reason", "")
++    timeout_seconds = int(opa_res.get("timeout_seconds", 0) or 0)
++
++    insert_decision("auto_approval_agent","evaluate",payload,{"allow":allow,"defer":defer,"reason":reason,"timeout_seconds":timeout_seconds})
++
++    if allow:
++        print("[auto-approve] OPA allowed. Executing action.")
++        if args.execute_cmd:
++            ok, out = execute_command(args.execute_cmd)
++            insert_decision("auto_approval_agent","executed",payload,{"success":ok,"output":out})
++            sys.exit(0 if ok else 3)
++        else:
++            print("No execute command provided; marking approved in decision log.")
++            insert_decision("auto_approval_agent","approved_noop",payload,{"note":"no exec cmd"})
++            sys.exit(0)
++
++    if defer:
++        # create GitHub issue for signoff
++        title = f"[Approval request] {payload.get('action')} on {payload.get('model')}"
++        body = "Automated approval workflow created. Timeout (seconds): %d\n\nPayload:\n```\n%s\n```" % (timeout_seconds, json.dumps(payload, indent=2))
++        issue = None
++        try:
++            issue = create_github_issue(title, body)
++            issue_num = issue.get("number")
++            insert_decision("auto_approval_agent","created_signoff_issue",payload,{"issue": issue.get("html_url")})
++            print(f"[auto-approve] Created issue: {issue.get('html_url')}")
++        except Exception as e:
++            print("Failed to create GitHub issue:", e)
++            insert_decision("auto_approval_agent","signoff_issue_failed",payload,{"error": str(e)})
++            # If unable to create issue, fail safe (do not auto-approve)
++            sys.exit(4)
++
++        # Poll for auditor label until timeout; if timeout, auto-approve but record audit
++        start = time.time()
++        approved = False
++        while time.time() - start < timeout_seconds:
++            try:
++                if issue_has_label(issue_num, args.auto_approve_label):
++                    approved = True
++                    break
++            except Exception as e:
++                print("Issue label check failed:", e)
++            time.sleep(args.poll_interval)
++
++        if approved:
++            print("[auto-approve] Auditor approved via label; executing.")
++            insert_decision("auto_approval_agent","signoff_approved",payload,{"issue": issue.get("html_url")})
++            if args.execute_cmd:
++                ok, out = execute_command(args.execute_cmd)
++                insert_decision("auto_approval_agent","executed_post_signoff",payload,{"success":ok,"output":out})
++                sys.exit(0 if ok else 5)
++            else:
++                insert_decision("auto_approval_agent","approved_noop_post_signoff",payload,{})
++                sys.exit(0)
++        else:
++            # Timeout reached; auto-approve as time-boxed exception
++            comment = ("No auditor signoff within %d seconds. Auto-approving as time-boxed exception. " % timeout_seconds)
++            try:
++                post_issue_comment(issue_num, comment)
++            except Exception:
++                pass
++            insert_decision("auto_approval_agent","auto_approved_after_timeout",payload,{"timeout_seconds": timeout_seconds})
++            print("[auto-approve] Auto-approving after timeout.")
++            if args.execute_cmd:
++                ok, out = execute_command(args.execute_cmd)
++                insert_decision("auto_approval_agent","executed_after_timeout",payload,{"success":ok,"output":out})
++                sys.exit(0 if ok else 6)
++            else:
++                insert_decision("auto_approval_agent","auto_approved_noop",payload,{})
++                sys.exit(0)
++
++    # Deny case
++    print("[auto-approve] Action denied by policy:", reason)
++    insert_decision("auto_approval_agent","denied",payload,{"reason":reason})
++    sys.exit(7)
++
++if __name__ == "__main__":
++    main()
++
+diff --git a/scripts/enforce_budget_guard.py b/scripts/enforce_budget_guard.py
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/scripts/enforce_budget_guard.py
+@@ -0,0 +1,220 @@
++#!/usr/bin/env python3
++"""
++Lightweight enforcement wrapper for budget_guard policy.
++ - Accepts a JSON payload describing an action and model with estimated_cost_usd
++ - Queries OPA budget_guard policy and exits 0 if allowed, non-zero if denied.
++
++Usage:
++  echo '{"action":"generate","model":"expensive-model","params":{"estimated_cost_usd":5000}}' | python3 scripts/enforce_budget_guard.py
++"""
++import os
++import sys
++import json
++import requests
++
++OPA_URL = os.environ.get("OPA_URL","http://opa:8181")
++
++def opa_budget_eval(input_obj):
++    url = f"{OPA_URL}/v1/data/aegis/policies/budget_guard/result"
++    r = requests.post(url, json={"input": input_obj}, timeout=10)
++    r.raise_for_status()
++    return r.json().get("result",{})
++
++def main():
++    payload = json.load(sys.stdin)
++    res = opa_budget_eval(payload)
++    allow = res.get("allow", False)
++    deny = res.get("deny_budget_exceeded", False)
++    if deny or not allow:
++        print("Budget guard: DENY", json.dumps(res))
++        sys.exit(2)
++    print("Budget guard: ALLOW", json.dumps(res))
++    sys.exit(0)
++
++if __name__ == "__main__":
++    main()
++
+diff --git a/scripts/notify_auditors.py b/scripts/notify_auditors.py
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/scripts/notify_auditors.py
+@@ -0,0 +1,180 @@
++#!/usr/bin/env python3
++"""
++Notifier helper used by automated approval flows.
++ - Creates a GitHub issue summarizing the requested action (auditor signoff)
++ - Optionally posts to Slack via webhook
++
++Environment:
++ - GITHUB_TOKEN, GITHUB_REPO
++ - SLACK_WEBHOOK (optional)
++
++Usage:
++  python3 scripts/notify_auditors.py --title "Approval requested" --body-file payload.json
++"""
++import os
++import argparse
++import json
++import requests
++
++GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
++GITHUB_REPO = os.environ.get("GITHUB_REPO")
++SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK")
++
++def create_issue(title, body):
++    url = f"https://api.github.com/repos/{GITHUB_REPO}/issues"
++    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
++    r = requests.post(url, headers=headers, json={"title": title, "body": body})
++    r.raise_for_status()
++    return r.json()
++
++def post_slack(text):
++    if not SLACK_WEBHOOK:
++        return None
++    r = requests.post(SLACK_WEBHOOK, json={"text": text}, timeout=5)
++    r.raise_for_status()
++    return r.json()
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--title", required=True)
++    p.add_argument("--body-file", required=True)
++    args = p.parse_args()
++    with open(args.body_file) as fh:
++        body = fh.read()
++    issue = create_issue(args.title, body)
++    print("Created issue:", issue.get("html_url"))
++    try:
++        post_slack(f"Audit approval request created: {issue.get('html_url')}\n*{args.title}*")
++    except Exception as e:
++        print("Slack notify failed:", e)
++
++if __name__ == "__main__":
++    main()
++
+diff --git a/.github/workflows/auto_approval_dispatch.yml b/.github/workflows/auto_approval_dispatch.yml
+new file mode 100644
+index 0000000..6666666
+--- /dev/null
++++ b/.github/workflows/auto_approval_dispatch.yml
+@@ -0,0 +1,180 @@
++name: Auto-Approval Dispatch (demo)
++
++on:
++  workflow_dispatch:
++    inputs:
++      model:
++        description: 'Model name'
++        required: true
++        default: 'low-demo-model'
++      action:
++        description: 'Action to request'
++        required: true
++        default: 'scale'
++      estimated_cost:
++        description: 'Estimated cost USD'
++        required: true
++        default: '10'
++      execute_cmd:
++        description: 'Command to run if approved (for demo)'
++        required: false
++        default: 'echo "approved"'
++
++jobs:
++  request-approval:
++    runs-on: ubuntu-latest
++    permissions:
++      contents: read
++      issues: write
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: Prepare input
++        run: |
++          cat > /tmp/request.json <<EOF
++          {
++            "action": "${{ github.event.inputs.action }}",
++            "model": "${{ github.event.inputs.model }}",
++            "params": {"estimated_cost_usd": ${{ github.event.inputs.estimated_cost }}},
++            "metrics": {}
++          }
++          EOF
++          jq . /tmp/request.json
++
++      - name: Call auto-approve executor (requires OPA_URL and GITHUB_TOKEN in secrets)
++        env:
++          OPA_URL: ${{ secrets.OPA_URL || '' }}
++          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN || '' }}
++          GITHUB_REPO: ${{ github.repository }}
++        run: |
++          python3 scripts/auto_approve_execute.py --input-file /tmp/request.json --execute-cmd "${{ github.event.inputs.execute_cmd }}" --poll-interval 20
++
+diff --git a/docs/AUTOMATED_APPROVALS_RUNBOOK.md b/docs/AUTOMATED_APPROALS_RUNBOOK.md
+new file mode 100644
+index 0000000..7777777
+--- /dev/null
++++ b/docs/AUTOMATED_APPROALS_RUNBOOK.md
+@@ -0,0 +1,220 @@
++# Automated Approvals & Budget Enforcement — Runbook
++
++This patch implements:
++- an OPA auto_approval policy that can auto-approve low-risk actions when safety checks and budget checks pass
++- a deferred signoff workflow that opens a GitHub issue and time-boxes approval (auto-approve after timeout)
++- a budget enforcement wrapper that queries OPA budget_guard before scheduling expensive operations
++- helper scripts to notify auditors and to execute approved actions
++
++Files added
++- policy/opa/auto_approval.rego
++- policy/opa/tests/auto_approval_tests.rego
++- scripts/auto_approve_execute.py
++- scripts/enforce_budget_guard.py
++- scripts/notify_auditors.py
++- .github/workflows/auto_approval_dispatch.yml
++
++How it works (operator summary)
++1. Orchestrator constructs an action payload including: action, model, params.estimated_cost_usd, metrics (safety_checks_ok)
++2. Call `scripts/enforce_budget_guard.py` (stdin JSON) to do a quick budget check via OPA.
++   - If denied, the request is rejected immediately.
++3. If budget guard allows, call `scripts/auto_approve_execute.py` with the payload:
++   - It queries OPA auto_approval policy:
++     - If policy allows, the provided execute command is run and decision logged.
++     - If policy defers, a GitHub issue is created and auditors/SREs are asked to label issue "auditor-approved".
++       The script polls the issue for the label until `timeout_seconds` (from policy). If the timeout elapses without approval,
++       the action is auto-approved as a time-boxed exception and executed; every step is recorded in decision_log.
++4. All decisions are written to decision_log (via tools.decisionlog_client.insert_decision) where available.
++
++Safe defaults & operator notes
++- The auto_approval policy is conservative: it only auto-approves when (a) action is in eligible_actions, (b) safety_checks_ok is true,
++  and (c) estimated_cost_usd <= 10% of model monthly budget.
++- The deferred path requires human auditor label to approve before timeout; if no label, auto-approval occurs but is recorded and an issue comment posted.
++- You must set OPA_URL to your OPA server, and provide GITHUB_TOKEN + GITHUB_REPO for issue workflows and notifications.
++- Integrate these scripts into your orchestrator (Argo/Orchestrator) so that they run as precondition checks before executing high-risk actions.
++
++Next steps you may request
++- Wire Slack notifications and a dedicated auditor dashboard showing pending approval issues.
++- Add RBAC and a small UI for auditors to see pending approval requests and approve with one click.
++- Extend auto_approval.rego to incorporate live metrics (canary pass rates, error budgets) pulled from monitoring.
++
++End of runbook.
++

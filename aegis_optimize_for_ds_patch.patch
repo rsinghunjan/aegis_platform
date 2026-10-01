@@ -1,0 +1,323 @@
+*** Begin Patch
+*** Add File:optimize/README_OPTIMIZE_DS.md
++Overview
++--------
++This patch adds focused integrations and orchestration to optimize Aegis for data science and analytics while preserving the platform's core guarantees: cross‑cloud model build/run/governance, cost discipline, and compliance (signed evidence + audit).
++
++What this patch adds (high level)
++- Orchestrated ETL → dbt → GE → MLflow → validation pipeline with CI gating and manual promotion.
++- dbt macros & models to propagate evidence_s3_key and connect analytics to provenance.
++- MLflow integration helpers to log experiments with evidence links and automatic artifact signing.
++- DataHub ingestion recipe that includes dbt manifest + MLflow metadata for lineage.
++- Superset SSO + dataset RBAC snippet, and guidance to enforce RLS in DB.
++- Improved idempotent Airflow DAG that runs parquet pipeline, manifest, bulk load, dbt, GE validations and triggers model retrain & gated promotion.
++- Prometheus rules for the analytics SLOs (median error, ETL lag, enforcement coverage, model drift).
++- Operator runbook for daily/weekly tasks for data scientists and SREs.
++
++Principles maintained
++- Every analytic metric is traceable to signed evidence artifacts (evidence_s3_key).
++- CI gating prevents promotion of models or profile changes unless validation passes (median error <= threshold).
++- Least-privilege defaults for new service accounts and RBAC guidance included.
++
++How to use
++- Deploy components to staging first (Airflow, dbt, DataHub, MLflow, Superset).
++- Wire secrets: EVIDENCE_BUCKET, KUBECONFIG, COSIGN_KMS_KEY_ARN, DATAHUB_SERVER, DATAHUB_API_KEY, MLFLOW_TRACKING_URI.
++- Run the ETL/ML pipeline in staging, inspect validation artifacts in S3, then use manual promote path to apply to production.
++
+*** End Patch
+*** Begin Patch
+*** Add File:dbt/macros/get_evidence_key.sql
++{% macro get_evidence_key(evidence_col, fallback_key='evidence_s3_key') -%}
++-- Macro to normalize evidence key propagation in dbt models.
++-- Usage: {{ get_evidence_key('evidence_s3_key') }}
++  coalesce({{ evidence_col }}, {{ fallback_key }})
++{%- endmacro %}
++
+*** End Patch
+*** Begin Patch
+*** Add File:dbt/models/marts/feature_snapshot_bridge.sql
++-- Bridge table: feature snapshots referenced from experiments and models.
++-- Each row should reference evidence_s3_key to trace features back to raw artifacts.
++with feats as (
++  select
++    fs.feature_id,
++    fs.feature_name,
++    fs.snapshot_s3_path as evidence_s3_key,
++    fs.created_at
++  from {{ source('feature_store','feature_snapshots') }} fs
++)
++select * from feats
++
+*** End Patch
+*** Begin Patch
+*** Add File:mlflow/mlflow_evidence_logger.py
++#!/usr/bin/env python3
++"""
++Helper to log MLflow runs with evidence linkage and automatic cosign of important artifacts.
++Usage:
++  from mlflow_evidence_logger import MLflowEvidenceLogger
++  logger = MLflowEvidenceLogger(tracking_uri=os.environ['MLFLOW_TRACKING_URI'])
++  with logger.start_run(experiment_name='aegis-experiments', run_name='trial-1') as run:
++      logger.log_params({...})
++      logger.log_artifact('/tmp/runtime_model.pkl', evidence_s3_key='s3://.../models/runtime_model.pkl')
++      logger.sign_and_upload('/tmp/runtime_model.pkl', s3_dest='s3://<EVIDENCE_BUCKET>/models/runtime_model.pkl')
++"""
++import os, tempfile, subprocess, mlflow, boto3, shutil
++
++class MLflowEvidenceLogger:
++    def __init__(self, tracking_uri=None, evidence_bucket=None, cosign_kms_arn=None):
++        if tracking_uri:
++            mlflow.set_tracking_uri(tracking_uri)
++        self.evidence_bucket = evidence_bucket or os.environ.get("EVIDENCE_BUCKET")
++        self.cosign_kms = cosign_kms_arn or os.environ.get("COSIGN_KMS_KEY_ARN")
++        self.s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION","us-west-2"))
++
++    def start_run(self, experiment_name=None, run_name=None):
++        exp_id = mlflow.set_experiment(experiment_name) if experiment_name else None
++        return mlflow.start_run(run_name=run_name)
++
++    def log_params(self, params: dict):
++        for k,v in params.items():
++            mlflow.log_param(k,v)
++
++    def log_artifact(self, local_path, evidence_s3_key=None):
++        mlflow.log_artifact(local_path)
++        if evidence_s3_key:
++            # Upload to S3 if provided and return key
++            if evidence_s3_key.startswith("s3://"):
++                # parse
++                bucket = evidence_s3_key.split("s3://",1)[1].split("/",1)[0]
++                key = evidence_s3_key.split("s3://",1)[1].split("/",1)[1]
++                self.s3.upload_file(local_path, bucket, key)
++                return evidence_s3_key
++        return None
++
++    def sign_and_upload(self, local_path, s3_dest):
++        # upload then sign via cosign+KMS (cosign must be installed in runner)
++        if s3_dest.startswith("s3://"):
++            bucket = s3_dest.split("s3://",1)[1].split("/",1)[0]
++            key = s3_dest.split("s3://",1)[1].split("/",1)[1]
++            self.s3.upload_file(local_path, bucket, key)
++            if self.cosign_kms:
++                try:
++                    subprocess.run(["cosign","sign","--key",f"awskms://{self.cosign_kms}", local_path], check=True)
++                except Exception:
++                    # cosign failure should be non-fatal for experiments, but record event in logs
++                    print("Warning: cosign signing failed")
++            return f"s3://{bucket}/{key}"
++        else:
++            raise ValueError("s3_dest must be s3://...")
++
+*** End Patch
+*** Begin Patch
+*** Add File:airflow/dags/etl_ml_flow_optimized.py
++from datetime import datetime, timedelta
++from airflow import DAG
++from airflow.operators.python import PythonOperator
++from airflow.providers.cncf.kubernetes.operators.kubernetes_pod import KubernetesPodOperator
++import os, subprocess
++from operational.airflow_idempotent_helper import already_done_marker, mark_done
++
++DEFAULT_ARGS = {
++    'owner': 'aegis',
++    'depends_on_past': False,
++    'email_on_failure': True,
++    'retries': 1,
++    'retry_delay': timedelta(minutes=10),
++}
++
++WAREHOUSE_DSN = os.environ.get("WAREHOUSE_DSN", "postgresql://user:pass@host:5432/aegis_dw")
++JOB_PREFIX = "etl_ml_pipeline_" + datetime.utcnow().strftime("%Y%m%d")
++
++def run_parquet():
++    job_key = "parquet_pipeline_" + datetime.utcnow().strftime("%Y%m%d")
++    if already_done_marker(WAREHOUSE_DSN, job_key):
++        print("Parquet pipeline already run for today; skipping.")
++        return
++    rc = subprocess.call("python3 /opt/ingest/s3_parquet_pipeline_v3.py", shell=True)
++    if rc != 0:
++        raise RuntimeError("Parquet pipeline failed")
++    mark_done(WAREHOUSE_DSN, job_key)
++
++def run_manifest():
++    subprocess.check_call("python3 /opt/ingest/copy_manifest_generator.py", shell=True)
++
++def run_bulk_load():
++    subprocess.check_call("/opt/etl/redshift_loader_wrapper.sh", shell=True)
++
++def run_dbt():
++    subprocess.check_call("cd /opt/bi && dbt deps && dbt run --profiles-dir /opt/bi/profiles", shell=True)
++
++def run_ge():
++    rc = subprocess.call("python3 /opt/data_quality/run_expectations.py", shell=True)
++    if rc != 0:
++        raise RuntimeError("GE validations failed")
++
++def trigger_retrain_and_validate():
++    # Launch a K8s job that trains a runtime predictor and writes model + reconciliation examples.
++    subprocess.check_call("kubectl -n aegis apply -f ci/jobs/runtime_train_job.yaml && kubectl -n aegis wait --for=condition=complete job/aegis-runtime-train --timeout=3600s", shell=True)
++    # run validation gating script
++    subprocess.check_call("python3 ci/validate_model_gating.py --bucket ${EVIDENCE_BUCKET} --prefix reconciliations/ --threshold 0.10 --upload-report true", shell=True)
++
++with DAG(
++    dag_id="aegis_etl_ml_optimized",
++    default_args=DEFAULT_ARGS,
++    schedule_interval="@daily",
++    start_date=datetime(2025,1,1),
++    catchup=False,
++    max_active_runs=1
++) as dag:
++
++    parquet = PythonOperator(task_id="parquet_pipeline", python_callable=run_parquet)
++
++    manifest = PythonOperator(task_id="generate_manifest", python_callable=run_manifest)
++
++    bulk = KubernetesPodOperator(
++        task_id="bulk_loader",
++        name="bulk-loader",
++        namespace="aegis",
++        image="ghcr.io/yourorg/aegis-dw-loader:latest",
++        cmds=["/bin/sh","-c"],
++        arguments=["/opt/etl/redshift_loader_wrapper.sh"],
++        get_logs=True,
++        is_delete_operator_pod=True,
++        in_cluster=True
++    )
++
++    dbt_run = PythonOperator(task_id="dbt_run", python_callable=run_dbt)
++
++    ge = PythonOperator(task_id="great_expectations", python_callable=run_ge)
++
++    retrain = PythonOperator(task_id="train_and_validate", python_callable=trigger_retrain_and_validate)
++
++    parquet >> manifest >> bulk >> dbt_run >> ge >> retrain
++
+*** End Patch
+*** Begin Patch
+*** Add File:datahub/datahub_ingest_enhanced.yml
++source:
++  type: dbt
++  config:
++    manifest_path: /opt/bi/target/manifest.json
++    catalog_path: /opt/bi/target/catalog.json
++    project_name: aegis_bi
++transformations:
++  - type: mlflow
++    config:
++      tracking_uri: ${MLFLOW_TRACKING_URI}
++      include_experiments: true
++sink:
++  type: datahub-rest
++  config:
++    server: ${DATAHUB_SERVER}
++    api_key: ${DATAHUB_API_KEY}
++
+*** End Patch
+*** Begin Patch
+*** Add File:security/superset_oidc_rbac_snippet.py
++# superset_config.py snippet: OIDC + group->role mapping example
++from flask_appbuilder.security.manager import AUTH_OID
++AUTH_TYPE = AUTH_OID
++OPENID_PROVIDERS = [
++    {
++      'name': 'keycloak',
++      'token_key': 'access_token',
++      'icon': 'fa-address-card',
++      'remote_app': {
++          'client_id': 'superset-client',
++          'client_secret': 'SUPERSECRET',
++          'api_base_url': 'https://keycloak.example.com/auth/realms/aegis',
++          'access_token_url': 'https://keycloak.example.com/auth/realms/aegis/protocol/openid-connect/token',
++          'authorize_url': 'https://keycloak.example.com/auth/realms/aegis/protocol/openid-connect/auth',
++          'client_kwargs': {'scope': 'openid email profile groups'}
++      }
++    }
++]
++
++# Map OIDC groups to Superset roles with a custom security manager if necessary.
++# Ensure DB connection uses pre-query: SET app.team = '{{ current_user.extra.team }}' for RLS.
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/prometheus_rules_ds_slos.yaml
++groups:
++- name: aegis-ds-slos
++  rules:
++  - alert: MedianEstimatorErrorExceeded
++    expr: aegis_reconciliation_median_rel_error > 0.10
++    for: 30m
++    labels:
++      severity: page
++    annotations:
++      summary: "Median reconciliation relative error above 10%"
++
++  - alert: ETLIngestionLagHigh
++    expr: aegis_etl_ingestion_lag_seconds > 86400  # >24h
++    for: 15m
++    labels:
++      severity: page
++    annotations:
++      summary: "ETL ingestion lag exceeds 24 hours"
++
++  - alert: EnforcementCoverageLow
++    expr: aegis_enforcement_coverage < 0.95
++    for: 30m
++    labels:
++      severity: page
++    annotations:
++      summary: "Enforcement coverage below 95%"
++
++  - alert: ModelDriftDetected
++    expr: aegis_model_drift_score > 0.5
++    for: 30m
++    labels:
++      severity: warning
++    annotations:
++      summary: "Model drift score high for one or more models"
++
+*** End Patch
+*** Begin Patch
+*** Add File:runbooks/ops_ds_quick.md
++# Ops runbook: Daily/Weekly checklist for Data Science & Analytics (Aegis)
++
++Daily
++- Check ETL DAG success and ingestion lag:
++  - Airflow: DAG `aegis_etl_ml_optimized` status
++  - Prometheus: `aegis_etl_ingestion_lag_seconds` < 24h
++- Great Expectations: check last GE validation artifacts in S3 and `aegis_ge_latest_success` metric.
++- MLflow: ensure scheduled retrain jobs completed and artifacts uploaded to S3 with evidence_s3_key.
++
++Weekly
++- Run iterative calibration CronJob (aegis-iterative-calibration) in staging; review drafts under `s3://<EVIDENCE_BUCKET>/calibration/drafts/`.
++- Run enforcement E2E tests and review enforcement coverage metric.
++- Run DataHub ingestion after dbt run and verify lineage for newly added marts.
++- Review Prometheus alerts and triage any SLO violations.
++
++Promotion procedure (manual)
++1. Inspect validation report in S3 (uploaded by CI).
++2. If median error <= threshold, sign artifact using cosign (KMS) and apply ConfigMap to production:
++   kubectl -n aegis create configmap aegis-power-profiles --from-file=power_profiles.yaml=/path/to/approved.yaml --dry-run=client -o yaml | kubectl apply -f -
++3. Document action in evidence S3 and create Rekor entry automatically via cosign.
++
+*** End Patch
+*** Begin Patch
+*** Add File:tests/dbt_evidence_tests.sql
++-- Example SQL-based dbt test to ensure evidence_s3_key exists for rows used in production dashboards
++select count(*) from {{ ref('core_job_runs') }} where evidence_s3_key is null;
++
+*** End Patch
+*** Begin Patch
+*** Add File:ci/README_CI_DS.md
++# CI integration for data-science workflows
++
++This folder contains artifacts and guidance for the CI gating of calibration/model promotion:
++- validate_model_gating.py (already in repo) computes median error and uploads validation report.
++- The ETL/ML workflow (telemetry→calibration→train→validate) is wired to GitHub Actions (telemetry_retrain_pipeline.yml).
++- Promotion is manual: operator validates evidence and applies ConfigMap to production.
++
++Best practices
++- Protect production environment with GitHub environment approvals for promote job.
++- Store COSIGN_KMS_KEY_ARN in GitHub secrets and restrict who can trigger promotion.
++
+*** End Patch
+*** End Patch

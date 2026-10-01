@@ -1,0 +1,444 @@
+*** Begin Patch
+*** Add File:docs/validation_sprint_runbook.md
++# Validation Sprint Runbook: Drift → Retrain → Canary (Staged Validation)
++
++Objective:
++- Execute a 2–4 week staged validation sprint to prove the drift→retrain→canary flow end‑to‑end on a real model/dataset, collect evidence, and iterate on hardening issues.
++
++Scope:
++- One model family, one dataset. Use staging cluster, real provider credentials if available (no paid QPU usage without legal signoff).
++
++Prereqs:
++- Tekton pipeline `drift-retrain-canary-pipeline` installed.
++- Drift detector deployed and configured with baseline/latest sample URIs.
++- Evidence S3 bucket configured (EVIDENCE_BUCKET) and accessible by CI/pipelines.
++- OTEL collector + Prometheus running and reachable.
++- Labeling UI (Label Studio) deployed for active learning (optional).
++- Redis instance for rate limiter (optional).
++
++Phases:
++1) Preparation (Day 0)
++ - Select model & dataset; snapshot baseline dataset (S3 path) and ensure latest sample ingestion.
++ - Configure DRIFT_THRESHOLD conservatively (e.g. 0.05).
++ - Ensure cosign key and KMS access; store key in secret mount for pipeline.
++ - Create pipeline-approvals ConfigMap in cicd namespace and set approved=false.
++
++2) Dry runs (Days 1–3)
++ - Run `services/quantum/live_e2e_runner.py --run-tests` to sanity-check provider adapters (if used).
++ - Trigger Tekton pipeline manually for a single retrain; validate all tasks succeed and evidence is uploaded.
++ - Review Great Expectations and other validation outputs.
++
++3) Controlled stress & canary validation (Days 4–10)
++ - Run Tekton `validation-sprint-pipeline` repeatedly (1–2 runs/day) with simulated traffic to canary service.
++ - Run the `qpu-stress` task if testing QPU submission scale impacts (careful with cost).
++ - Collect traces using OTEL; run `services/quantum/worker_postmortem_helpers.py` after each run for artifacts.
++
++4) Active learning (Days 7–21)
++ - Use Label Studio to label edge cases; integrate labeled batches via Tekton `labeling-ingest-task`.
++ - Re-run retrain pipeline using new labeled data and compare metrics.
++
++5) Acceptance & long-shadow (Day 14+)
++ - After N successful runs and SME signoffs, start long-shadow mode: route a % of live traffic to canary while collecting metrics for 30 days or run accelerated simulations.
++ - Configure Canary controller thresholds and Prometheus alerting.
++
++Deliverables:
++- Evidence S3 path with all artifacts.
++- Postmortem report with issues and fixes.
++- SME signoffs uploaded to s3://<EVIDENCE_BUCKET>/signoffs/
++- Checklist marking components hardened or requiring further work.
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tekton/tasks/validation-sprint-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: validation-sprint-task
++  namespace: cicd
++spec:
++  params:
++    - name: runs
++      type: string
++      default: "3"
++    - name: pipeline_name
++      type: string
++      default: "drift-retrain-canary-pipeline"
++    - name: evidence_bucket
++      type: string
++      default: ""
++  steps:
++    - name: loop
++      image: bitnami/kubectl:1.27
++      script: |
++        #!/bin/sh
++        set -euo pipefail
++        RUNS=$(params.runs)
++        PIPE=$(params.pipeline_name)
++        EB=$(params.evidence_bucket)
++        i=0
++        while [ $i -lt $RUNS ]; do
++          echo "Triggering run $(expr $i + 1) of $RUNS"
++          cat > /tmp/pr.yaml <<EOF
++apiVersion: tekton.dev/v1beta1
++kind: PipelineRun
++metadata:
++  generateName: validation-run-
++spec:
++  pipelineRef:
++    name: ${PIPE}
++  params:
++    - name: evidence_bucket
++      value: "${EB}"
++EOF
++          kubectl apply -f /tmp/pr.yaml
++          i=$(expr $i + 1)
++          sleep 30
++        done
++        echo "Validation sprint task triggered $RUNS runs"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/telemetry/otel_instrumentation_helpers.py
++#!/usr/bin/env python3
++"""
++Helper utilities for adding OpenTelemetry tracing & metric instrumentation across tasks and services.
++Usage:
++ - Import and call `init_tracing(service_name, exporter_url)` in Tekton task wrappers and python services.
++ - Use `span_context(run_id=...)` to annotate spans with run_id (evidence correlation).
++"""
++from opentelemetry import trace, metrics
++from opentelemetry.sdk.resources import Resource
++from opentelemetry.sdk.trace import TracerProvider
++from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
++from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
++from opentelemetry.sdk.metrics import MeterProvider
++from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
++import os
++
++def init_tracing(service_name="aegis-service", otlp_endpoint=None):
++    otlp_endpoint = otlp_endpoint or os.environ.get("OTLP_ENDPOINT")
++    resource = Resource.create({"service.name": service_name})
++    tp = TracerProvider(resource=resource)
++    if otlp_endpoint:
++        exporter = OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True)
++        tp.add_span_processor(BatchSpanProcessor(exporter))
++    else:
++        tp.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
++    trace.set_tracer_provider(tp)
++    return trace.get_tracer(service_name)
++
++def span_context(tracer, run_id=None, attrs=None):
++    return tracer.start_as_current_span("aegis.run", attributes={"run_id": run_id} if run_id else attrs or {})
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/label-studio/values.yaml
++replicaCount: 1
++service:
++  type: ClusterIP
++persistence:
++  enabled: true
++  size: 10Gi
++auth:
++  enabled: true
++  oauth:
++    provider: keycloak
++    client_id: aegis-labelstudio
++    client_secret: REPLACE_ME
++    token_url: "https://keycloak.monitoring.svc:8080/realms/aegis/protocol/openid-connect/token"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tekton/tasks/labeling-ingest-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: labeling-ingest-task
++  namespace: cicd
++spec:
++  params:
++    - name: labelstudio_export_s3
++      type: string
++    - name: dataset_target_s3
++      type: string
++  steps:
++    - name: download-labels
++      image: python:3.10
++      script: |
++        #!/bin/sh
++        set -euo pipefail
++        pip install boto3 pandas || true
++        python - <<'PY'
++import os, boto3, pandas as pd, json
++export_s3 = os.environ.get("LABELS")
++target = os.environ.get("TARGET")
++bucket, key = export_s3.replace("s3://","").split("/",1)
++tmp="/tmp/labels.json"
++boto3.client("s3").download_file(bucket, key, tmp)
++df = pd.read_json(tmp)
++parquet="/tmp/labeled.parquet"
++df.to_parquet(parquet)
++tb, tk = target.replace("s3://","").split("/",1)
++boto3.client("s3").upload_file(parquet, tb, tk)
++print("Uploaded labeled batch to", target)
++PY
++      env:
++        - name: LABELS
++          value: "$(params.labelstudio_export_s3)"
++        - name: TARGET
++          value: "$(params.dataset_target_s3)"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/ratelimit/redis_rate_limiter.py
++#!/usr/bin/env python3
++"""
++Redis-backed token-bucket rate limiter for per-tenant throttling (multi-replica safe).
++Usage: instantiate RedisRateLimiter(redis_url) and call allow(tenant) -> (bool, info)
++PoC uses simple Lua script for atomic tokens.
++"""
++import os, time, redis
++import logging
++
++logger = logging.getLogger("redis-rate-limiter")
++logging.basicConfig(level=logging.INFO)
++
++LUA_SCRIPT = """
++local key = KEYS[1]
++local burst = tonumber(ARGV[1])
++local rate = tonumber(ARGV[2])
++local now = tonumber(ARGV[3])
++local requested = tonumber(ARGV[4])
++local fill = math.min(burst, tonumber(redis.call('hget', key, 'tokens') or burst) + (now - tonumber(redis.call('hget', key, 'last') or now)) * rate)
++if fill < requested then
++  redis.call('hset', key, 'tokens', fill)
++  redis.call('hset', key, 'last', now)
++  return {0, fill}
++else
++  fill = fill - requested
++  redis.call('hset', key, 'tokens', fill)
++  redis.call('hset', key, 'last', now)
++  return {1, fill}
++end
++"""
++
++class RedisRateLimiter:
++    def __init__(self, redis_url=None, burst=5, rate=0.2):
++        self.redis_url = redis_url or os.environ.get("REDIS_URL", "redis://redis.data.svc.cluster.local:6379/0")
++        self.r = redis.from_url(self.redis_url)
++        self.burst = int(os.environ.get("RATE_BURST", burst))
++        self.rate = float(os.environ.get("RATE_PER_SEC", rate))
++        self.lua = self.r.register_script(LUA_SCRIPT)
++
++    def allow(self, tenant, requested=1):
++        key = f"rate:{tenant}"
++        now = int(time.time())
++        ok, tokens = self.lua(keys=[key], args=[self.burst, self.rate, now, requested])
++        return bool(ok), float(tokens)
++
++if __name__ == "__main__":
++    rl = RedisRateLimiter()
++    for i in range(10):
++        ok, rem = rl.allow("tenant1")
++        print(i, ok, rem)
++        time.sleep(0.5)
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/placement/optimizer_service.py
++#!/usr/bin/env python3
++"""
++Placement optimizer prototype (PoC)
++ - Simple cost-latency scoring to pick a region/instance type given job metadata
++ - Exposes a REST endpoint to request placement suggestion
++ - Can be extended to RL; currently uses heuristic scoring: score = cost * alpha + latency * beta
++"""
++from flask import Flask, request, jsonify
++import os, math
++
++app = Flask(__name__)
++
++# sample catalog (cost_per_hour, baseline_latency_ms)
++CANDIDATES = {
++    "region-a/c5.4xlarge": {"cost": 1.0, "latency": 50},
++    "region-b/c5.2xlarge": {"cost": 0.6, "latency": 100},
++    "region-c/g4dn.xlarge": {"cost": 1.4, "latency": 30}
++}
++
++ALPHA = float(os.environ.get("PLACEMENT_ALPHA", "0.7"))
++BETA = float(os.environ.get("PLACEMENT_BETA", "0.3"))
++
++@app.route("/suggest", methods=["POST"])
++def suggest():
++    payload = request.json or {}
++    urgency = float(payload.get("urgency", 1.0))
++    pref = payload.get("preference", "cost")  # or "latency"
++    best = None
++    best_score = float("inf")
++    for k,v in CANDIDATES.items():
++        cost = v["cost"]
++        lat = v["latency"] / 1000.0
++        score = ALPHA * cost + BETA * lat / urgency
++        if pref == "latency":
++            score = ALPHA * lat + BETA * cost / urgency
++        if score < best_score:
++            best_score = score
++            best = k
++    return jsonify({"choice": best, "score": best_score})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8082")))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tekton/tasks/placement-request-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: request-placement
++  namespace: cicd
++spec:
++  params:
++    - name: job_urgency
++      type: string
++      default: "1.0"
++    - name: preference
++      type: string
++      default: "cost"
++    - name: optimizer_url
++      type: string
++      default: "http://placement.optimizer.svc:8082/suggest"
++  steps:
++    - name: call
++      image: curlimages/curl:8.2.1
++      script: |
++        #!/bin/sh
++        set -euo pipefail
++        URL=$(params.optimizer_url)
++        URG=$(params.job_urgency)
++        PREF=$(params.preference)
++        echo "Requesting placement: urgency=$URG pref=$PREF"
++        curl -sS -X POST -H "Content-Type: application/json" -d "{\"urgency\":$URG, \"preference\":\"$PREF\"}" $URL
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/pen_test_remediation.md
++# Pen Test Remediation Checklist (Prioritized)
++
++High priority (fix within 1–2 weeks)
++- Fix critical container image CVEs identified by Trivy; rebuild images with patched base images.
++- Ensure Keycloak admin endpoints are not publicly reachable; enforce mTLS for admin traffic.
++- Harden Kubernetes RBAC: remove cluster-admin bindings from automation SAs, adopt least privilege.
++- Ensure all secrets are stored in Secrets Manager or Vault and not in plain YAML or git.
++
++Medium priority (2–6 weeks)
++- Implement network policies to limit cross-namespace traffic.
++- Ensure external services (Keycloak, model endpoints) have authentication & rate limiting.
++- Enforce Gatekeeper constraints for dataset/PII labels and audit logging of dataset access.
++
++Low priority (6–12 weeks)
++- Rotate all long-lived tokens; validate rotations produce evidence in S3.
++- Perform tabletop incident response exercises and fix gaps.
++
++Verification:
++- Re-run automated pen test suite and ensure no critical/high findings; upload reports to EVIDENCE_BUCKET.
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/security/keycloak_hardening_advanced2.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Extended Keycloak hardening - apply recommended realm and client settings (PoC)
++KEYCLOAK_URL=${KEYCLOAK_URL:-http://keycloak.monitoring.svc:8080}
++REALM=${REALM:-aegis}
++ADMIN_USER=${ADMIN_USER:-admin}
++ADMIN_PASS=${ADMIN_PASS:-changeme}
++
++echo "Obtaining admin token"
++TOKEN=$(curl -sS -X POST "$KEYCLOAK_URL/realms/master/protocol/openid-connect/token" -d "grant_type=password&client_id=admin-cli&username=$ADMIN_USER&password=$ADMIN_PASS" | jq -r .access_token)
++
++echo "Updating realm config for security best practices (PoC)"
++curl -sS -X GET -H "Authorization: Bearer $TOKEN" "$KEYCLOAK_URL/admin/realms/$REALM" -o /tmp/realm.json
++jq '. + {
++  "accessTokenLifespan": 300,
++  "clientSessionIdleTimeout": 300,
++  "ssoSessionIdleTimeout": 1800,
++  "ssoSessionMaxLifespan": 3600,
++  "bruteForceProtected": true,
++  "registrationAllowed": false,
++  "eventsEnabled": true,
++  "eventsExpiration": 3600
++}' /tmp/realm.json > /tmp/realm2.json
++curl -sS -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" --data @/tmp/realm2.json "$KEYCLOAK_URL/admin/realms/$REALM"
++
++echo "Lock down clients: remove direct access grants, reduce token lifespans per client (review manually in admin console)."
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/gatekeeper/dataset_pii_constraint_template.yaml
++apiVersion: templates.gatekeeper.sh/v1beta1
++kind: ConstraintTemplate
++metadata:
++  name: requiredatasetpiilabel
++spec:
++  crd:
++    spec:
++      names:
++        kind: RequireDatasetPIILabel
++  targets:
++    - target: admission.k8s.gatekeeper.sh
++      rego: |
++        package requiredatasetpiilabel
++
++        violation[{"msg": msg}] {
++          input.review.object.kind == "PipelineRun"
++          input.review.object.metadata.namespace == "cicd"
++          not input.review.object.metadata.annotations["aegis.dataset_pii"]
++          msg := "PipelineRun must include annotation 'aegis.dataset_pii' to acknowledge PII handling (true|false)"
++        }
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/gatekeeper/dataset_pii_constraint.yaml
++apiVersion: constraints.gatekeeper.sh/v1beta1
++kind: RequireDatasetPIILabel
++metadata:
++  name: require-dataset-pii
++spec:
++  enforcementAction: deny
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/long_shadow_acceptance.yml
++name: Long-Shadow Acceptance (Accelerated Simulation)
++on:
++  workflow_dispatch:
++    inputs:
++      evidence_bucket:
++        required: true
++      simulate_days:
++        required: false
++        default: "30"
++
++jobs:
++  long-shadow:
++    runs-on: ubuntu-latest
++    timeout-minutes: 4320
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup
++        run: python -m pip install boto3 requests || true
++      - name: Trigger accelerated validation sprint
++        env:
++          EVIDENCE_BUCKET: ${{ github.event.inputs.evidence_bucket }}
++        run: |
++          # Accelerated simulation: run many validation runs and simulated traffic
++          python -c "import time, json; print('Simulating accelerated long-shadow...')"
++          # Trigger Tekton validation sprint task if available via kubectl (requires kubeconfig)
++          echo "Note: For full simulation deploy validation-sprint task in cluster; GH Actions can't do in-cluster heavy runs reliably."
++      - name: Collect artifacts reminder
++        run: echo "Please review evidence in s3://${{ github.event.inputs.evidence_bucket }}/"
++
+*** End Patch
+*** End Patch

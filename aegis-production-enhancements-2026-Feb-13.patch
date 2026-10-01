@@ -1,0 +1,446 @@
+*** Begin Patch
+*** Add File:tools/install_vault_helm.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Install HashiCorp Vault via Helm in HA mode and bootstrap Kubernetes auth, transit and KV for cosign keys.
++# Operator MUST run this from a machine with kubectl/helm configured to the target cluster.
++#
++NAMESPACE=${1:-aegis-system}
++HELM_RELEASE=${2:-vault}
++VAULT_ADDR="http://vault.${NAMESPACE}.svc.cluster.local:8200"
++
++echo "Creating namespace ${NAMESPACE} (if missing)"
++kubectl create ns ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
++
++echo "Adding HashiCorp Helm repo"
++helm repo add hashicorp https://helm.releases.hashicorp.com || true
++helm repo update
++
++cat <<EOF > /tmp/vault-values.yaml
++server:
++  ha:
++    enabled: true
++  dataStorage:
++    enabled: true
++service:
++  type: ClusterIP
++ui:
++  enabled: true
++injector:
++  enabled: true
++initContainers:
++  enabled: false
++EOF
++
++echo "Installing Vault Helm release ${HELM_RELEASE} into ${NAMESPACE}"
++helm upgrade --install ${HELM_RELEASE} hashicorp/vault -n ${NAMESPACE} -f /tmp/vault-values.yaml
++
++echo "Waiting for Vault pods to be ready..."
++kubectl -n ${NAMESPACE} rollout status deployment/${HELM_RELEASE}-server --timeout=5m || true
++
++echo "Initialize/Unseal (if using dev mode you can skip)."
++echo "To initialize VAULT in HA, follow HashiCorp docs. This script assumes Vault is ready and reachable at ${VAULT_ADDR}."
++
++cat <<'DOC'
++Next manual bootstrap steps (operator):
++1) Initialize/unseal Vault or configure auto-unseal with cloud KMS.
++2) Create a policy allowing transit/encrypt/sign and kv read/write for a Kubernetes role:
++   - Policy JSON example:
++     path "transit/*" { capabilities = ["encrypt","decrypt","sign","verify","read"] }
++     path "kv/data/cosign" { capabilities = ["create","read","update","delete"] }
++3) Enable Kubernetes auth and create a role bound to a ServiceAccount so pods can use Vault (see Vault docs).
++4) Store cosign keys into kv or use transit to hold signing keys:
++   - kubectl exec -n aegis-system <vault-pod> -- vault kv put kv/cosign private_key="$(cat cosign.key)"
++   - Or use transit: vault write -f transit/keys/cosign-signing
++5) Configure your services to use Vault (VAULT_ADDR, and Kubernetes service account token) and ensure RBAC is minimal.
++DOC
++
++echo "Vault Helm install done. Remember to perform init/unseal and create policies/roles."
++
+*** End File
+*** Add File:services/signing/receipt_signer_vault.py
++#!/usr/bin/env python3
++"""
++Production receipt signer that uses Vault Transit to sign payloads and records a minimal entry to Rekor.
++
++Expected environment:
++ - VAULT_ADDR (e.g., https://vault.aegis-system.svc:8200)
++ - VAULT_TOKEN or use Kubernetes ServiceAccount + Vault Agent sidecar (recommended)
++ - TRANSIT_KEY_NAME: transit key name created in Vault (e.g., "cosign-signing")
++ - REKOR_URL (optional) to record entries
++ - TIMEOUT_SECONDS optional
++"""
++import os
++import json
++import base64
++import requests
++from typing import Dict
++
++VAULT_ADDR = os.environ.get("VAULT_ADDR", "http://vault.aegis-system.svc.cluster.local:8200")
++VAULT_TOKEN = os.environ.get("VAULT_TOKEN", "")
++TRANSIT_KEY = os.environ.get("TRANSIT_KEY_NAME", "cosign-signing")
++REKOR_URL = os.environ.get("REKOR_URL", "")
++TIMEOUT = int(os.environ.get("TIMEOUT_SECONDS", "5"))
++
++def vault_sign(payload: Dict) -> Dict:
++    """
++    Calls Vault Transit sign endpoint. Returns the Vault response (signature blob).
++    """
++    url = f"{VAULT_ADDR.rstrip('/')}/v1/transit/sign/{TRANSIT_KEY}"
++    b64 = base64.b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode()
++    body = {"input": b64, "prehashed": False}
++    headers = {"X-Vault-Token": VAULT_TOKEN} if VAULT_TOKEN else {}
++    r = requests.post(url, json=body, headers=headers, timeout=TIMEOUT)
++    r.raise_for_status()
++    return r.json()
++
++def record_rekor(payload: Dict, signature_blob: Dict):
++    if not REKOR_URL:
++        return
++    entry = {"payload": payload, "signature": signature_blob}
++    try:
++        requests.post(f"{REKOR_URL.rstrip('/')}/api/v1/log/entries", json=entry, timeout=TIMEOUT)
++    except Exception:
++        # best-effort; do not fail signing if Rekor unreachable
++        pass
++
++def sign_and_record(payload: Dict) -> Dict:
++    """
++    Signs payload in Vault and records to Rekor. Returns a dict with signature metadata.
++    """
++    sig = vault_sign(payload)
++    record_rekor(payload, sig)
++    return {"vault_signature": sig}
++
++if __name__ == "__main__":
++    import sys, time
++    obj = {"event":"test-sign", "ts": time.time()}
++    print("Signing payload via Vault Transit...")
++    print(sign_and_record(obj))
++
+*** End File
+*** Add File:services/storage/encrypt_store_vault.py
++#!/usr/bin/env python3
++"""
++encrypt_store_vault.py
++Encrypts artifacts using Vault Transit then stores ciphertext in object storage (S3/MinIO).
++This avoids storing plaintext in the cluster or object-store.
++
++Environment:
++ - VAULT_ADDR, VAULT_TOKEN
++ - TRANSIT_KEY_NAME: previously created transit key (must allow encrypt)
++ - STORAGE_BACKEND: s3|minio
++ - S3_BUCKET, MINIO_ENDPOINT, etc.
++ - AWS_REGION/AWS creds for S3
++ - AEGIS_MCP_API for audit recording
++"""
++import os
++import requests
++import base64
++import boto3
++from botocore.client import Config
++
++VAULT_ADDR = os.environ.get("VAULT_ADDR", "http://vault.aegis-system.svc.cluster.local:8200")
++VAULT_TOKEN = os.environ.get("VAULT_TOKEN", "")
++TRANSIT_KEY = os.environ.get("TRANSIT_KEY_NAME", "aegis-transit")
++STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "s3")
++S3_BUCKET = os.environ.get("S3_BUCKET", "aegis-artifacts")
++
++def vault_encrypt(data: bytes) -> str:
++    url = f"{VAULT_ADDR.rstrip('/')}/v1/transit/encrypt/{TRANSIT_KEY}"
++    b64 = base64.b64encode(data).decode()
++    body = {"plaintext": b64}
++    headers = {"X-Vault-Token": VAULT_TOKEN} if VAULT_TOKEN else {}
++    r = requests.post(url, json=body, headers=headers, timeout=10)
++    r.raise_for_status()
++    return r.json()["data"]["ciphertext"]
++
++def upload_ciphertext(artifact_id: str, ciphertext: str, metadata: dict = None):
++    key = f"originals/{artifact_id}.enc"
++    if STORAGE_BACKEND == "minio":
++        s3 = boto3.client("s3",
++                          endpoint_url=os.environ.get("MINIO_ENDPOINT"),
++                          aws_access_key_id=os.environ.get("MINIO_ACCESS_KEY"),
++                          aws_secret_access_key=os.environ.get("MINIO_SECRET_KEY"),
++                          config=Config(signature_version="s3v4"),
++                          region_name=os.environ.get("AWS_REGION"))
++        s3.put_object(Bucket=S3_BUCKET, Key=key, Body=ciphertext.encode(), Metadata=metadata or {})
++    else:
++        s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION"))
++        # store ciphertext as object; lifecycle and access controlled via S3 policies
++        s3.put_object(Bucket=S3_BUCKET, Key=key, Body=ciphertext.encode(), Metadata=metadata or {})
++    return {"bucket": S3_BUCKET, "key": key}
++
++def encrypt_store(artifact_id: str, data: bytes, metadata: dict = None):
++    ct = vault_encrypt(data)
++    res = upload_ciphertext(artifact_id, ct, metadata)
++    # record to MCP
++    try:
++        mcp = os.environ.get("AEGIS_MCP_API", "")
++        if mcp:
++            requests.post(f"{mcp.rstrip('/')}/artifacts", json={"id":artifact_id,"bucket":res["bucket"],"key":res["key"],"metadata":metadata or {}}, timeout=3.0)
++    except Exception:
++        pass
++    return res
++
++if __name__ == "__main__":
++    import sys
++    if len(sys.argv) < 3:
++        print("usage: encrypt_store_vault.py <artifact_id> <file>")
++        raise SystemExit(2)
++    aid = sys.argv[1]
++    with open(sys.argv[2],"rb") as f:
++        data = f.read()
++    print(encrypt_store(aid, data, {"uploaded-by":"encrypt_store_vault"}))
++
+*** End File
+*** Add File:tools/gatekeeper_audit_to_mcp.py
++#!/usr/bin/env python3
++"""
++Collect Gatekeeper constraint violations and post a remediation report to MCP (or print CSV).
++Requires kubectl on PATH with cluster access.
++"""
++import os
++import subprocess
++import json
++import csv
++import tempfile
++import requests
++
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++
++def kubectl_json(path):
++    r = subprocess.run(["kubectl","get",path,"-o","json"], capture_output=True, text=True, check=False)
++    if r.returncode != 0:
++        return None
++    return json.loads(r.stdout)
++
++def collect_violations():
++    # Gatekeeper uses 'constraints' of various kinds; fetch all constraints and look for status.violations
++    kinds = ["constraints.gatekeeper.sh/v1beta1"]  # generic fetch; we'll get all constraint CRDs via 'kubectl get --raw'
++    out = subprocess.run(["kubectl","get","--raw","/apis/constraints.gatekeeper.sh/v1beta1"], capture_output=True, text=True, check=False)
++    if out.returncode != 0:
++        print("Failed to query Gatekeeper constraints API")
++        return []
++    j = json.loads(out.stdout)
++    # The above returns constraint types; we will attempt a broad query via 'kubectl get' for known constraints from the repo
++    # For simplicity, query all CRs in all namespaces
++    r = subprocess.run(["kubectl","get","constraints","--all-namespaces","-o","json"], capture_output=True, text=True, check=False)
++    if r.returncode != 0:
++        # fallback: try 'kubectl get pod -A' to at least produce an empty list
++        return []
++    cj = json.loads(r.stdout)
++    violations = []
++    for item in cj.get("items", []):
++        status = item.get("status", {})
++        vs = status.get("violations", [])
++        for v in vs:
++            violations.append({
++                "constraint": item.get("metadata",{}).get("name"),
++                "namespace": v.get("namespace"),
++                "message": v.get("message"),
++                "resource": v.get("kind") + "/" + v.get("name"),
++            })
++    return violations
++
++def post_report(violations):
++    if not violations:
++        print("No gatekeeper violations found.")
++        return
++    payload = {"ts": __import__("time").time(), "violations": violations}
++    try:
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/governance/gatekeeper_violations", json=payload, timeout=5.0)
++        print("Posted violations to MCP")
++    except Exception:
++        # write to temp CSV
++        fd, path = tempfile.mkstemp(prefix="gatekeeper_violations_", suffix=".csv")
++        with os.fdopen(fd,"w",newline="") as csvfile:
++            w = csv.DictWriter(csvfile, fieldnames=["constraint","namespace","resource","message"])
++            w.writeheader()
++            for v in violations:
++                w.writerow(v)
++        print("Wrote violations CSV to", path)
++
++if __name__ == "__main__":
++    v = collect_violations()
++    post_report(v)
++
+*** End File
+*** Add File:services/edge/sync_retry.py
++#!/usr/bin/env python3
++"""
++Simple retry worker for edge -> central sync failures.
++This script watches a local directory for failed sync items and retries with exponential backoff.
++
++Configuration:
++ - FAILED_DIR (default /data/sync_failed)
++ - RETRY_INTERVAL_BASE (seconds)
++ - MAX_ATTEMPTS
++ - CENTRAL_UPLOAD_URL (where to POST payloads)
++"""
++import os
++import time
++import json
++import requests
++
++FAILED_DIR = os.environ.get("FAILED_DIR", "/data/sync_failed")
++BASE = int(os.environ.get("RETRY_INTERVAL_BASE", "5"))
++MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "6"))
++CENTRAL_UPLOAD = os.environ.get("CENTRAL_UPLOAD_URL", "http://milvus.central.svc.cluster.local:19530/sync")
++
++os.makedirs(FAILED_DIR, exist_ok=True)
++
++def backoff(attempt):
++    return BASE * (2 ** attempt)
++
++def retry_loop():
++    while True:
++        for fn in os.listdir(FAILED_DIR):
++            path = os.path.join(FAILED_DIR, fn)
++            try:
++                with open(path,"rb") as f:
++                    payload = f.read()
++                meta_path = path + ".meta"
++                attempts = 0
++                if os.path.exists(meta_path):
++                    with open(meta_path,"r") as m:
++                        attempts = int(m.read().strip())
++                if attempts >= MAX_ATTEMPTS:
++                    print("Max attempts reached for", fn, "- leaving for operator remediaton")
++                    continue
++                # attempt upload
++                r = requests.post(CENTRAL_UPLOAD, data=payload, timeout=10)
++                if r.ok:
++                    print("Resync success", fn)
++                    os.remove(path)
++                    if os.path.exists(meta_path):
++                        os.remove(meta_path)
++                else:
++                    attempts += 1
++                    with open(meta_path,"w") as m:
++                        m.write(str(attempts))
++                    sleep = backoff(attempts)
++                    print("Resync failed, will retry after", sleep, "s")
++                    time.sleep(sleep)
++            except Exception as e:
++                print("Error handling", fn, e)
++        time.sleep(10)
++
++if __name__ == "__main__":
++    retry_loop()
++
+*** End File
+*** Add File:tools/edge_offline_drill.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Run an offline approval drill: mint fetchtoken on central, copy to edge, redeem at edge, then sync redemption back.
++#
++FETCH_API=${1:-http://approver:8080}
++MCP_API=${2:-http://mcp:8082}
++
++echo "Create offline fetchtoken (central) (simulated via approver API)"
++tk=$(curl -sS -X POST -H "Content-Type: application/json" -d '{"artifact_id":"artifact-offline-demo"}' ${FETCH_API}/mint | jq -r .token)
++echo "Token minted: ${tk}"
++echo "Simulating copy token to edge and redeeming locally"
++redeem=$(curl -sS -X POST -H "Content-Type: application/json" -d "{\"token\":\"${tk}\"}" ${FETCH_API}/redeem)
++echo "Redeem result: ${redeem}"
++echo "Sync redemption to MCP (simulate)"
++curl -sS -X POST -H "Content-Type: application/json" -d "{\"token\":\"${tk}\",\"artifact_id\":\"artifact-offline-demo\",\"redeem_result\":${redeem}}" ${MCP_API}/offline/redemptions || true
++echo "Drill complete."
++
+*** End File
+*** Add File:services/observability/metrics_middleware.py
++#!/usr/bin/env python3
++"""
++WSGI middleware to expose Prometheus metrics and instrument request durations.
++Usage: wrap Flask/WSGI app with MetricsMiddleware(app, service_name="webhook")
++"""
++from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
++from time import time
++from wsgiref.util import setup_testing_defaults
++
++REQUEST_LATENCY = Histogram("aegis_request_latency_seconds", "Request latency", ["service","path"])
++REQUEST_COUNT = Counter("aegis_request_count_total", "Request count", ["service","path","status"])
++
++class MetricsMiddleware:
++    def __init__(self, app, service_name="aegis-service"):
++        self.app = app
++        self.service = service_name
++
++    def __call__(self, environ, start_response):
++        path = environ.get("PATH_INFO", "/")
++        if path == "/metrics":
++            data = generate_latest()
++            start_response("200 OK", [("Content-Type", CONTENT_TYPE_LATEST)])
++            return [data]
++        start = time()
++        def custom_start_response(status, headers, exc_info=None):
++            status_code = int(status.split()[0])
++            duration = time() - start
++            REQUEST_LATENCY.labels(self.service, path).observe(duration)
++            REQUEST_COUNT.labels(self.service, path, status_code).inc()
++            return start_response(status, headers, exc_info)
++        return self.app(environ, custom_start_response)
++
+*** End File
+*** Add File:k8s/prometheus/servicemonitor-webhook.yaml
++apiVersion: monitoring.coreos.com/v1
++kind: ServiceMonitor
++metadata:
++  name: model-provenance-webhook-sm
++  namespace: monitoring
++spec:
++  selector:
++    matchLabels:
++      app: model-provenance-webhook
++  endpoints:
++    - port: http-metrics
++      path: /metrics
++      interval: 15s
++
+*** End File
+*** Add File:k8s/prometheus/servicemonitor-triton.yaml
++apiVersion: monitoring.coreos.com/v1
++kind: ServiceMonitor
++metadata:
++  name: triton-servicemonitor
++  namespace: monitoring
++spec:
++  selector:
++    matchLabels:
++      app: triton
++  endpoints:
++    - port: metrics
++      path: /metrics
++      interval: 15s
++
+*** End File
+*** Add File:README_PROD_KMS_OBSERVABILITY_EDGE.md
++# Aegis Production Enhancements: KMS, Observability, Edge Resilience, Gatekeeper Audit
++
++This patch (aegis-production-enhancements-2026-02-13.patch) provides:
++- Vault Helm installer script to deploy HA Vault and bootstrap operator steps (tools/install_vault_helm.sh)
++- Production receipt signer using Vault Transit (services/signing/receipt_signer_vault.py)
++- Production encrypt-store using Vault Transit + object storage (services/storage/encrypt_store_vault.py)
++- Consent check + enhanced retrieval guard previously added — these integrate with the above
++- Gatekeeper audit collector that posts violations to MCP and/or writes CSV (tools/gatekeeper_audit_to_mcp.py)
++- Edge sync retry worker and offline drill tooling to handle network outages (services/edge/sync_retry.py, tools/edge_offline_drill.sh)
++- Observability middleware for WSGI apps (services/observability/metrics_middleware.py) and Prometheus ServiceMonitors for webhook & Triton.
++
++Deployment notes & operator tasks:
++1. Run tools/install_vault_helm.sh to install Vault (operator must initialize/unseal or configure auto-unseal with cloud KMS).
++2. Create Vault policies for transit and KV usage; create a Kubernetes auth role binding to the relevant ServiceAccounts.
++3. Ensure TRANSIT_KEY is created (vault write -f transit/keys/<name>) and that Vault token is available for CI or use Vault Agent sidecar in pods.
++4. Replace any prior stub signer/encryptor with these production services and update service env vars to point to VAULT_ADDR and TRANSIT_KEY_NAME.
++5. Deploy ServiceMonitors if you run Prometheus Operator so webhook and Triton metrics are scraped.
++6. Run tools/gatekeeper_audit_to_mcp.py periodically (cron) to post violations to MCP and track remediation.
++7. Deploy the edge sync_retry worker on edge nodes to ensure failed syncs are retried; run tools/edge_offline_drill.sh to validate fetchtoken flows.
++
++Security notes:
++- Vault should be HA and configured with secure auto-unseal, or use managed KMS-backed auto-unseal.
++- Keep VAULT_TOKEN out of repo; prefer Kubernetes auth + Vault Agent or CSI secrets provider.
++- Ensure S3 buckets and KMS policies are tight (least privilege).
++
+*** End Patch

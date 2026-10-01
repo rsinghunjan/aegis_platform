@@ -1,0 +1,817 @@
+diff --git a/scripts/deepspeed_staging_run.sh b/scripts/deepspeed_staging_run.sh
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/scripts/deepspeed_staging_run.sh
+@@ -0,0 +1,200 @@
++#!/usr/bin/env bash
++#
++# Orchestrate a multi-node DeepSpeed staging run using the deepspeed-trainer StatefulSet.
++# - Scales the StatefulSet to the requested node count
++# - Waits for pods to be ready
++# - Triggers a short training run (module mode) on the head pod
++# - Collects NCCL/GPU diagnostics and copies logs to a local artifacts dir
++#
++# Usage:
++#   ./scripts/deepspeed_staging_run.sh --nodes 2 --test-seconds 60 --artifact-dir ./artifacts
++
++set -euo pipefail
++
++NAMESPACE="${NAMESPACE:-aegis-ml}"
++STATEFULSET="${STATEFULSET:-deepspeed-trainer}"
++NODES=2
++TEST_SECONDS=60
++ARTIFACT_DIR="${ARTIFACT_DIR:-./artifacts}"
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --nodes) NODES="$2"; shift 2;;
++    --test-seconds) TEST_SECONDS="$2"; shift 2;;
++    --artifact-dir) ARTIFACT_DIR="$2"; shift 2;;
++    --namespace) NAMESPACE="$2"; shift 2;;
++    *) echo "Unknown arg $1"; exit 1;;
++  esac
++done
++
++mkdir -p "$ARTIFACT_DIR"
++
++echo "Scaling StatefulSet $STATEFULSET to $NODES replicas..."
++kubectl -n "$NAMESPACE" scale statefulset "$STATEFULSET" --replicas="$NODES"
++
++echo "Waiting for pods to be Ready..."
++kubectl -n "$NAMESPACE" rollout status statefulset "$STATEFULSET" --timeout=15m
++
++HEAD_POD="${STATEFULSET}-0"
++echo "Head pod is $HEAD_POD. Running short training then killing to test resume."
++
++echo "Triggering short run inside head pod..."
++kubectl -n "$NAMESPACE" exec "$HEAD_POD" -- bash -lc "export MASTER_ADDR=${HEAD_POD}.${STATEFULSET}-headless.${NAMESPACE}.svc.cluster.local ; python3 -c 'print(\"staging short run\")' & sleep ${TEST_SECONDS}"
++
++echo "Collecting NCCL & GPU diagnostics..."
++./scripts/collect_nccl_diagnostics.sh "$HEAD_POD" "$NAMESPACE" || true
++mv nccl_diagnostics_* "$ARTIFACT_DIR/" || true
++
++echo "Running sharded restore validation (if checkpoint exists) from pod-0"
++kubectl -n "$NAMESPACE" exec "$HEAD_POD" -- bash -lc "if [ -d /workspace/checkpoints ]; then python3 /app/scripts/sharded_restore_test.py --shards /workspace/checkpoints --s3-prefix '' || true; else echo 'No checkpoints found'; fi"
++
++echo "Test complete. Artifacts in $ARTIFACT_DIR"
++echo "You may now simulate a preemption by deleting a non-head pod and verifying resume:"
++echo "  kubectl -n $NAMESPACE delete pod ${STATEFULSET}-1"
++
++exit 0
++
+diff --git a/scripts/rotate_vault_keys.py b/scripts/rotate_vault_keys.py
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/scripts/rotate_vault_keys.py
+@@ -0,0 +1,240 @@
++#!/usr/bin/env python3
++"""
++Rotate secrets stored in Vault KV v2 for a list of secret paths.
++This script:
++ - Backs up the current secret value to a timestamped key (vault path + /rotations/<ts>)
++ - Writes a new placeholder value (operator should replace with generated secret or call provider)
++ - Optionally notifies services by hitting a webhook (to trigger reload)
++
++Usage:
++  VAULT_ADDR=... VAULT_TOKEN=... python3 scripts/rotate_vault_keys.py --paths secret/data/aegis/github_app --notify-url http://orchestrator/... --dry-run
++
++IMPORTANT: This script does not generate real PEMs; integrate with your key-generation flow or GH App rotate endpoints.
++"""
++import os
++import sys
++import argparse
++import time
++import json
++import requests
++
++VAULT_ADDR = os.environ.get("VAULT_ADDR")
++VAULT_TOKEN = os.environ.get("VAULT_TOKEN")
++
++def vault_read(path):
++    url = f"{VAULT_ADDR}/v1/{path}"
++    headers = {"X-Vault-Token": VAULT_TOKEN}
++    r = requests.get(url, headers=headers, timeout=10)
++    r.raise_for_status()
++    return r.json()
++
++def vault_write(path, payload):
++    url = f"{VAULT_ADDR}/v1/{path}"
++    headers = {"X-Vault-Token": VAULT_TOKEN}
++    r = requests.post(url, headers=headers, json=payload, timeout=10)
++    r.raise_for_status()
++    return r.json()
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--paths", nargs="+", required=True, help="Vault KV v2 paths to rotate (e.g. secret/data/aegis/github_app)")
++    p.add_argument("--notify-url", help="Optional webhook to call after rotation")
++    p.add_argument("--dry-run", action="store_true")
++    args = p.parse_args()
++
++    if not VAULT_ADDR or not VAULT_TOKEN:
++        print("Set VAULT_ADDR and VAULT_TOKEN in env")
++        sys.exit(2)
++
++    ts = int(time.time())
++    for pth in args.paths:
++        print("Processing:", pth)
++        try:
++            current = vault_read(pth)
++        except Exception as e:
++            print("  read failed:", e)
++            continue
++        # backup to rotations/<ts>
++        backup_path = pth.rstrip("/") + f"/rotations/{ts}"
++        backup_payload = {"data": current.get("data", {})}
++        print("  backup path:", backup_path)
++        if not args.dry_run:
++            try:
++                vault_write(backup_path, backup_payload)
++                print("  backup written")
++            except Exception as e:
++                print("  backup failed:", e)
++                continue
++
++        # generate placeholder new secret (operator should replace)
++        new_secret = {}
++        # copy keys and insert "rotated_at" field
++        for k, v in current.get("data", {}).get("data", {}).items():
++            new_secret[k] = v
++        new_secret["_rotated_at"] = ts
++        new_secret["_rotated_by"] = os.environ.get("USER", "automation")
++
++        print("  would write new secret (placeholder). Use your secret generation process to write a secure value.")
++        if not args.dry_run:
++            try:
++                vault_write(pth, {"data": new_secret})
++                print("  rotated secret written to", pth)
++            except Exception as e:
++                print("  rotate write failed:", e)
++                continue
++
++        if args.notify_url:
++            try:
++                requests.post(args.notify_url, json={"path": pth, "rotated_at": ts}, timeout=5)
++                print("  notify webhook called")
++            except Exception as e:
++                print("  notify failed:", e)
++
++    print("Done")
++
++if __name__ == "__main__":
++    main()
++
+diff --git a/.github/workflows/secret_enforce.yml b/.github/workflows/secret_enforce.yml
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/.github/workflows/secret_enforce.yml
+@@ -0,0 +1,180 @@
++name: Enforce Plaintext Secret Policy
++
++on:
++  pull_request:
++    paths:
++      - '**/*'
++  push:
++    branches:
++      - main
++
++jobs:
++  secret-scan:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Scan for plaintext secrets (strict)
++        run: |
++          set -euo pipefail
++          # Fail PR if any likely secret literal is found outside docs/policy directories
++          MATCHES=$(grep -RIn --exclude-dir=.git -E "OPENAI_API_KEY|AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID|ghp_[A-Za-z0-9_]+|-----BEGIN (PRIVATE|RSA) KEY-----|PRIVATE_KEY|SECRET_KEY|password[:=]" || true)
++          if [ -n "$MATCHES" ]; then
++            echo "Potential plaintext secrets found:"
++            echo "$MATCHES"
++            exit 1
++          fi
++          echo "Secret scan passed."
++
+diff --git a/policy/opa/agents_full.rego b/policy/opa/agents_full.rego
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/policy/opa/agents_full.rego
+@@ -0,0 +1,420 @@
++package aegis.policies.agents_full
++
++import data.models
++
++"""
++Comprehensive agent policy covering common agent actions and delegating to generative policy when appropriate.
++Input:
++{
++  "action": "<deploy|promote|retrain|generate|fine_tune|create_pr|delete|other>",
++  "model": "<model-name>",
++  "env": "staging"|"production",
++  "params": {...}
++}
++"""
++
++default allow = false
++default reason = "not allowed"
++
++allowed_actions = {"deploy","promote","retrain","generate","fine_tune","create_pr","delete","other"}
++
++is_action_valid {
++  input.action == a
++  a := allowed_actions[_]
++}
++
++model_meta(m) = meta {
++  meta := models.models[m]
++}
++
++is_high_risk {
++  model_meta(input.model).risk == "high"
++}
++
++is_medium_risk {
++  model_meta(input.model).risk == "medium"
++}
++
++is_low_risk {
++  model_meta(input.model).risk == "low"
++}
++
++# If action is generate or fine_tune with generative properties, defer to generative policy module
++allow {
++  input.action == "generate"
++  resp := data.aegis.policies.generative.result with input as input
++  resp.allow
++}
++
++allow {
++  input.action == "fine_tune"
++  # fine_tune allowed in staging for any risk; in production, require reviewed_for_pi for sensitive datasets
++  input.env == "staging"
++}
++
++allow {
++  input.action == "fine_tune"
++  input.env == "production"
++  not is_high_risk
++}
++
++# Promotion rules: require approvals for medium/high in production
++allow {
++  input.action == "promote"
++  input.env == "production"
++  (is_low_risk)
++}
++allow {
++  input.action == "promote"
++  input.env == "production"
++  input.params.approved_by
++}
++
++# Deploy rules: allow deploys for low/medium with review for high
++allow {
++  input.action == "deploy"
++  input.env == "production"
++  not is_high_risk
++}
++allow {
++  input.action == "deploy"
++  input.env == "production"
++  input.params.approved_by
++}
++
++# Retrain rules: allow retrain in staging or if approved in prod for medium/high
++allow {
++  input.action == "retrain"
++  input.env == "staging"
++}
++allow {
++  input.action == "retrain"
++  input.env == "production"
++  is_low_risk
++}
++allow {
++  input.action == "retrain"
++  input.env == "production"
++  input.params.approved_by
++}
++
++# Promote safety: ensure model metadata includes owners and SLOs
++allow {
++  input.action == "promote"
++  model_meta(input.model)
++  count(model_meta(input.model).owners) > 0
++}
++
++reason = msg {
++  not allow
++  msg = sprintf("Action '%v' on model '%v' denied by agents_full policy", [input.action, input.model])
++}
++
++result = {"allow": allow, "reason": reason}
++
+diff --git a/scripts/deploy_opa_bundle.sh b/scripts/deploy_opa_bundle.sh
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/scripts/deploy_opa_bundle.sh
+@@ -0,0 +1,160 @@
++#!/usr/bin/env bash
++#
++# Download bundle artifact produced by CI and deploy to cluster as a configmap (example).
++# Requires KUBECONFIG env or in-cluster execution context.
++
++set -euo pipefail
++
++BUNDLE_PATH="${1:-policy/bundle.tar.gz}"
++NAMESPACE="${NAMESPACE:-aegis-ml}"
++CM_NAME="${CM_NAME:-opa-bundle}"
++
++if [ ! -f "$BUNDLE_PATH" ]; then
++  echo "Bundle not found at $BUNDLE_PATH"
++  exit 2
++fi
++
++echo "Creating configmap $CM_NAME in namespace $NAMESPACE with OPA bundle"
++kubectl -n "$NAMESPACE" create configmap "$CM_NAME" --from-file=bundle.tar.gz="$BUNDLE_PATH" --dry-run=client -o yaml | kubectl apply -f -
++
++echo "Optionally restart OPA pods to pick up new bundle:"
++echo "  kubectl -n $NAMESPACE rollout restart deployment/opa"
++
++exit 0
++
+diff --git a/k8s/manifests/vllm-quant-configmap.yaml b/k8s/manifests/vllm-quant-configmap.yaml
+new file mode 100644
+index 0000000..6666666
+--- /dev/null
++++ b/k8s/manifests/vllm-quant-configmap.yaml
+@@ -0,0 +1,160 @@
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: aegis-vllm-config
++  namespace: aegis-ml
++data:
++  # Example vLLM / model-serving tuning and quantization parameters (application must read this)
++  MODEL_QUANTIZATION: "true"
++  QUANT_BITS: "4"
++  OPTIMIZE_FOR_LATENCY: "true"
++  BATCH_MAX_TOKENS: "2048"
++  BATCH_MAX_REQUESTS: "8"
++  # Application-specific knobs: vllm server should read these and apply quantization/batching at model load time
++
+diff --git a/k8s/manifests/keda-gpu-scaledobject.yaml b/k8s/manifests/keda-gpu-scaledobject.yaml
+new file mode 100644
+index 0000000..7777777
+--- /dev/null
++++ b/k8s/manifests/keda-gpu-scaledobject.yaml
+@@ -0,0 +1,260 @@
++apiVersion: keda.sh/v1alpha1
++kind: ScaledObject
++metadata:
++  name: aegis-vllm-gpu-scaledobject
++  namespace: aegis-ml
++spec:
++  scaleTargetRef:
++    name: aegis-vllm
++  minReplicaCount: 1
++  maxReplicaCount: 8
++  pollingInterval: 15
++  cooldownPeriod: 120
++  triggers:
++    - type: prometheus
++      metadata:
++        serverAddress: http://prometheus-operated.monitoring.svc.cluster.local
++        metricName: aegis_gpu_utilization_percent
++        threshold: "70"
++        query: avg_over_time(aegis_gpu_utilization_percent[2m])
++
++---
++# ScaledObject for inference gateway using request-rate metric (prometheus-based)
++apiVersion: keda.sh/v1alpha1
++kind: ScaledObject
++metadata:
++  name: aegis-inference-rate-scaledobject
++  namespace: aegis-ml
++spec:
++  scaleTargetRef:
++    name: aegis-inference-gateway
++  minReplicaCount: 2
++  maxReplicaCount: 50
++  pollingInterval: 15
++  cooldownPeriod: 60
++  triggers:
++    - type: prometheus
++      metadata:
++        serverAddress: http://prometheus-operated.monitoring.svc.cluster.local
++        metricName: aegis_inference_request_rate_per_second
++        threshold: "10"
++        query: sum(rate(aegis_inference_requests_total[1m]))
++
+diff --git a/scripts/run_inference_bench.sh b/scripts/run_inference_bench.sh
+new file mode 100644
+index 0000000..8888888
+--- /dev/null
++++ b/scripts/run_inference_bench.sh
+@@ -0,0 +1,200 @@
++#!/usr/bin/env bash
++#
++# Run vLLM load tests and push summary metrics/artifacts for analysis.
++#
++# Usage:
++#   ./scripts/run_inference_bench.sh --gateway http://localhost:8080/generate --concurrency 8 --requests 200
++
++set -euo pipefail
++
++GATEWAY="${GATEWAY:-http://localhost:8080/generate}"
++CONCURRENCY="${CONCURRENCY:-8}"
++REQUESTS="${REQUESTS:-200}"
++PROM_PUSHGATEWAY="${PROM_PUSHGATEWAY:-http://pushgateway.monitoring.svc.cluster.local:9091}"
++
++python3 scripts/vllm_load_test.py --gateway "${GATEWAY}" --concurrency "${CONCURRENCY}" --requests "${REQUESTS}"
++
++if [ -f vllm_load_results.csv ]; then
++  echo "Uploading results as artifact to pushgateway (if configured)..."
++  if [ -n "${PROM_PUSHGATEWAY:-}" ]; then
++    # simple push: number of requests and p95 latency heuristic
++    P95=$(python3 - <<'PY'
++import csv,sys
++vals=[]
++with open('vllm_load_results.csv') as fh:
++    r=csv.DictReader(fh)
++    for row in r:
++        try:
++            if row['ok']=='True':
++                vals.append(float(row['latency']))
++        except:
++            pass
++vals.sort()
++p95=vals[int(len(vals)*0.95)] if vals else 0.0
++print(p95)
++PY
++)
++    # push as a gauge metric
++    cat <<EOF | curl --data-binary @- ${PROM_PUSHGATEWAY}/metrics/job/aegis_vllm_bench
++aegis_vllm_bench_p95 ${P95}
++EOF
++  fi
++fi
++
++echo "Bench complete."
++
+diff --git a/scripts/metabase_setup.py b/scripts/metabase_setup.py
+new file mode 100644
+index 0000000..9999999
+--- /dev/null
++++ b/scripts/metabase_setup.py
+@@ -0,0 +1,260 @@
++#!/usr/bin/env python3
++"""
++Provision Metabase datasource & saved questions/dashboards for auditors.
++Requires: METABASE_URL, METABASE_ADMIN_USER, METABASE_ADMIN_PASS in env.
++
++This is an example that creates a Postgres datasource pointing to your decision_log DB
++and creates a simple saved question for recent decision_log entries.
++"""
++import os
++import requests
++import time
++import json
++
++MB_URL = os.environ.get("METABASE_URL")
++MB_USER = os.environ.get("METABASE_ADMIN_USER")
++MB_PASS = os.environ.get("METABASE_ADMIN_PASS")
++PG_HOST = os.environ.get("MB_PG_HOST")
++PG_PORT = os.environ.get("MB_PG_PORT","5432")
++PG_DB = os.environ.get("MB_PG_DB")
++PG_USER = os.environ.get("MB_PG_USER")
++PG_PASS = os.environ.get("MB_PG_PASS")
++
++if not MB_URL:
++    print("Set METABASE_URL and admin credentials")
++    raise SystemExit(2)
++
++def login():
++    resp = requests.post(f"{MB_URL}/api/session", json={"username": MB_USER, "password": MB_PASS})
++    resp.raise_for_status()
++    return resp.json()["id"]
++
++def create_postgres_datasource(session_token):
++    headers = {"X-Metabase-Session": session_token}
++    payload = {
++        "name": "decision_log_postgres",
++        "engine": "postgres",
++        "details": {
++            "host": PG_HOST,
++            "port": int(PG_PORT),
++            "dbname": PG_DB,
++            "user": PG_USER,
++            "password": PG_PASS
++        }
++    }
++    resp = requests.post(f"{MB_URL}/api/databases", headers=headers, json=payload)
++    if resp.status_code == 200 or resp.status_code == 201:
++        print("Created datasource")
++    else:
++        print("Datasource creation response:", resp.status_code, resp.text)
++
++def create_saved_question(session_token):
++    headers = {"X-Metabase-Session": session_token}
++    # simple SQL question for recent decision_log
++    question = {
++        "name": "Recent decision_log entries",
++        "dataset_query": {
++            "database": 1,  # may need adjustment depending on datasource id
++            "native": {
++                "query": "SELECT id, created_at, agent, payload->>'action' as action FROM decision_log ORDER BY created_at DESC LIMIT 100"
++            },
++            "type": "native"
++        },
++        "display": "table"
++    }
++    resp = requests.post(f"{MB_URL}/api/card", headers=headers, json=question)
++    print("Saved question response:", resp.status_code, resp.text)
++
++def main():
++    token = login()
++    print("Logged into Metabase, session:", token)
++    create_postgres_datasource(token)
++    time.sleep(2)
++    create_saved_question(token)
++    print("Metabase provisioning attempted. Adjust datasource id and queries as needed.")
++
++if __name__ == "__main__":
++    main()
++
+diff --git a/argo/workflows/promote_with_canary.yaml b/argo/workflows/promote_with_canary.yaml
+new file mode 100644
+index 0000000..aaaaaaaa
+--- /dev/null
++++ b/argo/workflows/promote_with_canary.yaml
+@@ -0,0 +1,320 @@
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: aegis-promote-canary-
++  namespace: aegis-ml
++spec:
++  entrypoint: promote-canary
++  serviceAccountName: aegis-agent-sa
++  templates:
++    - name: promote-canary
++      steps:
++        - - name: canary-deploy
++            template: canary-deploy
++        - - name: canary-monitor
++            template: canary-monitor
++        - - name: opa-gate-final
++            template: opa-gate-final
++        - - name: promote-traffic
++            template: promote-traffic
++        - - name: rollback-check
++            template: rollback-check
++
++    - name: canary-deploy
++      container:
++        image: bitnami/kubectl:latest
++        command: ["bash","-lc"]
++        args:
++          - |
++            set -euo pipefail
++            echo "Applying canary Kubernetes manifests (assumes canary manifest exists in repo)"
++            kubectl -n aegis-ml apply -f k8s/canary/canary-deployment.yaml
++            kubectl -n aegis-ml rollout status deploy/aegis-canary --timeout=120s
++
++    - name: canary-monitor
++      script:
++        image: curlimages/curl
++        command: ["bash"]
++        source: |
++          set -euo pipefail
++          echo "Monitoring canary: sleep 60 (collect metrics via Prometheus)"
++          sleep 60
++          # Query Prometheus for error rate on canary service - operator must adapt Prometheus endpoint
++          PROM="http://prometheus-operated.monitoring.svc.cluster.local"
++          QUERY='sum(rate(http_request_errors_total{job="aegis-canary"}[1m]))'
++          echo "Querying prometheus for canary errors..."
++          RESP=$(curl -sS --data-urlencode "query=${QUERY}" "${PROM}/api/v1/query")
++          ERR_COUNT=$(echo "$RESP" | jq -r '.data.result[0].value[1] // 0')
++          echo "Canary error count (1m): $ERR_COUNT"
++          if (( $(echo "$ERR_COUNT > 0.0" | bc -l) )); then
++            echo "Canary failing - aborting"
++            exit 2
++          fi
++          echo "Canary looks healthy"
++
++    - name: opa-gate-final
++      script:
++        image: curlimages/curl
++        command: ["bash"]
++        source: |
++          set -euo pipefail
++          echo "Calling OPA to gate final promotion"
++          INPUT='{"action":"promote","model":"{{workflow.parameters.model}}","env":"production","params":{}}'
++          RESP=$(curl -sS -H "Content-Type: application/json" -d "$INPUT" http://opa.aegis-ml.svc.cluster.local:8181/v1/data/aegis/policies/agents_full/result)
++          ALLOW=$(echo "$RESP" | jq -r '.result.allow')
++          if [ "$ALLOW" != "true" ]; then
++            echo "OPA denied promotion: $RESP"
++            exit 3
++          fi
++          echo "OPA allowed promotion"
++
++    - name: promote-traffic
++      container:
++        image: bitnami/kubectl:latest
++        command: ["bash","-lc"]
++        args:
++          - |
++            set -euo pipefail
++            echo "Promoting canary to primary (example: update service selector)"
++            kubectl -n aegis-ml apply -f k8s/canary/promote-final.yaml
++            kubectl -n aegis-ml rollout status deploy/aegis-primary --timeout=180s
++
++    - name: rollback-check
++      script:
++        image: curlimages/curl
++        command: ["bash"]
++        source: |
++          set -euo pipefail
++          echo "Post-promotion monitoring (5m window)"
++          sleep 300
++          PROM="http://prometheus-operated.monitoring.svc.cluster.local"
++          QUERY='sum(rate(http_request_errors_total{job="aegis-primary"}[5m]))'
++          RESP=$(curl -sS --data-urlencode "query=${QUERY}" "${PROM}/api/v1/query")
++          ERR_COUNT=$(echo "$RESP" | jq -r '.data.result[0].value[1] // 0')
++          if (( $(echo "$ERR_COUNT > 0.0" | bc -l) )); then
++            echo "Promotion caused errors - performing rollback"
++            kubectl -n aegis-ml apply -f k8s/canary/rollback.yaml
++            exit 4
++          fi
++          echo "Promotion stable"
++
++  arguments:
++    parameters:
++      - name: model
++        value: "aegis-rlhf-trl-model"
++
++  ttlStrategy:
++    secondsAfterCompletion: 3600
++
+diff --git a/tools/promotion_gate.sh b/tools/promotion_gate.sh
+new file mode 100644
+index 0000000..bbbbbbbb
+--- /dev/null
++++ b/tools/promotion_gate.sh
+@@ -0,0 +1,160 @@
++#!/usr/bin/env bash
++#
++# Gate promotion by checking OPA and canary metrics in Prometheus.
++#
++# Usage:
++#   tools/promotion_gate.sh --model my-model --prometheus http://prometheus:9090 --opa http://opa:8181/v1/data/aegis/policies/agents_full/result
++
++set -euo pipefail
++
++MODEL=""
++PROM_URL="http://prometheus-operated.monitoring.svc.cluster.local"
++OPA_URL="http://opa.aegis-ml.svc.cluster.local:8181/v1/data/aegis/policies/agents_full/result"
++CANARY_ERROR_THRESHOLD=0
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --model) MODEL="$2"; shift 2;;
++    --prometheus) PROM_URL="$2"; shift 2;;
++    --opa) OPA_URL="$2"; shift 2;;
++    *) echo "Unknown arg $1"; exit 1;;
++  esac
++done
++
++if [ -z "$MODEL" ]; then
++  echo "--model required"
++  exit 2
++fi
++
++echo "Querying OPA for model promotion permission..."
++INPUT=$(jq -n --arg m "$MODEL" '{"input":{"action":"promote","model":$m,"env":"production","params":{}}}')
++RESP=$(curl -sS -H "Content-Type: application/json" -d "$INPUT" "$OPA_URL")
++ALLOW=$(echo "$RESP" | jq -r '.result.allow // false')
++if [ "$ALLOW" != "true" ]; then
++  echo "OPA denied promotion: $RESP"
++  exit 3
++fi
++echo "OPA allowed promotion"
++
++echo "Checking canary metrics in Prometheus..."
++QUERY='sum(rate(http_request_errors_total{job="aegis-canary"}[1m]))'
++CANARY_ERR=$(curl -sS --data-urlencode "query=${QUERY}" "${PROM_URL}/api/v1/query" | jq -r '.data.result[0].value[1] // 0')
++echo "Canary errors: $CANARY_ERR"
++if (( $(echo "$CANARY_ERR > $CANARY_ERROR_THRESHOLD" | bc -l) )); then
++  echo "Canary exceeds error threshold; block promotion"
++  exit 4
++fi
++
++echo "Gate passed"
++exit 0
++
+diff --git a/k8s/manifests/decisionlog-es-roles.yaml b/k8s/manifests/decisionlog-es-roles.yaml
+new file mode 100644
+index 0000000..cccccccc
+--- /dev/null
++++ b/k8s/manifests/decisionlog-es-roles.yaml
+@@ -0,0 +1,220 @@
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: metabase-es-access
++  namespace: aegis-ml
++rules:
++  - apiGroups: [""]
++    resources: ["secrets"]
++    verbs: ["get"]
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: metabase-es-access-binding
++  namespace: aegis-ml
++subjects:
++  - kind: ServiceAccount
++    name: aegis-metabase
++    namespace: aegis-ml
++roleRef:
++  kind: Role
++  name: metabase-es-access
++  apiGroup: rbac.authorization.k8s.io
++
++---
++# Elasticsearch index template example - operators should apply to ES cluster
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: decisionlog-es-template
++  namespace: aegis-ml
++data:
++  index_template.json: |
++    {
++      "index_patterns": ["decision_log*"],
++      "template": {
++        "mappings": {
++          "properties": {
++            "created_at": {"type":"date"},
++            "agent": {"type":"keyword"},
++            "payload": {"type":"object"},
++            "evidence": {"type":"object"}
++          }
++        }
++      }
++    }
++
+diff --git a/README_PROD_READY.md b/README_PROD_READY.md
+new file mode 100644
+index 0000000..dddddddd
+--- /dev/null
++++ b/README_PROD_READY.md
+@@ -0,0 +1,220 @@
++# Aegis Production Readiness Patch — What this bundle provides
++
++This patch implements code and manifests to:
++
++- Run multi-node DeepSpeed staging runs and collect NCCL diagnostics
++- Rotate Vault secrets with a backup step and optional notifier
++- Enforce plaintext-secret scanning in CI and fail PRs with likely secrets
++- Expand OPA coverage to a full agent policy and tools to build & deploy bundles
++- Productionize inference autoscaling with KEDA GPU ScaledObjects and vLLM quantization config
++- Load test harness for inference and pushbench reporting
++- Harden decision_log -> ES -> Metabase provisioning and RBAC for auditors
++- Add promote-with-canary Argo workflow and gate script that calls OPA + Prometheus
++
++How to use
++1. DeepSpeed staging:
++   ./scripts/deepspeed_staging_run.sh --nodes 2 --test-seconds 60 --artifact-dir ./artifacts
++
++2. Vault rotation (dry-run then apply):
++   VAULT_ADDR=... VAULT_TOKEN=... python3 scripts/rotate_vault_keys.py --paths secret/data/aegis/github_app --dry-run
++
++3. OPA bundle:
++   (CI will build bundle) then ./scripts/deploy_opa_bundle.sh policy/bundle.tar.gz
++
++4. Inference autoscaling:
++   Apply k8s/manifests/keda-gpu-scaledobject.yaml and configure Prometheus metrics exporters for GPU utilization
++
++5. Decision_log auditing:
++   Deploy k8s/manifests/decisionlog-es-cronjob.yaml earlier and metabase deployment; run scripts/metabase_setup.py with env vars to provision dashboards.
++
++6. Promotion with canary:
++   Submit an Argo workflow using argo/workflows/promote_with_canary.yaml or call tools/promotion_gate.sh to evaluate gate conditions before manual promotion.
++
++Operators must adapt values, secrets, registry image names, and cluster-specific tuning (NCCL, RDMA) for their environment.
++
++End.
++

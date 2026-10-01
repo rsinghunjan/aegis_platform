@@ -1,0 +1,558 @@
+*** Begin Patch
+*** Add File: ml/anomaly/feature_extract.py
++#!/usr/bin/env python3
++"""
++Feature extraction helpers for anomaly detector.
++ - Query Prometheus for a set of metrics and produce a feature vector per time window.
++ - This is intentionally simple; replace/add features as you gather signals.
++"""
++import os
++import requests
++import time
++import numpy as np
++
++PROM_URL = os.environ.get("PROM_URL")
++
++def query_prometheus(prom, query):
++    r = requests.get(f"{prom}/api/v1/query", params={"query": query}, timeout=10)
++    r.raise_for_status()
++    data = r.json()
++    results = data.get("data", {}).get("result", [])
++    if not results:
++        return 0.0
++    # return numeric value of first timeseries point
++    try:
++        return float(results[0]["value"][1])
++    except Exception:
++        return 0.0
++
++def extract_features(prom= PROM_URL):
++    """
++    Example feature vector:
++      - agent_stuck_tx_total (increase over 5m)
++      - agent_prepare_failure_rate
++      - agent_commit_failure_rate
++      - tm_pod_restarts
++      - tx_queue_length
++    Returns dict of features.
++    """
++    if not prom:
++        raise RuntimeError("PROM_URL not set")
++    f = {}
++    f["stuck_increase_5m"] = query_prometheus(prom, 'increase(agent_stuck_transactions_total[5m])') or 0.0
++    f["prepare_fail_rate"] = query_prometheus(prom, 'rate(agent_prepare_failures_total[5m])') or 0.0
++    f["commit_fail_rate"] = query_prometheus(prom, 'rate(agent_commit_failures_total[5m])') or 0.0
++    f["tm_restarts"] = query_prometheus(prom, 'increase(kube_pod_container_status_restarts_total{pod=~"transaction-manager.*"}[10m])') or 0.0
++    f["tx_queue"] = query_prometheus(prom, 'sum(transaction_queue_length)') or 0.0
++    # normalize
++    return f
++
++if __name__ == "__main__":
++    print(extract_features())
++
+*** End Patch
+*** Begin Patch
+*** Add File: ml/anomaly/trainer.py
++#!/usr/bin/env python3
++"""
++Simple trainer to create an anomaly detector from historical metrics.
++Uses IsolationForest as a lightweight unsupervised detector.
++Outputs a saved model (joblib) to ml/anomaly/model.joblib
++"""
++import os
++import argparse
++import joblib
++import numpy as np
++from sklearn.ensemble import IsolationForest
++from ml.anomaly.feature_extract import extract_features
++
++OUT_MODEL = os.environ.get("ANOMALY_MODEL_PATH", "ml/anomaly/model.joblib")
++
++def synthetic_build_dataset(prom_url, n=200):
++    """
++    Build a toy dataset by sampling features over time.
++    In production, replace with historical metric ingestion and labeled incidents.
++    """
++    import time
++    from ml.anomaly.feature_extract import query_prometheus
++    X = []
++    for i in range(n):
++        # best-effort; if Prometheus unavailable produce random baseline
++        try:
++            f = extract_features(prom_url)
++            vec = [f[k] for k in sorted(f.keys())]
++        except Exception:
++            vec = list(np.random.normal(0, 1, 5))
++        X.append(vec)
++        time.sleep(0.1)
++    return np.array(X)
++
++def train(prom_url=None, out=OUT_MODEL):
++    print("Training anomaly detector (isolation forest)")
++    X = synthetic_build_dataset(prom_url, n=300)
++    clf = IsolationForest(n_estimators=100, contamination=0.01, random_state=42)
++    clf.fit(X)
++    os.makedirs(os.path.dirname(out), exist_ok=True)
++    joblib.dump({
++        "model": clf,
++        "feature_keys": sorted(["stuck_increase_5m","prepare_fail_rate","commit_fail_rate","tm_restarts","tx_queue"])
++    }, out)
++    print("Saved model to", out)
++
++if __name__ == "__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--prom", default=os.environ.get("PROM_URL"))
++    p.add_argument("--out", default=OUT_MODEL)
++    args = p.parse_args()
++    train(prom_url=args.prom, out=args.out)
++
+*** End Patch
+*** Begin Patch
+*** Add File: ml/anomaly/detector_service.py
++#!/usr/bin/env python3
++"""
++Anomaly detector service:
++ - Loads a trained model (isolation forest)
++ - Periodically samples Prometheus features or accepts a webhook event
++ - If anomaly is detected, creates a GitHub issue (automatic triage) and uploads evidence to S3
++"""
++import os
++import time
++import json
++import joblib
++import requests
++from ml.anomaly.feature_extract import extract_features
++import boto3
++
++MODEL_PATH = os.environ.get("ANOMALY_MODEL_PATH", "ml/anomaly/model.joblib")
++GITHUB_REPO = os.environ.get("GITHUB_REPO")  # owner/repo
++GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++PROM_URL = os.environ.get("PROM_URL")
++SLEEP = int(os.environ.get("ANOMALY_POLL_INTERVAL", "60"))
++THRESHOLD_SCORE = float(os.environ.get("ANOMALY_THRESHOLD", "0.01"))
++
++def load_model(path=MODEL_PATH):
++    m = joblib.load(path)
++    return m["model"], m["feature_keys"]
++
++def create_github_issue(title, body, labels=None):
++    if not GITHUB_REPO or not GITHUB_TOKEN:
++        print("GH config missing; printing issue to stdout")
++        print("ISSUE:", title)
++        print(body)
++        return None
++    url = f"https://api.github.com/repos/{GITHUB_REPO}/issues"
++    h = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
++    payload = {"title": title, "body": body}
++    if labels:
++        payload["labels"] = labels
++    r = requests.post(url, headers=h, json=payload, timeout=10)
++    r.raise_for_status()
++    data = r.json()
++    print("Created issue", data.get("html_url"))
++    return data.get("html_url")
++
++def upload_evidence_to_s3(local_path, s3_prefix="anomalies"):
++    if not COMPLIANCE_BUCKET:
++        print("No COMPLIANCE_BUCKET configured; evidence not uploaded")
++        return None
++    s3 = boto3.client("s3")
++    key = f"{s3_prefix}/{os.path.basename(local_path)}"
++    s3.upload_file(local_path, COMPLIANCE_BUCKET, key)
++    return f"s3://{COMPLIANCE_BUCKET}/{key}"
++
++def run_loop():
++    model, keys = load_model()
++    print("Loaded model; feature keys:", keys)
++    while True:
++        try:
++            f = extract_features(PROM_URL)
++            vec = [f[k] for k in keys]
++            score = model.decision_function([vec])[0]  # higher = normal; lower = anomalous
++            print("Score:", score, "vec:", vec)
++            # IsolationForest: negative scores -> anomaly. We'll treat low percentiles as anomalies.
++            if score < -0.1:  # heuristic threshold; tune in production
++                ts = int(time.time())
++                fname = f"/tmp/anomaly_{ts}.json"
++                payload = {"ts": ts, "features": f, "score": float(score)}
++                open(fname, "w").write(json.dumps(payload))
++                s3url = upload_evidence_to_s3(fname)
++                title = f"[AUTO-ANOMALY] Agentic anomaly detected ({ts})"
++                body = f"Anomaly detected at {ts}\n\nscore: {score}\n\nfeatures: {json.dumps(f, indent=2)}\n\nEvidence: {s3url}"
++                create_github_issue(title, body, labels=["anomaly","auto-triage"])
++        except Exception as e:
++            print("Error in anomaly loop:", e)
++        time.sleep(SLEEP)
++
++if __name__ == "__main__":
++    run_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File: remediation/assistant_agent.py
++#!/usr/bin/env python3
++"""
++Assisted remediation agent (LLM-backed suggestions + operator approval to execute).
++
++Flow:
++ - Given an incident (GitHub issue URL or S3 evidence), the agent gathers context, creates
++   a suggested remediation plan (commands to run), posts as a GitHub issue comment.
++ - Operator approves by commenting "/approve" on the issue (from an authorized user).
++ - A webhook (remediation/webhook_server.py) listens for approval comments and triggers the executor.
++
++Security & safety:
++ - Executor has a whitelist of allowed commands and a dry-run mode.
++ - Actual execution requires environment variable ALLOW_EXECUTE=true and an authorized approver.
++ - All actions are logged to S3 and an audit DB.
++"""
++import os
++import json
++import requests
++from typing import List
++
++GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
++GITHUB_REPO = os.environ.get("GITHUB_REPO")
++LLM_API = os.environ.get("LLM_API")  # placeholder URL if you have an LLM/LLM-proxy
++AUDIT_S3_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++
++def gather_context_from_issue(issue_url: str) -> str:
++    """
++    Fetch issue body and attached evidence; return consolidated context text.
++    """
++    if not GITHUB_TOKEN:
++        raise RuntimeError("GITHUB_TOKEN required")
++    api = issue_url.replace("https://github.com/", "https://api.github.com/repos/").replace("/issues/", "/issues/")
++    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
++    r = requests.get(api, headers=headers, timeout=10)
++    r.raise_for_status()
++    data = r.json()
++    body = data.get("body", "")
++    return f"Issue title: {data.get('title')}\n\n{body}"
++
++def propose_remediation(context_text: str) -> List[str]:
++    """
++    Placeholder: call an LLM endpoint to produce remediation steps/commands.
++    If no LLM available, use a simple heuristic.
++    Returns list of shell commands (strings) intended to remediate.
++    """
++    if LLM_API:
++        try:
++            r = requests.post(LLM_API, json={"prompt": context_text, "task": "remediation"}, timeout=20)
++            r.raise_for_status()
++            resp = r.json()
++            cmds = resp.get("commands") or []
++            return cmds
++        except Exception as e:
++            print("LLM call failed:", e)
++    # Fallback heuristic suggestions
++    cmds = [
++        "kubectl -n aegis rollout restart deploy/transaction-manager",
++        "kubectl -n aegis get pods -l app=transaction-manager -o wide"
++    ]
++    return cmds
++
++def post_suggestion_to_issue(issue_url: str, commands: List[str]):
++    """
++    Post a GitHub issue comment with the suggested remediation and approval instructions.
++    """
++    if not GITHUB_TOKEN or not GITHUB_REPO:
++        print("GH config missing; printing proposed commands:")
++        print("\n".join(commands))
++        return None
++    # Map issue URL to API URL for comments
++    api = issue_url.replace("https://github.com/", "https://api.github.com/repos/") + "/comments"
++    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
++    body = "Suggested remediation plan (assisted):\n\n"
++    for c in commands:
++        body += f"- `{c}`\n"
++    body += "\nTo execute these commands, reply to this issue with `/approve`. Execution will be logged and audited."
++    r = requests.post(api, headers=headers, json={"body": body}, timeout=10)
++    r.raise_for_status()
++    return r.json().get("html_url")
++
++def run_assist_for_issue(issue_url: str):
++    ctx = gather_context_from_issue(issue_url)
++    cmds = propose_remediation(ctx)
++    post_suggestion_to_issue(issue_url, cmds)
++    # persist suggestion to audit S3 if configured
++    if AUDIT_S3_BUCKET:
++        import boto3, tempfile
++        s3 = boto3.client("s3")
++        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
++        tmp.write(json.dumps({"issue": issue_url, "commands": cmds}).encode()); tmp.flush(); tmp.close()
++        key = f"remediation_suggestions/{os.path.basename(tmp.name)}"
++        s3.upload_file(tmp.name, AUDIT_S3_BUCKET, key)
++        print("Uploaded suggestion to s3://%s/%s" % (AUDIT_S3_BUCKET, key))
++
++if __name__ == "__main__":
++    import sys
++    if len(sys.argv) < 2:
++        print("Usage: assistant_agent.py <github_issue_url>")
++        raise SystemExit(2)
++    run_assist_for_issue(sys.argv[1])
++
+*** End Patch
+*** Begin Patch
+*** Add File: remediation/webhook_server.py
++#!/usr/bin/env python3
++"""
++Webhook server to listen to GitHub issue comments.
++ - When it sees a comment "/approve" on an auto-triaged issue, and the author is authorized,
++   it triggers execution (via remediation/executor.py).
++ - All approvals and executions are recorded in an audit SQLite DB and S3 (if configured).
++"""
++import os
++import hmac
++import hashlib
++import json
++import subprocess
++from flask import Flask, request, jsonify
++
++from remediation.executor import Executor, is_user_authorized
++
++GITHUB_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET")
++AUDIT_S3_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++
++app = Flask("remediation-webhook")
++
++@app.route("/webhook", methods=["POST"])
++def webhook():
++    sig = request.headers.get("X-Hub-Signature-256", "")
++    payload = request.data
++    if GITHUB_SECRET:
++        mac = "sha256=" + hmac.new(GITHUB_SECRET.encode(), msg=payload, digestmod=hashlib.sha256).hexdigest()
++        if not hmac.compare_digest(mac, sig):
++            return "invalid signature", 401
++    evt = request.headers.get("X-GitHub-Event", "")
++    j = request.get_json() or {}
++    # Only handle issue_comment events
++    if evt == "issue_comment":
++        comment = j.get("comment", {}).get("body", "").strip()
++        author = j.get("comment", {}).get("user", {}).get("login")
++        issue = j.get("issue", {})
++        issue_url = issue.get("html_url")
++        if comment == "/approve":
++            if not is_user_authorized(author):
++                return jsonify({"ok": False, "reason": "unauthorized"}), 403
++            # fetch latest suggested commands from S3 or scan issue comments to find commands block
++            # For simplicity, we scan comments for the suggested remediation block
++            comments_api = issue_url.replace("https://github.com/", "https://api.github.com/repos/") + "/comments"
++            import requests, os
++            headers = {"Authorization": f"token {os.environ.get('GITHUB_TOKEN')}"}
++            resp = requests.get(comments_api, headers=headers, timeout=10)
++            cmds = []
++            if resp.ok:
++                for c in resp.json():
++                    body = c.get("body","")
++                    if "Suggested remediation plan" in body:
++                        # parse inline `code` blocks of commands
++                        import re
++                        found = re.findall(r'`([^`]+?)`', body)
++                        cmds = found
++                        break
++            if not cmds:
++                return jsonify({"ok": False, "reason": "no_suggested_commands_found"}), 400
++            ex = Executor()
++            run_id, result = ex.execute_commands(cmds, issue_url)
++            return jsonify({"ok": True, "execution_id": run_id, "result": result})
++    return jsonify({"ok": True})
++
++@app.route("/health", methods=["GET"])
++def health():
++    return jsonify({"ok": True})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8411")))
++
+*** End Patch
+*** Begin Patch
+*** Add File: remediation/executor.py
++#!/usr/bin/env python3
++"""
++Executor for approved remediation commands.
++ - Maintains an audit SQLite DB and uploads logs to S3.
++ - Enforces a whitelist of allowed commands; by default only kubectl, helm and specific scripts are allowed.
++ - Dry-run is the default unless ALLOW_EXECUTE=true is set (safety).
++"""
++import os
++import sqlite3
++import time
++import json
++import shlex
++import subprocess
++import uuid
++import boto3
++
++DB_PATH = os.environ.get("REMEDIATION_AUDIT_DB", "/data/remediation_audit.db")
++S3_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++ALLOW_EXECUTE = os.environ.get("ALLOW_EXECUTE", "false").lower() in ("1","true","yes")
++
++ALLOWED_PREFIXES = [
++    "kubectl ",
++    "helm ",
++    "/opt/operator/rotate_with_audit.sh",
++    "ansible-playbook "
++]
++
++def ensure_db():
++    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
++    conn = sqlite3.connect(DB_PATH)
++    c = conn.cursor()
++    c.execute("""CREATE TABLE IF NOT EXISTS executions (id TEXT PRIMARY KEY, ts INTEGER, issue TEXT, commands TEXT, result TEXT)""")
++    conn.commit(); conn.close()
++
++def is_cmd_allowed(cmd):
++    for p in ALLOWED_PREFIXES:
++        if cmd.strip().startswith(p):
++            return True
++    return False
++
++def is_user_authorized(user):
++    # In production consult an RBAC system; here we allow users in a simple env var list
++    admins = os.environ.get("REMEDIATION_AUTHORIZED_USERS", "")
++    if not admins:
++        return False
++    return user in [u.strip() for u in admins.split(",") if u.strip()]
++
++class Executor:
++    def __init__(self):
++        ensure_db()
++
++    def execute_commands(self, commands, issue_url=None):
++        rid = str(uuid.uuid4())
++        ts = int(time.time())
++        results = []
++        for c in commands:
++            if not is_cmd_allowed(c):
++                res = {"command": c, "status": "rejected", "reason": "not_allowed"}
++                results.append(res)
++                continue
++            if not ALLOW_EXECUTE:
++                # dry-run: just echo the command
++                res = {"command": c, "status": "dry-run", "output": "", "rc": 0}
++                results.append(res)
++                continue
++            try:
++                proc = subprocess.run(c, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
++                out = proc.stdout.decode()
++                res = {"command": c, "status": "executed", "rc": proc.returncode, "output": out}
++            except Exception as e:
++                res = {"command": c, "status": "error", "error": str(e)}
++            results.append(res)
++        # persist audit
++        conn = sqlite3.connect(DB_PATH)
++        c = conn.cursor()
++        c.execute("INSERT INTO executions VALUES (?, ?, ?, ?, ?)", (rid, ts, issue_url or "", json.dumps(commands), json.dumps(results)))
++        conn.commit(); conn.close()
++        # upload results to s3 if configured
++        if S3_BUCKET:
++            s3 = boto3.client("s3")
++            key = f"remediation/executions/{rid}.json"
++            tf = f"/tmp/{rid}.json"
++            open(tf, "w").write(json.dumps({"id": rid, "ts": ts, "issue": issue_url, "results": results}, indent=2))
++            s3.upload_file(tf, S3_BUCKET, key)
++        return rid, results
++
++if __name__ == "__main__":
++    # CLI helper for local testing
++    import sys
++    ensure_db()
++    if len(sys.argv) < 2:
++        print("Usage: executor.py <command> [<command> ...]")
++        raise SystemExit(2)
++    ex = Executor()
++    rid, res = ex.execute_commands(sys.argv[1:], issue_url="cli-test")
++    print("Execution id:", rid)
++    print(json.dumps(res, indent=2))
++
+*** End Patch
+*** Begin Patch
+*** Add File: governance/autonomy_roadmap.md
++ # Aegis Autonomy Roadmap (phased)
++
++Goal: incrementally add safe, auditable automation capabilities while preserving operator control and meeting compliance/pen-test requirements.
++
++Phase 0 — Foundations (complete)
++- Evidence & audit infrastructure: COMPLIANCE_BUCKET, Rekor signing, runbooks, Prometheus alerts, GitHub issue integration.
++- Baseline operator processes and production gate orchestrator (orchestrator/production_orchestrator.py).
++
++Phase 1 — Assisted Triage (weeks 0–4)
++- Deliverables:
++  - Anomaly detector (IsolationForest) trained on metrics (ml/anomaly/trainer.py).
++  - Detector service (ml/anomaly/detector_service.py) that auto-creates triage GitHub issues + uploads evidence to S3.
++  - Acceptance criteria: detector identifies known historical incidents with >= 70% precision in test set; auto issues include evidence links; SOC/ops confirm triage useful.
++  - Tests: offline replay of historical metrics and incident creation; end-to-end integration test to GH + S3.
++
++Phase 2 — Assisted Remediation (weeks 2–8)
++- Deliverables:
++  - Assistant agent (remediation/assistant_agent.py) that suggests remediation commands using an LLM or rule heuristic; posts suggested plan to GH issue.
++  - Webhook + executor (remediation/webhook_server.py + remediation/executor.py) that executes only after authorized "/approve" comment.
++  - Acceptance criteria: successful dry-run executions for 20 sample incidents; real executions gated by ALLOW_EXECUTE; audit logs in S3 and sqlite.
++  - Tests: simulate issue lifecycle, approve events from authorized users, verify audit artifacts in S3.
++
++Phase 3 — Closed-loop Tuning (weeks 4–12)
++- Deliverables:
++  - Replace heuristic tuner with safe optimizer (bandit or constrained RL) to tune adapter timeouts.
++  - Safety: rollback on regression, human-in-loop approval for large changes.
++  - Acceptance criteria: measured reduction in transient failures under chaos runs; rollback succeeds within 5 minutes if regressions detected.
++  - Tests: blue/green rollout of tuning profile, canary metrics, automated rollback test.
++
++Phase 4 — Safe Promotion Automation (weeks 8–20)
++- Deliverables:
++  - Automated multi-stage promote pipeline with adversarial tests, ML risk scoring, cosign verification.
++  - Hard policy: only auto-promote when risk score < threshold AND policy asserts (e.g., no high-severity adv failures).
++  - Acceptance: pilot promotions with synthetic tenants; legal signoff; external adversarial pen-test passed.
++  - Tests: end-to-end dry-run promotion, adversarial harness gating, cosign verification.
++
++Phase 5 — Billing & Reconciliation Automation (weeks 6–16)
++- Deliverables:
++  - ML-assisted receipt normalization and anomaly suggestion; auto-create remediation tickets; auto-resolve low-risk discrepancies.
++  - Acceptance: >80% of reconcilation items auto-resolved or properly triaged; finance signoff.
++  - Tests: replay provider receipts and synthetic discrepancies, verify remediation flows.
++
++Governance & Safety (ongoing)
++- RBAC for approvals; require at least two authorized approvers for critical actions (HSM rotation, wide promotions).
++- Full audit trail for any automated action; immutable evidence in COMPLIANCE_BUCKET and optional Rekor entries.
++- External pen-tests before enabling any "automatic execute" features in production.
++- Legal & compliance gating step before first cross-tenant automation.
++
++Estimated effort summary
++- Phase 1: 2–4 sprints (2 engineers + one SRE)
++- Phase 2: 2–3 sprints (2 engineers + security)
++- Phase 3: 3–5 sprints (2 engineers, SRE)
++- Phase 4: 4–8 sprints (ML, safety, legal)
++- Phase 5: 3–6 sprints (quantum/product/finance)
++
++KPIs & Acceptance
++- MTTR improvement for incidents (target 30% reduction after Phase 2)
++- False positive rate of anomaly detection < 15% in production after tuning
++- No unauthorized execution events; all auto-executions have audit and rollback capability
++
+*** End Patch
+*** Begin Patch
+*** Add File: runbooks/autonomy_acceptance_checks.md
++# Autonomy Acceptance Checks (Quick)
++
++For each delivered capability verify these items before enabling any automated action in production:
++
++Phase 1 (Assisted Triage)
++- [ ] Detector model exists at ml/anomaly/model.joblib and is versioned.
++- [ ] Detector service can connect to PROM_URL and COMPLIANCE_BUCKET.
++- [ ] On anomaly, an issue is created in GitHub with S3 evidence link.
++- [ ] SOC confirms auto-triage issues are actionable and not noisy for 48h test window.
++
++Phase 2 (Assisted Remediation)
++- [ ] Assistant agent posts suggested remediation with commands as a GH issue comment.
++- [ ] Executor dry-run returns predicted outputs without performing any state change.
++- [ ] ALLOW_EXECUTE is false in staging unless explicitly allowed.
++- [ ] Authorized users list configured in REMEDIATION_AUTHORIZED_USERS env var.
++- [ ] All execution outputs are saved to s3://<COMPLIANCE_BUCKET>/remediation/executions/
++
++Phase 3+ (Tuning / Promotion)
++- [ ] Rollback mechanism and canary validation exist and tested.
++- [ ] Legal signoff on model promotion policy & billing remediation rules.
++- [ ] External pen-test completed for automations which can act without human intervention.
++
+*** End Patch
+*** End Patch

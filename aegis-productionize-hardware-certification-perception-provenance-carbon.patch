@@ -1,0 +1,483 @@
+*** Begin Patch
+*** Add File:ops/validation/hardware_proof_runner.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Run deterministic hardware proofs across provided targets and fail if any target doesn't meet SLOs.
++# - Uses existing vehicle_rt_validation.sh / run_hw_rt_sweep.sh to produce rt_slo_proof.json per target.
++# - Calls rt_remediation_agent.py to emit remediation recommendations on failures.
++#
++# Usage:
++#   TARGETS="ecu1:can0,ecu2:eth0" COSIGN_KMS_URI=kms://... S3_UPLOAD=s3://aegis-evidence/run123 \
++#     ./ops/validation/hardware_proof_runner.sh --out /tmp/hw_proofs
++
++OUT=${1:-/tmp/aegis_hw_proofs_$(date +%s)}
++TARGETS=${TARGETS:-localhost:can0}
++COSIGN=${COSIGN_KMS_URI:-}
++S3=${S3_UPLOAD:-}
++
++mkdir -p "$OUT"
++
++echo "Starting hardware proof run -> $OUT"
++IFS="," read -r -a targets <<< "$TARGETS"
++failed=0
++for t in "${targets[@]}"; do
++  host=${t%%:*}
++  iface=${t#*:}
++  id="${host}_${iface}_$(date +%s)"
++  od="$OUT/$id"
++  mkdir -p "$od"
++  echo "[run] Target: $host iface: $iface -> $od"
++  # call run_hw_rt_sweep.sh for this single target (it accepts TARGETS env)
++  TARGETS="$host:$iface" COSIGN_KMS_URI="$COSIGN" S3_UPLOAD="$S3" ./ops/av/rt/run_hw_rt_sweep.sh "$od" || true
++  proof="$od/rt_slo_proof.json"
++  if [ ! -f "$proof" ]; then
++    echo "No rt_slo_proof.json for $t; marking failed"
++    failed=1
++    continue
++  fi
++  p99_ok=$(jq -r '.p99_ok // false' "$proof")
++  safe_ok=$(jq -r '.safe_ok // false' "$proof")
++  echo "Results for $t: p99_ok=$p99_ok safe_ok=$safe_ok"
++  if [ "$p99_ok" != "true" ] || [ "$safe_ok" != "true" ]; then
++    echo "SLOs failed for $t; running remediation suggestion"
++    python3 ops/validation/rt_remediation_agent.py --report "$proof" --out "$od/remediation.json" || true
++    failed=1
++  fi
++done
++
++if [ "$failed" -ne 0 ]; then
++  echo "Hardware proof run had failures. Inspect $OUT"
++  exit 2
++fi
++
++echo "All hardware proofs passed. Bundling and signing."
++bundle="$OUT/hw_proofs_$(date +%s).tar.gz"
++tar -czf "$bundle" -C "$OUT" .
++if [ -n "$COSIGN" ]; then
++  cosign sign --key "$COSIGN" "$bundle" || true
++fi
++if [ -n "$S3" ]; then
++  aws s3 cp "$bundle" "$S3" || true
++fi
++python3 - <<PY || true
++from ops.sdk.evidence_sdk import record_manifest
++record_manifest("hardware_proof_bundle", {"bundle":"$bundle"})
++print("recorded")
++PY
++echo "Hardware proof run complete. Bundle: $bundle"
++
+*** End File
+*** Add File:ops/validation/rt_remediation_agent.py
++#!/usr/bin/env python3
++"""
++Lightweight RT remediation agent (companion to hardware_proof_runner.sh)
++ - Parses rt_slo_proof.json and emits prioritized remediation actions.
++ - Intended to be run by operators after a failing SLO. Does not run changes automatically.
++"""
++import argparse, json, sys
++
++def remediate_suggestions(report):
++    s = []
++    if not report:
++        return ["No report data found"]
++    p99 = report.get("p99_ms")
++    p99_slo = report.get("p99_slo_ms", 0.2)
++    safe = report.get("safe_ms")
++    safe_slo = report.get("safe_slo_ms", 50.0)
++    if p99 is None:
++        s.append("No jitter samples found — ensure jitter sampler ran and produced rt_jitter_samples.ndjson")
++    else:
++        if p99 > p99_slo:
++            s.append(f"p99 ({p99} ms) > target ({p99_slo} ms): prioritize CPU isolation / IRQ affinity / raise control thread RTF priority.")
++            s.append("Check: PREEMPT_RT kernel, chrt/chrt -f for control process, cset shield, irqbalance disabled for critical NICs.")
++    if safe is None:
++        s.append("No safe-stop sample found — ensure safe-stop trace capture on HIL.")
++    else:
++        if safe > safe_slo:
++            s.append(f"safe-stop ({safe} ms) > target ({safe_slo} ms): investigate actuator chain latency & control loop deadlines.")
++            s.append("Check: command queuing, CAN/CAN-FD bus congestion, actuator firmware delays.")
++    return s
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--report", required=True)
++    p.add_argument("--out", default=None)
++    args = p.parse_args()
++    try:
++        r = json.load(open(args.report))
++    except Exception as e:
++        print("Failed to read report:", e)
++        sys.exit(3)
++    suggestions = remediate_suggestions(r)
++    output = {"report": args.report, "suggestions": suggestions}
++    if args.out:
++        with open(args.out, "w") as fh:
++            json.dump(output, fh, indent=2)
++        print("Wrote remediation to", args.out)
++    else:
++        print(json.dumps(output, indent=2))
++
++if __name__ == "__main__":
++    import json
++    main()
++
+*** End File
+*** Add File:ops/robotics/control/certified/hil_certification_runner.py
++#!/usr/bin/env python3
++"""
++HIL Certification Runner
++ - Executes HIL campaign manager, runs Apalache triage until either clean or max attempts reached,
++   packages signed HIL bundles and optionally POSTs to a certifier endpoint.
++ - Records artifacts with evidence_sdk.
++"""
++import argparse, os, subprocess, json
++from datetime import datetime
++
++def run_campaign(scenarios, golden, outdir):
++    cmd = ["python3","ops/robotics/control/certified/hil_campaign_manager.py","--golden",golden,"--out",outdir]
++    for s in scenarios:
++        cmd += ["--scenarios", s]
++    return subprocess.call(cmd)
++
++def run_apalache(outdir):
++    return subprocess.call(["./ops/formal/apalache_triage_runner.sh", outdir])
++
++def package_and_sign(outdir, cosign_key):
++    bundle = outdir + ".tar.gz"
++    subprocess.check_call(["tar","-czf",bundle,"-C",outdir,"."])
++    if cosign_key:
++        try:
++            subprocess.check_call(["cosign","sign","--key",cosign_key,bundle])
++        except Exception:
++            print("cosign signing failed (best-effort)")
++    return bundle
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--scenarios-file", required=True, help="file with one scenario runner command per line")
++    p.add_argument("--golden", required=True)
++    p.add_argument("--out", default=f"/tmp/hil_cert_{int(datetime.utcnow().timestamp())}")
++    p.add_argument("--cosign-key", default=os.environ.get("COSIGN_KMS_URI",""))
++    p.add_argument("--cert-upload-url", default="")
++    p.add_argument("--max-apalache-attempts", type=int, default=5)
++    args = p.parse_args()
++    os.makedirs(args.out, exist_ok=True)
++    with open(args.scenarios_file) as fh:
++        scenarios = [l.strip() for l in fh if l.strip()]
++    rc = run_campaign(scenarios, args.golden, args.out)
++    ap_attempts = 0
++    ap_rc = 1
++    while ap_attempts < args.max_apalache_attempts:
++        ap_rc = run_apalache(args.out)
++        if ap_rc == 0:
++            print("Apalache checks clean")
++            break
++        ap_attempts += 1
++        print(f"Apalache had issues; attempt {ap_attempts}/{args.max_apalache_attempts}. Triage and fix, then retry.")
++        # Operator must triage; we pause after attempt
++        break
++    bundle = package_and_sign(args.out, args.cosign_key)
++    # optional upload to certifier
++    if args.cert_upload_url:
++        try:
++            import requests
++            with open(bundle,"rb") as fh:
++                r = requests.post(args.cert_upload_url, files={"file": fh}, timeout=120)
++                print("Certifier upload status:", r.status_code)
++        except Exception as e:
++            print("Failed to upload to certifier endpoint:", e)
++    try:
++        from ops.sdk.evidence_sdk import record_manifest
++        record_manifest("hil_cert_bundle", {"bundle": bundle})
++    except Exception:
++        pass
++    print("HIL certification runner complete. Bundle:", bundle)
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:ops/av/perception/scale/perception_validation_runner.py
++#!/usr/bin/env python3
++"""
++Perception validation runner
++ - Orchestrates large-scale sim -> HIL -> retrain -> NPU validation cycle
++ - Produces signed model artifacts and evidence manifests
++"""
++import argparse, os, subprocess
++from datetime import datetime
++
++def generate_and_run(packs, per_pack, parallel, outdir):
++    cmd = ["python3","ops/av/perception/scale/run_simulation_cluster.py",
++           "--packs", str(packs), "--scenarios-per-pack", str(per_pack),
++           "--parallel", str(parallel), "--out", outdir]
++    return subprocess.call(cmd)
++
++def collect_and_retrain(failures_file, outdir, npu_runners, cosign_key):
++    coll_cmd = ["python3","ops/av/perception/scale/ood_failure_collector.py","--failures", failures_file, "--out", outdir]
++    rc = subprocess.call(coll_cmd)
++    if rc != 0:
++        return False
++    ndjson = os.path.join(outdir, "adv_data.ndjson")
++    retrain_cmd = ["python3","ops/av/perception/scale/auto_retrain_pipeline.py","--dataset", ndjson, "--out", outdir]
++    if npu_runners:
++        retrain_cmd += ["--npu-runners", ",".join(npu_runners)]
++    if cosign_key:
++        retrain_cmd += ["--cosign-key", cosign_key]
++    rc2 = subprocess.call(retrain_cmd)
++    return rc2 == 0
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--packs", type=int, default=10)
++    p.add_argument("--per-pack", type=int, default=100)
++    p.add_argument("--parallel", type=int, default=4)
++    p.add_argument("--out", default=f"/tmp/perception_val_{int(datetime.utcnow().timestamp())}")
++    p.add_argument("--npu-runners", default=os.environ.get("NPU_RUNNERS",""))
++    p.add_argument("--cosign-key", default=os.environ.get("COSIGN_KMS_URI",""))
++    args = p.parse_args()
++    os.makedirs(args.out, exist_ok=True)
++    print("Running simulation cluster...")
++    rc = generate_and_run(args.packs, args.per_pack, args.parallel, args.out)
++    failures = os.path.join(args.out, "failures.json")
++    if os.path.exists(failures):
++        print("Collected failures; starting retrain pipeline")
++        ok = collect_and_retrain(failures, os.path.join(args.out, "retrain"), args.npu_runners.split(",") if args.npu_runners else [], args.cosign_key)
++        if not ok:
++            print("Retrain pipeline failed; inspect artifacts")
++    else:
++        print("No failures.json produced by sim cluster; inspect sim outputs")
++    # record manifest
++    try:
++        from ops.sdk.evidence_sdk import record_manifest
++        record_manifest("perception_validation_run", {"out": args.out})
++    except Exception:
++        pass
++    print("Perception validation runner done. Output:", args.out)
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:ops/ci/promotion_gate/enforce_builder_provenance.py
++#!/usr/bin/env python3
++"""
++Enforce builder provenance:
++ - Verify builder hardening and that all images in manifests are cosign-signed and have Rekor entries.
++ - Fail fast to block promotions if any check is missing.
++ - Use ensure_builder_hardening.py and strict_rekor_verify.py as helpers.
++"""
++import os, sys, subprocess, json
++
++MANIFESTS = os.environ.get("IMAGE_MANIFESTS","").split(",")
++REKOR_SERVER = os.environ.get("REKOR_SERVER","")
++BUILDERS = os.environ.get("BUILDERS","")
++
++def verify_builders():
++    cmd = ["python3","ops/ci/promotion_gate/ensure_builder_hardening.py"]
++    rc = subprocess.call(cmd)
++    return rc == 0
++
++def verify_images():
++    bad = []
++    for m in MANIFESTS:
++        if not m:
++            continue
++        try:
++            import yaml
++            docs = yaml.safe_load_all(open(m))
++            for d in docs:
++                def walk(o):
++                    if isinstance(o, dict):
++                        for k,v in o.items():
++                            if k=="image" and isinstance(v,str):
++                                img=v
++                                # cosign verify
++                                try:
++                                    subprocess.check_call(["cosign","verify",img], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++                                except Exception:
++                                    bad.append((img,"cosign_missing"))
++                                # rekor verify
++                                if REKOR_SERVER:
++                                    try:
++                                        subprocess.check_call(["python3","ops/ci/promotion_gate/strict_rekor_verify.py","--artifact",img,"--rekor-server",REKOR_SERVER])
++                                    except Exception:
++                                        bad.append((img,"rekor_missing_or_invalid"))
++                            else:
++                                walk(v)
++                    elif isinstance(o, list):
++                        for e in o:
++                            walk(e)
++                walk(d)
++        except Exception as e:
++            print("Failed parsing manifest", m, e)
++            bad.append((m,"parse_failed"))
++    return bad
++
++def main():
++    if not verify_builders():
++        print("Builder hardening verification failed. Block promotion.")
++        sys.exit(10)
++    bad = verify_images()
++    if bad:
++        print("Provenance failures found:")
++        for i,r in bad:
++            print(i,r)
++        sys.exit(11)
++    print("Builder provenance enforcement passed.")
++    sys.exit(0)
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:ops/carbon/monitor_tune.py
++#!/usr/bin/env python3
++"""
++Carbon monitor + threshold tuner
++ - Runs carbon monitor for a configured observation window (secs), computes rolling mean/variance
++ - Suggests a tuned threshold and writes override policy guidance
++ - Does not enforce; operators must adopt suggested thresholds into CI
++"""
++import argparse, time, json, statistics
++from datetime import datetime
++from ops.carbon.watttime_client import get_latest_intensity
++
++def collect(duration_s, interval_s, region):
++    samples=[]
++    end = time.time() + duration_s
++    while time.time() < end:
++        val = get_latest_intensity(region)
++        samples.append(val)
++        time.sleep(interval_s)
++    return [v for v in samples if v is not None]
++
++def suggest_threshold(samples, base_threshold):
++    if not samples:
++        return base_threshold
++    mean = statistics.mean(samples)
++    stdev = statistics.pstdev(samples)
++    # suggested: base + stdev factor
++    factor = 1.0 + min(1.0, stdev / (mean+1e-6))
++    return mean * factor
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--duration-s", type=int, default=3600, help="Observation duration in seconds")
++    p.add_argument("--interval-s", type=int, default=60, help="Poll interval seconds")
++    p.add_argument("--region", default="US-CA")
++    p.add_argument("--base-threshold", type=float, default=300.0)
++    p.add_argument("--out", default="/tmp/carbon_tune.json")
++    args = p.parse_args()
++    print("Collecting carbon data for", args.duration_s, "s...")
++    samples = collect(args.duration_s, args.interval_s, args.region)
++    suggested = suggest_threshold(samples, args.base_threshold)
++    report = {"collected_at": datetime.utcnow().isoformat()+"Z", "samples_count": len(samples), "mean": statistics.mean(samples) if samples else None, "stdev": statistics.pstdev(samples) if len(samples)>1 else 0.0, "suggested_threshold": suggested}
++    with open(args.out,"w") as fh:
++        json.dump(report, fh, indent=2)
++    print("Wrote tuning report to", args.out)
++    try:
++        from ops.sdk.evidence_sdk import record_manifest
++        record_manifest("carbon_tune_report", {"out": args.out})
++    except Exception:
++        pass
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:.github/workflows/hardware_certify_perception_provenance_carbon.yml
++name: Hardware Proofs, HIL Certify, Perception Validate & Provenance Enforcement
++on:
++  workflow_dispatch:
++    inputs:
++      targets:
++        required: false
++      scenarios_file:
++        required: false
++      upload_s3:
++        required: false
++      cert_upload_url:
++        required: false
++      manifests:
++        required: false
++      override_artifact:
++        required: false
++jobs:
++  run_all:
++    runs-on: [self-hosted, linux, hardware]
++    steps:
++      - uses: actions/checkout@v4
++      - name: Hardware proofs (RT SLOs)
++        env:
++          TARGETS: ${{ github.event.inputs.targets || 'localhost:can0' }}
++          COSIGN_KMS_URI: ${{ secrets.COSIGN_KMS_URI }}
++          S3_UPLOAD: ${{ github.event.inputs.upload_s3 || '' }}
++        run: |
++          ./ops/validation/hardware_proof_runner.sh /tmp/hw_proofs
++      - name: HIL certification (campaign + formal)
++        env:
++          COSIGN_KMS_URI: ${{ secrets.COSIGN_KMS_URI }}
++          CERT_UPLOAD_URL: ${{ github.event.inputs.cert_upload_url || '' }}
++        run: |
++          python3 ops/robotics/control/certified/hil_certification_runner.py --scenarios-file "${{ github.event.inputs.scenarios_file || 'ops/av/certification/default_scenarios.txt' }}" --golden /opt/aegis/golden_trace.ndjson --out /tmp/hil_cert_run --cosign-key "${{ secrets.COSIGN_KMS_URI }}" --cert-upload-url "${{ github.event.inputs.cert_upload_url || '' }}"
++      - name: Perception validation & retrain
++        env:
++          COSIGN_KMS_URI: ${{ secrets.COSIGN_KMS_URI }}
++          NPU_RUNNERS: ${{ secrets.NPU_RUNNERS || '' }}
++        run: |
++          python3 ops/av/perception/scale/perception_validation_runner.py --packs 5 --per-pack 100 --parallel 3 --out /tmp/perception_run --npu-runners "${{ secrets.NPU_RUNNERS || '' }}" --cosign-key "${{ secrets.COSIGN_KMS_URI }}"
++      - name: Provenance enforcement (builders & rekor)
++        env:
++          IMAGE_MANIFESTS: ${{ github.event.inputs.manifests || 'deploy.yaml' }}
++          REKOR_SERVER: ${{ secrets.REKOR_SERVER }}
++          BUILDERS: ${{ secrets.BUILDERS_LIST || '' }}
++        run: |
++          python3 ops/ci/promotion_gate/enforce_builder_provenance.py
++      - name: Carbon tuning & override guidance
++        env:
++          WATTTIME_API_KEY: ${{ secrets.WATTTIME_API_KEY }}
++        run: |
++          python3 ops/carbon/monitor_tune.py --duration-s 600 --interval-s 30 --out /tmp/carbon_tune.json
++          cat /tmp/carbon_tune.json
++      - name: Record artifacts
++        run: |
++          python3 - <<PY
++from ops.sdk.evidence_sdk import record_manifest
++record_manifest("full_validation_run", {"run": "${{ github.run_id }}", "targets":"${{ github.event.inputs.targets || 'localhost:can0' }}"})
++print("recorded")
++PY
++
+*** End File
+*** Add File:ops/validation/production_readiness_checklist.md
++# Production Readiness Checklist (what must pass before calling Aegis "production")
++
++1) Hardware proofs (per-target)
++ - p99 loop jitter and safe-stop SLOs measured and passing for each representative ECU/controller/bus topology (CAN, CAN-FD, TSN).
++ - Signed evidence bundle for each proof present in S3.
++
++2) Controller certification
++ - HIL campaigns executed for all critical controllers; waveform compare results within thresholds.
++ - All Apalache counterexamples resolved or documented as accepted mitigations.
++ - Signed HIL certification bundle submitted to certifier and response tracked.
++
++3) Perception validation
++ - Large-scale sim -> HIL -> field campaigns executed.
++ - Adversarial/OOD failures collected, retrained/hardened models exported to ONNX and smoke-tested on NPU runners.
++ - False negative / OOD metrics within acceptance thresholds.
++
++4) Provenance & CI
++ - Builder hardening validated and builders produce cosign-signed images with Rekor entries.
++ - CI promotion gates (enforce_builder_provenance.py) block unsigned/unanotated images.
++
++5) Carbon & governance
++ - Carbon monitor run for observation window; tuned thresholds committed to CI.
++ - Override process documented and tested (override_signer.py) and audit logs retained.
++
++6) Evidence & retention
++ - All evidence manifests recorded via ops.sdk.evidence_sdk.record_manifest
++ - Evidence stored in S3 per ops/governance/evidence_retention_policy.md
++
+*** End File
+*** End Patch

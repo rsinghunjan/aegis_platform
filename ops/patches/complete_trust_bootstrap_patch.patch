@@ -1,0 +1,350 @@
+*** Begin Patch
+*** Add File:terraform/bootstrap/run_terraform_and_create_secret.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Wrapper to run Terraform for KMS & S3, extract outputs, and store KMS ARN in k8s secret
++#
++# Usage:
++#   ./run_terraform_and_create_secret.sh <terraform_dir> <k8s_namespace>
++#
++TF_DIR=${1:-terraform/kms_and_s3}
++K8S_NS=${2:-security}
++
++if [ ! -d "$TF_DIR" ]; then
++  echo "Terraform dir $TF_DIR not found"
++  exit 2
++fi
++
++pushd "$TF_DIR" >/dev/null
++terraform init
++terraform apply -auto-approve
++# read outputs
++KMS_ARN=$(terraform output -raw cosign_kms_key_arn)
++EVIDENCE_BUCKET=$(terraform output -raw evidence_bucket)
++popd >/dev/null
++
++echo "KMS ARN: $KMS_ARN"
++echo "Evidence bucket: $EVIDENCE_BUCKET"
++
++# create k8s namespace and secret
++kubectl create namespace "$K8S_NS" --dry-run=client -o yaml | kubectl apply -f -
++kubectl -n "$K8S_NS" create secret generic cosign-kms --from-literal=kms_arn="$KMS_ARN" --dry-run=client -o yaml | kubectl apply -f -
++echo "Stored cosign KMS ARN in k8s secret $K8S_NS/cosign-kms"
++
++cat > /tmp/aegis_evidence_bucket.env <<EOF
++EVIDENCE_BUCKET=$EVIDENCE_BUCKET
++COSIGN_KMS_ARN=$KMS_ARN
++EOF
++echo "Wrote /tmp/aegis_evidence_bucket.env with outputs"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/cosign/helm_deploy_and_populate_ca.yml
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Deploy cert-manager (if not present), deploy cosign-admission Helm chart and populate CA bundle
++#
++# Usage:
++#   ./ops/cosign/helm_deploy_and_populate_ca.yml <helm_release_name> <helm_chart_dir> <namespace>
++#
++RELEASE=${1:-cosign-admission}
++CHART_DIR=${2:-helm/cosign-admission}
++NAMESPACE=${3:-admission}
++
++echo "Ensure cert-manager is installed (operator should manage this in prod). Installing cert-manager in cluster if missing..."
++kubectl get deployment -n cert-manager cert-manager >/dev/null 2>&1 || kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
++
++echo "Deploying Helm chart $CHART_DIR as $RELEASE in namespace $NAMESPACE"
++helm upgrade --install "$RELEASE" "$CHART_DIR" -n "$NAMESPACE" --create-namespace --wait
++
++echo "Waiting for Certificate (if cert-manager configured to issue)..."
++# Wait for the secret to appear
++SECRET_NAME=$(kubectl -n "$NAMESPACE" get secret -l app=cosign-admission -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
++if [ -z "$SECRET_NAME" ]; then
++  # default secret name from chart values
++  SECRET_NAME=${SECRET_NAME:-cosign-webhook-tls}
++fi
++
++for i in $(seq 1 30); do
++  if kubectl -n "$NAMESPACE" get secret "$SECRET_NAME" >/dev/null 2>&1; then
++    echo "Found TLS secret $SECRET_NAME"
++    break
++  fi
++  echo "Waiting for TLS secret $SECRET_NAME... ($i/30)"
++  sleep 10
++done
++
++echo "Populating ValidatingWebhookConfiguration CA bundle..."
++./ops/cosign/populate_ca_bundle.sh "$NAMESPACE" "$SECRET_NAME" cosign-validating-webhook || true
++
++echo "Helm deploy & CA population complete."
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/cosign_kms_sign_template.yml
++name: Reusable Cosign KMS Sign Template
++on:
++  workflow_call:
++    inputs:
++      artifact_path:
++        required: true
++        type: string
++      image:
++        required: false
++        type: string
++
++jobs:
++  sign:
++    runs-on: ubuntu-latest
++    permissions:
++      id-token: write
++      contents: read
++    steps:
++      - uses: actions/checkout@v4
++      - name: Install cosign
++        run: |
++          curl -sSL -o cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
++          chmod +x cosign
++          sudo mv cosign /usr/local/bin/
++      - name: Sign artifact with KMS
++        env:
++          COSIGN_AWS_KMS_KEY_ARN: ${{ secrets.COSIGN_AWS_KMS_KEY_ARN }}
++        run: |
++          echo "Signing ${{ inputs.artifact_path }}"
++          cosign sign --key "$COSIGN_AWS_KMS_KEY_ARN" "${{ inputs.artifact_path }}"
++      - name: Verify signature
++        env:
++          COSIGN_AWS_KMS_KEY_ARN: ${{ secrets.COSIGN_AWS_KMS_KEY_ARN }}
++        run: |
++          cosign verify --key "$COSIGN_AWS_KMS_KEY_ARN" "${{ inputs.artifact_path }}"
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/verifier_full_ci.yml
++name: Verifier Full CI Gate
++on:
++  workflow_dispatch:
++
++jobs:
++  verifier_gate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.10'
++      - name: Install deps
++        run: pip install -r requirements-ci.txt
++
++      - name: Finetune verifier (deterministic)
++        run: |
++          python services/factuality/finetune_domain.py --manifest ops/factuality/sample_manifest.jsonl --out_dir out/candidate --model_name facebook/bart-large --epochs 1 --seed 42
++
++      - name: Calibrate thresholds & publish to cluster
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG }}
++          PUSHGATEWAY: ${{ secrets.PUSHGATEWAY }}
++          NAMESPACE: safety
++        run: |
++          python services/factuality/calibrate_and_publish.py
++
++      - name: Run adversarial suite
++        run: |
++          python services/ci/adversarial_suite.py || (echo "Adversarial suite failed" && exit 1)
++
++      - name: Run fairness checks
++        run: |
++          python services/ci/fairness_check.py || (echo "Fairness checks failed" && exit 1)
++
++      - name: Run validation battery
++        run: |
++          python services/ci/validation_battery.py out/candidate || (echo "Validation battery failed" && exit 1)
++
++      - name: Upload artifact & sign (call reusable)
++        uses: ./.github/workflows/cosign_kms_sign_template.yml
++        with:
++          artifact_path: out/candidate.tar.gz
++
++      - name: Create SME signoff request
++        run: |
++          REQ_ID="verifier_ci_${{ github.run_id }}"
++          curl -sS -X POST "${{ secrets.MANUAL_APPROVAL_URL }}/request" -H "Content-Type: application/json" -d "{\"request_id\":\"$REQ_ID\",\"user\":\"ci\",\"reason\":\"SME signoff for verifier candidate\"}"
++          echo "Waiting for SME approval (timeout 48h) ..."
++          for i in $(seq 1 576); do
++            sleep 300
++            RES=$(curl -sS "${{ secrets.MANUAL_APPROVAL_URL }}/list")
++            echo "$RES" | grep "$REQ_ID" | grep approved && { echo "Approved"; break; } || true
++          done
++          # check final state
++          RES=$(curl -sS "${{ secrets.MANUAL_APPROVAL_URL }}/list")
++          echo "$RES" | grep "$REQ_ID" | grep approved || (echo "No SME approval observed; failing gate" && exit 1)
++
++      - name: Publish calibration & signoff artifacts to evidence bucket
++        env:
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++          AWS_REGION: ${{ secrets.AWS_REGION }}
++        run: |
++          aws s3 cp out/candidate.tar.gz "s3://${EVIDENCE_BUCKET}/verifier_ci/${{ github.run_id }}/candidate.tar.gz"
++          aws s3 cp out/calib/thresholds.json "s3://${EVIDENCE_BUCKET}/verifier_ci/${{ github.run_id }}/thresholds.json"
++
++      - name: Finalize - artifact ready for promotion
++        run: echo "Verifier CI gate passed - artifact signed, calibrated, tested, and SME-approved"
++
+*** End Patch
+*** Begin Patch
+*** Add File:argo/cron_shadow_upload.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: CronWorkflow
++metadata:
++  name: shadow-longrun-upload
++  namespace: ml-pipelines
++spec:
++  schedule: "0 * * * *" # hourly
++  startingDeadlineSeconds: 600
++  concurrencyPolicy: "Allow"
++  workflowSpec:
++    entrypoint: shadow-upload
++    ttlStrategy:
++      secondsAfterCompletion: 3600
++    templates:
++      - name: shadow-upload
++        steps:
++        - - name: run-shadow
++            template: run-shadow
++        - - name: upload-results
++            template: upload-results
++
++      - name: run-shadow
++        container:
++          image: us.gcr.io/aegis/shadow-runner:latest
++          command: ["/bin/sh","-c"]
++          args:
++            - |
++              echo "Starting hourly shadow run"
++              python services/observability/shadow_run_longterm.py --once || true
++
++      - name: upload-results
++        container:
++          image: bitnami/kubectl:1.27
++          command: ["/bin/sh","-c"]
++          args:
++            - |
++              set -euo pipefail
++              OUT=/data/shadow_longterm.jsonl
++              if [ -f "$OUT" ]; then
++                echo "Uploading shadow results to evidence bucket"
++                gsutil cp "$OUT" gs://aegis-evidence/shadow/$(date +%s)_shadow.jsonl || true
++                rm -f "$OUT"
++              else
++                echo "No shadow output to upload"
++              fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/prometheus/alerts_shadow.yml
++groups:
++- name: shadow-monitoring
++  rules:
++  - alert: ShadowDivergenceHigh
++    expr: aegis_shadow_divergence_rate > 0.2
++    for: 30m
++    labels:
++      severity: page
++    annotations:
++      summary: "High divergence rate between prod and canary"
++      description: "Shadow divergence has exceeded 20% for 30m. Investigate canary/perf/quality."
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/grafana/watt_and_carbon_dashboard.json
++{
++  "title": "Wattmeter & Carbon Validation",
++  "panels": [
++    {
++      "type": "timeseries",
++      "title": "NVML Estimated Power (W)",
++      "targets": [{"expr":"nvml_power_watts"}]
++    },
++    {
++      "type": "timeseries",
++      "title": "Wattmeter Actual Power (W)",
++      "targets": [{"expr":"wattmeter_power_watts"}]
++    },
++    {
++      "type": "timeseries",
++      "title": "Calibration Scale",
++      "targets": [{"expr":"aegis_telemetry_scale"}]
++    },
++    {
++      "type": "timeseries",
++      "title": "Carbon Intensity (kgCO2e/kWh)",
++      "targets": [{"expr":"aegis_carbon_intensity_kg_per_kwh"}]
++    },
++    {
++      "type": "stat",
++      "title": "Avg Abs Error (NVML vs Wattmeter, 1h)",
++      "targets": [{"expr":"avg_over_time(abs(nvml_power_watts - wattmeter_power_watts)[1h:])"}]
++    }
++  ]
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:jobs/kernel_autotuner/run_autotuner_and_validate.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Run kernel autotuner locally (or call in a pod) and validate results, then create ConfigMap for Triton
++#
++OUT_PATH=${1:-ops/triton/backend/kernel_best_config.json}
++NAMESPACE=${2:-inference}
++
++python services/triton/kernel_opt/opt_tuner.py --out "$OUT_PATH"
++python services/triton/kernel_opt/validate_kernel_results.py "$OUT_PATH"
++
++kubectl -n "$NAMESPACE" create configmap kernel-best-config --from-file="$OUT_PATH" --dry-run=client -o yaml | kubectl apply -f -
++echo "Applied kernel-best-config configmap into namespace $NAMESPACE"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/runbooks/bootstrap_trust_and_validation.md
++# Bootstrap: Trust (KMS, Cosign, Webhook) & Verifier Validation Runbook
++
++This runbook sequences the five high-priority tasks to reach trusted, auditable promotions and verifier gating.
++
++1) Provision KMS & Evidence bucket
++ - Run: ./terraform/bootstrap/run_terraform_and_create_secret.sh terraform/kms_and_s3 security
++ - Confirm outputs in /tmp/aegis_evidence_bucket.env
++
++2) Deploy cosign admission webhook with TLS
++ - Ensure cert-manager installed
++ - Run: ./ops/cosign/helm_deploy_and_populate_ca.yml
++ - Confirm ValidatingWebhookConfiguration caBundle populated
++
++3) Configure CI for cosign KMS signing
++ - Add GitHub secret COSIGN_AWS_KMS_KEY_ARN with the KMS ARN
++ - Use .github/workflows/cosign_kms_sign_template.yml as reusable workflow in CI jobs
++
++4) Run verifier full CI gate
++ - Trigger .github/workflows/verifier_full_ci.yml manually or via a PR
++ - Observe steps: finetune -> calibrate -> adversarial -> fairness -> validation -> sign -> SME signoff -> artifact upload
++
++5) Deploy shadow & long-run canaries
++ - Apply Argo CronWorkflow argo/cron_shadow_upload.yaml in ml-pipelines
++ - Watch monitoring (Prometheus/Grafana) for divergence alerts
++
++6) Kernel autotuner & validation
++ - Run jobs/kernel_autotuner/run_autotuner_and_validate.sh on representative GPU host(s)
++ - Confirm kernel-best-config ConfigMap is present and Triton uses new config
++
++7) Archive evidence & retention
++ - Confirm ops/s3/event_uploader.py or equivalent is pushing events to the evidence bucket
++ - Verify object retention metadata and legal signoff
++
++If any step fails, follow the incident runbooks in ops/runbooks/* and notify SRE + Security + ML Lead.
++
+*** End Patch
+*** End Patch

@@ -1,0 +1,600 @@
+*** Begin Patch
+*** Add File: services/quantum_controller/requirements.txt
++fastapi
++uvicorn[standard]
++redis
++boto3
++mlflow
++requests
++python-dotenv
++sqlite3-binary
++qiskit            # optional but recommended for simulator adapter
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/quantum_controller/main.py
++"""
++Quantum Job Controller (FastAPI)
++ - Enqueue hybrid quantum-classical jobs
++ - Store job metadata in SQLite
++ - Push job payloads into Redis queue for workers
++ - Provide job status / results endpoints
++
++Run:
++  pip install -r requirements.txt
++  uvicorn main:app --host 0.0.0.0 --port 8080
++
++Env:
++  REDIS_URL (default redis://redis:6379/0)
++  DB_PATH (default ./quantum_jobs.db)
++  REKOR_URL (optional)
++  COSIGN_KEY (optional) - local cosign key or refer to Vault wrapper
++  MLFLOW_TRACKING_URI (optional)
++  AWS_REGION, GCP_PROJECT envs used by adapters if configured
++"""
++import os
++import json
++import uuid
++import time
++import sqlite3
++from typing import Optional
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++import redis
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
++DB_PATH = os.environ.get("DB_PATH", "./quantum_jobs.db")
++
++r = redis.from_url(REDIS_url := REDIS_URL, decode_responses=True)
++
++app = FastAPI(title="Aegis Quantum Job Controller")
++
++class JobSpec(BaseModel):
++    name: str
++    backend: str  # 'braket' | 'simulator' | 'local'
++    circuit: str  # circuit description (QASM / PennyLane / Quil / JSON)
++    params: Optional[dict] = {}
++
++def init_db():
++    conn = sqlite3.connect(DB_PATH)
++    cur = conn.cursor()
++    cur.execute("""
++    CREATE TABLE IF NOT EXISTS jobs (
++      id TEXT PRIMARY KEY,
++      name TEXT,
++      backend TEXT,
++      circuit TEXT,
++      params TEXT,
++      status TEXT,
++      created_at INTEGER,
++      updated_at INTEGER,
++      result TEXT
++    )
++    """)
++    conn.commit()
++    conn.close()
++
++def db_insert(job_id, spec: JobSpec):
++    conn = sqlite3.connect(DB_PATH)
++    cur = conn.cursor()
++    cur.execute("INSERT INTO jobs (id,name,backend,circuit,params,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
++                (job_id, spec.name, spec.backend, spec.circuit, json.dumps(spec.params), "queued", int(time.time()), int(time.time())))
++    conn.commit()
++    conn.close()
++
++def db_update_status(job_id, status, result=None):
++    conn = sqlite3.connect(DB_PATH)
++    cur = conn.cursor()
++    cur.execute("UPDATE jobs SET status=?, updated_at=?, result=? WHERE id=?", (status, int(time.time()), json.dumps(result) if result else None, job_id))
++    conn.commit()
++    conn.close()
++
++def db_get(job_id):
++    conn = sqlite3.connect(DB_PATH)
++    cur = conn.cursor()
++    cur.execute("SELECT id,name,backend,circuit,params,status,created_at,updated_at,result FROM jobs WHERE id=?", (job_id,))
++    r = cur.fetchone()
++    conn.close()
++    if not r:
++        return None
++    return {
++        "id": r[0],
++        "name": r[1],
++        "backend": r[2],
++        "circuit": r[3],
++        "params": json.loads(r[4] or "{}"),
++        "status": r[5],
++        "created_at": r[6],
++        "updated_at": r[7],
++        "result": json.loads(r[8]) if r[8] else None
++    }
++
++@app.on_event("startup")
++def startup():
++    init_db()
++
++@app.post("/jobs")
++def submit_job(spec: JobSpec):
++    job_id = str(uuid.uuid4())
++    db_insert(job_id, spec)
++    payload = {
++        "id": job_id,
++        "name": spec.name,
++        "backend": spec.backend,
++        "circuit": spec.circuit,
++        "params": spec.params,
++        "submitted_at": int(time.time())
++    }
++    r.lpush("quantum:queue", json.dumps(payload))
++    return {"id": job_id, "status": "queued"}
++
++@app.get("/jobs/{job_id}")
++def get_job(job_id: str):
++    job = db_get(job_id)
++    if not job:
++        raise HTTPException(status_code=404, detail="job not found")
++    return job
++
++@app.post("/jobs/{job_id}/cancel")
++def cancel_job(job_id: str):
++    # simplistic: mark as cancelled (worker should check DB status)
++    db_update_status(job_id, "cancelled")
++    return {"id": job_id, "status": "cancelled"}
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/quantum_controller/worker.py
++"""
++Quantum job worker.
++ - Blocks on Redis queue 'quantum:queue'
++ - Dispatches to provider adapters
++ - Logs to MLflow (if configured)
++ - Signs circuit snapshot via cosign (optional) and stores/artifacts + Rekor (optional)
++
++Run as:
++  python worker.py
++
++Env:
++  REDIS_URL (redis://...)
++  DB_PATH
++  MLFLOW_TRACKING_URI
++  REKOR_URL (optional)
++  COSIGN_KEY (optional)
++"""
++import os
++import time
++import json
++import redis
++import sqlite3
++import subprocess
++from pathlib import Path
++from adapters.braket_adapter import BraketAdapter
++from adapters.simulator_adapter import SimulatorAdapter
++from rekor_sign import sign_and_rekor
++import mlflow
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
++DB_PATH = os.environ.get("DB_PATH", "./quantum_jobs.db")
++QUEUE = "quantum:queue"
++
++r = redis.from_url(REDIS_URL, decode_responses=True)
++
++ADAPTERS = {
++    "braket": BraketAdapter(),
++    "simulator": SimulatorAdapter(),
++    "local": SimulatorAdapter()
++}
++
++def db_update_status(job_id, status, result=None):
++    conn = sqlite3.connect(DB_PATH)
++    cur = conn.cursor()
++    cur.execute("UPDATE jobs SET status=?, updated_at=?, result=? WHERE id=?", (status, int(time.time()), json.dumps(result) if result else None, job_id))
++    conn.commit()
++    conn.close()
++
++def process_job(payload):
++    job_id = payload["id"]
++    backend = payload["backend"]
++    circuit = payload["circuit"]
++    params = payload.get("params", {})
++    print("Processing job", job_id, "backend", backend)
++    try:
++        db_update_status(job_id, "running")
++        adapter = ADAPTERS.get(backend)
++        if not adapter:
++            raise RuntimeError("Unsupported backend: " + backend)
++        # write circuit snapshot to disk for provenance/signing
++        artifacts_dir = Path("artifacts") / job_id
++        artifacts_dir.mkdir(parents=True, exist_ok=True)
++        snapshot_path = artifacts_dir / "circuit.txt"
++        snapshot_path.write_text(circuit)
++        # optional sign + Rekor
++        try:
++            sign_output = sign_and_rekor(str(snapshot_path))
++        except Exception as e:
++            sign_output = {"warning": f"signing failed: {e}"}
++        # execute
++        result = adapter.run(circuit, params, artifacts_dir)
++        # log to mlflow if configured
++        if os.environ.get("MLFLOW_TRACKING_URI"):
++            mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI"))
++            with mlflow.start_run(run_name=f"quantum-{job_id}"):
++                mlflow.log_params(params or {})
++                mlflow.log_text(circuit, "circuit.txt")
++                mlflow.log_text(json.dumps(result), "result.json")
++        # update DB
++        db_update_status(job_id, "succeeded", {"result": result, "sign": sign_output})
++    except Exception as e:
++        print("Job failed:", e)
++        db_update_status(job_id, "failed", {"error": str(e)})
++
++def main():
++    print("Quantum worker started listening on", REDIS_URL)
++    while True:
++        _, payload_raw = r.brpop(QUEUE)
++        payload = json.loads(payload_raw)
++        process_job(payload)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/quantum_controller/adapters/braket_adapter.py
++"""
++Adapter for AWS Braket (placeholder).
++Real implementation requires boto3 with appropriate IAM & region, and handling of task specs and result polling.
++"""
++import os
++import time
++import json
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++class BraketAdapter:
++    def __init__(self):
++        self.region = os.environ.get("AWS_REGION", "us-west-2")
++        if boto3:
++            self.client = boto3.client("braket", region_name=self.region)
++        else:
++            self.client = None
++
++    def run(self, circuit: str, params: dict, artifacts_dir):
++        # Placeholder: submit task to Braket and poll for result.
++        if not self.client:
++            # simulate
++            time.sleep(2)
++            return {"simulated": True, "note": "boto3 not installed in this environment"}
++        # Example (very simplified) - in practice build S3 input and task spec
++        # resp = self.client.create_quantum_task(...)
++        # task_arn = resp["quantumTaskArn"]
++        # poll until task succeeded and collect result from S3
++        raise NotImplementedError("BraketAdapter.run must be implemented with real submission logic")
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/quantum_controller/adapters/simulator_adapter.py
++"""
++Simulator adapter using Qiskit (if available) or a simple fallback simulator.
++"""
++import os, time, json
++try:
++    from qiskit import QuantumCircuit, Aer, execute
++except Exception:
++    QuantumCircuit = None
++    Aer = None
++
++class SimulatorAdapter:
++    def __init__(self):
++        pass
++
++    def run(self, circuit: str, params: dict, artifacts_dir):
++        # Try QASM parse if Qiskit is available
++        if QuantumCircuit:
++            qc = QuantumCircuit.from_qasm_str(circuit) if "OPENQASM" in circuit or "qasm" in circuit.lower() else None
++            if qc:
++                backend = Aer.get_backend('qasm_simulator')
++                job = execute(qc, backend, shots=int(params.get("shots",1024)))
++                res = job.result().get_counts()
++                # save result
++                with open(os.path.join(artifacts_dir, "counts.json"), "w") as f:
++                    json.dump(res, f)
++                return {"counts": res}
++        # Fallback simulation: pretend result
++        time.sleep(1)
++        fake = {"result": "simulated", "params": params}
++        with open(os.path.join(artifacts_dir, "result.json"), "w") as f:
++            json.dump(fake, f)
++        return fake
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/quantum_controller/rekor_sign.py
++"""
++Helper: sign a snapshot using cosign (if available) and optionally post to Rekor.
++This is a best-effort helper; in production use Vault/cosign transit wrappers and Rekor clients.
++"""
++import os
++import subprocess
++import requests
++import json
++
++REKOR_URL = os.environ.get("REKOR_URL", "")
++COSIGN_KEY = os.environ.get("COSIGN_KEY", "")  # e.g., awskms://... or path to key
++
++def sign_and_rekor(snapshot_path):
++    # Attempt to sign snapshot using cosign sign-blob
++    try:
++        sig_path = snapshot_path + ".sig"
++        if COSIGN_KEY:
++            # use cosign sign-blob --key <key> <file>
++            cmd = ["cosign", "sign-blob", "--key", COSIGN_KEY, snapshot_path]
++        else:
++            # local keyless or skip
++            cmd = ["cosign", "sign-blob", snapshot_path]
++        subprocess.run(cmd, check=True, capture_output=True)
++        # cosign sign-blob writes <file>.sig by default; read it
++        if os.path.exists(sig_path):
++            sig_b = open(sig_path, "rb").read()
++        else:
++            sig_b = None
++        # Optionally post to Rekor (this requires constructing appropriate entry)
++        if REKOR_URL:
++            # This is illustrative: building a proper rekor entry requires correct format (see Rekor API)
++            # We'll upload the snapshot as a new artifact (not a full correct entry). Production: use official Rekor client.
++            files = {"artifact": open(snapshot_path, "rb")}
++            r = requests.post(f"{REKOR_URL}/api/v1/log", files=files, timeout=10)
++            return {"rekor_status": r.status_code, "rekor_resp": r.text}
++        return {"signed": True, "sig_path": sig_path}
++    except Exception as e:
++        return {"signed": False, "error": str(e)}
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/submit_quantum_job.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Submit a quantum job to the controller
++# Usage: ./submit_quantum_job.sh <controller-url> <backend> <job-name> <circuit-file>
++CONTROLLER=${1:-http://localhost:8080}
++BACKEND=${2:-simulator}
++NAME=${3:-test-job}
++CIRCUIT_FILE=${4:-}
++if [ -z "$CIRCUIT_FILE" ]; then
++  echo "Usage: $0 <controller-url> <backend> <job-name> <circuit-file>"
++  exit 2
++fi
++CIRCUIT=$(jq -Rs . < "$CIRCUIT_FILE")
++PAYLOAD="{\"name\":\"$NAME\",\"backend\":\"$BACKEND\",\"circuit\":$CIRCUIT}"
++curl -sS -X POST "$CONTROLLER/jobs" -H "Content-Type: application/json" -d "$PAYLOAD" | jq .
++
+*** End Patch
+*** Begin Patch
+*** Add File: argo/workflows/quantum_hybrid_workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  name: quantum-hybrid-workflow
++  namespace: staging
++spec:
++  entrypoint: submit-and-wait
++  templates:
++  - name: submit-and-wait
++    steps:
++    - - name: submit
++        template: submit-job
++      - name: wait
++        template: wait-for-completion
++
++  - name: submit-job
++    script:
++      image: curlimages/curl:latest
++      command: [sh]
++      source: |
++        set -eux
++        CONTROLLER=${CONTROLLER:-http://quantum-controller.staging.svc.cluster.local:8080}
++        CIRCUIT=$(cat /workspace/circuit.qasm | jq -Rs .)
++        PAYLOAD="{\"name\":\"argo-hybrid-job\",\"backend\":\"simulator\",\"circuit\":$CIRCUIT}"
++        resp=$(curl -s -X POST "$CONTROLLER/jobs" -H "Content-Type: application/json" -d "$PAYLOAD")
++        echo "$resp" > /tmp/job.json
++        cat /tmp/job.json
++        jq -r .id /tmp/job.json > /tmp/jobid
++        echo "JOBID=$(cat /tmp/jobid)" >> /tmp/outputs
++      outputs:
++        parameters:
++        - name: jobid
++          valueFrom:
++            path: /tmp/jobid
++
++  - name: wait-for-completion
++    inputs:
++      parameters:
++      - name: jobid
++    script:
++      image: curlimages/curl:latest
++      command: [sh]
++      source: |
++        set -eux
++        CONTROLLER=${CONTROLLER:-http://quantum-controller.staging.svc.cluster.local:8080}
++        JOBID="{{inputs.parameters.jobid}}"
++        for i in $(seq 1 600); do
++          resp=$(curl -s "$CONTROLLER/jobs/$JOBID")
++          status=$(echo "$resp" | jq -r .status)
++          echo "Status: $status"
++          if [ "$status" = "succeeded" ]; then
++            echo "$resp" | jq .result > /tmp/result.json
++            cat /tmp/result.json
++            exit 0
++          fi
++          if [ "$status" = "failed" ]; then
++            echo "Job failed: $resp"
++            exit 2
++          fi
++          sleep 5
++        done
++        echo "Timeout waiting for job" && exit 3
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/redis/redis-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: redis
++  namespace: staging
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: redis
++  template:
++    metadata:
++      labels:
++        app: redis
++    spec:
++      containers:
++      - name: redis
++        image: redis:6.2-alpine
++        ports:
++        - containerPort: 6379
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: redis
++  namespace: staging
++spec:
++  selector:
++    app: redis
++  ports:
++  - port: 6379
++    targetPort: 6379
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/simulator/simulator-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: quantum-simulator
++  namespace: staging
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: quantum-simulator
++  template:
++    metadata:
++      labels:
++        app: quantum-simulator
++    spec:
++      containers:
++      - name: simulator
++        # Use an image that has Qiskit/Pennylane installed; placeholder:
++        image: qiskit/terra:latest
++        env:
++        - name: MLFLOW_TRACKING_URI
++          value: "http://mlflow.staging.svc.cluster.local:5000"
++        - name: REDIS_URL
++          value: "redis://redis.staging.svc.cluster.local:6379/0"
++        - name: DB_PATH
++          value: "/data/quantum_jobs.db"
++        volumeMounts:
++        - name: data
++          mountPath: /data
++      volumes:
++      - name: data
++        emptyDir: {}
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/quantum_cost_watcher.py
++#!/usr/bin/env python3
++"""
++Quantum cost watcher: watch AWS (Braket) and GCP quantum spend and alert.
++ - AWS: uses Cost Explorer and filters ServiceName 'Amazon Braket'
++ - GCP: placeholder (requires Billing export ingestion or Cloud Billing API)
++This script can annotate jobs or notify via webhook.
++"""
++import os, time, boto3, requests
++THRESHOLD_PCT = float(os.environ.get("QUANTUM_BUDGET_PCT", "90"))
++BUDGET_AMOUNT = float(os.environ.get("QUANTUM_BUDGET_USD", "500"))
++NOTIFY_WEBHOOK = os.environ.get("QUANTUM_NOTIFY_WEBHOOK")
++CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))
++
++def notify(msg):
++    if NOTIFY_WEBHOOK:
++        requests.post(NOTIFY_WEBHOOK, json={"text": msg})
++    else:
++        print("ALERT:", msg)
++
++def aws_braket_spend():
++    try:
++        client = boto3.client("ce")
++        start = time.strftime("%Y-%m-01")
++        end = time.strftime("%Y-%m-%d")
++        res = client.get_cost_and_usage(TimePeriod={"Start": start, "End": end}, Granularity="MONTHLY", Metrics=["UnblendedCost"],
++                                        Filter={"Dimensions":{"Key":"SERVICE","Values":["Amazon Braket"]}})
++        amt = float(res["ResultsByTime"][0]["Total"]["UnblendedCost"]["Amount"])
++        return amt
++    except Exception as e:
++        print("AWS CE error:", e)
++        return 0.0
++
++def gcp_braket_spend():
++    # Placeholder: implement via billing export / BigQuery or Cloud Billing API
++    return float(os.environ.get("GCP_QUANTUM_SPEND", "0"))
++
++if __name__ == "__main__":
++    while True:
++        aws_spend = aws_braket_spend()
++        gcp_spend = gcp_braket_spend()
++        total = aws_spend + gcp_spend
++        pct = total / BUDGET_AMOUNT * 100.0 if BUDGET_AMOUNT > 0 else 0.0
++        print(f"Quantum spend MTD: ${total:.2f} ({pct:.1f}% of ${BUDGET_AMOUNT})")
++        if pct > THRESHOLD_PCT:
++            notify(f"Quantum spend exceeded threshold: ${total:.2f} ({pct:.1f}%)")
++        time.sleep(CHECK_INTERVAL)
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/quantum_controller/README_QUANTUM.md
++# Aegis Quantum Orchestration: Quickstart
++
++Overview
++- Quantum Job Controller (FastAPI) accepts job submissions and enqueues them to Redis.
++- Worker(s) pop jobs and execute via provider adapters (Braket adapter placeholder) or a simulator.
++- Workers log experiments to MLflow, sign circuit snapshots (cosign) and optionally post provenance to Rekor.
++- A simulator deployment is provided to run many simulator workers as a "simulator farm".
++- A quantum cost watcher monitors Braket/GCP quantum spend to alert when budgets are reached.
++
++Local quickstart (dev)
++1. Start Redis (local or kubectl port-forward / k8s deploy)
++   docker run -d --name redis -p 6379:6379 redis:6.2-alpine
++2. Start controller
++   cd services/quantum_controller
++   pip install -r requirements.txt
++   uvicorn main:app --host 0.0.0.0 --port 8080
++3. Start a worker (in another shell)
++   python worker.py
++4. Submit a job
++   ./scripts/submit_quantum_job.sh http://localhost:8080 simulator test-job examples/sample_circuit.qasm
++5. Monitor job
++   curl http://localhost:8080/jobs/<job-id>
++
++Kubernetes
++- Deploy Redis (k8s/redis/redis-deployment.yaml)
++- Deploy simulator farm (k8s/simulator/simulator-deployment.yaml)
++- Deploy controller as Deployment (wrap main:uvicorn with a container image)
++- Run worker(s) as Deployment / DaemonSet
++
++Notes & Production
++- Replace placeholders: BraketAdapter must be implemented to submit tasks to AWS Braket; worker should run with proper IAM and access to S3 for results.
++- Use Vault + KMS for cosign signing keys and avoid storing private keys on disk.
++- Rekor integration: use the official Rekor client or API with properly formatted entries for artifacts.
++
+*** End Patch
+*** End Patch

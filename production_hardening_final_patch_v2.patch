@@ -1,0 +1,811 @@
+*** Begin Patch
+*** Add File: provider/onboarding/attestation_validation_service.py
++#!/usr/bin/env python3
++"""
++Attestation validation & SLA monitor service.
++ - Verifies cosign signatures / Rekor evidence for provider attestations.
++ - Checks freshness against provider SLA (trusted sources registry).
++ - Emits alerts (webhook) when attestation missing, stale or signature/rekor invalid.
++"""
++import os, json, subprocess, tempfile
++from datetime import datetime, timezone, timedelta
++from flask import Flask, request, jsonify
++import requests
++import boto3
++
++REKOR_SERVER = os.environ.get("REKOR_SERVER")
++TRUSTED_REGISTRY = os.environ.get("TRUSTED_REGISTRY_URL", "http://trusted-source-registry.aegis.svc:8200/get")
++ATTEST_S3_BUCKET = os.environ.get("ATTEST_S3_BUCKET", "aegis-provider-attestations")
++OPERATOR_WEBHOOK = os.environ.get("OPERATOR_NOTIFY_WEBHOOK")
++
++app = Flask("attestation-validation")
++s3 = boto3.client("s3")
++
++def verify_cosign(local_path, signature_path=None, pubkey=None):
++    cmd = ["cosign", "verify-blob"]
++    if pubkey:
++        cmd += ["--key", pubkey]
++    if signature_path:
++        cmd += ["--signature", signature_path]
++    cmd += [local_path]
++    try:
++        subprocess.check_output(cmd, stderr=subprocess.STDOUT)
++        return True, None
++    except subprocess.CalledProcessError as e:
++        return False, e.output.decode()
++    except Exception as e:
++        return False, str(e)
++
++def has_rekor(local_path):
++    if not REKOR_SERVER:
++        return False, None
++    try:
++        out = subprocess.check_output(["rekor-cli", "search", "--rekor_server", REKOR_SERVER, "--artifact", local_path])
++        return True, out.decode()
++    except Exception as e:
++        return False, str(e)
++
++@app.route("/validate_s3/<key>", methods=["POST"])
++def validate_s3(key):
++    # key is S3 key under ATTEST_S3_BUCKET
++    tmp = tempfile.NamedTemporaryFile(delete=False)
++    s3.download_file(ATTEST_S3_BUCKET, key, tmp.name)
++    ok, err = has_rekor(tmp.name)
++    verified, verr = verify_cosign(tmp.name)
++    resp = {"s3_key": key, "rekor": ok, "rekor_err": err, "verified": verified, "verify_err": verr}
++    # freshness: try to parse timestamps inside JSON
++    try:
++        j = json.load(open(tmp.name))
++        period_end = j.get("period_end")
++        if period_end:
++            pe = datetime.fromisoformat(period_end.replace("Z","+00:00"))
++            age = datetime.now(timezone.utc) - pe
++            resp["age_seconds"] = age.total_seconds()
++            # check against registry SLA if provider registered
++            prov = j.get("provider_id")
++            if prov:
++                r = requests.get(f"{TRUSTED_REGISTRY}/{prov}", timeout=5)
++                if r.ok:
++                    src = r.json()
++                    max_age = src.get("sla",{}).get("max_age_min",15)
++                    if age > timedelta(minutes=max_age):
++                        resp["stale"] = True
++                        if OPERATOR_WEBHOOK:
++                            requests.post(OPERATOR_WEBHOOK, json={"alert":"stale_attestation","provider":prov,"s3_key":key}, timeout=5)
++    except Exception:
++        pass
++    return jsonify(resp)
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8091")))
++
+*** End Patch
+*** Begin Patch
+*** Add File: provider/onboarding/auto_onboard.py
++#!/usr/bin/env python3
++"""
++Simple CLI to register provider metadata into trusted-source registry.
++"""
++import os, json
++import requests
++
++REGISTRY_URL = os.environ.get("TRUSTED_REGISTRY_URL", "http://trusted-source-registry.aegis.svc:8200/register")
++
++def onboard(name, endpoint, contact, sla_max_age_min=15, pubkey=None):
++    payload = {
++        "name": name,
++        "endpoint": endpoint,
++        "contact": contact,
++        "sla": {"max_age_min": sla_max_age_min},
++        "pubkey": pubkey
++    }
++    r = requests.post(REGISTRY_URL, json=payload, timeout=10)
++    print("onboard response:", r.status_code, r.text)
++
++if __name__=="__main__":
++    import argparse
++    p=argparse.ArgumentParser()
++    p.add_argument("--name", required=True)
++    p.add_argument("--endpoint", required=True)
++    p.add_argument("--contact", required=True)
++    p.add_argument("--max-age", type=int, default=15)
++    p.add_argument("--pubkey")
++    args=p.parse_args()
++    onboard(args.name, args.endpoint, args.contact, args.max_age, args.pubkey)
++
+*** End Patch
+*** Begin Patch
+*** Add File: measurement/fleet_provision.py
++#!/usr/bin/env python3
++"""
++Bulk provisioning script to register many devices from CSV.
++CSV schema: device_id,node,ipmi_host,rack
++"""
++import csv, sys
++from device.device_registry import register_device
++
++def provision(csv_path):
++    with open(csv_path) as fh:
++        r = csv.DictReader(fh)
++        for row in r:
++            device_id = row['device_id']
++            meta = {"node": row.get("node"), "ipmi_host": row.get("ipmi_host"), "rack": row.get("rack")}
++            register_device(device_id, meta)
++            print("registered", device_id)
++
++if __name__=="__main__":
++    if len(sys.argv) < 2:
++        print("usage: fleet_provision.py devices.csv"); raise SystemExit(2)
++    provision(sys.argv[1])
++
+*** End Patch
+*** Begin Patch
+*** Add File: measurement/coverage_exporter.py
++#!/usr/bin/env python3
++"""
++Prometheus exporter that exposes measurement coverage metrics for recent window.
++ - coverage_mapped_ratio, coverage_measured_ratio
++"""
++from prometheus_client import start_http_server, Gauge
++import time, os
++from sqlalchemy import create_engine, text
++from datetime import datetime, timedelta
++
++DB_URL = os.environ.get("DATABASE_URL", "postgresql://aegis:aegis@localhost:5432/aegis")
++engine = create_engine(DB_URL)
++G_MAPPED = Gauge("aegis_measurement_coverage_mapped_ratio", "Percent of jobs with device mapping")
++G_MEASURED = Gauge("aegis_measurement_coverage_measured_ratio", "Percent of jobs with measured kWh")
++
++def compute(window_days=7):
++    since = datetime.utcnow() - timedelta(days=window_days)
++    with engine.connect() as conn:
++        total = conn.execute(text("SELECT count(*) FROM job_ledger WHERE created_at >= :since"), {"since": since}).scalar() or 0
++        mapped = conn.execute(text("SELECT count(distinct jl.job_id) FROM job_ledger jl JOIN job_device_map jdm ON jl.job_id=jdm.job_id WHERE jl.created_at >= :since"), {"since": since}).scalar() or 0
++        measured = conn.execute(text("SELECT count(distinct job_id) FROM job_events WHERE event='measured' AND ts >= :since"), {"since": since}).scalar() or 0
++    pct_mapped = (mapped/total*100.0) if total else 0.0
++    pct_measured = (measured/total*100.0) if total else 0.0
++    return pct_mapped, pct_measured
++
++def main():
++    start_http_server(int(os.environ.get("PORT", "9102")))
++    while True:
++        pm, pme = compute()
++        G_MAPPED.set(pm)
++        G_MEASURED.set(pme)
++        time.sleep(60)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: telemetry/calibration_runner.py
++#!/usr/bin/env python3
++"""
++Orchestrates calibration runs across a list of devices and computes error bounds relative to provider attestations (if provided).
++Writes profiles to /etc/aegis/power_profiles and emits report to compliance bucket.
++"""
++import os, json, statistics, boto3
++from datetime import datetime
++
++DEVICES = os.environ.get("CALIB_DEVICES", "device-1,device-2").split(",")
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++
++def load_samples(device):
++    f = f"/tmp/{device}_power_samples.jsonl"
++    if not os.path.exists(f):
++        return []
++    return [json.loads(l).get("w",0.0) for l in open(f).read().splitlines() if l.strip()]
++
++report = {"devices":{}, "ts": datetime.utcnow().isoformat()}
++for d in DEVICES:
++    s = load_samples(d)
++    if not s:
++        report["devices"][d] = {"error":"no_samples"}
++        continue
++    mean = statistics.mean(s); stdev = statistics.pstdev(s)
++    profile = {"baseline": statistics.median(s), "slope": 1.0, "mean": mean, "stdev": stdev}
++    os.makedirs("/etc/aegis/power_profiles", exist_ok=True)
++    open(f"/etc/aegis/power_profiles/{d}.json","w").write(json.dumps(profile))
++    report["devices"][d] = profile
++
++out="/tmp/calibration_full_report.json"
++open(out,"w").write(json.dumps(report, indent=2))
++if COMPLIANCE_BUCKET:
++    s3=boto3.client("s3"); s3.upload_file(out, COMPLIANCE_BUCKET, f"calibration/{os.path.basename(out)}")
++print("Wrote calibration report", out)
++
+*** End Patch
+*** Begin Patch
+*** Add File: measurement/error_bounds_estimator.py
++#!/usr/bin/env python3
++"""
++Estimate bias and variance of job energy estimates vs provider attestations over window.
++Produces a CSV/JSON summary for reconciliation.
++"""
++import os, json
++from sqlalchemy import create_engine, text
++from datetime import datetime, timedelta
++import statistics
++
++DB_URL = os.environ.get("DATABASE_URL", "postgresql://aegis:aegis@localhost:5432/aegis")
++engine = create_engine(DB_URL)
++
++def run(days=30):
++    since = datetime.utcnow() - timedelta(days=days)
++    with engine.connect() as conn:
++        att_rows = conn.execute(text("SELECT id, metadata->'raw' as raw FROM provider_attestations WHERE created_at >= :since"), {"since": since}).fetchall()
++        diffs=[]
++        for r in att_rows:
++            raw = r.raw
++            if not raw: continue
++            period_start = raw.get("period_start"); period_end = raw.get("period_end")
++            if not period_start or not period_end: continue
++            # sum measured kg for jobs in period
++            q = text("SELECT SUM((payload->>'kwh')::float) as kwh FROM job_events WHERE event='measured' AND ts >= :start AND ts <= :end")
++            measured = conn.execute(q, {"start": period_start, "end": period_end}).scalar() or 0.0
++            att_kwh = raw.get("energy_kwh") or 0.0
++            diffs.append(att_kwh - measured)
++    if diffs:
++        bias = statistics.mean(diffs); stdev = statistics.pstdev(diffs)
++    else:
++        bias = None; stdev = None
++    out = {"bias_kwh": bias, "stdev_kwh": stdev, "samples": len(diffs), "ts": datetime.utcnow().isoformat()}
++    print(json.dumps(out, indent=2))
++
++if __name__=="__main__":
++    run()
++
+*** End Patch
+*** Begin Patch
+*** Add File: forecast/model_monitoring_service.py
++#!/usr/bin/env python3
++"""
++Small service that exposes current MAE/PI coverage metrics for forecasting models and a health endpoint.
++ - Integrates with model_registry to show active model MAE
++"""
++import os, json
++from flask import Flask, jsonify
++from forecast.model_registry import list_models
++
++app = Flask("model-monitor")
++
++@app.route("/models/<region>")
++def models(region):
++    return jsonify(list_models(region))
++
++@app.route("/health")
++def health():
++    return jsonify({"status":"ok"})
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8088")))
++
+*** End Patch
+*** Begin Patch
+*** Add File: forecast/auto_retrain.py
++#!/usr/bin/env python3
++"""
++Automatic retrain invoker using Kubernetes API (python client).
++ - Fetches MAE from compliance S3 monitor file; if above threshold, creates a one-off retrain Job from CronJob.
++"""
++import os, json
++from kubernetes import client, config
++import boto3
++from datetime import datetime
++
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++REGION = os.environ.get("REGION", "US")
++MAE_THRESHOLD = float(os.environ.get("FORECAST_MAE_THRESHOLD", "5.0"))
++
++def fetch_latest_mae():
++    s3 = boto3.client("s3")
++    key = f"forecast_monitor/prophet_monitor_{REGION}.json"
++    tmp = f"/tmp/prophet_monitor_{REGION}.json"
++    try:
++        s3.download_file(COMPLIANCE_BUCKET, key, tmp)
++        j = json.load(open(tmp))
++        return j.get("mae")
++    except Exception:
++        return None
++
++def trigger_cronjob(namespace="aegis", cronjob_name="aegis-prophet-retrain"):
++    config.load_kube_config()
++    batch = client.BatchV1Api()
++    core = client.CoreV1Api()
++    # Create job from cronjob
++    body = {"apiVersion":"batch/v1","kind":"Job","metadata":{"name":f"retrain-trigger-{int(datetime.utcnow().timestamp())}"}}
++    # Use kubectl equivalent: create job from existing cronjob - simplified by shelling out for demo
++    import subprocess
++    subprocess.check_call(["kubectl","create","job","--from=cronjob/"+cronjob_name, "retrain-manual-"+str(int(datetime.utcnow().timestamp())), "-n", namespace])
++
++if __name__=="__main__":
++    mae = fetch_latest_mae()
++    print("latest mae", mae)
++    if mae and mae > MAE_THRESHOLD:
++        print("Triggering retrain")
++        trigger_cronjob()
++    else:
++        print("No retrain needed")
++
+*** End Patch
+*** Begin Patch
+*** Add File: forecast/prometheus_alerts/mae_alerts.yaml
++groups:
++- name: forecast
++  rules:
++  - alert: ForecastMAEHigh
++    expr: forecast_mae{region="US"} > 10
++    for: 30m
++    labels:
++      severity: critical
++    annotations:
++      summary: "Forecast MAE exceeded threshold for US"
++      description: "MAE has exceeded 10 gCO2e for the last 30m — consider retrain"
++
+*** End Patch
+*** Begin Patch
+*** Add File: hsm/multi_hsm_orchestrator.py
++#!/usr/bin/env python3
++"""
++Coordinate HSM operations across multiple HSM admin hosts:
++ - Run test signing on each host
++ - Collect logs and attempt Rekor verification
++ - Upload combined report to compliance bucket
++"""
++import os, subprocess, json, boto3
++from datetime import datetime
++
++HOSTS = [h for h in os.environ.get("HSM_ADMIN_HOSTS","").split(",") if h]
++SAMPLE_ARTIFACT = os.environ.get("HSM_SAMPLE_ART","/opt/aegis/sample_snapshot.json")
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++
++def run_host(h):
++    out="/tmp/hsm_"+h.replace("@","_")+".log"
++    try:
++        cmd = ["ssh", h, "bash -lc", f"'/opt/aegis/hsm_sign_snapshot_remote.sh \"{SAMPLE_ARTIFACT}\"; tail -n 200 /var/log/aegis/hsm_signing.log'"]
++        logs = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=120).decode()
++        open(out,"w").write(logs)
++        return {"host":h,"ok":True,"log":out}
++    except Exception as e:
++        open(out,"w").write(str(e))
++        return {"host":h,"ok":False,"error":str(e),"log":out}
++
++def main():
++    results=[]
++    for h in HOSTS:
++        results.append(run_host(h))
++    report = {"ts": datetime.utcnow().isoformat(), "results": results}
++    tmp="/tmp/hsm_multi_report.json"
++    open(tmp,"w").write(json.dumps(report, indent=2))
++    if COMPLIANCE_BUCKET:
++        s3=boto3.client("s3"); s3.upload_file(tmp, COMPLIANCE_BUCKET, f"hsm_rotations/{os.path.basename(tmp)}")
++    print("Wrote", tmp)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: hsm/runbook_multi_hsm.md
++# Multi-HSM Rotation & Recovery Runbook
++
++1. Pre-reqs:
++ - HSM_ADMIN_HOSTS list configured
++ - /opt/aegis/hsm_sign_snapshot_remote.sh present on each admin host
++ - Rekor server reachable
++
++2. Monthly drill:
++ - Run hsm/multi_hsm_orchestrator.py on operator workstation
++ - Confirm logs uploaded to COMPLIANCE_BUCKET and Rekor entries exist
++
++3. Recovery:
++ - If an HSM fails, promote standby HSM by updating COSIGN_PKCS11_KEY_LABEL mapping and re-running sign tasks
++ - Document and record rekey events, upload to compliance bucket
++
+*** End Patch
+*** Begin Patch
+*** Add File: admission/throttle_api.py
++#!/usr/bin/env python3
++"""
++HTTP API to interact with throttle_db (persistent token bucket).
++Endpoints:
++ - POST /consume {tenant, amount} -> 200 allowed / 429 throttle
++ - POST /refill -> refill all tokens (admin)
++ - GET /status/{tenant} -> current tokens/capacity
++"""
++from flask import Flask, request, jsonify
++from admission.throttle_db import try_consume, ensure_tenant, refill_all
++from sqlalchemy import create_engine, text
++import os
++
++app = Flask("throttle-api")
++
++@app.route("/consume", methods=["POST"])
++def consume():
++    j = request.json or {}
++    tenant = j.get("tenant")
++    amount = float(j.get("amount",0.0))
++    if try_consume(tenant, amount):
++        return jsonify({"allowed": True}), 200
++    return jsonify({"allowed": False, "action":"throttle"}), 429
++
++@app.route("/refill", methods=["POST"])
++def refill():
++    refill_all()
++    return jsonify({"ok": True})
++
++@app.route("/status/<tenant>")
++def status(tenant):
++    # best-effort: read DB directly
++    return jsonify({"tenant": tenant, "info": "use throttle_db for details"})
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","9112")))
++
+*** End Patch
+*** Begin Patch
+*** Add File: scheduler/scheduler_service.py
++#!/usr/bin/env python3
++"""
++HTTP scheduler service that integrates admission, throttle API, device mapping and queueing.
++ - POST /submit-job {"job_id","tenant","estimated_kgco2e","preferred_device"}
++"""
++from flask import Flask, request, jsonify
++import os, requests, json
++import redis
++
++REDIS_URL = os.environ.get("REDIS_URL","redis://localhost:6379/0")
++r = redis.from_url(REDIS_URL)
++QUEUE = "aegis:queue:zset"
++ADMISSION_URL = os.environ.get("ADMISSION_URL","http://admission-prod.aegis.svc:9110/admit")
++THROTTLE_CONSUME = os.environ.get("THROTTLE_API","http://throttle-api.aegis.svc:9112/consume")
++SCHEDULER_ADAPTER = os.environ.get("SCHEDULER_ADAPTER_URL","http://localhost:8200/schedule")
++
++app = Flask("scheduler-service")
++
++def push_zset(job, score):
++    r.zadd(QUEUE, {json.dumps(job): score})
++
++@app.route("/submit-job", methods=["POST"])
++def submit_job():
++    j = request.json or {}
++    tenant = j.get("tenant"); kg = float(j.get("estimated_kgco2e",0.0))
++    # call admission
++    resp = requests.post(ADMISSION_URL, json={"tenant":tenant,"requested_kgco2e":kg,"mode":"soft"}, timeout=5)
++    if resp.status_code != 200:
++        return jsonify({"allowed": False, "reason": resp.text}), resp.status_code
++    # try immediate throttle consume
++    try:
++        tc = requests.post(THROTTLE_CONSUME, json={"tenant":tenant, "amount": kg}, timeout=3)
++        if tc.status_code == 200:
++            # schedule via adapter synchronously
++            adp = requests.post(SCHEDULER_ADAPTER, json=j, timeout=10)
++            return jsonify({"scheduled": adp.status_code==200, "adapter_response": adp.text}), 200
++        else:
++            # throttle: enqueue
++            push_zset(j, int(__import__("time").time()) + 30)
++            return jsonify({"scheduled": False, "queued": True}), 202
++    except Exception as e:
++        push_zset(j, int(__import__("time").time()) + 30)
++        return jsonify({"scheduled": False, "queued": True, "error": str(e)}), 202
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8201")))
++
+*** End Patch
+*** Begin Patch
+*** Add File: scheduler/redis_queue_worker.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: aegis-redis-queue-worker
++  namespace: aegis
++spec:
++  template:
++    spec:
++      containers:
++        - name: worker
++          image: python:3.10-slim
++          command: ["/bin/sh","-c"]
++          args:
++            - pip install redis requests >/dev/null 2>&1 || true; python /opt/scripts/redis_queue_consumer.py
++          volumeMounts:
++            - name: scripts
++              mountPath: /opt/scripts
++      restartPolicy: OnFailure
++      volumes:
++        - name: scripts
++          configMap:
++            name: aegis-queue-scripts
++
+*** End Patch
+*** Begin Patch
+*** Add File: scheduler/redis_queue_consumer.py
++#!/usr/bin/env python3
++"""
++Consumer that pops due items from ZSET and calls scheduler adapter; on throttle requeue with backoff.
++"""
++import os, json, time, redis, requests
++from datetime import datetime
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
++ZSET = "aegis:queue:zset"
++r = redis.from_url(REDIS_URL)
++ADAPTER = os.environ.get("SCHEDULER_ADAPTER_URL","http://scheduler-adapter.aegis.svc:8200/schedule")
++
++def pop_due():
++    now = int(time.time())
++    items = r.zrangebyscore(ZSET, 0, now, start=0, num=1)
++    if not items:
++        return None
++    item = items[0]
++    if r.zrem(ZSET, item):
++        return json.loads(item)
++    return None
++
++def requeue(item, delay):
++    item["attempts"] = item.get("attempts",0) + 1
++    r.zadd(ZSET, {json.dumps(item): int(time.time()) + delay})
++
++def main():
++    while True:
++        it = pop_due()
++        if not it:
++            time.sleep(2); continue
++        job = it
++        try:
++            resp = requests.post(ADAPTER, json=job, timeout=10)
++            if resp.status_code == 200:
++                print("Scheduled", job.get("job_id"))
++            elif resp.status_code == 429:
++                print("Adapter throttled, requeue")
++                requeue(job, min(60*(2**job.get("attempts",0)), 3600))
++            else:
++                print("Adapter error", resp.status_code)
++        except Exception as e:
++            print("Exception", e); requeue(job, 60)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: experiments/sop_enforcer.py
++#!/usr/bin/env python3
++"""
++Enforce A/B SOP before promotion:
++ - checks for sample size, snapshot_id, attestation_ids, randomization log presence
++ - fail promotion if checks don't pass
++"""
++import os, json, sys
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++
++def load_meta(path):
++    return json.load(open(path))
++
++def main(meta_path):
++    meta = load_meta(meta_path)
++    required = ["snapshot_id","min_sample_size","randomization_log"]
++    missing = [r for r in required if r not in meta]
++    if missing:
++        print("Missing fields:", missing); raise SystemExit(2)
++    # check sample size present
++    if meta.get("observations_a",0) < meta["min_sample_size"] or meta.get("observations_b",0) < meta["min_sample_size"]:
++        print("Insufficient sample size"); raise SystemExit(2)
++    print("SOP checks passed")
++
++if __name__=="__main__":
++    if len(sys.argv)<2:
++        print("usage: sop_enforcer.py meta.json"); raise SystemExit(2)
++    main(sys.argv[1])
++
+*** End Patch
+*** Begin Patch
+*** Add File: experiments/randomization_checker.py
++#!/usr/bin/env python3
++"""
++Basic randomization checker to ensure assignment fairness.
++Input: experiments/ab_inputs/assignments.json which maps request_id->bucket
++"""
++import json, statistics
++
++def check(path):
++    a = json.load(open(path))
++    counts = {}
++    for k,v in a.items():
++        counts[v]=counts.get(v,0)+1
++    print("Counts:", counts)
++    vals = list(counts.values())
++    mean = statistics.mean(vals) if vals else 0
++    std = statistics.pstdev(vals) if len(vals)>1 else 0
++    print("mean", mean, "std", std)
++    return counts, mean, std
++
++if __name__=="__main__":
++    import sys
++    if len(sys.argv)<2:
++        print("usage: randomization_checker.py assignments.json"); raise SystemExit(2)
++    check(sys.argv[1])
++
+*** End Patch
+*** Begin Patch
+*** Add File: compliance/control_evidence_collector.py
++#!/usr/bin/env python3
++"""
++Automated mapping of controls to collected evidence: scans configured artifacts and verifies presence in compliance bucket.
++Creates a summary JSON for auditors.
++"""
++import os, json, boto3
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++CONTROL_MAP = "compliance/control_to_evidence.yaml"
++OUT = "/tmp/control_evidence_summary.json"
++
++def main():
++    s3 = boto3.client("s3")
++    summary = {"controls": {}, "ts": __import__("datetime").datetime.utcnow().isoformat()}
++    try:
++        cmap = json.load(open(CONTROL_MAP.replace(".yaml",".json"))) if os.path.exists(CONTROL_MAP.replace(".yaml",".json")) else {}
++    except Exception:
++        cmap = {}
++    # fallback: simple presence checks for known prefixes
++    prefixes = ["ab_verdicts/", "hsm_rotations/", "calibration/","forecast_monitor/"]
++    found = {}
++    for p in prefixes:
++        try:
++            res = s3.list_objects_v2(Bucket=COMPLIANCE_BUCKET, Prefix=p, MaxKeys=1)
++            found[p] = bool(res.get("Contents"))
++        except Exception:
++            found[p] = False
++    summary["found_prefixes"]=found
++    open(OUT,"w").write(json.dumps(summary, indent=2))
++    print("Wrote", OUT)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: scale/ha/exercise_simulator.py
++#!/usr/bin/env python3
++"""
++Simple HA exercise tool:
++ - Deletes a sample pod in a namespace and waits for replacement to become ready (k8s required)
++ - Measures time-to-recover and writes report
++"""
++import subprocess, time, json
++from datetime import datetime
++
++NS = "aegis"
++DEPLOY = os.environ.get("DEPLOYMENT", "provider-broker")
++
++def delete_one_pod():
++    out = subprocess.check_output(["kubectl","get","pods","-n",NS","-l","app="+DEPLOY,"-o","json"])
++    js = json.loads(out)
++    if not js["items"]:
++        return None
++    pod = js["items"][0]["metadata"]["name"]
++    subprocess.check_call(["kubectl","delete","pod",pod,"-n",NS])
++    return pod
++
++def wait_recovery(timeout=300):
++    start = time.time()
++    while time.time() - start < timeout:
++        out = subprocess.check_output(["kubectl","get","pods","-n",NS,"-l","app="+DEPLOY,"-o","json"])
++        js = json.loads(out)
++        all_ready = True
++        for it in js["items"]:
++            for c in it["status"].get("containerStatuses",[]):
++                if not c.get("ready"):
++                    all_ready = False
++        if all_ready:
++            return time.time() - start
++        time.sleep(5)
++    return None
++
++def main():
++    pod = delete_one_pod()
++    if not pod:
++        print("no pod to delete"); return
++    start = datetime.utcnow().isoformat()
++    dur = wait_recovery()
++    report = {"deleted_pod": pod, "start": start, "recovery_seconds": dur}
++    out = "/tmp/ha_exercise.json"
++    open(out,"w").write(json.dumps(report, indent=2))
++    print("Wrote", out)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: ui/auth_server.py
++#!/usr/bin/env python3
++"""
++Minimal JWT auth demo server for tenant UI (for demo only).
++ - POST /login {"user"} -> returns token (no password check)
++ - GET /whoami -> returns tenant from token
++"""
++import os, jwt, time
++from flask import Flask, request, jsonify
++
++SECRET = os.environ.get("UI_JWT_SECRET", "devsecret")
++app = Flask("auth-server")
++
++def issue(user):
++    payload = {"sub": user, "iat": int(time.time()), "exp": int(time.time())+3600}
++    token = jwt.encode(payload, SECRET, algorithm="HS256")
++    return token
++
++@app.route("/login", methods=["POST"])
++def login():
++    j = request.json or {}
++    user = j.get("user", "alice")
++    token = issue(user)
++    return jsonify({"token": token})
++
++@app.route("/whoami")
++def whoami():
++    auth = request.headers.get("Authorization","")
++    if not auth.startswith("Bearer "):
++        return jsonify({"error":"missing"}), 401
++    t = auth.split(" ",1)[1]
++    try:
++        p = jwt.decode(t, SECRET, algorithms=["HS256"])
++        return jsonify({"user": p.get("sub")})
++    except Exception as e:
++        return jsonify({"error": str(e)}), 401
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8150")))
++
+*** End Patch
+*** Begin Patch
+*** Add File: ui/recommend_api.py
++#!/usr/bin/env python3
++"""
++Recommendation endpoint used by tenant UI What‑If.
++ - POST /recommend/<tenant> {estimated_kgco2e, flexible} -> returns recommended action or slot
++"""
++from flask import Flask, request, jsonify
++import os, requests
++
++FORECAST_API = os.environ.get("FORECAST_API", "http://forecast-api.aegis.svc:8087/forecast")
++
++app = Flask("recommend-api")
++
++@app.route("/recommend/<tenant>", methods=["POST"])
++def recommend(tenant):
++    j = request.json or {}
++    region = j.get("region", "US")
++    flexible = j.get("flexible", False)
++    est_kg = j.get("estimated_kgco2e", 0.0)
++    # naive: call forecast and pick lowest upper bound
++    r = requests.get(FORECAST_API, params={"region": region, "hours": 24})
++    if not r.ok:
++        return jsonify({"error":"no forecast"}), 500
++    fc = r.json().get("forecast", [])
++    best = min(fc, key=lambda x: x.get("upper", x.get("pred")))
++    action = {"action":"schedule_at", "ts": best["ts"], "pred": best["pred"], "upper": best["upper"]}
++    return jsonify({"tenant": tenant, "recommendation": action})
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8160")))
++
+*** End Patch
+*** Begin Patch
+*** Modify File: tenant-ui/src/WhatIf.js
+@@
+   const simulate = async () => {
+-    // naive simulation: call prebook recommend endpoint to get recommended slot
+-    const resp = await fetch(`/recommend/${tenant}`, {method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({estimated_kgco2e: estKg, flexible: true})});
++    // call recommend endpoint with token if present
++    const token = localStorage.getItem('aegis_token');
++    const headers = {'Content-Type':'application/json'};
++    if (token) headers['Authorization'] = 'Bearer ' + token;
++    const resp = await fetch(`/recommend/${tenant}`, {method: 'POST', headers, body: JSON.stringify({estimated_kgco2e: estKg, flexible: true})});
+     const j = await resp.json();
+     setResult(j);
+   };
+*** End Patch
+*** End Patch

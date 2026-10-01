@@ -1,0 +1,638 @@
+*** Begin Patch
+*** Add File:monitoring/dcgm/dcgm-exporter-deployment.yaml
++apiVersion: apps/v1
++kind: DaemonSet
++metadata:
++  name: dcgm-exporter
++  namespace: monitoring
++  labels:
++    app: dcgm-exporter
++spec:
++  selector:
++    matchLabels:
++      app: dcgm-exporter
++  template:
++    metadata:
++      labels:
++        app: dcgm-exporter
++    spec:
++      hostNetwork: false
++      tolerations:
++        - key: "nvidia.com/gpu"
++          operator: "Exists"
++          effect: "NoSchedule"
++      containers:
++        - name: dcgm-exporter
++          image: nvidia/dcgm-exporter:2.5.13-2.11.5-ubuntu18.04
++          resources:
++            requests:
++              cpu: "100m"
++              memory: "128Mi"
++            limits:
++              cpu: "500m"
++              memory: "256Mi"
++          env:
++            - name: DCGM_EXPORTER_PORT
++              value: "9400"
++          ports:
++            - containerPort: 9400
++          securityContext:
++            runAsNonRoot: true
++            allowPrivilegeEscalation: false
++      nodeSelector:
++        nvidia.com/gpu.present: "true"
++
++---
++# Service for Prometheus scraping (if not using ServiceMonitor)
++apiVersion: v1
++kind: Service
++metadata:
++  name: dcgm-exporter
++  namespace: monitoring
++  labels:
++    app: dcgm-exporter
++spec:
++  selector:
++    app: dcgm-exporter
++  ports:
++    - port: 9400
++      targetPort: 9400
++      name: metrics
++
++# Notes:
++# - Requires NVIDIA drivers + DCGM on nodes.
++# - Ensure Prometheus scrapes this service or install Prometheus Operator + ServiceMonitor below.
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/prometheus/dcgm-servicemonitor.yaml
++apiVersion: monitoring.coreos.com/v1
++kind: ServiceMonitor
++metadata:
++  name: dcgm-exporter-sm
++  namespace: monitoring
++spec:
++  selector:
++    matchLabels:
++      app: dcgm-exporter
++  namespaceSelector:
++    matchNames:
++      - monitoring
++  endpoints:
++    - port: metrics
++      interval: 15s
++      path: /metrics
++
++# If you are not using Prometheus Operator, add scrape config to prometheus.yml:
++#
++# scrape_configs:
++# - job_name: 'dcgm-exporter'
++#   kubernetes_sd_configs:
++#   - role: endpoints
++#   relabel_configs:
++#   - source_labels: [__meta_kubernetes_service_label_app]
++#     regex: dcgm-exporter
++#     action: keep
++#   metrics_path: /metrics
++#   scheme: http
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/grafana/carbon_dashboard.json
++{
++  "dashboard": {
++    "title": "Aegis Carbon Awareness",
++    "panels": [
++      {
++        "title": "Cluster GPU Power (per-node)",
++        "type": "graph",
++        "targets": [
++          { "expr": "sum by (instance) (dcgm_gpu_power_usage_watts)", "legendFormat": "{{instance}}", "refId": "A" }
++        ]
++      },
++      {
++        "title": "Estimated CO2 per Run (kg)",
++        "type": "table",
++        "targets": [
++          { "expr": "aegis_run_co2e_kg", "refId": "B" }
++        ]
++      },
++      {
++        "title": "Grid Carbon Intensity (gCO2/kWh)",
++        "type": "graph",
++        "targets": [
++          { "expr": "carbon_grid_intensity_gco2_per_kwh", "refId": "C" }
++        ]
++      }
++    ]
++  }
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:carbon/estimator/requirements.txt
++requests
++prometheus-api-client
++boto3
++mlflow
++python-dateutil
++prometheus-client
++
+*** End Patch
+*** Begin Patch
+*** Add File:carbon/estimator/estimator.py
++#!/usr/bin/env python3
++"""
++Carbon estimator:
++ - Query Prometheus for GPU power (watts) over a time window for nodes used by a run_id
++ - Integrate with a carbon intensity API to get gCO2/kWh for the region/time
++ - Compute CO2e = integral_power_W * time_hours * intensity_gCO2_per_kWh / 1000 -> kgCO2
++ - Log result to MLflow and upload a signed evidence JSON to S3 (cosign signing is best-effort)
++
++Environment variables:
++ - PROM_URL: Prometheus HTTP API URL
++ - EVIDENCE_BUCKET, AWS_REGION
++ - CARBON_API_URL, CARBON_API_KEY (optional)
++ - MLflow settings: MLFLOW_TRACKING_URI
++ - COSIGN_KMS_ARN (optional) to sign the evidence file with cosign
++
++Usage:
++  python estimator.py --run-id <run_id> --start <iso> --end <iso> --prom-query 'sum(dcgm_gpu_power_usage_watts{instance=~".*"}) by (instance)'
++"""
++import os
++import sys
++import json
++import time
++import math
++import tempfile
++import subprocess
++import argparse
++from datetime import datetime, timezone
++import boto3
++import mlflow
++from prometheus_api_client import PrometheusConnect, MetricsList, MetricSnapshotDataFrame
++
++PROM_URL = os.environ.get("PROM_URL", "http://prometheus.monitoring.svc.cluster.local:9090")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "REPLACE_WITH_EVIDENCE_BUCKET")
++AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
++CARBON_API_URL = os.environ.get("CARBON_API_URL", "")
++CARBON_API_KEY = os.environ.get("CARBON_API_KEY", "")
++COSIGN_KMS_ARN = os.environ.get("COSIGN_KMS_ARN", "")
++MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "")
++
++s3 = boto3.client("s3", region_name=AWS_REGION)
++
++def query_power(prom, prom_query, start_ts, end_ts):
++    # prom_query expected to return watts per node; use range query and integrate
++    results = prom.custom_query_range(query=prom_query, start_time=start_ts, end_time=end_ts, step='30s')
++    # results: list of metrics with values [[ts, val]]
++    # integrate watts over time into Wh
++    total_wh = 0.0
++    per_series = {}
++    for metric in results:
++        series_name = json.dumps(metric.get('metric', {}))
++        vals = metric.get('values', [])
++        # numeric integration via trapezoid
++        if len(vals) < 2:
++            continue
++        w = 0.0
++        for i in range(1,len(vals)):
++            t0 = float(vals[i-1][0]); v0 = float(vals[i-1][1])
++            t1 = float(vals[i][0]); v1 = float(vals[i][1])
++            dt_h = (t1 - t0) / 3600.0
++            w += (v0 + v1) / 2.0 * dt_h
++        per_series[series_name] = w
++        total_wh += w
++    return total_wh, per_series
++
++def get_grid_intensity(start_ts, end_ts, region_hint=None):
++    """
++    Query external carbon API for average intensity between times.
++    This is a placeholder — integrate CarbonAware SDK or provider API.
++    Returns gCO2 per kWh.
++    """
++    if not CARBON_API_URL:
++        # fallback: default mid-range intensity
++        return 400.0
++    try:
++        params = {"start": int(start_ts), "end": int(end_ts)}
++        headers = {}
++        if CARBON_API_KEY:
++            headers["Authorization"] = f"Bearer {CARBON_API_KEY}"
++        import requests
++        r = requests.get(CARBON_API_URL, params=params, headers=headers, timeout=10)
++        r.raise_for_status()
++        j = r.json()
++        # provider-specific parsing required; here assume j["data"]["averageIntensity"]
++        val = j.get("data", {}).get("averageIntensity", None) or j.get("averageIntensity", 400.0)
++        return float(val)
++    except Exception:
++        return 400.0
++
++def compute_co2(total_wh, gco2_per_kwh):
++    # Wh to kWh
++    kwh = total_wh / 1000.0
++    # gCO2 = kWh * gco2_per_kwh
++    gco2 = kwh * gco2_per_kwh
++    kgco2 = gco2 / 1000.0
++    return kgco2, kwh
++
++def upload_evidence(run_id, payload):
++    t = int(time.time())
++    key = f"carbon/{run_id}/co2e_{t}.json"
++    s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(payload).encode())
++    # best-effort sign: download to tmp and cosign sign local file then upload sig
++    tmp = tempfile.mktemp(suffix=".json")
++    with open(tmp, "w") as f:
++        json.dump(payload, f)
++    if COSIGN_KMS_ARN:
++        try:
++            subprocess.run(["cosign","sign","--key",f"awskms://{COSIGN_KMS_ARN}", tmp], check=True)
++            sig = tmp + ".sig"
++            if os.path.exists(sig):
++                s3.upload_file(sig, EVIDENCE_BUCKET, key + ".sig")
++        except Exception as e:
++            print("cosign sign failed (best-effort)", e)
++    return key
++
++def log_to_mlflow(run_id, co2_kg, kwh, start_ts, end_ts):
++    if not MLFLOW_TRACKING_URI:
++        return
++    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
++    mlflow.start_run(run_id=run_id)
++    mlflow.log_metric("co2e_kg", co2_kg)
++    mlflow.log_metric("energy_kwh", kwh)
++    mlflow.set_tag("carbon_estimator", "aegis_estimator_v1")
++    mlflow.end_run()
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--run-id", required=True)
++    p.add_argument("--start", required=True, help="ISO8601 or epoch")
++    p.add_argument("--end", required=True)
++    p.add_argument("--prom-query", default='sum(dcgm_gpu_power_usage_watts) by (instance)')
++    args = p.parse_args()
++    # parse times
++    def parse_t(s):
++        try:
++            return int(s)
++        except:
++            dt = datetime.fromisoformat(s)
++            return int(dt.replace(tzinfo=timezone.utc).timestamp())
++    start_ts = parse_t(args.start)
++    end_ts = parse_t(args.end)
++
++    prom = PrometheusConnect(url=PROM_URL, disable_ssl=True)
++    total_wh, per_series = query_power(prom, args.prom_query, start_ts, end_ts)
++    intensity = get_grid_intensity(start_ts, end_ts)
++    co2kg, kwh = compute_co2(total_wh, intensity)
++    payload = {
++        "run_id": args.run_id,
++        "start_ts": start_ts,
++        "end_ts": end_ts,
++        "total_wh": total_wh,
++        "kwh": kwh,
++        "gco2_per_kwh": intensity,
++        "co2e_kg": co2kg,
++        "per_node_wh": per_series,
++        "ts": int(time.time())
++    }
++    key = upload_evidence(args.run_id, payload)
++    log_to_mlflow(args.run_id, co2kg, kwh, start_ts, end_ts)
++    print("Uploaded evidence to", key)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/carbon_estimation.yml
++name: Carbon Estimation (scheduled)
++
++on:
++  workflow_dispatch:
++  schedule:
++    - cron: "*/30 * * * *"
++
++jobs:
++  estimate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.11'
++      - name: Install deps
++        run: |
++          pip install -r carbon/estimator/requirements.txt
++      - name: Run estimator for recent 30m window (example run_id=scheduled)
++        env:
++          PROM_URL: ${{ secrets.PROM_URL }}
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++          AWS_REGION: ${{ secrets.AWS_REGION }}
++          CARBON_API_URL: ${{ secrets.CARBON_API_URL }}
++          CARBON_API_KEY: ${{ secrets.CARBON_API_KEY }}
++          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
++          COSIGN_KMS_ARN: ${{ secrets.COSIGN_KMS_ARN }}
++        run: |
++          end=$(date +%s)
++          start=$((end - 1800))
++          python carbon/estimator/estimator.py --run-id scheduled-${end} --start $start --end $end
++
+*** End Patch
+*** Begin Patch
+*** Add File:carbon/webhook/requirements.txt
++fastapi
++uvicorn[standard]
++requests
++python-jose
++
+*** End Patch
+*** Begin Patch
+*** Add File:carbon/webhook/webhook.py
++#!/usr/bin/env python3
++"""
++Simple Kubernetes mutating + validating admission webhook prototype for carbon-aware placement.
++ - Mutating behavior: optionally add annotation `carbon.preferred_zone` with 'low-carbon' when grid intensity low
++ - Validating behavior: reject pods requesting non-urgent runs if grid intensity high and annotation `carbon.defer=true`
++
++This is a prototype. In production:
++ - Use proper TLS with CA bundle in MutatingWebhookConfiguration.
++ - Use robust authentication & rate-limiting.
++ - Integrate with Carbon Aware SDK for accurate intensity signals.
++"""
++import os
++import json
++import base64
++from fastapi import FastAPI, Request
++from pydantic import BaseModel
++import requests
++
++CARBON_API_URL = os.environ.get("CARBON_API_URL", "")
++CARBON_THRESHOLD_GCO2 = float(os.environ.get("CARBON_THRESHOLD_GCO2", "300.0"))
++
++app = FastAPI(title="Aegis Carbon Webhook")
++
++def get_current_intensity():
++    if not CARBON_API_URL:
++        return 400.0
++    try:
++        r = requests.get(CARBON_API_URL, timeout=5)
++        r.raise_for_status()
++        j = r.json()
++        return float(j.get("data", {}).get("currentIntensity", j.get("averageIntensity", 400.0)))
++    except Exception:
++        return 400.0
++
++@app.post("/mutate")
++async def mutate(request: Request):
++    body = await request.json()
++    req = body.get("request", {})
++    uid = req.get("uid")
++    pod = req.get("object", {})
++    metadata = pod.get("metadata", {})
++    annotations = metadata.get("annotations", {}) or {}
++    intensity = get_current_intensity()
++    patches = []
++    if intensity < CARBON_THRESHOLD_GCO2:
++        # prefer low carbon zone
++        if annotations.get("carbon.preferred_zone") != "low-carbon":
++            patches.append({"op":"add","path":"/metadata/annotations/carbon.preferred_zone","value":"low-carbon"})
++    # respond with JSON patch if present
++    if patches:
++        return {
++            "response": {
++                "uid": uid,
++                "allowed": True,
++                "patchType": "JSONPatch",
++                "patch": base64.b64encode(json.dumps(patches).encode()).decode()
++            }
++        }
++    return {"response":{"uid": uid, "allowed": True}}
++
++@app.post("/validate")
++async def validate(request: Request):
++    body = await request.json()
++    req = body.get("request", {})
++    uid = req.get("uid")
++    pod = req.get("object", {})
++    metadata = pod.get("metadata", {})
++    annotations = metadata.get("annotations", {}) or {}
++    # if pod explicitly requests defer and carbon intensity high => deny
++    intensity = get_current_intensity()
++    if annotations.get("carbon.defer","false").lower() == "true" and intensity > CARBON_THRESHOLD_GCO2:
++        return {"response":{"uid": uid, "allowed": False, "status":{"message": f"Pod deferred due to high carbon intensity {intensity} gCO2/kWh"}}}
++    return {"response":{"uid": uid, "allowed": True}}
++
++if __name__ == "__main__":
++    import uvicorn
++    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("WEBHOOK_PORT", "8444")))
++
+*** End Patch
+*** Begin Patch
+*** Add File:carbon/webhook/k8s-webhook-manifests.md
++# Mutating + Validating Webhook manifests (operator)
++
++Steps (operator):
++1) Deploy the webhook service in namespace `aegis` and expose TLS using cert-manager to generate serving cert (MutatingWebhookConfiguration requires caBundle).
++2) Create a Service pointing to the webhook and a MutatingWebhookConfiguration + ValidatingWebhookConfiguration referencing the service and path `/mutate` and `/validate`.
++3) The webhook needs network access to Carbon API or to a cached carbon service in-cluster.
++
++Example (mutating webhook snippet - values must be adjusted):
++
++apiVersion: admissionregistration.k8s.io/v1
++kind: MutatingWebhookConfiguration
++metadata:
++  name: aegis-carbon-mutating
++webhooks:
++  - name: carbon-mutate.aegis.local
++    clientConfig:
++      service:
++        name: aegis-carbon-webhook
++        namespace: aegis
++        path: "/mutate"
++      caBundle: "REPLACE_WITH_CA_BUNDLE"
++    rules:
++      - operations: ["CREATE"]
++        apiGroups: [""]
++        apiVersions: ["v1"]
++        resources: ["pods"]
++
++Repeat similarly for ValidatingWebhookConfiguration pointing to /validate.
++
+*** End Patch
+*** Begin Patch
+*** Add File:cost/carbon_accounting.py
++#!/usr/bin/env python3
++"""
++Carbon budget enforcement integration
++ - Stores per-tenant carbon budgets in Redis and checks estimated CO2 before allowing new runs
++ - API: set_budget(tenant, kg), check_budget_and_reserve(tenant, kg_estimate)
++"""
++import os
++import time
++try:
++    import redis
++except Exception:
++    redis = None
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
++DEFAULT_CARBON_BUDGET_KG = float(os.environ.get("DEFAULT_CARBON_BUDGET_KG", "1000.0"))
++
++class CarbonAccounting:
++    def __init__(self):
++        self.r = redis.from_url(REDIS_URL) if redis else None
++
++    def get_used(self, tenant):
++        if not self.r:
++            return 0.0
++        return float(self.r.get(f"carbon:{tenant}:used") or 0.0)
++
++    def get_budget(self, tenant):
++        if not self.r:
++            return DEFAULT_CARBON_BUDGET_KG
++        return float(self.r.get(f"carbon:{tenant}:budget") or DEFAULT_CARBON_BUDGET_KG)
++
++    def set_budget(self, tenant, kg):
++        if not self.r:
++            return
++        self.r.set(f"carbon:{tenant}:budget", float(kg))
++
++    def check_and_reserve(self, tenant, kg_estimate):
++        """
++        Atomically check budget and reserve estimate. Returns True if reserved.
++        """
++        if not self.r:
++            return True
++        pipe = self.r.pipeline()
++        key_used = f"carbon:{tenant}:used"
++        key_budget = f"carbon:{tenant}:budget"
++        pipe.get(key_used)
++        pipe.get(key_budget)
++        used, budget = pipe.execute()
++        used = float(used or 0.0)
++        budget = float(budget or DEFAULT_CARBON_BUDGET_KG)
++        if used + kg_estimate > budget:
++            return False
++        # reserve (increment)
++        self.r.incrbyfloat(key_used, kg_estimate)
++        return True
++
+*** End Patch
+*** Begin Patch
+*** Add File:policies/carbon_policy.rego
++package aegis.carbon
++
++# Input schema: {"tenant": "team-a", "estimated_co2_kg": 12.3}
++deny[msg] {
++  input.tenant == t
++  input.estimated_co2_kg == e
++  # fetch budget from external data source; in production provide via data.external or host call
++  budget := data.carbon.budgets[t]
++  used := data.carbon.used[t]
++  used + e > budget
++  msg = sprintf("carbon budget exceeded for tenant %v (used: %v, budget: %v, estimate: %v)", [t, used, budget, e])
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/prometheus/carbon_rules.yaml
++apiVersion: monitoring.coreos.com/v1
++kind: PrometheusRule
++metadata:
++  name: aegis-carbon-rules
++  namespace: monitoring
++spec:
++  groups:
++    - name: carbon.rules
++      rules:
++        - alert: HighClusterEnergyUse
++          expr: sum(dcgm_gpu_power_usage_watts) > 50000
++          for: 10m
++          labels:
++            severity: warning
++          annotations:
++            summary: "Cluster GPU power usage is high"
++        - alert: CarbonBudgetExceeded
++          expr: sum(aegis_run_co2e_kg) by (tenant) > 1000
++          for: 5m
++          labels:
++            severity: critical
++          annotations:
++            summary: "Per-tenant carbon usage high"
++
+*** End Patch
+*** Begin Patch
+*** Add File:carbon/scripts/log_co2_run.py
++#!/usr/bin/env python3
++"""
++Helper to run carbon estimator for a particular run and attach results to MLflow and S3.
++Usage:
++  python log_co2_run.py --run-id <run_id> --start <iso> --end <iso>
++"""
++import argparse
++import subprocess
++import os
++import json
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--run-id", required=True)
++    p.add_argument("--start", required=True)
++    p.add_argument("--end", required=True)
++    args = p.parse_args()
++    cmd = [
++        "python", "carbon/estimator/estimator.py",
++        "--run-id", args.run_id,
++        "--start", args.start,
++        "--end", args.end
++    ]
++    env = os.environ.copy()
++    subprocess.check_call(cmd, env=env)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/carbon_aware_runbook.md
++# Carbon‑Aware Runbook (Aegis)
++
++This runbook describes how to collect energy telemetry, compute CO2e per run, enforce carbon budgets, and report results.
++
++Prerequisites
++- Prometheus scraping GPU power via DCGM exporter (monitoring/dcgm)
++- PrometheusRule & Grafana dashboard deployed (monitoring/grafana/carbon_dashboard.json)
++- Estimator tools available (python, carbon/estimator/estimator.py)
++- MLflow tracking server configured and EVIDENCE_BUCKET accessible
++- Optional: Carbon API credentials configured in CARBON_API_URL / CARBON_API_KEY
++
++Steps: Estimate CO2 for a run
++1. Identify run_id and time window (start, end) for the run.
++2. Run the estimator:
++   export PROM_URL=http://prometheus.monitoring.svc.cluster.local:9090
++   export EVIDENCE_BUCKET=<EVIDENCE_BUCKET>
++   python carbon/estimator/estimator.py --run-id <run_id> --start <start_iso_or_epoch> --end <end_iso_or_epoch>
++3. The estimator will:
++   - Query Prometheus for GPU power and integrate Wh
++   - Query carbon intensity API to get gCO2/kWh
++   - Compute kgCO2 and upload a signed JSON to s3://<EVIDENCE_BUCKET>/carbon/<run_id>/
++   - Log metrics to MLflow under run_id
++
++Carbon budget enforcement (operator)
++1. Set budget for tenant via Redis (or use provided tooling):
++   redis-cli SET carbon:<tenant>:budget 1000
++2. The CarbonAccounting.check_and_reserve will be used by pre-action checks to decide whether to allow a run.
++
++Dashboard & Alerts
++- Grafana dashboard shows per-run CO2 and cluster power use.
++- PrometheusRule alerts on high cluster energy use and per-tenant carbon thresholds.
++
++Notes & caveats
++- CO2 estimates are approximations; document uncertainty in audit package.
++- Use scheduler/webhook (carbon/webhook) to annotate or defer jobs based on carbon intensity.
++- Tune thresholds and budget values to match your organizational sustainability goals.
++
+*** End Patch
+*** End Patch

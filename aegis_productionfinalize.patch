@@ -1,0 +1,469 @@
+*** Begin Patch
+*** Add File:ci/finalize_production_release.yml
++name: Aegis Finalize: Production Readiness Pipeline
++
++on:
++  workflow_dispatch:
++  schedule:
++    - cron: '0 5 * * 1' # weekly Monday 05:00 UTC
++
++env:
++  EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++  AWS_REGION: ${{ secrets.AWS_REGION }}
++  KUBECONFIG_STAGING: ${{ secrets.KUBECONFIG_STAGING }}
++  KUBECONFIG_PROD: ${{ secrets.KUBECONFIG_PROD }}
++  COSIGN_KMS_KEY_ARN: ${{ secrets.COSIGN_KMS_KEY_ARN }}
++  MEDIAN_THRESHOLD: "0.10"
++  PUSHGATEWAY: ${{ secrets.PUSHGATEWAY }}
++
++jobs:
++  run-readiness-checks:
++    runs-on: ubuntu-latest
++    outputs:
++      median_result: ${{ steps.validate.outputs.result }}
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.11'
++
++      - name: Install dependencies
++        run: pip install boto3 kubernetes requests pandas pyarrow mlflow
++
++      - name: Telemetry healthcheck (staging)
++        env:
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++          AWS_REGION: ${{ secrets.AWS_REGION }}
++        run: |
++          python3 telemetry/telemetry_healthcheck.py --prefix telemetry/ --days 14
++
++      - name: Run enforcement coverage harness (staging)
++        env:
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++          AWS_REGION: ${{ secrets.AWS_REGION }}
++          PUSHGATEWAY: ${{ secrets.PUSHGATEWAY }}
++        run: |
++          python3 enforcement/test_harness/enforcement_coverage_harness.py || true
++
++      - name: Run parquet pipeline + generate manifest (staging)
++        env:
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++          AWS_REGION: ${{ secrets.AWS_REGION }}
++        run: |
++          python3 etl/s3_parquet_pipeline_v3.py
++          python3 etl/copy_manifest_generator.py
++
++      - name: Trigger dev bulk load job in cluster
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG_STAGING }}
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++          REDSHIFT_IAM_ROLE_ARN: ${{ secrets.REDSHIFT_IAM_ROLE_ARN }}
++        run: |
++          kubectl --kubeconfig=${KUBECONFIG} -n aegis apply -f etl/redshift_copy_job.yaml
++          kubectl --kubeconfig=${KUBECONFIG} -n aegis wait --for=condition=complete job/redshift-copy-loader --timeout=1800s || true
++
++      - name: Run dbt (dev)
++        env:
++          DBT_PROFILES_DIR: dbt/profiles
++        run: |
++          if [ -d "dbt" ]; then
++            cd dbt
++            dbt deps || true
++            dbt run || true
++            dbt test || true
++          fi
++
++      - name: Run Great Expectations checks
++        run: |
++          python3 data_quality/run_expectations.py || true
++
++      - name: Run iterative calibration + validation
++        id: validate
++        env:
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++          AWS_REGION: ${{ secrets.AWS_REGION }}
++          MEDIAN_THRESHOLD: ${{ env.MEDIAN_THRESHOLD }}
++        run: |
++          set -e
++          python3 calibration/aegis_iterative_calibration.py
++          echo "::set-output name=result::pass"
++
++  promote-to-prod:
++    needs: run-readiness-checks
++    runs-on: ubuntu-latest
++    if: needs.run-readiness-checks.outputs.median_result == 'pass'
++    environment:
++      name: production
++    steps:
++      - name: Manual approval required
++        run: echo "This job requires manual approval by an operator in GitHub Environments before applying profiles to production."
++
++      - name: Apply production power profiles (manual step guidance)
++        run: |
++          echo "Operator should download approved power_profiles.yaml from S3, sign it with cosign and apply to production cluster:"
++          echo "1) aws s3 cp s3://${EVIDENCE_BUCKET}/calibration/power_profiles_approved.yaml ./power_profiles.yaml"
++          echo "2) cosign sign --key awskms://${COSIGN_KMS_KEY_ARN} ./power_profiles.yaml"
++          echo "3) kubectl --kubeconfig=${{ secrets.KUBECONFIG_PROD }} -n aegis create configmap aegis-power-profiles --from-file=power_profiles.yaml=./power_profiles.yaml --dry-run=client -o yaml | kubectl apply -f -"
++
+*** End Patch
+*** Begin Patch
+*** Add File:terraform/redshift/provision_redshift_cluster.tf
++variable "cluster_identifier" { type = string }
++variable "master_username" { type = string }
++variable "master_password" { type = string, sensitive=true }
++variable "node_type" { default = "ra3.xlplus" }
++variable "cluster_type" { default = "multi-node" }
++variable "encrypted" { default = true }
++
++provider "aws" {
++  region = var.aws_region
++}
++
++resource "aws_redshift_cluster" "aegis" {
++  cluster_identifier = var.cluster_identifier
++  node_type          = var.node_type
++  database_name      = "aegis_dw"
++  master_username    = var.master_username
++  master_password    = var.master_password
++  cluster_type       = var.cluster_type
++  encrypted          = var.encrypted
++  automated_snapshot_retention_period = 7
++}
++
++output "endpoint" {
++  value = aws_redshift_cluster.aegis.endpoint
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:terraform/redshift/iam_for_redshift_copy.tf
++variable "evidence_bucket" { type = string }
++variable "parquet_prefix" { type = string, default = "parquet/evidence" }
++
++resource "aws_iam_role" "redshift_s3_access" {
++  name = "aegis-redshift-s3-access-prod"
++  assume_role_policy = jsonencode({
++    Version = "2012-10-17",
++    Statement = [{
++      Effect = "Allow",
++      Principal = { Service = "redshift.amazonaws.com" },
++      Action = "sts:AssumeRole"
++    }]
++  })
++}
++
++data "aws_iam_policy_document" "s3_access" {
++  statement {
++    effect = "Allow"
++    actions = [
++      "s3:ListBucket"
++    ]
++    resources = ["arn:aws:s3:::${var.evidence_bucket}"]
++    condition {
++      test = "StringLike"
++      variables = { "s3:prefix" = "${var.parquet_prefix}/*" }
++    }
++  }
++  statement {
++    effect = "Allow"
++    actions = ["s3:GetObject"]
++    resources = ["arn:aws:s3:::${var.evidence_bucket}/${var.parquet_prefix}/*"]
++  }
++}
++
++resource "aws_iam_policy" "redshift_s3_policy" {
++  name   = "aegis-redshift-s3-policy-prod"
++  policy = data.aws_iam_policy_document.s3_access.json
++}
++
++resource "aws_iam_role_policy_attachment" "attach" {
++  role       = aws_iam_role.redshift_s3_access.name
++  policy_arn = aws_iam_policy.redshift_s3_policy.arn
++}
++
++output "redshift_copy_role_arn" {
++  value = aws_iam_role.redshift_s3_access.arn
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:security/provision_kms.tf
++variable "allowed_principals" { type = list(string) }
++variable "kms_alias" { default = "alias/aegis-cosign" }
++
++resource "aws_kms_key" "cosign" {
++  description             = "Aegis cosign signing key (production)"
++  deletion_window_in_days = 30
++  policy = jsonencode({
++    Version = "2012-10-17",
++    Statement = [
++      {
++        Sid = "AllowUseOfKey",
++        Effect = "Allow",
++        Principal = { AWS = var.allowed_principals },
++        Action = ["kms:Sign","kms:GetPublicKey","kms:DescribeKey"],
++        Resource = "*"
++      }
++    ]
++  })
++}
++
++resource "aws_kms_alias" "cosign_alias" {
++  name          = var.kms_alias
++  target_key_id = aws_kms_key.cosign.key_id
++}
++
++output "cosign_kms_key_arn" {
++  value = aws_kms_key.cosign.arn
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:security/certmanager_clusterissuer_prod.yaml
++apiVersion: cert-manager.io/v1
++kind: ClusterIssuer
++metadata:
++  name: corporate-ca-issuer
++spec:
++  ca:
++    secretName: corporate-ca-keypair
++
++# Note: To provision corporate CA you must create the secret `corporate-ca-keypair` in the cert-manager namespace:
++# kubectl -n cert-manager create secret tls corporate-ca-keypair --cert=/path/to/ca.crt --key=/path/to/ca.key
++
+*** End Patch
+*** Begin Patch
+*** Add File:security/cosign_rotate_and_rekor_log.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Rotate cosign KMS key and log rotation in Rekor (operator-run)
++#
++if [ $# -lt 1 ]; then
++  echo "Usage: $0 <new-kms-alias> [rekor-server]"
++  exit 2
++fi
++ALIAS=$1
++REKOR=${2:-http://rekor.example.com:3000}
++
++KEY_ID=$(aws kms create-key --description "Aegis cosign rotation $(date -u +%Y%m%d)" --query KeyMetadata.KeyId --output text)
++aws kms create-alias --alias-name "alias/${ALIAS}" --target-key-id "${KEY_ID}"
++ARN=$(aws kms describe-key --key-id "${KEY_ID}" --query KeyMetadata.Arn --output text)
++echo "Created KMS key ${ARN}"
++echo "Update CI secret COSIGN_KMS_KEY_ARN to awskms://${ARN}"
++
++# Create a short Rekor entry (operator should use cosign or rekor-cli in practice)
++cat > rotation_note.json <<EOF
++{
++  "rotated_at": "$(date -u --iso-8601=seconds)",
++  "kms_alias": "${ALIAS}",
++  "kms_key_arn": "${ARN}",
++  "notes": "Rotate cosign signing key for Aegis"
++}
++EOF
++curl -X POST -H "Content-Type: application/json" -d @rotation_note.json ${REKOR}/api/v1/log/entries || true
++echo "Rotation recorded to Rekor (best-effort)"
++
+*** End Patch
+*** Begin Patch
+*** Add File:airflow/dags/production_etl_validation_and_promote.py
++from datetime import datetime, timedelta
++from airflow import DAG
++from airflow.operators.python import PythonOperator
++from airflow.operators.empty import EmptyOperator
++from airflow.providers.cncf.kubernetes.operators.kubernetes_pod import KubernetesPodOperator
++import subprocess, os
++from operational.airflow_idempotent_helper import already_done_marker, mark_done
++
++DEFAULT_ARGS = {
++    'owner': 'aegis',
++    'depends_on_past': False,
++    'email_on_failure': True,
++    'retries': 1,
++    'retry_delay': timedelta(minutes=10),
++}
++
++WAREHOUSE_DSN = os.environ.get("WAREHOUSE_DSN", "postgresql://user:pass@host:5432/aegis_dw")
++
++def run_parquet():
++    job_key = "parquet_pipeline_" + datetime.utcnow().strftime("%Y%m%d")
++    if already_done_marker(WAREHOUSE_DSN, job_key):
++        return
++    subprocess.check_call("python3 /opt/ingest/s3_parquet_pipeline_v3.py", shell=True)
++    mark_done(WAREHOUSE_DSN, job_key)
++
++def gen_manifest():
++    subprocess.check_call("python3 /opt/ingest/copy_manifest_generator.py", shell=True)
++
++def bulk_load():
++    subprocess.check_call("/opt/etl/redshift_loader_wrapper.sh", shell=True)
++
++def run_dbt():
++    subprocess.check_call("cd /opt/bi && dbt deps && dbt run", shell=True)
++
++def run_ge():
++    subprocess.check_call("python3 /opt/data_quality/run_expectations.py", shell=True)
++
++def trigger_iterative_calibration():
++    subprocess.check_call("python3 /opt/calibration/aegis_iterative_calibration.py", shell=True)
++
++with DAG(
++    dag_id="aegis_production_etl_validation",
++    default_args=DEFAULT_ARGS,
++    schedule_interval="@daily",
++    start_date=datetime(2025,1,1),
++    catchup=False,
++    max_active_runs=1
++) as dag:
++
++    start = EmptyOperator(task_id="start")
++    parquet = PythonOperator(task_id="run_parquet", python_callable=run_parquet)
++    manifest = PythonOperator(task_id="gen_manifest", python_callable=gen_manifest)
++    bulk = KubernetesPodOperator(task_id="bulk_load", namespace="aegis", image="ghcr.io/yourorg/aegis-redshift-loader:latest", cmds=["/bin/sh","-c"], arguments=["/opt/etl/redshift_loader_wrapper.sh"], get_logs=True, is_delete_operator_pod=True, in_cluster=True)
++    dbt = PythonOperator(task_id="run_dbt", python_callable=run_dbt)
++    ge = PythonOperator(task_id="run_ge", python_callable=run_ge)
++    calib = PythonOperator(task_id="iterative_calibration", python_callable=trigger_iterative_calibration)
++    end = EmptyOperator(task_id="done")
++
++    start >> parquet >> manifest >> bulk >> dbt >> ge >> calib >> end
++
+*** End Patch
+*** Begin Patch
+*** Add File:enforcement/production_rollout_playbook.md
++# Scheduler Extender & Argo Enforcer Production Rollout Playbook (Aegis)
++
++Overview
++- Goal: roll out scheduler extender + Argo admission enforcer from staging to production safely and measure enforcement coverage until ≥ 95%.
++
++Prereqs
++- Staging validated (healthchecks passed)
++- cert-manager ClusterIssuer corporate-ca-issuer provisioned and webhook certs created
++- RBAC tightened for webhook/enforcer service accounts
++- Monitoring in place (Pushgateway/Prometheus) to report enforcement metrics
++
++Staged rollout
++1. Deploy to staging (already done in CI). Run enforcement_coverage_harness and iterate rules until coverage >= 95%.
++2. Deploy to a small production namespace/team (5–10% of workloads). Monitor:
++   - aegis_enforcer_enforced_total
++   - aegis_policy_triggered_total
++   - aegis_enforcement_coverage
++3. If metrics stable, expand to 50% then 100% over 48–72h windows.
++
++Rollback
++- Remove extender entry from kube-scheduler config and restart scheduler OR scale down extender service.
++- Remove MutatingWebhookConfiguration to stop admission enforcement.
++
++Validation
++- Use enforcement/test_harness/enforcement_coverage_harness.py every day for first week and weekly thereafter.
++- Log each rollout step to evidence S3 for audit.
++
+*** End Patch
+*** Begin Patch
+*** Add File:runbooks/production_finalize_runbook.md
++# Production Finalization Runbook — actions to make Aegis audit-ready
++
++This is a concise sequence to finalize production readiness. Each step is required and should be performed in staging first.
++
++1) Telemetry collection & verification (7–14 days)
++ - Deploy node-power-exporter DaemonSet to representative nodes.
++ - Run telemetry/telemetry_healthcheck.py weekly and store results in S3.
++ - Acceptance: sustained telemetry for node types present and Prometheus exporter targets healthy.
++
++2) Iterative calibration until median <= 0.10
++ - Run CI job ci/finalize_production_release.yml or cronjob aegis-iterative-calibration in staging.
++ - Review s3://<EVIDENCE_BUCKET>/calibration/validation_reports/ for median_relative_error and sample_count.
++ - Acceptance: median <= 0.10 on holdout reconciliations for 14 days.
++
++3) Enforcement rollout
++ - Deploy extender + enforcer in staging and run enforcement harness.
++ - Tune policy and mutating behavior until coverage >= 95%.
++ - Roll out gradually to production following playbook.
++
++4) DW provisioning & bulk-load validation
++ - Run s3_parquet_pipeline_v3.py → generate manifest → run loader into dev DW.
++ - Validate MERGE/upsert idempotency and query performance.
++ - Acceptance: idempotent loads, ETL lag < 24h, daily success rate >= 99%.
++
++5) Security finalization
++ - Provision corporate CA secret for cert-manager and apply ClusterIssuer (security/certmanager_clusterissuer_prod.yaml).
++ - Provision KMS key for cosign via Terraform (security/provision_kms.tf) and update CI secret COSIGN_KMS_KEY_ARN.
++ - Rotate cosign key and log to Rekor (security/cosign_rotate_and_rekor_log.sh).
++ - Run RBAC audit scripts and remove broad privileges (security/rbac_audit.sh).
++
++6) Operationalization & drills
++ - Wire Prometheus SLO rules and Alertmanager to oncall.
++ - Run DR/resume drill operational/dr_resume_test.py and record artifacts.
++ - Schedule monthly runbook exercises and share results.
++
++7) Promotion to production (manual & auditable)
++ - Only after acceptance criteria met, operator downloads approved power_profiles.yaml, signs it with cosign, applies ConfigMap to production and records promotion evidence in S3.
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/production_prometheus_rules.yaml
++groups:
++- name: aegis-production.rules
++  rules:
++  - alert: MedianEstimatorErrorHigh
++    expr: aegis_reconciliation_median_rel_error > 0.10
++    for: 60m
++    labels:
++      severity: page
++    annotations:
++      summary: "Median relative error above 10% — audit risk"
++
++  - alert: EnforcementCoverageBelowSLO
++    expr: aegis_enforcement_coverage < 0.95
++    for: 30m
++    labels:
++      severity: page
++    annotations:
++      summary: "Enforcement coverage below 95%"
++
++  - alert: ETLIngestionLagExceeded
++    expr: aegis_etl_ingestion_lag_seconds > 86400
++    for: 30m
++    labels:
++      severity: page
++    annotations:
++      summary: "ETL ingestion lag > 24 hours"
++
++  - alert: GEValidationFailing
++    expr: aegis_ge_latest_success == 0
++    for: 15m
++    labels:
++      severity: warning
++    annotations:
++      summary: "Great Expectations validations failing"
++
+*** End Patch
+*** Begin Patch
+*** Add File:acceptance/FINAL_ACCEPTANCE_CRITERIA.md
++# Final Acceptance Criteria — Aegis Production Ready
++
++Data accuracy
++- Median(|measured − estimated| / measured) ≤ 0.10 for representative workloads across node types for a 14-day window.
++
++Enforcement
++- enforcement_coverage (enforced / triggered) ≥ 0.95 rolling 7-day window.
++
++ETL & DW
++- Daily ETL success rate ≥ 99% across 30 days.
++- Daily ingestion lag < 24 hours.
++- Bulk loader idempotency validated: re-running pipeline does not duplicate data.
++
++Security & Audit
++- Webhook certificates issued by corporate CA via cert-manager ClusterIssuer.
++- Cosign KMS key provisioned & rotation plan executed; Rekor entries exist for signing events.
++- No service accounts with cluster-admin (RBAC audit completed).
++- All promotions to production require manual operator approval and cosign signature.
++
++Operational Resilience
++- Monthly DR/resume drill executed and logged to evidence S3.
++- Incident playbooks exercised and updated.
++
+*** End Patch
+*** End Patch

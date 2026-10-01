@@ -1,0 +1,626 @@
+*** Begin Patch
+*** Add File: scripts/package_and_attest_cosign.sh
++#!/usr/bin/env bash
++#
++# Produce DSSE attestation and Rekor entry using cosign (keyless preferred),
++# fall back to Vault-transit signing if cosign keyless is not available.
++#
++# Usage:
++#   OBJECT_STORE_BUCKET=... REKOR_URL=... ./scripts/package_and_attest_cosign.sh <model_dir> <artifact_out_path>
++set -euo pipefail
++
++MODEL_DIR="${1:-}"
++OUT_TAR="${2:-}"
++
++if [ -z "$MODEL_DIR" ] || [ -z "$OUT_TAR" ]; then
++  echo "Usage: $0 <model_dir> <artifact_out_path>"
++  exit 2
++fi
++
++if [ ! -d "$MODEL_DIR" ]; then
++  echo "Model dir not found: $MODEL_DIR" >&2
++  exit 3
++fi
++
++TMPDIR=$(mktemp -d)
++trap 'rm -rf "$TMPDIR"' EXIT
++
++echo "Creating deterministic archive..."
++if [ -x scripts/make_deterministic_archive.py ]; then
++  python3 scripts/make_deterministic_archive.py "$MODEL_DIR" "$OUT_TAR"
++else
++  find "$MODEL_DIR" -type f | sort > "$TMPDIR/files.list"
++  tar --sort=name --mtime='UTC 2020-01-01' -czf "$OUT_TAR" -T "$TMPDIR/files.list"
++fi
++
++echo "Computing digest..."
++DIGEST_B64=$(openssl dgst -sha256 -binary "$OUT_TAR" | base64 -w 0)
++echo "digest: $DIGEST_B64"
++
++SIGJSON="${OUT_TAR}.sig.json"
++ATTEST="${OUT_TAR}.attestation.json"
++REKOR_RESP="${OUT_TAR}.rekor.json"
++SBOM="${OUT_TAR}.sbom.json"
++
++# Prefer cosign keyless signing (will upload to Rekor)
++if command -v cosign >/dev/null 2>&1; then
++  echo "Attempting cosign keyless sign (this requires OIDC available, e.g. GitHub Actions or keyless env)..."
++  # Use cosign to create a DSSE attestation (experimental attestation command)
++  # We will sign the raw artifact (blob) and create a DSSE envelope locally.
++  set +e
++  COSIGN_REKOR_OPTS=()
++  if [ -n "${REKOR_URL:-}" ]; then
++    COSIGN_REKOR_OPTS+=(--rekor-url "${REKOR_URL}")
++  fi
++  # keyless sign the blob; cosign will attempt OIDC if running in a supported environment.
++  cosign sign-blob --yes "${COSIGN_REKOR_OPTS[@]}" "$OUT_TAR" > "$TMPDIR/cosign_sign.out" 2>&1
++  COSIGN_EXIT=$?
++  set -e
++  if [ $COSIGN_EXIT -eq 0 ]; then
++    echo "cosign sign-blob completed. Extracting signature..."
++    # cosign prints signature metadata; use cosign to generate signature file
++    cosign sign-blob --output-signature "$TMPDIR/sig.b64" "$OUT_TAR" || true
++    if [ -f "$TMPDIR/sig.b64" ]; then
++      base64 -d "$TMPDIR/sig.b64" > "$TMPDIR/sig.bin" || true
++      jq -n --arg sig "$(base64 -w0 "$TMPDIR/sig.bin")" '{data:{signature:$sig}}' > "$SIGJSON"
++    else
++      # fallback create a minimal sig json from cosign output
++      jq -n --arg out "$(sed -n '1,200p' $TMPDIR/cosign_sign.out)" '{data:{cosign_output:$out}}' > "$SIGJSON"
++    fi
++    # Create minimal DSSE-like attestation referencing cosign
++    jq -n --arg art "$(basename "$OUT_TAR")" --arg d "$DIGEST_B64" --arg sigjson "$(jq -c . "$SIGJSON")" \
++      '{type:"dsse", subject:{artifact:$art,digest:$d}, signing:{method:"cosign-keyless"}, signature_json:( $sigjson|fromjson )}' > "$ATTEST"
++    echo "Attestation written to $ATTEST"
++    # If cosign/rekor recorded an entry, attempt to capture response (best effort)
++    if [ -n "${REKOR_URL:-}" ]; then
++      # The cosign sign-blob call may have uploaded to Rekor; we cannot easily get UUID here without cosign internals.
++      echo "{}" > "$REKOR_RESP" || true
++    fi
++  else
++    echo "cosign keyless signing failed or not available (output below):"
++    sed -n '1,200p' "$TMPDIR/cosign_sign.out" || true
++  fi
++fi
++
++# If cosign didn't produce a signature file, fallback to Vault transit (existing flow)
++if [ ! -f "$SIGJSON" ]; then
++  if [ -n "${VAULT_ADDR:-}" ] && [ -n "${VAULT_TOKEN:-}" ]; then
++    echo "Falling back to Vault transit signing..."
++    VAULT_ADDR="${VAULT_ADDR%/}"
++    SIGN_JSON=$(curl -sS --header "X-Vault-Token: $VAULT_TOKEN" --request POST --data "{\"input\":\"${DIGEST_B64}\"}" "${VAULT_ADDR}/v1/transit/sign/aegis-cosign")
++    echo "$SIGN_JSON" > "$SIGJSON"
++    jq -n --arg art "$(basename "$OUT_TAR")" --arg d "$DIGEST_B64" --argjson s "$(jq -c . "$SIGJSON")" \
++      '{type:"dsse", subject:{artifact:$art,digest:$d}, signing:{method:"vault-transit"}, signature_json:$s}' > "$ATTEST"
++    echo "Attestation written to $ATTEST"
++  else
++    echo "No signing mechanism succeeded (no cosign or Vault token). Aborting." >&2
++    exit 5
++  fi
++fi
++
++# Generate SBOM (syft) if available
++if command -v syft >/dev/null 2>&1; then
++  echo "Generating SBOM via syft..."
++  syft dir:"$MODEL_DIR" -o json > "$SBOM" || true
++  echo "SBOM -> $SBOM"
++else
++  echo "syft not present; skipping SBOM"
++fi
++
++# Upload artifacts to object store
++if [ -n "${OBJECT_STORE_BUCKET:-}" ]; then
++  PREFIX="model-archives/$(basename "$OUT_TAR")"
++  echo "Uploading artifact and evidence to s3://${OBJECT_STORE_BUCKET}/${PREFIX}/"
++  aws s3 cp "$OUT_TAR" "s3://${OBJECT_STORE_BUCKET}/${PREFIX}/$(basename "$OUT_TAR")"
++  [ -f "$SIGJSON" ] && aws s3 cp "$SIGJSON" "s3://${OBJECT_STORE_BUCKET}/${PREFIX}/$(basename "$SIGJSON")" || true
++  [ -f "$ATTEST" ] && aws s3 cp "$ATTEST" "s3://${OBJECT_STORE_BUCKET}/${PREFIX}/$(basename "$ATTEST")" || true
++  [ -f "$SBOM" ] && aws s3 cp "$SBOM" "s3://${OBJECT_STORE_BUCKET}/${PREFIX}/$(basename "$SBOM")" || true
++  [ -f "$REKOR_RESP" ] && aws s3 cp "$REKOR_RESP" "s3://${OBJECT_STORE_BUCKET}/${PREFIX}/$(basename "$REKOR_RESP")" || true
++else
++  echo "OBJECT_STORE_BUCKET not set; artifacts left in workspace"
++fi
++
++echo "Package + attest complete."
++
+*** End Patch
+*** Begin Patch
+*** Add File: .github/workflows/e2e_staging.yml
++name: E2E staging validation (Argo pipeline + artifact evidence)
++
++on:
++  workflow_dispatch:
++    inputs:
++      argo_workflow_manifest:
++        description: 'Path to Argo workflow YAML to submit (relative to repo root)'
++        required: false
++      artifact_prefix:
++        description: 'S3 prefix to check for artifacts (default: model-archives/)'
++        required: false
++
++jobs:
++  run-e2e:
++    runs-on: ubuntu-latest
++    permissions:
++      id-token: write
++      contents: read
++    env:
++      OBJECT_STORE_BUCKET: ${{ secrets.OBJECT_STORE_BUCKET }}
++      KUBECONFIG: ${{ secrets.KUBECONFIG }}
++      ARGO_NS: "aegis"
++      REKOR_URL: ${{ secrets.REKOR_URL }}
++    steps:
++      - uses: actions/checkout@v4
++      - name: Install tools
++        run: |
++          sudo apt-get update
++          sudo apt-get install -y jq curl
++          pip install --upgrade pip
++          pip install boto3
++      - name: Submit Argo workflow (optional)
++        if: ${{ github.event.inputs.argo_workflow_manifest != '' }}
++        run: |
++          # kubectl/argo must be configured via KUBECONFIG secret; here we assume it's available
++          kubectl apply -f "${{ github.event.inputs.argo_workflow_manifest }}" -n $ARGO_NS
++          # wait for workflow creation
++          sleep 5
++      - name: Wait for artifact and verify evidence
++        run: |
++          PREFIX="${{ github.event.inputs.artifact_prefix || 'model-archives/' }}"
++          BUCKET="${OBJECT_STORE_BUCKET}"
++          echo "Looking for artifacts under s3://${BUCKET}/${PREFIX}"
++          # list latest object
++          OBJ=$(aws s3 ls "s3://${BUCKET}/${PREFIX}" --recursive | sort | tail -n 1 | awk '{print $4}')
++          if [ -z "$OBJ" ]; then
++            echo "No artifacts found under prefix $PREFIX" >&2
++            exit 2
++          fi
++          echo "Found artifact: $OBJ"
++          # Check related evidence files
++          for ext in ".sig.json" ".attestation.json" ".sbom.json"; do
++            KEY="${OBJ}${ext}"
++            if aws s3 ls "s3://${BUCKET}/${KEY}" >/dev/null 2>&1; then
++              echo "Found evidence: $KEY"
++            else
++              echo "Missing expected evidence: $KEY" >&2
++              exit 3
++            fi
++          done
++          # (Optional) Query Rekor if configured
++          if [ -n "${REKOR_URL:-}" ]; then
++            echo "Attempting Rekor check (best-effort)..."
++            # No canonical uuid stored; skip strict check but ensure Rekor is reachable
++            curl -sSf "${REKOR_URL%/}/api/v1/log" >/dev/null || echo "Rekor unreachable"
++          fi
++          echo "E2E validation basic checks passed."
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/e2e_validate.sh
++#!/usr/bin/env bash
++# Local helper to validate artifacts after running Argo pipeline in staging
++set -euo pipefail
++
++BUCKET="${OBJECT_STORE_BUCKET:-}"
++PREFIX="${1:-model-archives/}"
++
++if [ -z "$BUCKET" ]; then
++  echo "Set OBJECT_STORE_BUCKET env var"
++  exit 2
++fi
++
++echo "Listing artifacts under s3://$BUCKET/$PREFIX"
++LATEST=$(aws s3 ls "s3://$BUCKET/$PREFIX" --recursive | sort | tail -n 1 | awk '{print $4}')
++echo "Latest: $LATEST"
++if [ -z "$LATEST" ]; then
++  echo "No artifacts" >&2
++  exit 3
++fi
++
++for ext in ".sig.json" ".attestation.json" ".sbom.json"; do
++  if aws s3 ls "s3://$BUCKET/${LATEST}${ext}" >/dev/null 2>&1; then
++    echo "Found ${LATEST}${ext}"
++  else
++    echo "Missing ${LATEST}${ext}" >&2
++    exit 4
++  fi
++done
++
++echo "Basic evidence presence check OK"
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/gatekeeper_remediate.py
++#!/usr/bin/env python3
++"""
++Scan repo for k8s manifests (yaml) that define PodTemplates/Pod specs without a verify initContainer
++or without a cosign-public-key volume. Emits a report and a suggested patch snippet for each file.
++"""
++import sys, yaml, os
++from pathlib import Path
++
++SKIP_DIRS = {".git", "vendor", "node_modules", "charts"}
++
++def load_yaml_documents(path):
++    text = path.read_text()
++    docs = []
++    for doc in yaml.safe_load_all(text):
++        if doc:
++            docs.append(doc)
++    return docs
++
++def pod_spec_from_doc(doc):
++    kind = doc.get("kind","")
++    if kind in ("Pod", "Deployment", "StatefulSet", "DaemonSet"):
++        # Pod: spec is doc.spec
++        if kind == "Pod":
++            return doc.get("spec",{})
++        else:
++            tmpl = doc.get("spec",{}).get("template",{})
++            return tmpl.get("spec",{})
++    return None
++
++def needs_remediation(spec):
++    if not spec:
++        return False, "no-spec"
++    initc = spec.get("initContainers", [])
++    has_verify = any("verify" in (c.get("name","").lower()) for c in initc)
++    vols = spec.get("volumes", [])
++    has_cosign = any(v.get("secret",{}).get("secretName","") == "cosign-public-key" for v in vols)
++    return (not (has_verify and has_cosign)), {"has_verify":has_verify, "has_cosign":has_cosign}
++
++def main(root="."):
++    root = Path(root)
++    files = list(root.rglob("*.yaml")) + list(root.rglob("*.yml"))
++    report = []
++    for f in files:
++        parts = set(f.parts)
++        if parts & SKIP_DIRS:
++            continue
++        try:
++            docs = load_yaml_documents(f)
++        except Exception:
++            continue
++        for doc in docs:
++            spec = pod_spec_from_doc(doc)
++            res, info = needs_remediation(spec)
++            if res:
++                report.append((str(f), doc.get("kind",""), doc.get("metadata",{}).get("name",""), info))
++    if not report:
++        print("No remediation needed")
++        return 0
++    print("Remediation suggestions:")
++    for fn, kind, name, info in report:
++        print(f"- {fn} ({kind}/{name}): {info}")
++        print("  Suggested initContainer snippet:")
++        print("""\
++    initContainers:
++      - name: verify-and-fetch
++        image: ghcr.io/rsinghunjan/aegis-tools:latest
++        command: ["/bin/sh","-c"]
++        args:
++          - /opt/aegis/verify_and_fetch.sh "s3://REPLACE_WITH_BUCKET/model-archives/<artifact>" /models
++        volumeMounts:
++          - name: model-volume
++            mountPath: /models
++          - name: cosign-pub
++            mountPath: /etc/cosign
++            readOnly: true
++    volumes:
++      - name: cosign-pub
++        secret:
++          secretName: cosign-public-key""")
++    return 0
++
++if __name__ == "__main__":
++    raise SystemExit(main(sys.argv[1] if len(sys.argv)>1 else "."))
++
+*** End Patch
+*** Begin Patch
+*** Add File: argo/workflows/promote_model.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: aegis-promote-
++  namespace: aegis
++spec:
++  entrypoint: promote
++  templates:
++    - name: promote
++      inputs:
++        parameters:
++          - name: artifact-s3-key
++      steps:
++        - - name: deploy-canary
++            template: deploy-canary
++    - name: deploy-canary
++      container:
++        image: bitnami/kubectl:latest
++        command: [sh, -c]
++        args:
++          - |
++            ART="${{inputs.parameters.artifact-s3-key}}"
++            echo "Promote workflow: would deploy artifact $ART to canary namespace (aegis-canary)"
++            # Example: patch a Deployment or create KServe InferenceService referencing the new artifact
++            # In production: implement templating to update manifest with artifact URI and apply
++            exit 0
++
+*** End Patch
+*** Begin Patch
+*** Add File: governance/api_v2.py
++#!/usr/bin/env python3
++"""
++Governance API v2
++- Adds API key auth, audit trail, presigned evidence URLs, and triggers Argo promote workflow via kubectl/argo.
++"""
++from flask import Flask, jsonify, request
++import os, sqlite3, subprocess, boto3, json, shlex, time
++
++app = Flask(__name__)
++S3 = boto3.client("s3")
++BUCKET = os.environ.get("OBJECT_STORE_BUCKET")
++DB = os.environ.get("GOV_DB","./governance.db")
++API_KEY = os.environ.get("GOV_API_KEY","changeme")
++
++def init_db():
++    conn = sqlite3.connect(DB)
++    c = conn.cursor()
++    c.execute("""CREATE TABLE IF NOT EXISTS approvals (id INTEGER PRIMARY KEY, artifact_key TEXT, approver TEXT, notes TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
++    conn.commit(); conn.close()
++
++init_db()
++
++def require_api_key(req):
++    key = req.headers.get("X-API-KEY","")
++    return key == API_KEY
++
++@app.before_request
++def check_auth():
++    if request.path.startswith("/health"):
++        return
++    if not require_api_key(request):
++        return jsonify({"error":"unauthenticated"}), 401
++
++@app.route("/health")
++def health():
++    return jsonify({"ok": True})
++
++@app.route("/artifacts")
++def list_artifacts():
++    if not BUCKET:
++        return jsonify({"error":"OBJECT_STORE_BUCKET not configured"}), 500
++    prefix = request.args.get("prefix","model-archives/")
++    objs = S3.list_objects_v2(Bucket=BUCKET, Prefix=prefix, MaxKeys=100)
++    items = []
++    for o in objs.get("Contents", []):
++        items.append({"key": o["Key"], "size": o["Size"], "last_modified": o["LastModified"].isoformat()})
++    return jsonify(items)
++
++@app.route("/artifact")
++def artifact_detail():
++    key = request.args.get("key")
++    if not key or not BUCKET:
++        return jsonify({"error":"key and OBJECT_STORE_BUCKET required"}), 400
++    presign = S3.generate_presigned_url("get_object", Params={"Bucket":BUCKET,"Key":key}, ExpiresIn=3600)
++    # try to include related evidence
++    evidence = {}
++    for suffix in [".sig.json", ".attestation.json", ".sbom.json", ".rekor.json"]:
++        k = f"{key}{suffix}"
++        try:
++            S3.head_object(Bucket=BUCKET, Key=k)
++            evidence[suffix] = S3.generate_presigned_url("get_object", Params={"Bucket":BUCKET,"Key":k}, ExpiresIn=3600)
++        except Exception:
++            pass
++    return jsonify({"artifact_url": presign, "evidence": evidence})
++
++@app.route("/approve", methods=["POST"])
++def approve():
++    payload = request.json or {}
++    key = payload.get("artifact_key")
++    approver = payload.get("approver","unknown")
++    notes = payload.get("notes","")
++    if not key:
++        return jsonify({"error":"artifact_key required"}), 400
++    conn = sqlite3.connect(DB)
++    c = conn.cursor()
++    c.execute("INSERT INTO approvals (artifact_key, approver, notes) VALUES (?,?,?)", (key, approver, notes))
++    conn.commit()
++    conn.close()
++    # Trigger Argo promote workflow using 'argo' CLI if available
++    try:
++        cmd = f"argo submit argo/workflows/promote_model.yaml -n aegis -p artifact-s3-key='{shlex.quote(key)}'"
++        print("Running:", cmd)
++        out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT)
++        print(out.decode())
++    except Exception as e:
++        print("Failed to start Argo workflow:", e)
++    return jsonify({"ok": True, "artifact_key": key})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8080")))
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/secret_inventory_improve.py
++#!/usr/bin/env python3
++"""
++Improved secret inventory:
++- Lists GitHub secrets and flags names that match high-risk patterns.
++- Optionally enumerates k8s secrets and warns about long-lived tokens.
++"""
++import argparse, os, requests, subprocess, json, re
++
++HIGH_RISK_PATTERNS = [re.compile(r"(?i)cosign|private_key|secret|token|aws_secret")]
++
++def list_github_secrets(repo, token):
++    url = f"https://api.github.com/repos/{repo}/actions/secrets"
++    headers = {"Authorization": f"token {token}"}
++    r = requests.get(url, headers=headers)
++    r.raise_for_status()
++    return r.json().get("secrets", [])
++
++def list_k8s_secrets(ns):
++    try:
++        out = subprocess.check_output(["kubectl","get","secrets","-n",ns,"-o","json"])
++        data = json.loads(out)
++        return [item["metadata"]["name"] for item in data.get("items",[])]
++    except Exception as e:
++        return {"error": str(e)}
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--repo")
++    ap.add_argument("--namespaces", default="")
++    args = ap.parse_args()
++    if args.repo:
++        token = os.environ.get("GITHUB_TOKEN")
++        if not token:
++            print("GITHUB_TOKEN not set")
++        else:
++            secrets = list_github_secrets(args.repo, token)
++            print("GitHub secrets:")
++            for s in secrets:
++                name = s["name"]
++                risk = any(p.search(name) for p in HIGH_RISK_PATTERNS)
++                print(f" - {name} {'[HIGH RISK]' if risk else ''}")
++    if args.namespaces:
++        for ns in args.namespaces.split(","):
++            print(f"Kubernetes secrets in namespace {ns}:")
++            print(list_k8s_secrets(ns))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: monitoring/prometheus_rules.yml
++groups:
++- name: aegis-alerts
++  rules:
++  - alert: VaultTransitSignSpike
++    expr: increase(vault_transit_sign_total[5m]) > 100
++    for: 5m
++    labels:
++      severity: warning
++    annotations:
++      summary: "Spike in Vault transit sign operations"
++      description: "High number of transit sign operations in last 5m"
++
++  - alert: GatekeeperViolationsHigh
++    expr: sum(gatekeeper_audit_violations) by (namespace) > 10
++    for: 10m
++    labels:
++      severity: warning
++    annotations:
++      summary: "High Gatekeeper violation rate"
++      description: "Gatekeeper audit violations in namespace {{ $labels.namespace }}"
++
+*** End Patch
+*** Begin Patch
+*** Add File: .github/workflows/sbom_sign.yml
++name: Generate SBOM and sign SBOM (cosign keyless)
++
++on:
++  push:
++    paths:
++      - 'training/**'
++      - 'Dockerfile'
++
++jobs:
++  sbom-sign:
++    runs-on: ubuntu-latest
++    permissions:
++      id-token: write
++      contents: read
++    env:
++      IMAGE_NAME: ghcr.io/${{ github.repository }}/aegis-train
++    steps:
++      - uses: actions/checkout@v4
++      - name: Build image
++        run: |
++          docker build -t "${IMAGE_NAME}:$GITHUB_SHA" training/
++          docker push "${IMAGE_NAME}:$GITHUB_SHA"
++      - name: Install syft & cosign
++        run: |
++          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b ~/.local/bin
++          echo "$HOME/.local/bin" >> $GITHUB_PATH
++          curl -sSfL https://raw.githubusercontent.com/sigstore/cosign/main/install.sh | sh -s -- -b ~/.local/bin
++      - name: Generate SBOM
++        run: |
++          syft "${IMAGE_NAME}:$GITHUB_SHA" -o json > sbom.json
++          ls -lh sbom.json
++      - name: Sign SBOM (keyless cosign)
++        run: |
++          cosign sign-blob --output-signature sbom.json.sig --keyless sbom.json || true
++      - name: Upload SBOM artifacts
++        uses: actions/upload-artifact@v4
++        with:
++          name: sbom
++          path: |
++            sbom.json
++            sbom.json.sig
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/pg_restore_test_ext.sh
++#!/usr/bin/env bash
++# Extended restore test: records timing and emits simple metrics to stdout (CI can capture logs)
++set -euo pipefail
++
++S3_BUCKET="${1:-}"
++PREFIX="${2:-backups}"
++PG_VERSION="${3:-15}"
++
++if [ -z "$S3_BUCKET" ]; then
++  echo "Usage: $0 <s3_bucket> <prefix> [pg_version]"
++  exit 2
++fi
++
++start=$(date +%s)
++./scripts/pg_restore_test.sh "$S3_BUCKET" "$PREFIX" "$PG_VERSION"
++end=$(date +%s)
++dur=$((end-start))
++echo "restore_test_duration_seconds $dur"
++
++if [ $dur -gt 1800 ]; then
++  echo "Warning: restore duration exceeds 30 minutes"
++fi
++
+*** End Patch
+*** Begin Patch
+*** Add File: vault/policies/aegis-sign-min.hcl
++# Minimal Vault policy for transit signing role
++path "transit/sign/aegis-cosign" {
++  capabilities = ["update"]
++}
++path "transit/keys/aegis-cosign" {
++  capabilities = ["read"]
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File: docs/E2E_CHECKLIST.md
++````markdown
++# E2E Staging Validation Checklist
++
++1. Prereqs
++   - OBJECT_STORE_BUCKET, REKOR_URL, VAULT_ADDR configured in staging.
++   - Argo Workflows and Argo Events deployed in aegis namespace.
++2. Run pipeline
++   - Submit argo/workflows/train_with_provenance.yaml with image-digest and git-commit set.
++3. Validate artifacts
++   - Run scripts/e2e_validate.sh (sets OBJECT_STORE_BUCKET) or run the GitHub Action e2e_staging.yml.
++   - Confirm artifact exists in S3 and .sig.json, .attestation.json, .sbom.json exist.
++4. Rekor
++   - Confirm Rekor reachable; for cosign keyless signing, cosign will post to Rekor automatically.
++5. Deploy canary
++   - Create cosign-public-key secret in aegis-canary (if using pubkey verification).
++   - Deploy KServe/Triton canary and confirm initContainer verify_and_fetch.sh succeeds.
++6. Governance
++   - Use governance/api_v2.py (set GOV_API_KEY) to list artifacts and approve promotion.
++7. Observability
++   - Ensure Prometheus rules loaded and alerts for Vault transit spikes and Gatekeeper violations are visible.
++
++````markdown
++
+*** End Patch
+*** End Patch

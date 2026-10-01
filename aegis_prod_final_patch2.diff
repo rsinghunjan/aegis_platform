@@ -1,0 +1,667 @@
+diff --git a/scripts/deepspeed_vllm_stress_pipeline.sh b/scripts/deepspeed_vllm_stress_pipeline.sh
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/scripts/deepspeed_vllm_stress_pipeline.sh
+@@ -0,0 +1,260 @@
++#!/usr/bin/env bash
++#
++# Orchestrated large-scale DeepSpeed + vLLM stress pipeline.
++# - Scales DeepSpeed statefulset to target node counts
++# - Runs brief training bursts to exercise NCCL/RDMA
++# - Simulates preemption by deleting a worker pod mid-run and verifies resume
++# - Runs simultaneous vLLM load tests while training is running
++# - Collects logs, nvidia-smi, dmesg, vLLM bench CSVs and bundles artifacts
++# - Optionally uploads artifacts to S3
++#
++# Usage:
++# ./scripts/deepspeed_vllm_stress_pipeline.sh --nodes 4 --rounds 3 --train-seconds 300 --gateway http://gateway:8080/generate --artifact-dir ./artifacts --s3-bucket my-bucket --simulate-preemption true
++
++set -euo pipefail
++
++NAMESPACE="${NAMESPACE:-aegis-ml}"
++STATEFULSET="${STATEFULSET:-deepspeed-trainer}"
++NODES="${NODES:-4}"
++ROUNDS="${ROUNDS:-2}"
++TRAIN_SECONDS="${TRAIN_SECONDS:-300}"
++GATEWAY="${GATEWAY:-http://aegis-inference-gateway.aegis-ml.svc.cluster.local/generate}"
++ARTIFACT_DIR="${ARTIFACT_DIR:-./artifacts}"
++S3_BUCKET="${S3_BUCKET:-}"
++S3_PREFIX="${S3_PREFIX:-aegis/staging}"
++VLLM_CONCURRENCY="${VLLM_CONCURRENCY:-32}"
++VLLM_REQUESTS="${VLLM_REQUESTS:-800}"
++SIMULATE_PREEMPTION="${SIMULATE_PREEMPTION:-false}"
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --nodes) NODES="$2"; shift 2;;
++    --rounds) ROUNDS="$2"; shift 2;;
++    --train-seconds) TRAIN_SECONDS="$2"; shift 2;;
++    --gateway) GATEWAY="$2"; shift 2;;
++    --artifact-dir) ARTIFACT_DIR="$2"; shift 2;;
++    --s3-bucket) S3_BUCKET="$2"; shift 2;;
++    --s3-prefix) S3_PREFIX="$2"; shift 2;;
++    --concurrency) VLLM_CONCURRENCY="$2"; shift 2;;
++    --requests) VLLM_REQUESTS="$2"; shift 2;;
++    --simulate-preemption) SIMULATE_PREEMPTION="$2"; shift 2;;
++    --namespace) NAMESPACE="$2"; shift 2;;
++    *) echo "Unknown arg $1"; exit 1;;
++  esac
++done
++
++mkdir -p "$ARTIFACT_DIR"
++
++echo "[stress] Starting harness: nodes=$NODES rounds=$ROUNDS train_seconds=$TRAIN_SECONDS"
++for r in $(seq 1 "$ROUNDS"); do
++  echo "[stress] Round $r/$ROUNDS -- scaling statefulset to $NODES replicas"
++  kubectl -n "$NAMESPACE" scale statefulset "$STATEFULSET" --replicas="$NODES"
++  kubectl -n "$NAMESPACE" rollout status statefulset/"$STATEFULSET" --timeout=20m || true
++
++  HEAD_POD="${STATEFULSET}-0"
++  echo "[stress] Launching a short training burst on head pod ($HEAD_POD)"
++  # Run training in background on head pod (assumes the container image has train_finetune entrypoint)
++  kubectl -n "$NAMESPACE" exec "$HEAD_POD" -- bash -lc "nohup python3 /app/scripts/train_finetune.py --data_dir /workspace/data --output_dir /workspace/checkpoints --epochs 1 > /workspace/train_run.log 2>&1 & echo \$! > /workspace/train_pid"
++
++  # Start vLLM load test in background
++  echo "[stress] Starting vLLM load test concurrently"
++  python3 scripts/vllm_perf_benchmark.py --gateway "$GATEWAY" --concurrency "$VLLM_CONCURRENCY" --requests "$VLLM_REQUESTS" --out-csv "${ARTIFACT_DIR}/vllm_round_${r}.csv" &
++  VLLM_PID=$!
++
++  # Optionally simulate preemption: delete a non-head pod after a short delay
++  if [[ "$SIMULATE_PREEMPTION" == "true" ]]; then
++    sleep 20
++    WORKER_POD=$(kubectl -n "$NAMESPACE" get pods -l app=deepspeed-trainer -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -v "${STATEFULSET}-0" | head -n1 || true)
++    if [[ -n "$WORKER_POD" ]]; then
++      echo "[stress] Simulating preemption by deleting pod $WORKER_POD"
++      kubectl -n "$NAMESPACE" delete pod "$WORKER_POD" --grace-period=0 --force || true
++    fi
++  fi
++
++  echo "[stress] Waiting ${TRAIN_SECONDS}s for training & load to run"
++  sleep "$TRAIN_SECONDS"
++
++  # Attempt to check resume: see if newer checkpoints exist on head or other pods
++  echo "[stress] Collecting artifacts for round $r"
++  ROUND_DIR="${ARTIFACT_DIR}/round_${r}"
++  mkdir -p "$ROUND_DIR"
++  pods=$(kubectl -n "$NAMESPACE" get pods -l app=deepspeed-trainer -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
++  for p in $pods; do
++    echo "[stress] - collecting logs for pod $p"
++    kubectl -n "$NAMESPACE" logs "$p" --tail=2000 > "${ROUND_DIR}/${p}.logs.txt" || true
++    kubectl -n "$NAMESPACE" exec "$p" -- nvidia-smi -q -x > "${ROUND_DIR}/${p}.nvidia.xml" 2>/dev/null || true
++    kubectl -n "$NAMESPACE" exec "$p" -- dmesg | tail -n 500 > "${ROUND_DIR}/${p}.dmesg.txt" 2>/dev/null || true
++    # copy train run log if present
++    kubectl -n "$NAMESPACE" exec "$p" -- bash -lc 'if [ -f /workspace/train_run.log ]; then cat /workspace/train_run.log; fi' > "${ROUND_DIR}/${p}.train_run.log" 2>/dev/null || true
++  done
++
++  if kill -0 "$VLLM_PID" 2>/dev/null; then
++    wait "$VLLM_PID" || true
++  fi
++
++  echo "[stress] Round $r complete"
++  sleep 10
++done
++
++BUNDLE_NAME="deepspeed_vllm_stress_$(date +%Y%m%d%H%M%S).tar.gz"
++tar -czf "$BUNDLE_NAME" -C "$ARTIFACT_DIR" .
++echo "[stress] Created artifact bundle $BUNDLE_NAME"
++
++if [[ -n "$S3_BUCKET" && -x "$(command -v aws)" ]]; then
++  KEY="${S3_PREFIX%/}/${BUNDLE_NAME}"
++  echo "[stress] Uploading bundle to s3://${S3_BUCKET}/${KEY}"
++  aws s3 cp "$BUNDLE_NAME" "s3://${S3_BUCKET}/${KEY}"
++fi
++
++echo "[stress] Done"
++exit 0
++
+diff --git a/.github/workflows/deepspeed_vllm_scale_dispatch.yml b/.github/workflows/deepspeed_vllm_scale_dispatch.yml
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/.github/workflows/deepspeed_vllm_scale_dispatch.yml
+@@ -0,0 +1,220 @@
++name: Dispatch DeepSpeed+vLLM Scale Test
++
++on:
++  workflow_dispatch:
++    inputs:
++      nodes:
++        description: "Number of nodes"
++        required: false
++        default: "4"
++      rounds:
++        description: "Number of rounds"
++        required: false
++        default: "2"
++      simulate_preemption:
++        description: "Simulate preemption (true/false)"
++        required: false
++        default: "true"
++
++jobs:
++  scale-test:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run stress pipeline (requires KUBECONFIG_STAGING + AWS creds in secrets)
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG_STAGING || '' }}
++          S3_BUCKET: ${{ secrets.ARTIFACT_S3_BUCKET || '' }}
++          S3_PREFIX: "aegis/staging"
++        run: |
++          if [ -z "$KUBECONFIG" ]; then
++            echo "KUBECONFIG not provided; skipping run. Use a self-hosted runner with cluster access."
++            exit 0
++          fi
++          ./scripts/deepspeed_vllm_stress_pipeline.sh --nodes ${{ github.event.inputs.nodes }} --rounds ${{ github.event.inputs.rounds }} --train-seconds 300 --gateway http://aegis-inference-gateway.aegis-ml.svc.cluster.local/generate --artifact-dir ./artifacts --s3-bucket "$S3_BUCKET" --s3-prefix "$S3_PREFIX" --simulate-preemption ${{ github.event.inputs.simulate_preemption }}
++      - name: Upload artifacts
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: deepspeed-vllm-stress-artifacts
++          path: artifacts || .
++
+diff --git a/scripts/vault_kms_multienv_rotation.py b/scripts/vault_kms_multienv_rotation.py
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/scripts/vault_kms_multienv_rotation.py
+@@ -0,0 +1,360 @@
++#!/usr/bin/env python3
++"""
++Vault rotation integrated with KMS/CA across multiple environments.
++ - For each target environment/namespace:
++    * Request new key material from KMS/CA (or generate locally)
++    * Write into Vault KV v2 under environment path (e.g. secret/data/aegis/<env>/<app>)
++    * Notify services (webhook or rollout annotation)
++    * Verify injector propagation (checks /vault/secrets in pods)
++    * Delete any matching plaintext k8s secrets after successful verification
++    * Write audit events to decision_log for every step
++
++This is intended to be run from a privileged operator job (CronJob or manual).
++"""
++import os
++import argparse
++import requests
++import subprocess
++import json
++import time
++from typing import List, Tuple
++
++try:
++    from tools.decisionlog_client import insert_decision
++except Exception:
++    def insert_decision(agent, action, payload, evidence):
++        print("decision_log stub:", agent, action, payload, evidence)
++        return None
++
++VAULT_ADDR = os.environ.get("VAULT_ADDR")
++VAULT_TOKEN = os.environ.get("VAULT_TOKEN")
++KMS_URL = os.environ.get("KMS_URL")  # optional external KMS/CA endpoint
++NOTIFY_WEBHOOK = os.environ.get("NOTIFY_WEBHOOK")
++
++def request_from_kms(kms_url: str) -> Tuple[str,str]:
++    try:
++        r = requests.post(kms_url.rstrip("/") + "/generate_keypair", timeout=10)
++        r.raise_for_status()
++        data = r.json()
++        return data.get("private_key"), data.get("public_key")
++    except Exception:
++        return None, None
++
++def generate_local_keypair(bits=2048) -> Tuple[str,str]:
++    priv_path = "/tmp/aegis_priv.pem"
++    pub_path = "/tmp/aegis_pub.pem"
++    subprocess.check_call(["openssl", "genrsa", "-out", priv_path, str(bits)])
++    subprocess.check_call(["openssl", "rsa", "-in", priv_path, "-pubout", "-out", pub_path)])
++    with open(priv_path, "r") as fh: priv = fh.read()
++    with open(pub_path, "r") as fh: pub = fh.read()
++    os.unlink(priv_path); os.unlink(pub_path)
++    return priv, pub
++
++def vault_write(path: str, data: dict):
++    url = f"{VAULT_ADDR}/v1/{path}"
++    headers = {"X-Vault-Token": VAULT_TOKEN}
++    r = requests.post(url, headers=headers, json={"data": data}, timeout=10)
++    r.raise_for_status()
++    return r.json()
++
++def notify(webhook: str, payload: dict):
++    try:
++        r = requests.post(webhook, json=payload, timeout=5)
++        r.raise_for_status()
++        return True
++    except Exception:
++        return False
++
++def verify_injection(namespace: str, expected_files: List[str], timeout: int = 120) -> bool:
++    end = time.time() + timeout
++    while time.time() < end:
++        pods = subprocess.check_output(["kubectl","-n",namespace,"get","pods","-o","jsonpath={.items[*].metadata.name}"]).decode().strip().split()
++        all_ok = True
++        for p in pods:
++            try:
++                phase = subprocess.check_output(["kubectl","-n",namespace,"get","pod",p,"-o","jsonpath={.status.phase}"]).decode().strip()
++                if phase != "Running":
++                    all_ok = False; break
++                if subprocess.call(["kubectl","-n",namespace,"exec",p,"--","test","-d","/vault/secrets"]) != 0:
++                    all_ok = False; break
++                for f in expected_files:
++                    if subprocess.call(["kubectl","-n",namespace,"exec",p,"--","test","-f",f"/vault/secrets/{f}"]) != 0:
++                        all_ok = False; break
++            except Exception:
++                all_ok = False; break
++        if all_ok:
++            return True
++        time.sleep(5)
++    return False
++
++def delete_plaintext_secret(namespace: str, secret_name: str, dry_run: bool = True) -> dict:
++    if dry_run:
++        return {"status": "dry-run", "detail": f"would delete {namespace}/{secret_name}"}
++    try:
++        subprocess.check_call(["kubectl","-n",namespace,"delete","secret",secret_name])
++        return {"status":"deleted", "secret": f"{namespace}/{secret_name}"}
++    except Exception as e:
++        return {"status":"failed", "error": str(e)}
++
++def rotate_for_env(env: str, vault_base: str, k8s_secret: str, verify_files: List[str], namespaces: List[str], dry_run: bool):
++    # obtain material
++    priv, pub = (None, None)
++    if KMS_URL:
++        priv, pub = request_from_kms(KMS_URL)
++    if not priv:
++        # fallback (staging only)
++        priv, pub = generate_local_keypair()
++
++    vault_path = f"{vault_base}/{env}"
++    payload = {"private_key": priv, "public_key": pub, "rotated_at": int(time.time())}
++    insert_decision(agent="aegis-vault-rotation", action="rotate_start", payload={"env": env, "vault_path": vault_path}, evidence={})
++    if not dry_run:
++        vault_write(vault_path, payload)
++    if NOTIFY_WEBHOOK and not dry_run:
++        notify(NOTIFY_WEBHOOK, {"env": env, "vault_path": vault_path, "rotated_at": payload["rotated_at"]})
++
++    # verify injection across namespaces
++    verified = True
++    for ns in namespaces:
++        ok = verify_injection(ns, verify_files, timeout=180)
++        verified = verified and ok
++        insert_decision(agent="aegis-vault-rotation", action="verify", payload={"env":env,"namespace":ns}, evidence={"ok": ok})
++
++    deletion_result = None
++    if verified:
++        deletion_result = delete_plaintext_secret(namespaces[0], k8s_secret, dry_run=dry_run)
++        insert_decision(agent="aegis-vault-rotation", action="delete_plaintext_secret", payload={"secret":k8s_secret}, evidence=deletion_result)
++    else:
++        insert_decision(agent="aegis-vault-rotation", action="delete_aborted", payload={"env":env}, evidence={"verified":verified})
++
++    return {"env": env, "verified": verified, "deletion_result": deletion_result}
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--vault-base", required=True, help="Vault base path e.g. secret/data/aegis")
++    p.add_argument("--envs", required=True, help="comma-separated environments to rotate e.g. staging,production")
++    p.add_argument("--k8s-secret", required=True, help="k8s plaintext secret to delete after verify (per env)")
++    p.add_argument("--verify-files", required=True, help="comma-separated expected files in /vault/secrets")
++    p.add_argument("--namespaces", required=True, help="comma-separated namespaces to verify")
++    p.add_argument("--dry-run", action="store_true")
++    args = p.parse_args()
++
++    envs = [e.strip() for e in args.envs.split(",")]
++    verify_files = [f.strip() for f in args.verify_files.split(",")]
++    namespaces = [n.strip() for n in args.namespaces.split(",")]
++
++    reports = []
++    for env in envs:
++        print(f"[rotate] Rotating for env={env}")
++        r = rotate_for_env(env, args.vault_base, args.k8s_secret, verify_files, namespaces, dry_run=args.dry_run)
++        reports.append(r)
++
++    report_file = f"vault_multienv_rotate_report_{int(time.time())}.json"
++    with open(report_file, "w") as fh:
++        json.dump(reports, fh, indent=2)
++    print("[rotate] wrote report:", report_file)
++    return 0
++
++if __name__ == "__main__":
++    import sys
++    sys.exit(main())
++
+diff --git a/.github/workflows/vault_multienv_rotate.yml b/.github/workflows/vault_multienv_rotate.yml
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/.github/workflows/vault_multienv_rotate.yml
+@@ -0,0 +1,200 @@
++name: Vault Multi-Env Rotation (dispatch)
++
++on:
++  workflow_dispatch:
++    inputs:
++      vault_base:
++        description: "Vault base path (secret/data/aegis)"
++        required: true
++      envs:
++        description: "Comma-separated envs"
++        required: true
++      k8s_secret:
++        description: "Plaintext k8s secret to delete"
++        required: true
++
++jobs:
++  rotate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run multi-env vault rotation (dry-run)
++        env:
++          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
++          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
++          KMS_URL: ${{ secrets.KMS_URL || '' }}
++        run: |
++          python3 scripts/vault_kms_multienv_rotation.py --vault-base "${{ github.event.inputs.vault_base }}" --envs "${{ github.event.inputs.envs }}" --k8s-secret "${{ github.event.inputs.k8s_secret }}" --verify-files "github_app.pem" --namespaces "aegis-ml" --dry-run
++      - name: Upload report
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: vault-rotation-report
++          path: "*.json"
++
+diff --git a/policy/opa/tests/agents_exhaustive_tests.rego b/policy/opa/tests/agents_exhaustive_tests.rego
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/policy/opa/tests/agents_exhaustive_tests.rego
+@@ -0,0 +1,320 @@
++package aegis.policies.tests
++
++import data.aegis.policies.agents_full_coverage
++import data.aegis.policies.generative
++
++# Exhaustive suite of edge cases and combined conditions
++
++test_unknown_model_promote_denied {
++  input := {"action":"promote","model":"unknown-model","env":"production","params":{}}
++  result := data.aegis.policies.agents_full_coverage.result with input as input
++  result.allow == false
++}
++
++test_generate_high_risk_requires_approval {
++  input := {"action":"generate","model":"fraud-detector-v1","env":"production","params":{"max_tokens":128}}
++  result := data.aegis.policies.generative.result with input as input
++  result.allow == false
++}
++
++test_finetune_sensitive_dataset_denied_without_review {
++  input := {"action":"fine_tune","model":"default","env":"production","params":{"dataset_sensitivity":"high"}}
++  result := data.aegis.policies.agents_full_coverage.result with input as input
++  result.allow == false
++}
++
++test_promote_with_approval_allowed {
++  input := {"action":"promote","model":"fraud-detector-v1","env":"production","params":{"approved_by":"sec"}}
++  result := data.aegis.policies.agents_full_coverage.result with input as input
++  result.allow == true
++}
++
++test_scale_gpu_high_requires_approval {
++  input := {"action":"scale","model":"fraud-detector-v1","env":"production","params":{"scale_to":16}}
++  result := data.aegis.policies.agents_full_coverage.result with input as input
++  result.allow == false
++}
++
++test_snapshot_restore_require_approval {
++  input := {"action":"snapshot","model":"default","env":"production","params":{}}
++  result := data.aegis.policies.agents_full_coverage.result with input as input
++  result.allow == false
++}
++
++test_retrain_in_staging_allowed {
++  input := {"action":"retrain","model":"fraud-detector-v1","env":"staging","params":{}}
++  result := data.aegis.policies.agents_full_coverage.result with input as input
++  result.allow == true
++}
++
++test_generate_delegation_low_risk {
++  input := {"action":"generate","model":"low-demo-model","env":"production","params":{"max_tokens":512}}
++  result := data.aegis.policies.agents_full_coverage.result with input as input
++  result.allow == true
++}
++
++test_edge_combined_conditions {
++  # generate + budget guard: estimated cost > budget should deny
++  input := {"action":"generate","model":"low-demo-model","env":"production","params":{"estimated_cost_usd": 5000, "max_tokens":4096}}
++  result := data.aegis.policies.budget_guard.result with input as input
++  result.allow == false
++}
++
+diff --git a/.github/workflows/policy_org_block.yml b/.github/workflows/policy_org_block.yml
+new file mode 100644
+index 0000000..6666666
+--- /dev/null
++++ b/.github/workflows/policy_org_block.yml
+@@ -0,0 +1,220 @@
++name: Policy Organization Blocking CI (dispatch to set protections)
++
++on:
++  workflow_dispatch:
++    inputs:
++      org:
++        description: "GitHub organization"
++        required: true
++      repos:
++        description: "Comma-separated repos to apply protection"
++        required: true
++      branch:
++        description: "Branch to protect (main)"
++        required: false
++        default: "main"
++      required_check:
++        description: "Required status check name (policy-blocking-ci)"
++        required: false
++        default: "policy-blocking-ci"
++
++jobs:
++  protect:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set branch protection across repos (requires gh auth)
++        run: |
++          chmod +x scripts/set_org_branch_protection.sh
++          ./scripts/set_org_branch_protection.sh --org "${{ github.event.inputs.org }}" --repos "${{ github.event.inputs.repos }}" --branch "${{ github.event.inputs.branch }}" --required-check "${{ github.event.inputs.required_check }}"
++
+diff --git a/scripts/keda_threshold_suggester.py b/scripts/keda_threshold_suggester.py
+new file mode 100644
+index 0000000..7777777
+--- /dev/null
++++ b/scripts/keda_threshold_suggester.py
+@@ -0,0 +1,220 @@
++#!/usr/bin/env python3
++"""
++Simple KEDA threshold suggester that reads vLLM benchmark CSVs (latency samples)
++and recommends a GPU utilization threshold based on p95 latency and desired SLO.
++
++Usage:
++  python3 scripts/keda_threshold_suggester.py --csv artifacts/vllm_round_1.csv --slo-p95 1.0
++"""
++import argparse
++import csv
++import statistics
++
++def read_latencies(csvfile):
++    lat = []
++    with open(csvfile) as fh:
++        r = csv.DictReader(fh)
++        for row in r:
++            try:
++                if row.get("ok","") == "True":
++                    lat.append(float(row.get("latency") or 0.0))
++            except:
++                pass
++    return lat
++
++def suggest_threshold(latencies, slo_p95=1.0):
++    if not latencies:
++        return 70
++    p95 = sorted(latencies)[int(len(latencies)*0.95)] if latencies else 0.0
++    # simple linear rule: if p95 < slo -> keep threshold moderate, otherwise raise replicas i.e. lower threshold
++    if p95 <= slo_p95:
++        return 70
++    # if p95 exceeds slo by factor, lower utilization threshold to trigger scaling earlier
++    factor = p95 / slo_p95
++    base = 70
++    new = max(40, int(base / factor))
++    return new
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--csv", required=True)
++    p.add_argument("--slo-p95", type=float, default=1.0)
++    args = p.parse_args()
++    lat = read_latencies(args.csv)
++    if not lat:
++        print("No latency samples found")
++        return
++    p95 = sorted(lat)[int(len(lat)*0.95)]
++    print(f"Observed p95 latency: {p95:.3f}s; desired slo-p95: {args.slo_p95}s")
++    threshold = suggest_threshold(lat, args.slo_p95)
++    print(f"Suggested KEDA GPU utilization threshold: {threshold}%")
++
++if __name__ == "__main__":
++    main()
++
+diff --git a/monitoring/prometheus/slo_and_budget_rules.yaml b/monitoring/prometheus/slo_and_budget_rules.yaml
+new file mode 100644
+index 0000000..8888888
+--- /dev/null
++++ b/monitoring/prometheus/slo_and_budget_rules.yaml
+@@ -0,0 +1,200 @@
++apiVersion: monitoring.coreos.com/v1
++kind: PrometheusRule
++metadata:
++  name: aegis-slo-budget-rules
++  namespace: aegis-ml
++spec:
++  groups:
++    - name: aegis.inference.slo.budget
++      rules:
++        - alert: InferenceP95SLOBreached
++          expr: histogram_quantile(0.95, sum(rate(aegis_inference_request_latency_seconds_bucket[5m])) by (le)) > 1.0
++          for: 10m
++          labels:
++            severity: critical
++          annotations:
++            summary: "Inference P95 latency > 1s"
++        - alert: ModelBudgetGuardTriggered
++          expr: increase(aegis_inference_cost_usd_total[1h]) > 200
++          for: 30m
++          labels:
++            severity: warning
++          annotations:
++            summary: "Model inference cost > $200 in the last hour - consider stopping expensive jobs"
++
+diff --git a/k8s/manifests/metabase_auditor_dashboard.json b/k8s/manifests/metabase_auditor_dashboard.json
+new file mode 100644
+index 0000000..9999999
+--- /dev/null
++++ b/k8s/manifests/metabase_auditor_dashboard.json
+@@ -0,0 +1,160 @@
++{
++  "dashboard": {
++    "name": "Aegis Auditor Dashboard",
++    "panels": [
++      { "title": "Recent decision_log entries", "type": "table", "query": "SELECT id, created_at, agent, payload->>'action' as action, payload->>'model' as model, evidence->>'pr_url' as pr_url FROM decision_log ORDER BY created_at DESC LIMIT 200" },
++      { "title": "Promotions awaiting approval", "type": "table", "query": "SELECT id, created_at, agent, payload FROM decision_log WHERE payload->>'action'='promote' AND payload->>'approved_by' IS NULL ORDER BY created_at DESC LIMIT 100" },
++      { "title": "Hallucination rate (1h)", "type": "timeseries", "query": "increase(aegis_hallucination_total[1h]) / max(increase(aegis_inference_requests_total[1h]),1)" }
++    ]
++  }
++}
++
+diff --git a/k8s/manifests/dr_run_cronjob.yaml b/k8s/manifests/dr_run_cronjob.yaml
+new file mode 100644
+index 0000000..aaaaaaaa
+--- /dev/null
++++ b/k8s/manifests/dr_run_cronjob.yaml
+@@ -0,0 +1,220 @@
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: aegis-dr-drill
++  namespace: aegis-ml
++spec:
++  schedule: "0 5 * * 1" # every Monday at 05:00
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          serviceAccountName: aegis-agent-sa
++          containers:
++            - name: dr-drill
++              image: <REGISTRY>/aegis-ops-tools:latest
++              command: ["bash","-lc"]
++              args:
++                - |
++                  set -euo pipefail
++                  echo "Starting DR drill: running minimal restore validation"
++                  python3 /app/scripts/sharded_restore_test.py --shards /workspace/checkpoints --s3-prefix s3://my-bucket/checkpoints || echo "restore test failed"
++                  # record event
++                  python3 /app/tools/decisionlog_client.py --record "dr_drill_run" || true
++          restartPolicy: OnFailure
++
+diff --git a/docs/PROD_FINAL_RUNBOOK.md b/docs/PROD_FINAL_RUNBOOK.md
+new file mode 100644
+index 0000000..bbbbbbbb
+--- /dev/null
++++ b/docs/PROD_FINAL_RUNBOOK.md
+@@ -0,0 +1,320 @@
++# Aegis Final Production Validation & Operations Runbook
++
++Summary
++-------
++This runbook collects the final validation steps and operational patterns to reach full production readiness.
++
++1) Large-scale validation
++ - Use .github workflow "Dispatch DeepSpeed+vLLM Scale Test" to run on a self-hosted runner with KUBECONFIG_STAGING.
++ - Run multiple rounds, including simulate_preemption=true to validate resume behavior.
++ - Inspect artifacts uploaded to S3 and review NCCL/dmesg/nvidia-smi for errors.
++ - Iterate on deepspeed-tuning configmap and re-run until stable (no IB/NCCL errors).
++
++2) Secrets lifecycle & rotation
++ - Configure KMS_URL and VAULT tokens in a secure operator secret.
++ - Use workflow "Vault Multi-Env Rotation" for dry-run, inspect generated reports, then run non-dry-run after approval.
++ - Ensure decision_log contains rotation and deletion events for audit.
++ - After verification, the job will delete plaintext secrets; operators must maintain a pre-rotation inventory and roll-back plan.
++
++3) Policy coverage & enforcement
++ - The policy tests suite (policy/opa/tests) contains exhaustive edge-case tests.
++ - Run policy_blocking_ci and enforce via branch protection across repos using scripts/set_org_branch_protection.sh
++ - Ensure OPA bundle deployment to staging occurs from CI artifact
++
++4) Autoscaling & SLO tuning
++ - Run vLLM benchmarks (vllm_perf_benchmark.py) and use scripts/keda_threshold_suggester.py to get suggested GPU utilization threshold.
++ - Apply tuned keda_tuned_scaledobject.yaml; monitor Prometheus rules in monitoring/prometheus/slo_and_budget_rules.yaml
++ - Configure budget_guard.rego and ensure OPA denies actions that exceed configured model budgets
++
++5) Auditor UX & retention
++ - Run scripts/metabase_provision_advanced.py to provision datasources and saved questions
++ - Apply metabase_auditor_rbac.yaml to give auditors least-privilege access
++ - Run decisionlog_es_retention_cronjob.yaml to snapshot indices; adjust es_retention.py to delete old indices per policy
++
++6) DR & on-call cadence
++ - The DR CronJob will run basic restore validation weekly; escalate failures to SRE on-call.
++ - Practice canary rollback simulations using simulate_canary_failure.sh and the Argo promote workflows.
++ - Maintain on-call runbooks and contact lists for SRE/Sec/ML owners.
++
++Operator checklist before enabling production automation
++ - All rotation runs pass dry-run and have decision_log audit entries
++ - At least 3 successful DeepSpeed multi-node stress runs with no NCCL/IB faults
++ - KEDA thresholds tuned to meet SLO in 95% of runs
++ - Branch protection enforces policy_blocking_ci across all repos
++ - Metabase dashboards and saved queries validated by auditors
++ - DR run completes and snapshot exists in S3
++
++End of runbook.
++

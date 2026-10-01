@@ -1,0 +1,595 @@
+*** Begin Patch
+*** Add File: edge/device_agent_hsm_bootstrap.py
++#!/usr/bin/env python3
++"""
++Device-side HSM/TPM bootstrap emulator (for device agent).
++Real device should:
++ - generate keypair inside TPM/HSM
++ - produce an attestation blob (TPM quote / CSR) proving key material is inside device TPM
++ - send attestation + public key to operator HSM signer endpoint
++ - receive signed cert and store it for mTLS with backend
++
++This script is a test/emulator to run on a device-like host to exercise operator signer flows.
++It intentionally avoids real TPM calls; replace with tpm2-tools or vendor SDK on real devices.
++"""
++import os, sys, json, time
++import base64
++import requests
++from cryptography.hazmat.primitives import serialization
++from cryptography.hazmat.primitives.asymmetric import rsa
++
++SIGNER_URL = os.environ.get("SIGNER_URL", "http://device-hsm-signer.operator.svc:8111/sign_device")
++DEVICE_ID = os.environ.get("DEVICE_ID", f"dev-{int(time.time())}")
++OPERATOR_APPROVAL = os.environ.get("OPERATOR_APPROVAL_HEADER", "1")
++
++def generate_keypair():
++    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++    pub = key.public_key().public_bytes(encoding=serialization.Encoding.PEM,
++                                       format=serialization.PublicFormat.SubjectPublicKeyInfo).decode()
++    priv_pem = key.private_bytes(encoding=serialization.Encoding.PEM,
++                                 format=serialization.PrivateFormat.TraditionalOpenSSL,
++                                 encryption_algorithm=serialization.NoEncryption()).decode()
++    return pub, priv_pem
++
++def make_attestation(pubkey_pem, device_id):
++    # Emulator: attach metadata and a fake signature to simulate TPM/SE attestation
++    payload = {"device_id": device_id, "pubkey": pubkey_pem, "nonce": str(int(time.time()))}
++    attestation = base64.b64encode(json.dumps(payload).encode()).decode()
++    return attestation
++
++def enroll():
++    pub, priv = generate_keypair()
++    att = make_attestation(pub, DEVICE_ID)
++    headers = { "X-Operator-Approved": OPERATOR_APPROVAL }
++    body = {"device_id": DEVICE_ID, "public_key": pub, "attestation": att}
++    print("Posting attestation to signer:", SIGNER_URL)
++    r = requests.post(SIGNER_URL, json=body, headers=headers, timeout=10)
++    if r.ok:
++        resp = r.json()
++        print("Received signer response:", resp.get("s3_key") or resp.get("signature")[:80])
++        # In real device: save cert to secure storage and configure mTLS
++        open("/tmp/device_private.pem","w").write(priv)
++        open("/tmp/device_pub.pem","w").write(pub)
++        open("/tmp/device_signed_cert.pem","w").write(resp.get("signature",""))
++        return True
++    else:
++        print("Signer rejected enrollment:", r.status_code, r.text)
++        return False
++
++if __name__=="__main__":
++    ok = enroll()
++    sys.exit(0 if ok else 2)
++
+*** End Patch
+*** Begin Patch
+*** Add File: hsm/device_hsm_signer_service.py
++#!/usr/bin/env python3
++"""
++Operator-side HSM signer service (minimal).
++ - Verifies a basic attestation blob (emulator) and signs the submitted public key using operator HSM or script.
++ - Records evidence to Rekor (optional) and uploads metadata to COMPLIANCE_BUCKET (S3).
++ - MUST be deployed in operator-only namespace and protected with NetworkPolicy so CI cannot reach it.
++"""
++import os, time, json, tempfile, subprocess
++from flask import Flask, request, jsonify
++import boto3
++
++HSM_SIGN_CMD = os.environ.get("HSM_SIGN_CMD", "/opt/hsm/hsm_sign_device.sh")
++REKOR_CLI = os.environ.get("REKOR_CLI", "rekor-cli")
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++APPROVAL_HEADER = os.environ.get("OPERATOR_APPROVAL_HEADER", "X-Operator-Approved")
++
++app = Flask("device-hsm-signer")
++s3 = boto3.client("s3") if COMPLIANCE_BUCKET else None
++
++def sign_with_hsm(pubkey_pem: str, device_id: str) -> str:
++    tmp = tempfile.NamedTemporaryFile(delete=False)
++    tmp.write(pubkey_pem.encode()); tmp.flush(); tmp.close()
++    try:
++        out = subprocess.check_output([HSM_SIGN_CMD, tmp.name, device_id], stderr=subprocess.STDOUT, timeout=30).decode().strip()
++        return out
++    finally:
++        try:
++            os.unlink(tmp.name)
++        except Exception:
++            pass
++
++def rekor_upload_artifact(local_path: str) -> str:
++    try:
++        out = subprocess.check_output([REKOR_CLI, "upload", "--artifact", local_path], stderr=subprocess.STDOUT, timeout=20).decode().strip()
++        return out
++    except Exception as e:
++        return str(e)
++
++@app.post("/sign_device")
++def sign_device():
++    if not request.headers.get(APPROVAL_HEADER):
++        return jsonify({"error":"operator approval header required"}), 403
++    j = request.get_json() or {}
++    device_id = j.get("device_id")
++    pubkey = j.get("public_key")
++    attestation = j.get("attestation")
++    if not device_id or not pubkey or not attestation:
++        return jsonify({"error":"device_id, public_key and attestation required"}), 400
++    # Emulator attestation verification: simply decode and sanity-check device_id
++    try:
++        import base64
++        payload = json.loads(base64.b64decode(attestation).decode())
++        if payload.get("device_id") != device_id:
++            return jsonify({"error":"attestation mismatch"}), 400
++    except Exception as e:
++        return jsonify({"error":"invalid_attestation","detail":str(e)}), 400
++    try:
++        signature = sign_with_hsm(pubkey, device_id)
++    except subprocess.CalledProcessError as e:
++        return jsonify({"error":"hsm_sign_failed","detail": getattr(e,"output",str(e))}), 500
++    evidence = {"device_id": device_id, "signature": signature, "ts": int(time.time())}
++    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
++    tmp.write(json.dumps(evidence).encode()); tmp.flush(); tmp.close()
++    rekor_out = rekor_upload_artifact(tmp.name)
++    s3_key = None
++    if s3:
++        s3_key = f"hsm/device_signatures/{device_id}_{int(time.time())}.json"
++        try:
++            s3.upload_file(tmp.name, COMPLIANCE_BUCKET, s3_key)
++        except Exception as e:
++            pass
++    try:
++        os.unlink(tmp.name)
++    except Exception:
++        pass
++    return jsonify({"ok": True, "signature": signature, "rekor": rekor_out, "s3_key": f"s3://{COMPLIANCE_BUCKET}/{s3_key}" if s3_key else None})
++
++@app.get("/health")
++def health():
++    return {"ok": True}
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8111")))
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/hsm/device-hsm-signer-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: device-hsm-signer
++  namespace: operator
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: device-hsm-signer
++  template:
++    metadata:
++      labels:
++        app: device-hsm-signer
++    spec:
++      nodeSelector:
++        operator: "true"
++      serviceAccountName: device-hsm-signer-sa
++      containers:
++        - name: device-hsm-signer
++          image: aegis/device-hsm-signer:latest
++          env:
++            - name: HSM_SIGN_CMD
++              value: "/opt/hsm/hsm_sign_device.sh"
++            - name: COMPLIANCE_BUCKET
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-secrets
++                  key: compliance-bucket
++          volumeMounts:
++            - name: hsm-socket
++              mountPath: /var/run/hsm
++            - name: bin-scripts
++              mountPath: /opt/hsm
++      volumes:
++        - name: hsm-socket
++          hostPath:
++            path: /var/run/hsm
++            type: DirectoryOrCreate
++        - name: bin-scripts
++          hostPath:
++            path: /opt/hsm
++            type: DirectoryOrCreate
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: device-hsm-signer
++  namespace: operator
++spec:
++  selector:
++    app: device-hsm-signer
++  ports:
++    - port: 8111
++      targetPort: 8111
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/hsm/networkpolicy-operator-only.yaml
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: allow-operator-to-hsm-signer
++  namespace: operator
++spec:
++  podSelector:
++    matchLabels:
++      app: device-hsm-signer
++  policyTypes:
++    - Ingress
++  ingress:
++    - from:
++        - namespaceSelector:
++            matchLabels:
++              role: operator
++        - podSelector:
++            matchLabels:
++              component: operator-control-plane
++      ports:
++        - protocol: TCP
++          port: 8111
++
+*** End Patch
+*** Begin Patch
+*** Add File: tests/device_enroll_emulator.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Emulator to test device enrollment against operator signer.
++# Requires SIGNER_URL env (must be reachable from runner). This test should be run in an operator-controlled network or a staging environment where signer is reachable.
++SIGNER_URL=${SIGNER_URL:-http://device-hsm-signer.operator.svc:8111/sign_device}
++DEVICE_ID="emulator-$(date +%s)"
++
++echo "Running device enrollment emulator against $SIGNER_URL"
++python - <<PY
++import requests, os, json
++from base64 import b64encode
++pub = "-----BEGIN PUBLIC KEY-----\nMOCKPUBKEY\n-----END PUBLIC KEY-----\n"
++att = b64encode(json.dumps({"device_id":"$DEVICE_ID","nonce":123}).encode()).decode()
++headers={"X-Operator-Approved":"1"}
++resp = requests.post("$SIGNER_URL", json={"device_id":"$DEVICE_ID","public_key":pub,"attestation":att}, headers=headers, timeout=10)
++print("Status:", resp.status_code)
++print(resp.text)
++PY
++
+*** End Patch
+*** Begin Patch
+*** Add File: runbooks/edge_hsm_enrollment_runbook.md
++# Edge: HSM-backed Device Enrollment Runbook
++
++Purpose
++- How to operate the operator HSM signer and onboard devices with TPM/HSM-backed keys.
++
++Prereqs
++- device-hsm-signer deployed in `operator` namespace and protected by NetworkPolicy.
++- HSM signing script available at /opt/hsm/hsm_sign_device.sh on signer host(s).
++- Rekor CLI configured on signer host if Rekor evidence is required.
++- COMPLIANCE_BUCKET configured in aegis-secrets.
++
++Steps (operator)
++1. Ensure device-hsm-signer Deployment is running and NetworkPolicy in place:
++   kubectl get pods -n operator -l app=device-hsm-signer
++2. Verify signer health:
++   curl -s http://<signer-service>.operator.svc:8111/health
++3. For testing, run tests/device_enroll_emulator.sh from an operator host (SIGNER_URL may be cluster DNS).
++4. After enrollment, evidence is uploaded to s3://<COMPLIANCE_BUCKET>/hsm/device_signatures/.
++
++Device OEM / Agent integration notes
++- Device must generate keys in hardware (TPM/HSM) and produce attestation (quote/CSR).
++- Attestation must be sent to operator signer; signer validates and returns signed cert.
++- Devices must store private key securely and use signed cert for mTLS to backend.
++
++Security notes
++- Ensure NetworkPolicy prevents CI runners or untrusted namespaces from contacting operator signer.
++- Rotate operator signing key in HSM per rotation policy and record rotation event to COMPLIANCE_BUCKET.
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/edge/fleet-load-simulator-job.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: fleet-load-simulator
++  namespace: aegis
++spec:
++  parallelism: 3
++  completions: 3
++  template:
++    spec:
++      containers:
++        - name: simulator
++          image: aegis/fleet-simulator:latest
++          command:
++            - /bin/sh
++            - -c
++            - |
++              pip install aiohttp
++              python /workspace/edge/fleet_load_simulator.py --total 2000 --concurrency 200
++          env:
++            - name: OTA_CHECKIN
++              value: "http://ota.aegis.svc:8205/device"
++            - name: TELEMETRY_URL
++              value: "http://telemetry.aegis.svc:8215/report"
++          volumeMounts:
++            - name: workspace
++              mountPath: /workspace
++      restartPolicy: Never
++      volumes:
++        - name: workspace
++          configMap:
++            name: edge-simulator-scripts
++  backoffLimit: 1
++
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: edge-simulator-scripts
++  namespace: aegis
++data:
++  edge/fleet_load_simulator.py: |
++    # Placeholder script (repo should include edge/fleet_load_simulator.py); mount real simulator or build image with it.
++    print("Please mount a real fleet_load_simulator.py or use a prebuilt image")
++
+*** End Patch
+*** Begin Patch
+*** Add File: ota/canary_monitor.py
++#!/usr/bin/env python3
++"""
++Canary monitor that watches telemetry and triggers OTA rollback when cohort failure rate exceeds threshold.
++(Simplified variant included here to be deployed in staging)
++"""
++import os, time, json, requests, redis
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/7")
++OTA_API = os.environ.get("OTA_API", "http://ota.aegis.svc:8205")
++CANARY_FAIL_RATE = float(os.environ.get("CANARY_FAIL_RATE", "0.05"))
++WINDOW_SECS = int(os.environ.get("CANARY_WINDOW_SECS", "600"))
++redis_client = redis.from_url(REDIS_URL)
++
++def recent_events(window=WINDOW_SECS):
++    events = []
++    items = redis_client.lrange("telemetry:events", 0, 2000) or []
++    cutoff = time.time() - window
++    for b in items:
++        try:
++            ev = json.loads(b.decode() if isinstance(b, bytes) else b)
++            if ev.get("ts", time.time()) >= cutoff:
++                events.append(ev)
++        except Exception:
++            continue
++    return events
++
++def monitor(artifact, version):
++    while True:
++        rollout_key = f"rollout:{artifact}:{version}"
++        rollout = redis_client.get(rollout_key)
++        cohort = []
++        if rollout:
++            cohort = json.loads(rollout).get("cohort", []) or []
++        events = recent_events()
++        failures = 0; total = 0
++        for ev in events:
++            if ev.get("device") in cohort:
++                total += 1
++                if ev.get("event") in ("install_failed","verify_failed"):
++                    failures += 1
++        rate = (failures / total) if total else 0.0
++        print(f"cohort={len(cohort)} total={total} failures={failures} rate={rate:.3f}")
++        if total >= 10 and rate >= CANARY_FAIL_RATE:
++            print("Failure threshold exceeded; trigger rollback")
++            try:
++                requests.post(f"{OTA_API}/rollback", json={"name": artifact, "version": version}, timeout=5)
++            except Exception as e:
++                print("rollback post failed:", e)
++            # upload evidence to compliance store if configured
++            break
++        time.sleep(15)
++
++if __name__=="__main__":
++    import sys
++    if len(sys.argv) < 3:
++        print("usage: canary_monitor.py <artifact> <version>"); sys.exit(2)
++    monitor(sys.argv[1], sys.argv[2])
++
+*** End Patch
+*** Begin Patch
+*** Add File: .github/workflows/edge_canary_simulation.yml
++name: Edge Canary Simulation & Induced Rollback
++on:
++  workflow_dispatch:
++    inputs:
++      artifact:
++        required: true
++      version:
++        required: true
++
++jobs:
++  run-sim:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Start fleet simulator job in cluster (k8s)
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG_STAGING }}
++        run: |
++          kubectl apply -f k8s/edge/fleet-load-simulator-job.yaml
++          # wait briefly for pods to start
++          sleep 10
++      - name: Allow simulator to generate traffic (60s)
++        run: sleep 60
++      - name: Induce canary failures (invoke tests/induce_canary_failures.sh)
++        env:
++          FLEET_API: ${{ secrets.FLEET_API }}
++          TELEMETRY_URL: ${{ secrets.TELEMETRY_URL }}
++        run: |
++          chmod +x tests/induce_canary_failures.sh
++          ./tests/induce_canary_failures.sh || true
++      - name: Wait for canary monitor to trigger rollback (poll)
++        env:
++          FLEET_API: ${{ secrets.FLEET_API }}
++        run: |
++          for i in $(seq 1 24); do
++            STATUS=$(curl -s "${FLEET_API}/rollout_status/${{ github.event.inputs.artifact }}/${{ github.event.inputs.version }}" | jq -r '.[].state // empty' || true)
++            echo "Rollout state: $STATUS"
++            if [ "$STATUS" = "rolled_back" ] || [ "$STATUS" = "rolling_back" ]; then
++              echo "Rollback detected"
++              exit 0
++            fi
++            sleep 5
++          done
++          echo "Rollback not detected in time"; exit 2
++
+*** End Patch
+*** Begin Patch
+*** Add File: vault/scripts/store_real_provider_creds.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Operator helper: store real quantum provider credentials in Vault KV (KV v2)
++#
++: "${VAULT_ADDR:?Please set VAULT_ADDR}"
++: "${VAULT_TOKEN:?Please set VAULT_TOKEN}"
++
++echo "Logging into Vault..."
++vault login "${VAULT_TOKEN}" >/dev/null
++
++read -p "IBM Quantum API key (paste, or leave empty to skip): " IBM_KEY
++if [ -n "$IBM_KEY" ]; then
++  vault kv put secret/aegis/quantum/ibm api_key="${IBM_KEY}"
++  echo "Stored IBM API key at secret/aegis/quantum/ibm"
++else
++  echo "Skipping IBM"
++fi
++
++read -p "AWS Access Key ID for Braket (or leave empty): " AWS_KEY
++if [ -n "$AWS_KEY" ]; then
++  read -s -p "AWS Secret Access Key: " AWS_SECRET
++  echo
++  vault kv put secret/aegis/quantum/braket aws_access_key_id="${AWS_KEY}" aws_secret_access_key="${AWS_SECRET}"
++  echo "Stored Braket credentials at secret/aegis/quantum/braket"
++else
++  echo "Skipping Braket"
++fi
++
++echo "Operator note: rotate credentials via Vault UI or CLI and update CI/staging roles to read only."
++
+*** End Patch
+*** Begin Patch
+*** Add File: .github/workflows/quantum_staging_real_provider.yml
++name: Quantum Staging: Operator-approved real-provider run
++on:
++  workflow_dispatch:
++    inputs:
++      backend:
++        required: true
++      qasm_path:
++        required: false
++      tenant:
++        required: false
++
++jobs:
++  request-approval:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Submit approval request (CI -> operator)
++        env:
++          APPROVAL_API: ${{ secrets.APPROVAL_API }}
++        run: |
++          python - <<PY
++import os,requests,json
++plan={"type":"qpu_run","backend":"${{ github.event.inputs.backend }}","tenant":"${{ github.event.inputs.tenant or 'staging' }}"}
++if "${{ github.event.inputs.qasm_path }}" != "":
++    plan["qasm"] = open("${{ github.event.inputs.qasm_path }}").read()
++r=requests.post(os.environ["APPROVAL_API"]+"/submit", json={"plan":plan,"tenant":plan["tenant"]})
++print("Approval response:", r.text)
++PY
++      - name: WAIT_FOR_OPERATOR (manual)
++        run: echo "Operator must approve in Approval UI. After approval, run the 'run-quantum-staging' workflow to continue."
++
++  run-quantum:
++    needs: request-approval
++    if: github.event_name == 'workflow_dispatch'
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run submit_and_wait (operator should run this after approval)
++        env:
++          SUBMIT_API: ${{ secrets.SUBMIT_API }}
++          APPROVAL_API: ${{ secrets.APPROVAL_API }}
++          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
++          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
++          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
++        run: |
++          python quantum/staging/submit_and_wait.py --backend "${{ github.event.inputs.backend }}" --qasm "${{ github.event.inputs.qasm_path or '' }}" --tenant "${{ github.event.inputs.tenant or 'staging' }}"
++
+*** End Patch
+*** Begin Patch
+*** Add File: .github/workflows/quantum_reconcile_and_report.yml
++name: Quantum Reconcile & Report (post-run)
++on:
++  workflow_dispatch:
++    inputs:
++      run_id:
++        required: true
++
++jobs:
++  reconcile:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup python deps
++        run: |
++          python -m pip install --upgrade pip
++          pip install boto3 elasticsearch
++      - name: Run reconciliation
++        env:
++          ES_HOST: ${{ secrets.ES_HOST }}
++          COMPLIANCE_BUCKET: ${{ secrets.COMPLIANCE_BUCKET }}
++        run: |
++          python quantum/reconcile_provider_billing.py
++      - name: Upload reconciliation artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: quantum-reconcile-report-${{ github.event.inputs.run_id }}
++          path: /tmp
++
+*** End Patch
+*** Begin Patch
+*** Add File: runbooks/edge_and_quantum_operator_playbook.md
++# Edge & Quantum Operator Combined Playbook (High-level)
++
++This playbook summarizes operator steps to:
++ - deploy operator HSM signer and enforce network policies,
++ - run fleet simulator + canary failure validation and observe auto rollback,
++ - provision quantum provider credentials in Vault and run operator-approved staging QPU jobs and reconciliation.
++
++Key steps
++1. Deploy signer and NetworkPolicy:
++   kubectl apply -f k8s/hsm/device-hsm-signer-deployment.yaml
++   kubectl apply -f k8s/hsm/networkpolicy-operator-only.yaml
++2. Verify signer service:
++   kubectl -n operator get pods -l app=device-hsm-signer
++   curl http://device-hsm-signer.operator.svc:8111/health
++3. Run device enrollment emulator (operator host):
++   tests/device_enroll_emulator.sh (ensure SIGNER_URL points to service)
++4. Run fleet simulator for canary test:
++   kubectl apply -f k8s/edge/fleet-load-simulator-job.yaml
++   Trigger .github/workflows/edge_canary_simulation.yml via GitHub UI
++5. Store provider creds in Vault (operator host):
++   VAULT_ADDR=... VAULT_TOKEN=... vault/scripts/store_real_provider_creds.sh
++6. Submit operator-approved QPU job:
++   Use GitHub workflow Quantum Staging: Operator-approved real-provider run to request approval, operator approves, then run submit_and_wait.py (or trigger workflow step 2).
++7. Post-run: run quantum reconciliation workflow to produce artifact and evidence.
++
++Security & compliance
++- Ensure signer endpoint resides in operator namespace with NetworkPolicy preventing CI or external access.
++- All enrollments and provider credential events must be recorded in COMPLIANCE_BUCKET and Rekor when available.
++
+*** End Patch
+*** End Patch

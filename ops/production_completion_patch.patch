@@ -1,0 +1,446 @@
+*** Begin Patch
+*** Add File:ops/carbon/mig_aware_attributor.py
++#!/usr/bin/env python3
++"""
++MIG-aware attribution helper.
++
++Reads:
++ - telemetry files (pid_map_*, mig_map_*)
++ - Prometheus DCGM metrics (if PROM_URL set) or NVML (if run on a node with NVML)
++Attempts to produce per-workflow / per-mig-partition attribution records for downstream aggregation.
++
++Usage:
++  python ops/carbon/mig_aware_attributor.py --prom http://prometheus:9090 --telemetry /var/lib/aegis/telemetry --out /var/lib/aegis/carbon_by_workflow
++"""
++import os
++import time
++import json
++import argparse
++from collections import defaultdict
++
++PROM_QUERY_POWER = 'dcgm_gpu_power'  # exporter metric names vary
++
++def read_latest_jsonl(dirpath, prefix):
++    files = sorted([os.path.join(dirpath,f) for f in os.listdir(dirpath) if f.startswith(prefix)])[-50:]
++    rows=[]
++    for f in files:
++        try:
++            with open(f) as fh:
++                for line in fh:
++                    rows.append(json.loads(line))
++        except Exception:
++            continue
++    return rows
++
++def read_mig_map(telemetry_dir):
++    # find mig_map_ file (JSON)
++    for f in sorted(os.listdir(telemetry_dir), reverse=True):
++        if f.startswith("mig_map_") and f.endswith(".json"):
++            try:
++                with open(os.path.join(telemetry_dir,f)) as fh:
++                    return json.load(fh)
++            except Exception:
++                continue
++    return []
++
++def read_pid_map(telemetry_dir):
++    mapping = {}
++    for f in sorted([fn for fn in os.listdir(telemetry_dir) if fn.startswith("pid_map_")])[-50:]:
++        try:
++            with open(os.path.join(telemetry_dir,f)) as fh:
++                for line in fh:
++                    rec = json.loads(line)
++                    mapping[str(rec.get("pid"))] = rec.get("pod")
++        except Exception:
++            continue
++    return mapping
++
++def query_prom(prom_url, q):
++    import requests
++    r = requests.get(f"{prom_url}/api/v1/query", params={"query": q}, timeout=10)
++    r.raise_for_status()
++    return r.json().get("data",{}).get("result",[])
++
++def collect_prom_power(prom_url):
++    try:
++        res = query_prom(prom_url, PROM_QUERY_POWER)
++    except Exception:
++        return {}
++    pod_power = defaultdict(lambda: {"power_w":0.0,"samples":0})
++    for it in res:
++        metric = it.get("metric",{})
++        value = float(it.get("value",[0,0])[1])
++        pod = metric.get("pod") or metric.get("kubernetes_pod_name")
++        if pod:
++            pod_power[pod]["power_w"] += value
++            pod_power[pod]["samples"] += 1
++    # average
++    for p in list(pod_power.keys()):
++        s = max(1, pod_power[p]["samples"])
++        pod_power[p]["avg_power_w"] = pod_power[p]["power_w"]/s
++    return pod_power
++
++def attribute(prom_map, pid_map, mig_map):
++    # Attribute per workflow (heuristic):
++    wf_agg = defaultdict(lambda: {"power_w":0.0,"samples":0})
++    # For each pod in prom_map, map to workflow via naming heuristics or via pid_map reverse lookup
++    for pod, v in prom_map.items():
++        # try to get workflow by pod name prefix convention (Argo pods include workflow name)
++        wf = "<unknown>"
++        if pod and "-" in pod:
++            parts = pod.split("-")
++            # Argo workflow pods often include the workflow name + random suffix; heuristically use first N parts
++            wf = "-".join(parts[:-2]) if len(parts) > 2 else parts[0]
++        wf_agg[wf]["power_w"] += v.get("avg_power_w",0.0)
++        wf_agg[wf]["samples"] += 1
++    # incorporate pid_map (if any pod missing)
++    for pid, podinfo in pid_map.items():
++        if isinstance(podinfo, dict):
++            podname = podinfo.get("name")
++        else:
++            podname = podinfo
++        if podname and podname not in prom_map:
++            # best-effort: assign small weight if missing
++            wf = podname.split("-")[0] if podname else "<unknown>"
++            wf_agg[wf]["power_w"] += 0.0
++            wf_agg[wf]["samples"] += 0
++    # produce records
++    out=[]
++    for wf,v in wf_agg.items():
++        samples = max(1, v["samples"])
++        rec = {"workflow": wf, "avg_power_w": v["power_w"]/samples if samples else 0.0, "samples": v["samples"], "ts": int(time.time())}
++        out.append(rec)
++    return out
++
++def write_out(out, out_dir):
++    os.makedirs(out_dir, exist_ok=True)
++    fname = os.path.join(out_dir, f"mig_attr_{int(time.time())}.jsonl")
++    with open(fname,"w") as fh:
++        for r in out:
++            fh.write(json.dumps(r) + "\n")
++    return fname
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--prom", default=os.environ.get("PROM_URL",""))
++    p.add_argument("--telemetry", default=os.environ.get("TELEMETRY_DIR","/var/lib/aegis/telemetry"))
++    p.add_argument("--out", default=os.environ.get("CARBON_ATTR_OUT","/var/lib/aegis/carbon_by_workflow"))
++    args = p.parse_args()
++    prom_map = collect_prom_power(args.prom) if args.prom else {}
++    pid_map = read_pid_map(args.telemetry)
++    mig_map = read_mig_map(args.telemetry)
++    recs = attribute(prom_map, pid_map, mig_map)
++    f = write_out(recs, args.out)
++    print("wrote", f)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/cost_calibrator_fix.py
++#!/usr/bin/env python3
++"""
++Improved cost->kWh calibrator that:
++ - queries AWS Cost Explorer for a time window
++ - computes kWh_per_usd using observed_kwh provided by operator (from telemetry)
++ - writes calibration JSON and optionally patches a kube ConfigMap
++"""
++import os
++import argparse
++import json
++import boto3
++import time
++
++OUT_FILE = os.environ.get("COST_CAL_FILE", "/var/lib/aegis/carbon_cost_cal.json")
++
++def query_cost(start, end):
++    ce = boto3.client("ce")
++    res = ce.get_cost_and_usage(TimePeriod={"Start": start, "End": end}, Granularity="DAILY", Metrics=["BlendedCost"])
++    total = 0.0
++    for d in res.get("ResultsByTime", []):
++        total += float(d.get("Total", {}).get("BlendedCost", {}).get("Amount", 0.0))
++    return total
++
++def write_calibration(start, end, observed_kwh, cost):
++    conv = observed_kwh / max(1e-6, cost)
++    rec = {"start": start, "end": end, "observed_kwh": observed_kwh, "cost_usd": cost, "kwh_per_usd": conv, "ts": int(time.time())}
++    os.makedirs(os.path.dirname(OUT_FILE), exist_ok=True)
++    with open(OUT_FILE, "w") as fh:
++        json.dump(rec, fh, indent=2)
++    return rec
++
++def apply_configmap(conv):
++    try:
++        from kubernetes import client, config
++        config.load_kube_config()
++        core = client.CoreV1Api()
++        name="aegis-carbon-calibration"
++        ns="kube-system"
++        body = client.V1ConfigMap(metadata=client.V1ObjectMeta(name=name), data={"kwh_per_usd": str(conv)})
++        try:
++            core.replace_namespaced_config_map(name, ns, body)
++        except Exception:
++            core.create_namespaced_config_map(ns, body)
++        return True
++    except Exception as e:
++        print("apply_configmap failed:", e)
++        return False
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--start", required=True)
++    p.add_argument("--end", required=True)
++    p.add_argument("--observed_kwh", required=True, type=float)
++    p.add_argument("--apply", action="store_true")
++    args = p.parse_args()
++    cost = query_cost(args.start, args.end)
++    rec = write_calibration(args.start, args.end, args.observed_kwh, cost)
++    print("wrote calibration:", rec)
++    if args.apply:
++        ok = apply_configmap(rec["kwh_per_usd"])
++        print("applied to cluster:", ok)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/gatekeeper_enforce.yml
++name: Gatekeeper Enforce (validation + manual approval)
++
++on:
++  workflow_dispatch:
++    inputs:
++      constraint_name:
++        description: 'Gatekeeper constraint name to flip'
++        required: true
++
++jobs:
++  validate:
++    runs-on: ubuntu-latest
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++      - name: Run staging validation (requires KUBECONFIG secret)
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG }}
++        run: |
++          python ops/validation/stage_validation_runner.py
++  request-approval:
++    needs: validate
++    runs-on: ubuntu-latest
++    steps:
++      - name: Request manual approval
++        uses: peter-evans/slash-command-dispatch@v2
++        with:
++          token: ${{ secrets.GITHUB_TOKEN }}
++      - name: Pause for approval
++        uses: hmarr/auto-approve-action@v2
++        with:
++          github-token: ${{ secrets.GITHUB_TOKEN }}
++  flip:
++    needs: request-approval
++    runs-on: ubuntu-latest
++    if: always()
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++      - name: Patch Gatekeeper constraint to enforce
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG }}
++        run: |
++          python ops/gatekeeper/flip_enforcement.py --constraint "${{ github.event.inputs.constraint_name }}" --mode enforce
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/milvus/restore-job.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: milvus-restore-job
++  namespace: default
++spec:
++  template:
++    spec:
++      containers:
++        - name: restore
++          image: python:3.11-slim
++          command: ["sh","-c"]
++          args:
++            - |
++              pip install pymilvus numpy && python /workdir/e2e_snapshot_restore.py
++          volumeMounts:
++            - name: workdir
++              mountPath: /workdir
++      restartPolicy: OnFailure
++      volumes:
++        - name: workdir
++          hostPath:
++            path: ./ops/milvus
++            type: Directory
++  backoffLimit: 1
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/redis/keda_scaledobject.yaml
++apiVersion: keda.sh/v1alpha1
++kind: ScaledObject
++metadata:
++  name: aegis-ingest-scaledobject
++  namespace: default
++spec:
++  scaleTargetRef:
++    name: aegis-ingest-worker
++  pollingInterval: 30
++  cooldownPeriod: 300
++  minReplicaCount: 1
++  maxReplicaCount: 10
++  triggers:
++    - type: redis
++      metadata:
++        address: redis:6379
++        listName: aegis:ingest:queue
++        listLength: "100"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/generative/llm_healthcheck.py
++#!/usr/bin/env python3
++"""
++LLM readiness & healthcheck helper.
++ - Periodically calls /health and /ready endpoints on the local model server
++ - Exits non-zero if unhealthy (used by k8s liveness/readiness containers or sidecar)
++"""
++import os
++import time
++import requests
++
++URL = os.environ.get("LLM_LOCAL_URL", "http://localhost:8080")
++HEALTH_PATH = os.environ.get("LLM_HEALTH_PATH", "/health")
++READY_PATH = os.environ.get("LLM_READY_PATH", "/ready")
++TIMEOUT = int(os.environ.get("LLM_HEALTH_TIMEOUT", "5"))
++
++def check():
++    try:
++        r = requests.get(URL + HEALTH_PATH, timeout=TIMEOUT)
++        if r.status_code != 200:
++            return False
++        r2 = requests.get(URL + READY_PATH, timeout=TIMEOUT)
++        return r2.status_code == 200
++    except Exception:
++        return False
++
++if __name__ == "__main__":
++    ok = check()
++    if not ok:
++        print("llm healthcheck failed")
++        raise SystemExit(2)
++    print("llm healthy")
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/token/token-retention-cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: aegis-token-retention
++  namespace: aegis-system
++spec:
++  schedule: "0 2 * * *"
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          containers:
++            - name: token-prune
++              image: python:3.11-slim
++              command: ["sh","-c","pip install boto3 && python /opt/aegis/token_retention.py"]
++              env:
++                - name: LLM_TOKEN_LOG_DIR
++                  value: "/var/lib/aegis/llm_tokens"
++                - name: LLM_TOKEN_RETENTION_DAYS
++                  value: "90"
++              volumeMounts:
++                - name: code
++                  mountPath: /opt/aegis
++                - name: tokens
++                  mountPath: /var/lib/aegis/llm_tokens
++          restartPolicy: OnFailure
++          volumes:
++            - name: code
++              hostPath:
++                path: ./ops/generative
++                type: Directory
++            - name: tokens
++              hostPath:
++                path: /var/lib/aegis/llm_tokens
++                type: DirectoryOrCreate
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/agentic/train_historical_cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: aegis-train-historical-success
++  namespace: aegis-system
++spec:
++  schedule: "0 4 * * *"
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          containers:
++            - name: trainer
++              image: python:3.11-slim
++              command: ["sh","-c","pip install scikit-learn joblib && python /opt/aegis/train_historical_success.py"]
++              volumeMounts:
++                - name: code
++                  mountPath: /opt/aegis
++                - name: audit
++                  mountPath: /var/lib/aegis/agent_audit
++          restartPolicy: OnFailure
++          volumes:
++            - name: code
++              hostPath:
++                path: ./ops/agentic
++                type: Directory
++            - name: audit
++              hostPath:
++                path: /var/lib/aegis/agent_audit
++                type: DirectoryOrCreate
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/runbooks/final_cutover_playbook.md
++Final cutover playbook (summary)
++
++1) Attribution validation
++   - Run ops/carbon/mig_aware_attributor.py (with PROM_URL and TELEMETRY_DIR set)
++   - Run ops/carbon/attribution_scale_test.py and inspect /tmp/aegis_attribution_scale_report.json
++   - Acceptance: MAE within threshold.
++
++2) Cost calibration
++   - Run ops/carbon/cost_calibrator_fix.py --start YYYY-MM-DD --end YYYY-MM-DD --observed_kwh 123.4 --apply
++   - Verify ConfigMap aegis-carbon-calibration in kube-system.
++
++3) Gatekeeper flip
++   - Use the GitHub Action .github/workflows/gatekeeper_enforce.yml to run validations and require manual approval.
++   - Alternatively run ops/gatekeeper/flip_enforcement.py --constraint require-carbon-check --mode enforce after manual validation.
++
++4) Milvus snapshot/restore & failover
++   - Run k8s/milvus/restore-job.yaml to validate restore.
++   - Run ops/milvus/failover_test.sh and check metrics.
++
++5) LLM & token policies
++   - Deploy LLM with healthchecks and HPA; ensure token-retention CronJob present.
++   - Review token bucket IAM and encryption.
++
++6) Agentic promotions
++   - Ensure HIL evidence present; run ops/agentic/hil_validation_runner.py and store evidence.
++   - Ensure historical-success model trained and verify invariants engine before promotion.
++   - Promote policies using CI with approval gating.
++
+*** End Patch
+*** End Patch

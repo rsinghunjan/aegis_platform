@@ -1,0 +1,481 @@
+*** Begin Patch
+*** Add File:services/legal/delegation_manager.py
++#!/usr/bin/env python3
++"""
++Legal Delegation Manager
++
++Purpose:
++ - Manage legal delegation records for Aegis automated decisions.
++ - Record delegations in Vault, produce delegation manifests, and cosign-sign them.
++ - Provide an API (CLI) operators/legal can use to create/renew/revoke delegations.
++
++Notes:
++ - This is an operator-facing tool; final legal text must be provided by counsel.
++ - Delegations stored in Vault KV v2 at path: VAULT_DELEGATION_PATH (env).
++"""
++import os
++import json
++import subprocess
++import tempfile
++from datetime import datetime, timezone
++
++VAULT_PATH = os.environ.get("VAULT_DELEGATION_PATH", "secret/data/aegis/delegations")
++COSIGN_KEY_REFS = os.environ.get("COSIGN_KEY_REFS", "")  # comma-separated list for redundant signing
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++
++def _vault_put(key, data):
++    # store JSON metadata at VAULT_PATH/<key>
++    try:
++        subprocess.check_call(["vault", "kv", "put", f"{VAULT_PATH}/{key}", f"metadata={json.dumps(data)}"])
++        return True
++    except Exception as e:
++        print("Vault write failed:", e)
++        return False
++
++def _cosign_sign(path):
++    # multi-signer: sign with each KMS key ref (if provided)
++    sigs = []
++    if not COSIGN_KEY_REFS:
++        raise RuntimeError("COSIGN_KEY_REFS not configured")
++    for ref in [r.strip() for r in COSIGN_KEY_REFS.split(",") if r.strip()]:
++        try:
++            subprocess.check_call(["cosign", "sign", "--key", ref, path])
++            sigs.append(ref)
++        except Exception as e:
++            print("cosign sign failed for", ref, ":", e)
++            raise
++    return sigs
++
++def create_delegation(delegation_id, actions, delegated_to, expires_iso, notes=""):
++    manifest = {
++        "delegation_id": delegation_id,
++        "actions": actions,
++        "delegated_to": delegated_to,
++        "created_at": datetime.now(timezone.utc).isoformat(),
++        "expires_at": expires_iso,
++        "notes": notes,
++    }
++    tmp = tempfile.mkdtemp()
++    path = os.path.join(tmp, f"delegation_{delegation_id}.json")
++    with open(path, "w") as fh:
++        json.dump(manifest, fh, indent=2)
++    # sign manifest with multi-party keys
++    sigs = _cosign_sign(path)
++    # upload to evidence store
++    uploaded = None
++    if EVIDENCE_BUCKET:
++        if EVIDENCE_BUCKET.startswith("s3://"):
++            subprocess.check_call(["aws", "s3", "cp", path, f"{EVIDENCE_BUCKET}/delegations/{os.path.basename(path)}"])
++            uploaded = f"{EVIDENCE_BUCKET}/delegations/{os.path.basename(path)}"
++        elif EVIDENCE_BUCKET.startswith("gs://"):
++            subprocess.check_call(["gsutil", "cp", path, f"{EVIDENCE_BUCKET}/delegations/{os.path.basename(path)}"])
++            uploaded = f"{EVIDENCE_BUCKET}/delegations/{os.path.basename(path)}"
++    # record in Vault
++    record = {"manifest_path": uploaded, "signers": sigs, "manifest": manifest}
++    _vault_put(delegation_id, record)
++    return record
++
++def revoke_delegation(delegation_id, revoked_by):
++    rec = {"revoked_by": revoked_by, "revoked_at": datetime.now(timezone.utc).isoformat()}
++    _vault_put(f"{delegation_id}_revocation", rec)
++    return rec
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("command", choices=["create", "revoke"])
++    p.add_argument("--id", required=True)
++    p.add_argument("--actions", help="comma-separated action keys (for create)")
++    p.add_argument("--delegated-to", help="party delegated to (for create)")
++    p.add_argument("--expires", help="ISO expiry (for create)")
++    p.add_argument("--notes", default="")
++    p.add_argument("--revoked-by", help="who revoked (for revoke)")
++    args = p.parse_args()
++    if args.command == "create":
++        out = create_delegation(args.id, args.actions.split(","), args.delegated_to, args.expires, notes=args.notes)
++        print(json.dumps(out, indent=2))
++    else:
++        out = revoke_delegation(args.id, args.revoked_by or "operator")
++        print(json.dumps(out, indent=2))
++
+*** End File
+*** Add File:ops/hsm/threshold_signer.py
++#!/usr/bin/env python3
++"""
++Threshold signer helper.
++
++This script performs multi-signer signing by iterating over a list of KMS key refs and invoking cosign for each.
++It produces a manifest.json that lists the signers and the resulting signature files.
++
++Usage:
++  ops/hsm/threshold_signer.py --artifact /path/to/art.tar.gz --keys "kms://aws/alias/...,gcp-kms-path,..."
++"""
++import argparse
++import os
++import subprocess
++import json
++import tempfile
++
++def sign_with_keys(artifact, keys):
++    sig_files = []
++    tmp = tempfile.mkdtemp()
++    for i, k in enumerate(keys):
++        print("Signing with", k)
++        try:
++            subprocess.check_call(["cosign", "sign", "--key", k, artifact])
++            # assume cosign writes artifact.sig; move to unique name
++            signame = f"{os.path.basename(artifact)}.sig.{i}"
++            os.rename(artifact + ".sig", os.path.join(tmp, signame))
++            sig_files.append(signame)
++        except subprocess.CalledProcessError as e:
++            print("cosign sign failed for", k, e)
++            raise
++    manifest = {"artifact": os.path.basename(artifact), "signatures": sig_files, "keys": keys}
++    manifest_path = os.path.join(tmp, "threshold_manifest.json")
++    with open(manifest_path, "w") as fh:
++        json.dump(manifest, fh, indent=2)
++    return tmp, manifest_path
++
++def verify_all(artifact, manifest_path, tmpdir):
++    with open(manifest_path) as fh:
++        m = json.load(fh)
++    results = []
++    for idx, sig in enumerate(m["signatures"]):
++        sigpath = os.path.join(tmpdir, sig)
++        # cosign verify supports verifying a signature file by using --signature
++        try:
++            subprocess.check_call(["cosign", "verify-blob", "--signature", sigpath, artifact])
++            results.append(True)
++        except subprocess.CalledProcessError:
++            results.append(False)
++    return results
++
++if __name__ == "__main__":
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--artifact", required=True)
++    ap.add_argument("--keys", required=True, help="comma-separated KMS key refs")
++    args = ap.parse_args()
++    keys = [k.strip() for k in args.keys.split(",") if k.strip()]
++    tmpdir, manifest = sign_with_keys(args.artifact, keys)
++    print("Created multi-sign manifest:", manifest)
++    print("Verifying signatures...")
++    print(verify_all(args.artifact, manifest, tmpdir))
++
+*** End File
+*** Add File:ops/hsm/rotate_keys.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Placeholder key rotation helper. Real rotation requires using cloud KMS/HSM CLI and updating cosign keyrefs.
++# This script demonstrates the expected steps:
++#  - create new key (cloud-specific)
++#  - update COSIGN_KEY_REFS list in Vault
++#  - run a rolling re-sign workflow (re-sign critical artifacts) or set up new-sign policy
++#
++echo "Key rotation must be implemented per-cloud. This is a placeholder script."
++echo "Steps:"
++echo "1) Create new key in KMS/HSM"
++echo "2) Update VAULT path secret/data/aegis/keys with new cosign key ref list"
++echo "3) Run re-sign job to sign active artifacts with new key set"
++exit 0
++
+*** End File
+*** Add File:services/audit/audit_packager.py
++#!/usr/bin/env python3
++"""
++Audit packager for third-party certification.
++ - Collects provided evidence paths, attestation bundles, reproducibility reports, policy simulation outputs,
++   red-team reports, and creates a signed archive for auditors.
++"""
++import argparse, os, tempfile, shutil, json, subprocess
++from datetime import datetime
++
++def collect(paths, outdir):
++    for p in paths:
++        if os.path.exists(p):
++            if os.path.isdir(p):
++                shutil.copytree(p, os.path.join(outdir, os.path.basename(p)), dirs_exist_ok=True)
++            else:
++                shutil.copy2(p, outdir)
++
++def sign_archive(archive_path, cosign_key_ref):
++    subprocess.check_call(["cosign", "sign", "--key", cosign_key_ref, archive_path])
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--paths", nargs="+", required=True)
++    ap.add_argument("--out", default="/tmp/aegis_audit_pkg.tar.gz")
++    ap.add_argument("--cosign-key", default=os.environ.get("COSIGN_KEY_REF",""))
++    args = ap.parse_args()
++    tmp = tempfile.mkdtemp(prefix="aegis_audit_")
++    collect(args.paths, tmp)
++    meta = {"collected_at": datetime.utcnow().isoformat(), "items": args.paths}
++    with open(os.path.join(tmp, "package_meta.json"), "w") as fh:
++        json.dump(meta, fh, indent=2)
++    subprocess.check_call(["tar","-czf", args.out, "-C", tmp, "."])
++    if args.cosign_key:
++        sign_archive(args.out, args.cosign_key)
++    print("Audit package created at", args.out)
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:.github/workflows/audit_package.yml
++name: Build & Upload Audit Package
++on:
++  workflow_dispatch:
++jobs:
++  package:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Build audit package
++        env:
++          COSIGN_KEY_REF: ${{ secrets.COSIGN_KEY_REF }}
++        run: |
++          python3 services/audit/audit_packager.py --paths "ops/attestation" "policies" "ops/repro" --out /tmp/aegis_audit_pkg.tar.gz --cosign-key "$COSIGN_KEY_REF"
++      - name: Upload artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: aegis-audit-package
++          path: /tmp/aegis_audit_pkg.tar.gz
++      - name: Notify auditor (optional)
++        if: ${{ secrets.AUDITOR_WEBHOOK != '' }}
++        run: |
++          curl -X POST -H "Content-Type: application/json" -d "{\"message\":\"New audit package ready\",\"artifact\":\"/tmp/aegis_audit_pkg.tar.gz\"}" "${{ secrets.AUDITOR_WEBHOOK }}"
++
+*** End File
+*** Add File:services/finance/production_reconcile_v2.py
++#!/usr/bin/env python3
++"""
++Enhanced production reconcile with shadow mode, thresholds and promotion gating.
++
++Environment:
++ - SHADOW_MODE=true/false (if true, do not perform real charges; only simulate/report)
++ - PROMOTION_THRESHOLD (float between 0 and 1) fraction of mismatch allowed before gating
++ - RECONCILE_DB - Postgres URL
++ - VAULT_FINANCE_PATH - vault path for finance creds
++ - FINANCE_AUTO_BLOCK (as before) - must be enabled only after promotion
++"""
++import os, subprocess, requests, psycopg2, json, time
++
++SHADOW = os.environ.get("SHADOW_MODE", "true").lower() == "true"
++PROMOTION_THRESHOLD = float(os.environ.get("PROMOTION_THRESHOLD", "0.001"))  # 0.1%
++RECON_DB = os.environ.get("RECONCILE_DB", os.environ.get("DATABASE_URL"))
++VAULT_FINANCE_PATH = os.environ.get("VAULT_FINANCE_PATH", "secret/data/aegis/finance")
++FINANCE_AUTO_BLOCK = os.environ.get("FINANCE_AUTO_BLOCK", "false").lower() == "true"
++
++def vault_get(key):
++    return subprocess.check_output(["vault", "kv", "get", "-field=value", f"{VAULT_FINANCE_PATH}/{key}"], universal_newlines=True).strip()
++
++def post_charge(finance_api, api_key, record):
++    if SHADOW:
++        return {"status":"shadow", "body":"shadow-run: not posting"}
++    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
++    r = requests.post(finance_api.rstrip("/") + "/charges", json=record, headers=headers, timeout=15)
++    return {"status": r.status_code, "body": r.text}
++
++def analyze_and_report():
++    conn = psycopg2.connect(RECON_DB)
++    with conn.cursor() as cur:
++        cur.execute("SELECT COUNT(*) FILTER (WHERE status!='ok') as bad, COUNT(*) as total FROM reconciliation_log")
++        bad, total = cur.fetchone()
++        conn.commit()
++    mismatch_rate = 0.0
++    if total > 0:
++        mismatch_rate = bad / float(total)
++    print("Mismatch rate:", mismatch_rate, "bad/total:", bad, total)
++    return mismatch_rate, bad, total
++
++def promote_if_safe():
++    mismatch_rate, bad, total = analyze_and_report()
++    if mismatch_rate <= PROMOTION_THRESHOLD:
++        print("Promotion allowed: mismatch_rate", mismatch_rate)
++        # operator: enable FINANCE_AUTO_BLOCK in prod (manual step) or call a secured API to flip
++        return True
++    print("Promotion blocked: mismatch_rate", mismatch_rate)
++    return False
++
++if __name__ == "__main__":
++    # used as a daily job: run analyze and optionally call promote_if_safe
++    if promote_if_safe():
++        print("Consider enabling FINANCE_AUTO_BLOCK after operator review.")
++    else:
++        print("Keep in shadow mode and investigate mismatches.")
++
+*** End File
+*** Add File:ops/vault/vault_ha_setup.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Bootstrap Vault Raft HA cluster (development/staging helper).
++# For production use follow HashiCorp Vault hardening docs and managed services.
++#
++echo "This script is a helper for setting up Vault in raft mode for HA."
++echo "It will initialize a single-node raft cluster (expand per cloud infra)."
++echo "Operator must adapt for cloud-specific infra and secure storage of init keys."
++exit 0
++
+*** End File
+*** Add File:ops/vault/sync_kms_per_cloud.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Sync per-cloud KMS key refs into Vault at secret/data/aegis/kms/<provider>
++# Usage: ops/vault/sync_kms_per_cloud.sh <provider> <key_ref>
++#
++PROVIDER=${1:-}
++KEYREF=${2:-}
++VAULT_BASE=${VAULT_BASE:-secret/data/aegis/kms}
++if [ -z "$PROVIDER" ] || [ -z "$KEYREF" ]; then
++  echo "Usage: $0 <provider> <key_ref>"
++  exit 2
++fi
++vault kv put "${VAULT_BASE}/${PROVIDER}" key_ref="$KEYREF"
++echo "Stored KMS ref for $PROVIDER"
++
+*** End File
+*** Add File:ops/crosscloud/verify_evidence_across_clouds.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Verify attestation bundles across multiple clouds by extracting pubkeys and running cosign verify.
++# Usage: ops/crosscloud/verify_evidence_across_clouds.sh --artifact s3://... --pubkeys "s3://...,gs://..."
++#
++ARTIFACT=${1:-}
++shift || true
++PUBKEYS=("$@")
++if [ -z "$ARTIFACT" ] || [ ${#PUBKEYS[@]} -eq 0 ]; then
++  echo "Usage: $0 <artifact-uri> <pubkey-uri> [<pubkey-uri> ...]"
++  exit 2
++fi
++tmp=$(mktemp -d)
++if [[ "$ARTIFACT" == s3://* ]]; then aws s3 cp "$ARTIFACT" "$tmp/art.tar.gz"; fi
++if [[ "$ARTIFACT" == gs://* ]]; then gsutil cp "$ARTIFACT" "$tmp/art.tar.gz"; fi
++for p in "${PUBKEYS[@]}"; do
++  if [[ "$p" == s3://* ]]; then aws s3 cp "$p" "$tmp/pubkey.pem"; fi
++  if [[ "$p" == gs://* ]]; then gsutil cp "$p" "$tmp/pubkey.pem"; fi
++  cosign verify --key "$tmp/pubkey.pem" "$tmp/art.tar.gz" && echo "Verified with $p" || echo "FAILED verify with $p"
++done
++
+*** End File
+*** Add File:services/accelerators/TPU_INFERENCE_README.md
++TPU integration notes (staging)
++
++- TPU runs require:
++  - TPU VM images or cloud-managed TPU setup
++  - A self-hosted builder/runner that can build TPU-compatible artifacts (jaxlib/XLA)
++  - Or use vendor-provided wheels (preferred)
++- CI stub:
++  - Use .github/workflows/tpu_ci.yml (existing) and point to a self-hosted TPU worker runner
++- Operator tasks:
++  - Provide TPU VM names, zones and ensure IAM roles allow ephemeral access for CI runners
++
+*** End File
+*** Add File:services/accelerators/NEURON_INFERENCE_README.md
++AWS Neuron (Inferentia/Trainium) integration notes
++
++- You need:
++  - Neuron-enabled EC2 instances (Inf1/Trn1) as self-hosted runners or in CI
++  - AWS neuron runtime packages installed in node images
++  - Device plugin DaemonSet (deploy/neuron) and packer image templates (ops/node_provision/packer-ubuntu-gpu.pkr.hcl adapted)
++- CI stub:
++  - Use .github/workflows/neuron-build.yml with self-hosted Neuron runner; ensure AMI has neuron runtime
++
+*** End File
+*** Add File:.github/workflows/tpu_ci.yml
++name: TPU CI Stub
++on:
++  workflow_dispatch:
++jobs:
++  tpu_build:
++    runs-on: self-hosted
++    # Runner must be a TPU-enabled host
++    steps:
++      - uses: actions/checkout@v4
++      - name: Notes
++        run: |
++          echo "This workflow is a stub. Replace with TPU-hosted build steps or vendor wheel download."
++      - name: Upload artifact (instruction)
++        run: echo "Upload TPU-compatible artifact to model repo or S3"
++
+*** End File
+*** Add File:.github/workflows/neuron_ci.yml
++name: Neuron CI Stub
++on:
++  workflow_dispatch:
++jobs:
++  neuron_build:
++    runs-on: self-hosted
++    steps:
++      - uses: actions/checkout@v4
++      - name: Build Neuron artifact
++        run: |
++          echo "This is a Neuron CI stub. Use a self-hosted Inf1 instance as runner and run neuron-cc build steps."
++
+*** End File
+*** Add File:services/policy/policy_test_harness.py
++#!/usr/bin/env python3
++"""
++Policy test harness & coverage reporter.
++ - Loads policy catalog & delegation matrix
++ - Runs through each action and verifies policy engine returns an expected decision
++ - Produces a coverage report per action->expected automation level
++"""
++import yaml, json, os, requests
++POLICY_CATALOG = os.environ.get("POLICY_CATALOG","policies/auto_policy_catalog.yaml")
++DELEGATION = os.environ.get("DELEGATION_MATRIX","policies/delegation_matrix.yaml")
++POLICY_ENGINE = os.environ.get("POLICY_ENGINE_URL","http://localhost:8085/evaluate")
++
++def load(p): return yaml.safe_load(open(p))
++
++def expected_from_delegation(action_key):
++    d = load(DELEGATION)
++    return d.get("actions", {}).get(action_key, {}).get("automation")
++
++def run_test():
++    pol = load(POLICY_CATALOG)
++    results = []
++    for action in pol.get("actions", {}).keys():
++        actor = "aegis-bot"
++        payload = {"action": action, "actor": actor}
++        try:
++            r = requests.post(POLICY_ENGINE, json=payload, timeout=5)
++            r.raise_for_status()
++            resp = r.json()
++        except Exception as e:
++            resp = {"error": str(e)}
++        expected = expected_from_delegation(action)
++        results.append({"action": action, "expected": expected, "result": resp})
++    out = "/tmp/policy_test_report.json"
++    with open(out,"w") as fh: json.dump(results, fh, indent=2)
++    print("Wrote report to", out)
++    return results
++
++if __name__=="__main__":
++    run_test()
++
+*** End File
+*** Add File:policies/tests/test_policy_harness.yml
++name: Policy Harness Runner
++on:
++  workflow_dispatch:
++jobs:
++  harness:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run policy harness
++        env:
++          POLICY_ENGINE_URL: ${{ secrets.POLICY_ENGINE_URL }}
++        run: |
++          python3 services/policy/policy_test_harness.py
++      - name: Upload report
++        uses: actions/upload-artifact@v4
++        with:
++          name: policy-harness-report
++          path: /tmp/policy_test_report.json
++
+*** End File
+*** End Patch

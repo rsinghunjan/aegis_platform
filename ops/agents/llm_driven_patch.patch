@@ -1,0 +1,506 @@
+*** Begin Patch
+*** Add File:ops/agents/hardened_tool_wrappers.py
++#!/usr/bin/env python3
++"""
++Hardened tool wrappers for agent use.
++
++- Enforces an allowlist of tools and a per-tool parameter schema/check.
++- Executes wrappers with timeouts and limited environment.
++- Records structured results for provenance.
++"""
++from typing import Any, Dict, Tuple
++import shlex
++import subprocess
++import json
++import os
++import re
++import time
++
++# Allowlist: tool_name -> {"cmd": shell command template or callable, "params_schema": callable}
++# cmd may be a format string like "psql -c '{query}'" or a python callable accepting params dict.
++ALLOWLIST = {
++    "echo": {
++        "cmd": lambda params: ["echo", str(params.get("message", ""))],
++        "params_check": lambda p: True,
++        "timeout": 5
++    },
++    "db_query": {
++        # Example: call a hardened DB query wrapper that uses parameterized queries.
++        "cmd": ["python3", "ops/agents/hardend_db_query.py"],  # expects args via stdin/json
++        "params_check": lambda p: isinstance(p, dict) and "name" in p and isinstance(p.get("params", []), list),
++        "timeout": 30
++    },
++    "http_post": {
++        "cmd": lambda params: ["curl", "-sS", "-X", "POST", "-H", "Content-Type: application/json", "-d", json.dumps(params.get("body", {})), params.get("url")],
++        "params_check": lambda p: isinstance(p.get("url", ""), str) and p.get("url", "").startswith("http"),
++        "timeout": 10
++    },
++    # Add real, audited tools here
++}
++
++# Basic blacklist for unsafe substrings in parameters
++BLACKLIST_PATTERNS = [
++    re.compile(r"\b(ssh|scp|rm\s+-rf|curl\s+http://(localhost|127\.0\.0\.1))\b", re.I),
++    re.compile(r"api[_-]?key", re.I),
++    re.compile(r"aws\s+credentials", re.I)
++]
++
++
++def is_safe_params(params: Any) -> Tuple[bool, str]:
++    """
++    Basic safety checks on parameters (prevent obvious exfil attempts).
++    """
++    s = json.dumps(params, default=str)
++    for pat in BLACKLIST_PATTERNS:
++        if pat.search(s):
++            return False, f"blacklisted pattern matched: {pat.pattern}"
++    return True, ""
++
++
++def run_tool(tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
++    """
++    Run an allowlisted tool with params and return a structured result.
++    Result includes: start_ts, end_ts, exit_code, stdout, stderr, error (if exception)
++    """
++    if tool_name not in ALLOWLIST:
++        raise RuntimeError(f"Tool '{tool_name}' not allowlisted")
++
++    info = ALLOWLIST[tool_name]
++    params_ok = info.get("params_check", lambda p: True)(params)
++    if not params_ok:
++        raise RuntimeError("Tool parameters failed validation")
++
++    safe, reason = is_safe_params(params)
++    if not safe:
++        raise RuntimeError(f"Tool parameters considered unsafe: {reason}")
++
++    cmd_spec = info["cmd"]
++    timeout = info.get("timeout", 10)
++
++    # Build command
++    if callable(cmd_spec):
++        cmd = cmd_spec(params)
++    elif isinstance(cmd_spec, list):
++        # when wrapper is a script, we pass params via stdin as JSON
++        cmd = cmd_spec
++    elif isinstance(cmd_spec, str):
++        # format string with params keys
++        cmd = shlex.split(cmd_spec.format(**params))
++    else:
++        raise RuntimeError("Invalid command spec for tool")
++
++    start = time.time()
++    try:
++        if isinstance(cmd, list) and cmd_spec == info.get("cmd"):
++            # If the wrapper expects JSON on stdin (e.g., hardend_db_query), pass it
++            p = subprocess.run(cmd, input=json.dumps(params).encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
++        else:
++            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
++        end = time.time()
++        return {
++            "tool": tool_name,
++            "cmd": cmd,
++            "start_ts": start,
++            "end_ts": end,
++            "duration_s": end - start,
++            "exit_code": p.returncode,
++            "stdout": p.stdout.decode(errors="replace"),
++            "stderr": p.stderr.decode(errors="replace"),
++        }
++    except subprocess.TimeoutExpired as te:
++        end = time.time()
++        return {
++            "tool": tool_name,
++            "cmd": cmd,
++            "start_ts": start,
++            "end_ts": end,
++            "duration_s": end - start,
++            "exit_code": -124,
++            "stdout": "",
++            "stderr": f"timeout after {timeout}s",
++            "error": str(te)
++        }
++    except Exception as e:
++        end = time.time()
++        return {
++            "tool": tool_name,
++            "cmd": cmd,
++            "start_ts": start,
++            "end_ts": end,
++            "duration_s": end - start,
++            "exit_code": -1,
++            "stdout": "",
++            "stderr": "",
++            "error": str(e)
++        }
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/agents/step_provenance.py
++#!/usr/bin/env python3
++"""
++Step-level provenance signing and storage.
++
++- Signs a JSON record either with cosign (KMS) if configured, or with HMAC fallback.
++- Uploads record and signature to S3 evidence bucket if configured.
++- Returns a provenance record containing storage keys and signature metadata.
++"""
++import os
++import json
++import subprocess
++import tempfile
++import hmac
++import hashlib
++import time
++from typing import Dict, Any
++
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++COSIGN_KMS_ARN = os.environ.get("COSIGN_KMS_ARN", "")
++HMAC_KEY = os.environ.get("PROVENANCE_HMAC_KEY", "")
++
++
++def _upload_to_s3(local_path: str, key: str) -> bool:
++    if not boto3:
++        return False
++    if not EVIDENCE_BUCKET:
++        return False
++    s3 = boto3.client("s3")
++    s3.upload_file(local_path, EVIDENCE_BUCKET, key)
++    return True
++
++
++def _sign_with_cosign(local_path: str) -> Dict[str, Any]:
++    """
++    Uses cosign sign-blob with KMS to sign the provided file.
++    Requires COSIGN_KMS_ARN to be configured.
++    """
++    if not COSIGN_KMS_ARN:
++        raise RuntimeError("COSIGN_KMS_ARN not configured")
++    sig_file = local_path + ".sig"
++    cmd = ["cosign", "sign-blob", "--kms", COSIGN_KMS_ARN, "-key", COSIGN_KMS_ARN, "--output-signature", sig_file, local_path]
++    subprocess.check_call(cmd)
++    with open(sig_file, "rb") as fh:
++        sig_bytes = fh.read()
++    return {"method": "cosign-kms", "signature_path": sig_file, "signature_hex": sig_bytes.hex()}
++
++
++def _sign_with_hmac(data: bytes) -> Dict[str, Any]:
++    if not HMAC_KEY:
++        raise RuntimeError("PROVENANCE_HMAC_KEY not set for HMAC signing")
++    sig = hmac.new(HMAC_KEY.encode(), data, hashlib.sha256).hexdigest()
++    return {"method": "hmac", "signature_hex": sig}
++
++
++def sign_and_store(record: Dict[str, Any], prefix: str = "agents/") -> Dict[str, Any]:
++    """
++    Sign a record dict and store both record and signature to S3.
++    Returns dict with keys: record_key, signature_key, signature_meta (method,...), timestamp
++    """
++    ts = int(time.time())
++    local = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
++    local.write(json.dumps(record, default=str).encode())
++    local.flush()
++    local_path = local.name
++    local.close()
++
++    result = {"timestamp": ts, "stored": False, "s3_record_key": None, "s3_signature_key": None, "signature_meta": None}
++
++    try:
++        if COSIGN_KMS_ARN:
++            sig_meta = _sign_with_cosign(local_path)
++            result["signature_meta"] = sig_meta
++            # Upload both file and signature if bucket configured
++            if EVIDENCE_BUCKET and boto3:
++                key = f"{prefix}{ts}-{os.path.basename(local_path)}"
++                _upload_to_s3(local_path, key)
++                result["s3_record_key"] = key
++                sig_key = f"{key}.sig"
++                _upload_to_s3(sig_meta["signature_path"], sig_key)
++                result["s3_signature_key"] = sig_key
++                result["stored"] = True
++        else:
++            # HMAC fallback
++            data = open(local_path, "rb").read()
++            sig_meta = _sign_with_hmac(data)
++            result["signature_meta"] = sig_meta
++            if EVIDENCE_BUCKET and boto3:
++                key = f"{prefix}{ts}-{os.path.basename(local_path)}"
++                _upload_to_s3(local_path, key)
++                result["s3_record_key"] = key
++                # store signature as small json
++                sig_key = f"{key}.sig.json"
++                tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
++                tmp.write(json.dumps(sig_meta).encode())
++                tmp.flush()
++                tmp.close()
++                _upload_to_s3(tmp.name, sig_key)
++                result["s3_signature_key"] = sig_key
++                result["stored"] = True
++    finally:
++        try:
++            os.remove(local_path)
++        except Exception:
++            pass
++    return result
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/agents/planner_validator.py
++#!/usr/bin/env python3
++"""
++Planner validator and instruction shielding.
++
++- Validates a planner output (list of steps) against required shape.
++- Ensures tools referenced are allowlisted and parameters are safe.
++- Strips or rewrites suspicious instructions.
++"""
++import json
++import re
++from typing import List, Dict, Any
++
++# Expected step shape:
++# { "id": "step-1", "tool": "db_query", "params": {...}, "run_after": [] }
++
++ALLOWED_TOOLS = {"echo", "db_query", "http_post"}
++MAX_STEPS = 50
++
++# very restrictive instruction shielding patterns
++SHIELD_PATTERNS = [
++    re.compile(r"(?i)exec\s+.*sh|bash|python|perl"),
++    re.compile(r"(?i)openai[_-]?api[_-]?key"),
++    re.compile(r"(?i)ssh\s+"),
++    re.compile(r"(?i)scp\s+"),
++]
++
++
++def validate_step(step: Dict[str, Any]) -> None:
++    if not isinstance(step, dict):
++        raise ValueError("step not a dict")
++    if "id" not in step or "tool" not in step:
++        raise ValueError("step missing required keys")
++    if step["tool"] not in ALLOWED_TOOLS:
++        raise ValueError(f"tool '{step['tool']}' not allowed")
++    # simple params shape guard
++    if "params" in step and not isinstance(step["params"], dict):
++        raise ValueError("params must be an object")
++    # shielding: check for dangerous strings inside params
++    s = json.dumps(step.get("params", {}))
++    for pat in SHIELD_PATTERNS:
++        if pat.search(s):
++            # remove risky content
++            raise ValueError(f"step params matched shielding pattern: {pat.pattern}")
++
++
++def validate_plan(plan: List[Dict[str, Any]]) -> bool:
++    if not isinstance(plan, list):
++        raise ValueError("plan must be a list")
++    if len(plan) > MAX_STEPS:
++        raise ValueError("plan too long")
++    ids = set()
++    for step in plan:
++        validate_step(step)
++        if step["id"] in ids:
++            raise ValueError("duplicate step id")
++        ids.add(step["id"])
++    return True
++
++
++def sanitize_plan(plan: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    """
++    Returns a sanitized copy. Currently just removes suspicious param keys.
++    """
++    sanitized = []
++    for step in plan:
++        params = dict(step.get("params", {}))
++        # remove any keys that look like credentials
++        for k in list(params.keys()):
++            if "key" in k.lower() or "secret" in k.lower() or "token" in k.lower():
++                params.pop(k)
++        new_step = dict(step)
++        new_step["params"] = params
++        sanitized.append(new_step)
++    return sanitized
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/agents/rate_limiter.py
++#!/usr/bin/env python3
++"""
++Simple token-bucket rate limiter for agent tool execution.
++"""
++import time
++from threading import Lock
++
++class TokenBucket:
++    def __init__(self, rate: float, capacity: float):
++        """
++        rate: tokens per second
++        capacity: maximum burst size
++        """
++        self.rate = rate
++        self.capacity = capacity
++        self.tokens = capacity
++        self.timestamp = time.time()
++        self.lock = Lock()
++
++    def consume(self, tokens: float = 1.0) -> bool:
++        with self.lock:
++            now = time.time()
++            delta = now - self.timestamp
++            self.tokens = min(self.capacity, self.tokens + delta * self.rate)
++            self.timestamp = now
++            if self.tokens >= tokens:
++                self.tokens -= tokens
++                return True
++            return False
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/agents/executor_with_limits.py
++#!/usr/bin/env python3
++"""
++Executor for LLM-driven plans with sandboxing, rate-limiting, provenance capture and hardened tool wrappers.
++
++Workflow:
++ - Validate & sanitize plan (planner_validator)
++ - For each step:
++   - enforce rate limit (TokenBucket)
++   - run hardened tool wrapper (hardened_tool_wrappers.run_tool)
++   - capture inputs, outputs, timing, exit codes
++   - call step_provenance.sign_and_store to persist evidence
++ - Return combined execution trace
++"""
++import os
++import json
++import time
++from typing import List, Dict, Any
++
++from ops.agents import planner_validator, hardened_tool_wrappers, step_provenance
++from ops.agents.rate_limiter import TokenBucket
++
++# instantiate a per-executor limiter (configurable via env)
++RATE = float(os.environ.get("AGENT_RATE_PER_SEC", "0.5"))  # default 0.5 calls/s
++BURST = float(os.environ.get("AGENT_BURST", "2"))
++
++token_bucket = TokenBucket(rate=RATE, capacity=BURST)
++
++
++def execute_plan(plan: List[Dict[str, Any]], provenance_prefix: str = "agents/") -> Dict[str, Any]:
++    """
++    Execute validated plan and capture signed evidence per step.
++    Returns an execution trace with step-level provenance metadata.
++    """
++    # Validate/sanitize plan
++    planner_validator.validate_plan(plan)
++    plan = planner_validator.sanitize_plan(plan)
++
++    trace = {"start_ts": int(time.time()), "steps": []}
++    for step in plan:
++        step_id = step.get("id")
++        tool = step.get("tool")
++        params = step.get("params", {})
++        # Rate limit
++        allowed = token_bucket.consume()
++        if not allowed:
++            # Wait briefly and retry once
++            time.sleep(1.0)
++            allowed = token_bucket.consume()
++            if not allowed:
++                raise RuntimeError("Rate limit exceeded for agent tool execution")
++
++        # Prepare evidence record before running
++        pre_record = {
++            "step_id": step_id,
++            "tool": tool,
++            "params": params,
++            "stage": "pre",
++            "ts": int(time.time())
++        }
++        pre_sign = step_provenance.sign_and_store(pre_record, prefix=provenance_prefix)
++
++        # Execute tool
++        start = time.time()
++        result = hardened_tool_wrappers.run_tool(tool, params)
++        end = time.time()
++
++        # Compose post record
++        post_record = {
++            "step_id": step_id,
++            "tool": tool,
++            "params": params,
++            "result": result,
++            "stage": "post",
++            "ts": int(time.time()),
++            "duration_s": end - start,
++            "pre_sign": pre_sign
++        }
++        post_sign = step_provenance.sign_and_store(post_record, prefix=provenance_prefix)
++
++        # Append trace entry
++        trace_entry = {
++            "id": step_id,
++            "tool": tool,
++            "params": params,
++            "result_summary": {
++                "exit_code": result.get("exit_code"),
++                "duration_s": result.get("duration_s"),
++                "stdout_snippet": (result.get("stdout") or "")[:512]
++            },
++            "provenance": {
++                "pre": pre_sign,
++                "post": post_sign
++            }
++        }
++        trace["steps"].append(trace_entry)
++
++    trace["end_ts"] = int(time.time())
++    # Optionally sign the whole trace
++    trace_sign = step_provenance.sign_and_store(trace, prefix=provenance_prefix + "traces/")
++    trace["provenance"] = trace_sign
++    return trace
++
++
++if __name__ == "__main__":
++    # Simple CLI: read plan from stdin and execute
++    import sys
++    plan = json.load(sys.stdin)
++    out = execute_plan(plan)
++    print(json.dumps(out, indent=2))
++
+*** End Patch
+*** Begin Patch
+*** Add File:tests/agents/test_executor.py
++import json
++import os
++import tempfile
++from ops.agents.executor_with_limits import execute_plan
++
++def test_execute_simple_plan():
++    plan = [
++        {"id": "s1", "tool": "echo", "params": {"message": "hello aegis"}},
++        {"id": "s2", "tool": "echo", "params": {"message": "second step"}}
++    ]
++    out = execute_plan(plan, provenance_prefix="tests/agents/")
++    assert "steps" in out and len(out["steps"]) == 2
++    for s in out["steps"]:
++        assert "result_summary" in s
++        assert s["result_summary"]["exit_code"] == 0
++    print("executor test passed")
++
++if __name__ == "__main__":
++    test_execute_simple_plan()
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/agents/llm_driven_runbook.md
++# LLM-Driven Agents — Runbook (Aegis)
++
++Purpose
++-------
++This runbook describes the LLM-driven agent execution flow added to Aegis, covering planner validation, hardened tool wrappers, execution with rate limits, step-level provenance signing, and basic red-team mitigation (instruction shielding). Use this runbook to
+

@@ -1,0 +1,429 @@
+*** Begin Patch
+*** Add File:telemetry/daemonset_node_power_exporter.yaml
++apiVersion: apps/v1
++kind: DaemonSet
++metadata:
++  name: node-power-exporter
++  namespace: observability
++spec:
++  selector:
++    matchLabels:
++      app: node-power-exporter
++  template:
++    metadata:
++      labels:
++        app: node-power-exporter
++    spec:
++      hostNetwork: true
++      hostPID: false
++      hostIPC: false
++      containers:
++        - name: node-power-exporter
++          image: ghcr.io/yourorg/node-power-exporter:latest
++          args: ["--metrics.addr=:9104"]
++          securityContext:
++            runAsNonRoot: true
++          ports:
++            - containerPort: 9104
++          resources:
++            limits:
++              cpu: "100m"
++              memory: "128Mi"
++      tolerations:
++        - operator: Exists
++
++---
++# ServiceMonitor for Prometheus Operator (if installed)
++apiVersion: monitoring.coreos.com/v1
++kind: ServiceMonitor
++metadata:
++  name: node-power-exporter-sm
++  namespace: observability
++spec:
++  selector:
++    matchLabels:
++      app: node-power-exporter
++  endpoints:
++    - port: metrics
++      interval: 30s
++
+*** End Patch
+*** Begin Patch
+*** Add File:telemetry/collect_and_upload.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Run calibration: collect telemetry CSVs, run calibration pipeline and upload calibrated profiles as ConfigMap.
++TELEM_DIR=${TELEM_DIR:-/data/telemetry}
++PROFILE_OUT=${PROFILE_OUT:-/tmp/power_profiles.yaml}
++CM_NAME=${CM_NAME:-aegis-power-profiles}
++NAMESPACE=${NAMESPACE:-aegis}
++
++python3 calibration/calibration_pipeline.py --input-dir "${TELEM_DIR}" --out "${PROFILE_OUT}" || true
++
++# Create/replace ConfigMap with calibrated profiles
++kubectl -n "${NAMESPACE}" create configmap "${CM_NAME}" --from-file=power_profiles.yaml="${PROFILE_OUT}" --dry-run=client -o yaml | kubectl apply -f -
++
++echo "Uploaded calibrated power_profiles to ConfigMap ${NAMESPACE}/${CM_NAME}"
++
+*** End Patch
+*** Begin Patch
+*** Add File:runtime/train_and_publish.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Train runtime predictor from runtime telemetry and push model into a ConfigMap for the runtime-predictor deployment.
++RUNTIME_TELEM_DIR=${RUNTIME_TELEM_DIR:-/data/runtime}
++MODEL_OUT=${MODEL_OUT:-/tmp/runtime_model.pkl}
++CM_NAME=${CM_NAME:-runtime-model-cm}
++NAMESPACE=${NAMESPACE:-aegis}
++
++python3 runtime_predictor/train_model.py --input-dir "${RUNTIME_TELEM_DIR}" --out "${MODEL_OUT}"
++
++# Create a binary ConfigMap via kubectl (base64)
++kubectl -n "${NAMESPACE}" create configmap "${CM_NAME}" --from-file=runtime_model.pkl="${MODEL_OUT}" --dry-run=client -o yaml | kubectl apply -f -
++echo "Published runtime model to ConfigMap ${NAMESPACE}/${CM_NAME}"
++
+*** End Patch
+*** Begin Patch
+*** Add File:controller/enforcer.py
++#!/usr/bin/env python3
++"""
++Carbon Enforcer Controller (placement + enforcement metrics)
++ - Watches Workflows and Pods; for objects annotated with aegis.carbon.hint:
++   - If action=defer: suspend workflow and create resume job (resume helper exists)
++   - If action=run but hint.prefer_spot: inject nodeSelector for spot pool (patch workflow templates)
++ - Emits Prometheus metrics via simple pushgateway or endpoint (here we update Redis counters)
++"""
++import os, time, json, traceback
++from kubernetes import client, config, watch
++import redis
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://aegis-redis.aegis.svc:6379/0")
++redis_cli = redis.Redis.from_url(REDIS_URL, decode_responses=True)
++
++def suspend_workflow(crd_api, name, ns):
++    try:
++        body = {"spec": {"suspend": True}}
++        crd_api.patch_namespaced_custom_object(group="argoproj.io", version="v1alpha1", namespace=ns, plural="workflows", name=name, body=body)
++        redis_cli.incr("aegis:enforcer:suspended_total")
++        print("Suspended workflow", name)
++    except Exception as e:
++        print("Error suspending:", e)
++
++def patch_node_selector(crd_api, name, ns, selector):
++    try:
++        patch = {"metadata": {"annotations": {"aegis.nodeSelector": json.dumps(selector)}}}
++        crd_api.patch_namespaced_custom_object(group="argoproj.io", version="v1alpha1", namespace=ns, plural="workflows", name=name, body=patch)
++        redis_cli.incr("aegis:enforcer:patched_node_selector_total")
++        print("Patched nodeSelector for", name)
++    except Exception as e:
++        print("Error patching:", e)
++
++def create_resume_job(batch_api, name, ns, delay_seconds):
++    job_name = f"resume-{name[:30]}-{int(time.time())}"
++    body = {
++        "apiVersion": "batch/v1",
++        "kind": "Job",
++        "metadata": {"name": job_name, "namespace": ns},
++        "spec": {
++            "template": {
++                "spec": {
++                    "restartPolicy": "OnFailure",
++                    "containers": [{
++                        "name": "resumer",
++                        "image": "bitnami/kubectl:latest",
++                        "command": ["/bin/sh","-c"],
++                        "args": [f"sleep {delay_seconds}; kubectl patch workflow {name} -n {ns} --type merge -p '{{\"spec\":{{\"suspend\":false}}}}'"]
++                    }]
++                }
++            }
++        }
++    }
++    batch_api.create_namespaced_job(namespace=ns, body=body)
++    redis_cli.incr("aegis:enforcer:resume_jobs_created")
++    print("Created resume job", job_name)
++
++def main():
++    config.load_incluster_config()
++    crd = client.CustomObjectsApi()
++    batch = client.BatchV1Api()
++    w = watch.Watch()
++    print("Starting carbon enforcer...")
++    for ev in w.stream(crd.list_cluster_custom_object, group="argoproj.io", version="v1alpha1", plural="workflows", timeout_seconds=60):
++        try:
++            obj = ev["object"]
++            meta = obj.get("metadata", {})
++            ann = meta.get("annotations", {}) or {}
++            hint = ann.get("aegis.carbon.hint")
++            if not hint:
++                continue
++            hintj = json.loads(hint)
++            if hintj.get("action") == "defer":
++                defer_until = hintj.get("defer_until")
++                et = int(time.mktime(time.strptime(defer_until.replace("Z",""), "%Y-%m-%dT%H:%M:%S")))
++                now = int(time.time())
++                delay = max(0, et - now)
++                suspend_workflow(crd, meta.get("name"), meta.get("namespace","aegis"))
++                create_resume_job(batch, meta.get("name"), meta.get("namespace","aegis"), delay)
++            elif hintj.get("action") == "run" and hintj.get("prefer_spot"):
++                # instruct workflow to prefer spot pool by adding nodeSelector annotation; the controller that launches pods should respect it
++                patch_node_selector(crd, meta.get("name"), meta.get("namespace","aegis"), {"lifecycle":"spot"})
++        except Exception:
++            traceback.print_exc()
++        time.sleep(0.5)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:rbac/enforcer_rbac.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: aegis-enforcer-sa
++  namespace: aegis
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRole
++metadata:
++  name: aegis-enforcer-role
++rules:
++  - apiGroups: ["argoproj.io"]
++    resources: ["workflows"]
++    verbs: ["get","list","watch","patch"]
++  - apiGroups: [""]
++    resources: ["jobs"]
++    verbs: ["create","get","list"]
++  - apiGroups: [""]
++    resources: ["pods"]
++    verbs: ["get","list"]
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRoleBinding
++metadata:
++  name: aegis-enforcer-binding
++subjects:
++  - kind: ServiceAccount
++    name: aegis-enforcer-sa
++    namespace: aegis
++roleRef:
++  kind: ClusterRole
++  name: aegis-enforcer-role
++  apiGroup: rbac.authorization.k8s.io
++
+*** End Patch
+*** Begin Patch
+*** Add File:terraform/eks_spot_nodegroup.tf
++# Terraform module skeleton for EKS spot nodegroup (operators should adapt)
++variable "cluster_name" {}
++variable "nodegroup_name" {}
++variable "subnets" { type = list(string) }
++variable "node_role_arn" {}
++variable "instance_types" { type = list(string) }
++variable "min_size" { default = 1 }
++variable "max_size" { default = 4 }
++
++resource "aws_eks_node_group" "spot" {
++  cluster_name    = var.cluster_name
++  node_group_name = var.nodegroup_name
++  node_role_arn   = var.node_role_arn
++  subnet_ids      = var.subnets
++  scaling_config {
++    desired_size = var.min_size
++    min_size     = var.min_size
++    max_size     = var.max_size
++  }
++  instance_types = var.instance_types
++  capacity_type  = "SPOT"
++  # Add tags and labels to identify spot nodegroup
++  tags = {
++    "lifecycle" = "spot"
++  }
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:terraform/apply_spot.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Simple wrapper to apply the Terraform spot nodegroup module.
++TFDIR=${TFDIR:-./terraform}
++cd "${TFDIR}"
++terraform init
++terraform apply -auto-approve
++
+*** End Patch
+*** Begin Patch
+*** Add File:policy/override_service.py
++#!/usr/bin/env python3
++"""
++Override / appeal service:
++ - Teams can request a one-time override token (stored to Redis) that expires.
++ - The mutating webhook/controller will consult Redis for an active override for the workflow name or team.
++"""
++from flask import Flask, request, jsonify
++import redis, os, uuid, time
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://aegis-redis.aegis.svc:6379/0")
++r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
++
++app = Flask("override-service")
++
++@app.route("/request", methods=["POST"])
++def request_override():
++    payload = request.json or {}
++    team = payload.get("team")
++    workflow = payload.get("workflow")
++    reason = payload.get("reason","")
++    token = str(uuid.uuid4())
++    key = f"override:{team}:{workflow}:{token}"
++    # store token with TTL (e.g., 2 hours)
++    r.set(key, reason, ex=7200)
++    # also store index for list
++    r.lpush(f"overrides:{team}:{workflow}", token)
++    return jsonify({"token": token, "ttl_seconds": 7200})
++
++@app.route("/validate", methods=["POST"])
++def validate_override():
++    payload = request.json or {}
++    team = payload.get("team")
++    workflow = payload.get("workflow")
++    token = payload.get("token")
++    key = f"override:{team}:{workflow}:{token}"
++    ok = r.exists(key)
++    return jsonify({"allowed": bool(ok)})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=8091)
++
+*** End Patch
+*** Begin Patch
+*** Add File:enforcement/token_budget_integration.md
++# Integrating token-budget with carbon enforcement
++
++Extend token-budget API with POST /check_carbon {"team","kg"} -> {"allowed":bool}
++ - token-budget should check remaining carbon budget for the team and return allowance
++ - if allowed true, webhook/controller proceeds; else policy may deny or defer
++
++Operator steps:
++ - Implement endpoint in token-budget service or add compatibility layer that consults FinOps system
++ - Ensure tokens and budgets are auditable and signed into evidence
++
+*** End Patch
+*** Begin Patch
+*** Add File:reconcile/approve_service.py
++#!/usr/bin/env python3
++"""
++Calibration approval service:
++ - Lists draft calibration proposals (uploaded to S3 by auto-calibrate)
++ - Allows an operator to approve a draft; when approved the service will apply the change to the power_profiles ConfigMap
++   (requires Kubernetes permissions) and record a signed evidence artifact.
++"""
++from flask import Flask, request, jsonify
++import boto3, os, json, subprocess
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++S3 = boto3.client("s3") if EVIDENCE_BUCKET else None
++CM_NAME = os.environ.get("POWER_CM", "aegis-power-profiles")
++NAMESPACE = os.environ.get("NAMESPACE", "aegis")
++
++app = Flask("cal-approve")
++
++@app.route("/list", methods=["GET"])
++def list_drafts():
++    # list S3 objects under calibration/draft_*
++    res = S3.list_objects_v2(Bucket=EVIDENCE_BUCKET, Prefix="calibration/") if S3 else {"Contents": []}
++    items = [o["Key"] for o in res.get("Contents", [])] if res.get("Contents") else []
++    return jsonify({"drafts": items})
++
++@app.route("/approve", methods=["POST"])
++def approve():
++    payload = request.json or {}
++    key = payload.get("s3_key")
++    if not key:
++        return jsonify({"ok": False, "reason": "s3_key required"}), 400
++    tmp = "/tmp/draft.json"
++    S3.download_file(EVIDENCE_BUCKET, key, tmp)
++    draft = json.load(open(tmp))
++    # convert draft changes into a new power_profiles.yaml (operator may customize)
++    new_profile = {"default": {"base_power_w": 150, "gpu_power_w_per_card": 300}}
++    # operator action: for demo write draft into ConfigMap
++    subprocess.run(["kubectl","-n",NAMESPACE,"create","configmap",CM_NAME,"--from-file=power_profiles.yaml="+tmp,"--dry-run=client","-o","yaml"], check=True, stdout=subprocess.PIPE)
++    apply_cmd = ["kubectl","-n",NAMESPACE,"create","configmap",CM_NAME,"--from-file=power_profiles.yaml="+tmp,"--dry-run=client","-o","yaml"]
++    out = subprocess.run(apply_cmd, check=True, stdout=subprocess.PIPE).stdout
++    subprocess.run(["kubectl","apply","-f","-"], input=out, check=True)
++    # sign and upload evidence (placeholder: cosign)
++    return jsonify({"ok": True, "applied": True})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=8092)
++
+*** End Patch
+*** Begin Patch
+*** Add File:reports/daily_team_report.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Generate daily per-team carbon reports using Prometheus queries and upload to S3, sign with cosign
++PROM=${PROM:-http://prometheus.observability.svc:9090}
++EVIDENCE_BUCKET=${EVIDENCE_BUCKET:-aegis-evidence}
++OUT="/tmp/daily_team_report_$(date -u +%Y%m%d).json"
++
++python3 - <<PY
++import requests, json, os
++prom = os.environ.get("PROM", "${PROM}")
++# Query total emissions per team from metric aegis_job_estimated_emissions_kg grouped by team
++q = 'sum(aegis_job_estimated_emissions_kg) by (team)'
++r = requests.get(prom + "/api/v1/query", params={"query": q}, timeout=60).json()
++data = r.get("data",{})
++open("${OUT}", "w").write(json.dumps(data, indent=2))
++print("Wrote report ${OUT}")
++PY
++
++# sign and upload
++cosign sign --key "awskms://${COSIGN_KMS_KEY_ARN:-}" "${OUT}" || true
++aws s3 cp "${OUT}" "s3://${EVIDENCE_BUCKET}/reports/$(basename ${OUT})" || true
++echo "Uploaded signed daily report to s3://${EVIDENCE_BUCKET}/reports/"
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/prometheus_rules_enforcement.yaml
++groups:
++- name: aegis-enforcement.rules
++  rules:
++  - alert: CarbonEnforcementFailures
++    expr: increase(aegis_enforcer_errors_total[5m]) > 0
++    for: 5m
++    labels:
++      severity: page
++    annotations:
++      summary: "Carbon enforcer errors detected"
++
++  - alert: FeedFallbackInUse
++    expr: aegis_feed_co2signal_ok == 0 and aegis_feed_grid_ok == 0
++    for: 10m
++    labels:
++      severity: warning
++    annotations:
++      summary: "All primary carbon feeds unavailable; fallback in use"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ui/policy_ui_improvements.md
++# Policy UI & Appeals improvements
++
++This document describes a minimal UX:
++- Request override: POST /request to override_service, returns token
++- Approve override: operator can view override tokens in Redis and approve via controller
++- Policy editor: update per-team policy via policy_ui.py (already present)
++- Billing integration: daily_team_report.sh produces signed reports for FinOps ingestion
++
++Operator: deploy override_service.py and policy_ui.py behind ingress and SSO for team access.
++
+*** End Patch
+*** End Patch

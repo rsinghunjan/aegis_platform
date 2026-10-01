@@ -1,0 +1,328 @@
+*** Begin Patch
+*** Add File:prod/hardening/COMPLETE_HARDENING_CHECKLIST.md
++# Aegis Production Hardening Checklist (Operator Playbook)
++
++This checklist collects the concrete steps to harden PoCs and scaffolds into production-ready components.
++Run through these items in sequence; many steps require operator privileges and coordination with security/infra owners.
++
++1) Vault ceremony & init/unseal
++ - Ensure KMS CMK exists for auto-unseal with strict key policy.
++ - Run deploy/vault/ceremony_automation.sh from a secure bastion to:
++   - initialize Vault (if necessary)
++   - upload init bundle to Secrets Manager and S3 object-lock
++   - create automation tokens & policies
++ - Verify auto-unseal on pod restart, verify audit logs landed in S3.
++
++2) Rekor durability & restore drills
++ - Configure Rekor with a managed RDS (Multi-AZ) and snapshots.
++ - Schedule CronJob (deploy/rekor/rekor_restore_drill_cronjob.yaml) to run backup/restore drills monthly.
++ - Ensure deploy/rekor/restore_drill_runner.sh produces a reconciliation report, cosigns it, and uploads to evidence bucket.
++
++3) Stateful services (Milvus, Redis, Postgres, etc.)
++ - Deploy Milvus with ops/milvus/prod_values.yaml and persistent PVCs on io2/high-IO storage.
++ - Run ops/milvus/backup_segments_prod.sh nightly to snapshot segments to S3.
++ - Test restore to a staging cluster; validate queries.
++ - Ensure Redis for replay has persistence enabled and is monitored.
++
++4) ONNX / model correctness & per-model tuning
++ - Add per-model exporter hooks into onnx/per_model_export_and_triton_pack.py where needed.
++ - Run onnx/validate_numeric_equivalence.py for each conversion; store validation JSON with artifact.
++ - Include TensorRT conversion via triton/tensorrt/convert_onnx_to_tensorrt.sh and validate via triton/validation/tensorrt_validate.py.
++ - Maintain tolerance thresholds per model family (config in onnx/model_tolerances.yaml).
++
++5) Distributed DL & large LLMs
++ - Provision high-throughput networking (RDMA where available) and node images with NCCL-optimized kernels.
++ - Use deepspeed/k8s_deepspeed_configmap.yaml for NCCL tuning and deploy DeepSpeed launcher jobs (ops/deepspeed/deepspeed-launcher-job.yaml).
++ - Provide Ray cluster via ops/ray manifests and use rl/trainer/rllib_improved_trainer.py or DeepSpeed launcher for multi-node.
++ - Validate NCCL allreduce across nodes and measure scaling.
++
++6) RL at scale (replay & safety)
++ - Deploy replay service via replay/redis/prioritized_replay_service.py with Helm/Deployment (ops/redis/values.yaml example).
++ - Run argo/rl/collector_scaled_workflow.yaml for collectors; aggregate to s3_parquet with rl/replay/s3_parquet_replay.py.
++ - Ensure safety gate workflow (argo/rl/rl_safety_gate_prod.yaml) is used to gate promotions.
++
++7) Edge & device productionization
++ - Replace PoC device enrollment with device/enrollment/service.py backed by TPM provisioning (cloud DPS or on-prem).
++ - Use HSM/Cloud KMS for signing if TPM not available on device; enforce attestation during enrollment.
++ - Implement OTA using TUF + cosign-signed artifacts; ensure offline batch reconcilers on devices.
++
++8) Operational maturity & SLOs
++ - Add/verify SLOs for evidence coverage, model latency (p95), replay buffer size, and eval frequency.
++ - Use monitoring/prometheus_rules_rl_prod.yaml + monitoring/prometheus_rules_additions.yaml and ensure alerts route to on-call.
++ - Run ops/slo/run_slo_drill.sh monthly and record signed reports to evidence bucket.
++
++9) Observability completeness
++ - Run monitoring/metrics_coverage_check.py to detect missing exporters; instrument missing metrics.
++ - Maintain Grafana dashboards in monitoring/grafana/ and add per-model panels as needed.
++
++Automation & CI
++ - Add CI templates/ci/templates/model_ci_template.yml to every model repo.
++ - Ensure CI upload evidence bundles and manifest to model artifact bucket before any promotion.
++
++Notes
++ - Many scripts assume AWS; adjust for other cloud providers (Azure KeyVault/Blob, GCP KMS/GCS).
++ - Replace placeholder images and registry paths (ghcr.io/yourorg/...) with your images.
++
+*** End Patch
+*** Begin Patch
+*** Add File:deploy/vault/ceremony_automation.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Automate a safe Vault init/unseal ceremony and storage of init bundles.
++# This script is intended to be executed from an operator bastion with AWS creds (or adapt for GCP/Azure).
++#
++# Pre-reqs:
++# - kubectl context set to cluster
++# - aws CLI configured with sufficient permissions for Secrets Manager and S3
++# - VAULT_ADDR set to the Vault service address
++:
++  "${VAULT_ADDR:?VAULT_ADDR required (eg https://vault.aegis.svc:8200)}"
++  "${EVIDENCE_BUCKET:?EVIDENCE_BUCKET required}"
++  "${S3_INIT_BUCKET:?S3_INIT_BUCKET required (immutable bucket)}"
++  "${SECRETSMANAGER_PREFIX:?SECRETSMANAGER_PREFIX required (eg aegis/vault)}"
++
++echo "Checking Vault init status..."
++if vault status -format=json | jq -e '.initialized' >/dev/null 2>&1; then
++  echo "Vault already initialized"
++else
++  echo "Initializing Vault..."
++  # initialize with 5 key shares, 3 required to unseal as an example
++  vault operator init -format=json -key-shares=5 -key-threshold=3 > /tmp/vault-init-bundle.json
++  echo "Vault initialized. Storing init bundle to Secrets Manager and to S3 (immutable copy)."
++  SM_NAME="${SECRETSMANAGER_PREFIX}/init-bundle-$(date -u +%Y%m%dT%H%M%SZ)"
++  aws secretsmanager create-secret --name "${SM_NAME}" --secret-string file:///tmp/vault-init-bundle.json || \
++    aws secretsmanager put-secret-value --secret-id "${SM_NAME}" --secret-string file:///tmp/vault-init-bundle.json
++  aws s3 cp /tmp/vault-init-bundle.json "s3://${S3_INIT_BUCKET}/vault-init-bundles/$(basename /tmp/vault-init-bundle.json)" --server-side-encryption aws:kms || true
++  echo "Init bundle saved to Secrets Manager (${SM_NAME}) and S3."
++fi
++
++echo "Ensure Vault auto-unseal is configured (KMS) in Helm values and that Vault pods can access the KMS key."
++echo "Creating automation token & baseline policy..."
++# create a least-privileged automation policy for platform tasks
++cat > /tmp/aegis-automation-policy.hcl <<'HCL'
++path "auth/*" {
++  capabilities = ["list"]
++}
++path "secret/data/aegis/*" {
++  capabilities = ["read","list"]
++}
++HCL
++vault policy write aegis-automation /tmp/aegis-automation-policy.hcl || true
++AUTOMATION_TOKEN=$(vault token create -policy="aegis-automation" -format=json | jq -r '.auth.client_token')
++echo "Automation token created. Storing token in Secrets Manager (short-lived token recommended)."
++aws secretsmanager create-secret --name "${SECRETSMANAGER_PREFIX}/automation-token-$(date -u +%Y%m%dT%H%M%SZ)" --secret-string "${AUTOMATION_TOKEN}" || \
++  aws secretsmanager put-secret-value --secret-id "${SECRETSMANAGER_PREFIX}/automation-token" --secret-string "${AUTOMATION_TOKEN}" || true
++
++echo "Ceremony automation complete. IMPORTANT: Securely distribute init bundle and ensure S3 bucket has Object Lock enabled if required."
++
+*** End Patch
+*** Begin Patch
+*** Add File:deploy/rekor/rekor_restore_drill_cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: rekor-restore-drill
++  namespace: aegis
++spec:
++  schedule: "0 3 1 * *" # monthly on day 1 at 03:00
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          containers:
++            - name: rekor-drill
++              image: ghcr.io/yourorg/aegis-ops:latest
++              command: ["/bin/bash","-c"]
++              args:
++                - /opt/scripts/restore_drill_runner.sh
++              env:
++                - name: REKOR_PG_HOST
++                  valueFrom:
++                    secretKeyRef:
++                      name: rekor-secrets
++                      key: host
++                - name: REKOR_PG_USER
++                  valueFrom:
++                    secretKeyRef:
++                      name: rekor-secrets
++                      key: user
++                - name: REKOR_PG_DB
++                  value: rekor
++                - name: S3_BACKUP_BUCKET
++                  valueFrom:
++                    secretKeyRef:
++                      name: aegis-secrets
++                      key: backup_bucket
++                - name: EVIDENCE_BUCKET
++                  valueFrom:
++                    secretKeyRef:
++                      name: aegis-secrets
++                      key: evidence_bucket
++          restartPolicy: OnFailure
++
+*** End Patch
+*** Begin Patch
+*** Add File:deploy/rekor/restore_drill_runner.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Run Rekor backup & restore drill inside Kubernetes job (used by CronJob above).
++# This wrapper adapts environment variables to call the repo's backup_and_restore_drill.sh script.
++:
++  "${REKOR_PG_HOST:?}"
++  "${REKOR_PG_USER:?}"
++  "${REKOR_PG_DB:?}"
++  "${S3_BACKUP_BUCKET:?}"
++  "${EVIDENCE_BUCKET:?}"
++
++export REKOR_PG_PORT=${REKOR_PG_PORT:-5432}
++export REKOR_PG_PASSWORD=${REKOR_PG_PASSWORD:-}
++export AWS_REGION=${AWS_REGION:-us-west-2}
++export COSIGN_KMS_KEY_ARN=${COSIGN_KMS_KEY_ARN:-}
++
++echo "Starting Rekor restore drill..."
++/opt/scripts/backup_and_restore_drill.sh
++echo "Drill completed."
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/milvus/prod_values.yaml
++## Production Helm values for Milvus (better defaults / persistence)
++cluster:
++  mode: distributed
++  replicas: 3
++
++persistence:
++  enabled: true
++  storageClass: "gp2-io2"  # use IO-optimized storage class
++  size: 1000Gi
++
++resources:
++  proxy:
++    requests:
++      cpu: "500m"
++      memory: "2Gi"
++    limits:
++      cpu: "1"
++      memory: "4Gi"
++  datanode:
++    requests:
++      cpu: "4"
++      memory: "32Gi"
++    limits:
++      cpu: "8"
++      memory: "64Gi"
++
++nodeSelector:
++  node-role.kubernetes.io/data: "true"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/milvus/backup_segments_prod.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Production Milvus backup script: exports segment files and metadata to S3.
++:
++  "${MILVUS_PVC_PATH:?MILVUS_PVC_PATH required (path mounted in backup job)}"
++  "${S3_BACKUP_BUCKET:?S3_BACKUP_BUCKET required}"
++  "${AWS_REGION:?AWS_REGION required}"
++
++TS=$(date -u +"%Y%m%dT%H%M%SZ")
++OUT_KEY="milvus/prod-backups/segments-${TS}.tar.gz"
++TMP="/tmp/milvus_prod_backup_${TS}.tar.gz"
++
++echo "Archiving Milvus data from ${MILVUS_PVC_PATH} -> ${TMP}"
++tar czf "${TMP}" -C "${MILVUS_PVC_PATH}" .
++
++echo "Uploading to s3://${S3_BACKUP_BUCKET}/${OUT_KEY}"
++aws s3 cp "${TMP}" "s3://${S3_BACKUP_BUCKET}/${OUT_KEY}" --region "${AWS_REGION}" --server-side-encryption aws:kms
++echo "Uploaded Milvus production backup."
++
+*** End Patch
+*** Begin Patch
+*** Add File:onnx/validate_numeric_equivalence.py
++#!/usr/bin/env python3
++"""
++Validate numeric equivalence between:
++ - ONNX runtime reference (CPU provider)
++ - Triton serving endpoint (if available) or TensorRT engine via Triton
++Produces a JSON report with per-output max-abs and mean-square error.
++"""
++import argparse, json, numpy as np
++import os, requests, tempfile
++
++def run_onnx_inference(onnx_path, input_feed):
++    import onnxruntime as ort
++    sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
++    out = sess.run(None, input_feed)
++    return out
++
++def call_triton_infer(model_name, url, input_feed):
++    # Build Triton v2 JSON payload and call
++    payload = {"inputs": []}
++    for name, arr in input_feed.items():
++        payload["inputs"].append({"name": name, "shape": list(arr.shape), "datatype": "INT32" if arr.dtype==np.int32 else "FP32", "data": arr.tolist()})
++    r = requests.post(f"{url}/v2/models/{model_name}/infer", json=payload, timeout=30)
++    r.raise_for_status()
++    res = r.json()
++    # parse res outputs to numpy arrays
++    outputs = []
++    for out in res.get("outputs", []):
++        outputs.append(np.array(out.get("data", [])))
++    return outputs
++
++def compare_outputs(ref, other):
++    res = []
++    for r,o in zip(ref, other):
++        r = np.array(r)
++        o = np.array(o)
++        maxabs = float(np.max(np.abs(r - o)))
++        mse = float(np.mean((r - o)**2))
++        res.append({"maxabs": maxabs, "mse": mse})
++    return res
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--onnx", required=True)
++    p.add_argument("--model-name", required=True)
++    p.add_argument("--triton-url", required=False, help="Triton server base url (eg http://triton:8000)")
++    p.add_argument("--input-shape", nargs="+", type=int, default=[1,8])
++    args = p.parse_args()
++
++    import numpy as np
++    feed = {}
++    feed_name = "input_ids"
++    feed[feed_name] = np.zeros(tuple(args.input_shape), dtype=np.int32)
++
++    ref_out = run_onnx_inference(args.onnx, feed)
++    report = {"ref_outputs": [list(map(int, o.shape)) for o in ref_out], "comparisons": []}
++    if args.triton_url:
++        triton_out = call_triton_infer(args.model_name, args.triton_url, feed)
++        report["comparisons"] = compare_outputs(ref_out, triton_out)
++    else:
++        report["comparisons"] = []
++
++    out_path = args.onnx + ".triton_validation.json"
++    with open(out_path, "w") as f:
++        json.dump(report, f, indent=2)
++    print("Validation report written to", out_path)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:deepspeed/k8s_deepspeed_configmap.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: deepspeed-nccl-config
++  namespace: aegis
++data:
++  NCCL_MIN_NRINGS: "4"
++  NCCL_IB_DISABLE: "0"
++  NCCL_SOCKET_IFNAME: "eth0"
++ 
+

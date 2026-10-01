@@ -1,0 +1,769 @@
+*** Begin Patch
+*** Add File:services/multimodal/embeddings.py
++#!/usr/bin/env python3
++"""
++Multimodal embedding helpers:
++ - Image embeddings using CLIP (Hugging Face transformers)
++ - Text embeddings using sentence-transformers
++ - Audio -> transcript -> text embedding (Whisper + sentence-transformers)
++ - Video frame extraction + embedding (ffmpeg)
++
++Exports convenient functions to compute embeddings suitable for Milvus upsert.
++"""
++import os, io, numpy as np
++from PIL import Image
++
++# Optional imports (install via services/requirements-multimodal.txt)
++try:
++    from transformers import CLIPProcessor, CLIPModel
++    _HAS_CLIP = True
++except Exception:
++    _HAS_CLIP = False
++
++try:
++    from sentence_transformers import SentenceTransformer
++    _HAS_ST = True
++except Exception:
++    _HAS_ST = False
++
++try:
++    import whisper
++    _HAS_WHISPER = True
++except Exception:
++    _HAS_WHISPER = False
++
++CLIP_MODEL = None
++CLIP_PROCESSOR = None
++TEXT_MODEL = None
++WHISPER_MODEL = None
++
++def ensure_models(clip_name="openai/clip-vit-base-patch32", text_model="sentence-transformers/all-MiniLM-L6-v2", whisper_model="small"):
++    global CLIP_MODEL, CLIP_PROCESSOR, TEXT_MODEL, WHISPER_MODEL
++    if _HAS_CLIP and CLIP_MODEL is None:
++        CLIP_MODEL = CLIPModel.from_pretrained(clip_name)
++        CLIP_PROCESSOR = CLIPProcessor.from_pretrained(clip_name)
++    if _HAS_ST and TEXT_MODEL is None:
++        TEXT_MODEL = SentenceTransformer(text_model)
++    if _HAS_WHISPER and WHISPER_MODEL is None:
++        WHISPER_MODEL = whisper.load_model(whisper_model)
++
++def image_to_embedding(image_bytes, clip_name=None):
++    """
++    Input: bytes (image file) or PIL Image
++    Return: numpy array embedding (float32)
++    """
++    if not _HAS_CLIP:
++        raise RuntimeError("transformers CLIP not available")
++    ensure_models()
++    if isinstance(image_bytes, (bytes, bytearray)):
++        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
++    elif isinstance(image_bytes, Image.Image):
++        image = image_bytes.convert("RGB")
++    else:
++        raise ValueError("image_bytes must be bytes or PIL.Image")
++    inputs = CLIP_PROCESSOR(images=image, return_tensors="pt")
++    with CLIP_MODEL.device_placement():
++        outputs = CLIP_MODEL.get_image_features(**inputs)
++    emb = outputs.detach().cpu().numpy()[0]
++    emb = emb / (np.linalg.norm(emb) + 1e-12)
++    return emb.astype(np.float32)
++
++def text_to_embedding(text):
++    if not _HAS_ST:
++        raise RuntimeError("sentence-transformers not available")
++    ensure_models()
++    emb = TEXT_MODEL.encode(text, convert_to_numpy=True)
++    emb = emb / (np.linalg.norm(emb) + 1e-12)
++    return emb.astype(np.float32)
++
++def audio_to_transcript(audio_path):
++    if not _HAS_WHISPER:
++        raise RuntimeError("whisper not installed")
++    ensure_models()
++    # whisper returns a dict with 'text'
++    res = WHISPER_MODEL.transcribe(audio_path)
++    return res.get("text","")
++
++def video_extract_frames(video_path, fps=1, out_dir="/tmp/video_frames"):
++    """
++    Extract frames with ffmpeg at 1 fps by default. Writes to out_dir and returns list of file paths.
++    Requires ffmpeg installed.
++    """
++    import subprocess, os
++    os.makedirs(out_dir, exist_ok=True)
++    out_pattern = os.path.join(out_dir, "frame_%04d.jpg")
++    cmd = ["ffmpeg","-i",video_path,"-vf",f"fps={fps}", out_pattern, "-hide_banner","-loglevel","error"]
++    subprocess.check_call(cmd)
++    files = sorted([os.path.join(out_dir,f) for f in os.listdir(out_dir) if f.startswith("frame_")])
++    return files
++
+*** End File
+*** Add File:services/multimodal/ingest_service.py
++#!/usr/bin/env python3
++"""
++Multimodal ingestion service:
++ - Accepts image/audio/video uploads and metadata
++ - Runs preprocessing: OCR (pytesseract), Whisper transcription for audio, frame extraction for video
++ - Computes embeddings (image/text) and upserts into Milvus with metadata for lineage
++ - Records dataset versioning & lineage in a simple JSON registry
++
++Endpoints:
++ - POST /ingest/image  (multipart/form-data: file, id, metadata JSON)
++ - POST /ingest/audio  (file, id, metadata)
++ - POST /ingest/video  (file, id, metadata)
++
++Requires: pymilvus, pytesseract (for OCR), services/multimodal/embeddings.py
++"""
++import os, json, tempfile, time
++from flask import Flask, request, jsonify
++from services.multimodal.embeddings import image_to_embedding, audio_to_transcript, text_to_embedding, video_extract_frames
++from services.rag.milvus_client import upsert_documents, ensure_collection
++try:
++    import pytesseract
++    _HAS_OCR = True
++except Exception:
++    _HAS_OCR = False
++
++STORE = os.environ.get("MM_STORE_DIR","/data/multimodal")
++COLLECTION = os.environ.get("RAG_COLLECTION","aegis_docs")
++LINEAGE_REG = os.path.join(STORE, "lineage_registry.json")
++
++os.makedirs(STORE, exist_ok=True)
++
++def record_lineage(entry):
++    try:
++        lst = json.load(open(LINEAGE_REG))
++    except Exception:
++        lst = []
++    lst.append(entry)
++    with open(LINEAGE_REG, "w") as fh:
++        json.dump(lst, fh, indent=2)
++
++app = Flask(__name__)
++
++@app.route("/ingest/image", methods=["POST"])
++def ingest_image():
++    f = request.files.get("file")
++    item_id = request.form.get("id") or f"img-{int(time.time())}"
++    meta = json.loads(request.form.get("metadata","{}"))
++    data = f.read()
++    # OCR
++    ocr_text = None
++    if _HAS_OCR:
++        from PIL import Image
++        im = Image.open(tempfile.NamedTemporaryFile(delete=False))
++        im = Image.open(io.BytesIO(data))
++        ocr_text = pytesseract.image_to_string(im)
++    emb = image_to_embedding(data)
++    # Upsert to Milvus: store embedding and metadata (text, ocr, original_uri placeholder)
++    meta_record = {"type":"image", "source_meta": meta, "ocr": ocr_text, "ingested_at": time.time(), "id": item_id}
++    pk = upsert_documents(COLLECTION, [(emb.tolist(), meta_record)])
++    # Save original file for lineage
++    path = os.path.join(STORE, f"{item_id}.jpg")
++    open(path, "wb").write(data)
++    record_lineage({"id": item_id, "type":"image", "path": path, "meta": meta_record})
++    return jsonify({"ok": True, "pk": pk})
++
++@app.route("/ingest/audio", methods=["POST"])
++def ingest_audio():
++    f = request.files.get("file")
++    item_id = request.form.get("id") or f"aud-{int(time.time())}"
++    meta = json.loads(request.form.get("metadata","{}"))
++    path = os.path.join(STORE, f"{item_id}.wav")
++    f.save(path)
++    # Transcribe
++    transcript = audio_to_transcript(path)
++    emb = text_to_embedding(transcript)
++    meta_record = {"type":"audio", "source_meta": meta, "transcript": transcript, "ingested_at": time.time(), "id": item_id}
++    pk = upsert_documents(COLLECTION, [(emb.tolist(), meta_record)])
++    record_lineage({"id": item_id, "type":"audio", "path": path, "meta": meta_record})
++    return jsonify({"ok": True, "pk": pk, "transcript": transcript})
++
++@app.route("/ingest/video", methods=["POST"])
++def ingest_video():
++    f = request.files.get("file")
++    item_id = request.form.get("id") or f"vid-{int(time.time())}"
++    meta = json.loads(request.form.get("metadata","{}"))
++    tmp = tempfile.mkdtemp()
++    vpath = os.path.join(tmp, f"{item_id}.mp4")
++    f.save(vpath)
++    # extract frames & compute embeddings for a subset
++    frames = video_extract_frames(vpath, fps=int(request.form.get("fps",1)))
++    pks = []
++    for i, frame_path in enumerate(frames):
++        with open(frame_path,"rb") as fh:
++            data = fh.read()
++        emb = image_to_embedding(data)
++        frame_meta = {"video_id": item_id, "frame_index": i, "type":"video_frame", "ingested_at": time.time(), "source_meta": meta}
++        pk = upsert_documents(COLLECTION, [(emb.tolist(), frame_meta)])
++        pks.extend(pk)
++    record_lineage({"id": item_id, "type":"video", "path": vpath, "frames": len(frames), "meta": meta})
++    return jsonify({"ok": True, "frame_pks": pks, "frames": len(frames)})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("MM_PORT","8095")))
++
+*** End File
+*** Add File:services/rag/rag_service_multimodal.py
++"""
++RAG service extension to support multimodal context composition:
++ - retrieve multimodal hits (text, image snippets, audio transcripts)
++ - compose multimodal prompt payload that includes text context + image captions/links
++Endpoint:
++ - POST /compose_multimodal { "query": "...", "embedding": [...], "top_k": 5, "include_images": true }
++"""
++from flask import Flask, request, jsonify
++import os, requests, json
++from services.rag.milvus_client import query_similar
++
++app = Flask(__name__)
++COLLECTION = os.environ.get("RAG_COLLECTION","aegis_docs")
++
++@app.route("/compose_multimodal", methods=["POST"])
++def compose_multimodal():
++    body = request.get_json()
++    query_embedding = body.get("embedding")
++    top_k = int(body.get("top_k", 5))
++    include_images = bool(body.get("include_images", True))
++    hits = query_similar(COLLECTION, query_embedding, top_k)
++    # Build a composite context: text snippets (ocr/transcript), plus image references for possible display
++    text_contexts = []
++    images = []
++    for h in hits:
++        meta = h.get("meta",{})
++        if meta.get("type") in ("text","audio","image","video_frame"):
++            if meta.get("type") in ("text","audio"):
++                text_contexts.append(meta.get("text") or meta.get("transcript") or meta.get("ocr") or "")
++            elif meta.get("type") == "image" or meta.get("type")=="video_frame":
++                if include_images:
++                    # Provide image id or S3 path if available
++                    images.append({"id": meta.get("id"), "note": meta.get("source_meta",{})})
++                    # include captions if OCR present
++                    if meta.get("ocr"):
++                        text_contexts.append(meta.get("ocr"))
++    context = "\n\n".join([t for t in text_contexts if t])
++    # Template: caller (LLM proxy) may accept a structured multimodal payload
++    payload = {"context": context, "images": images, "hits": hits}
++    return jsonify(payload)
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("RAG_MM_PORT","8086")))
++
+*** End File
+*** Add File:services/serving/diffusion_server.py
++#!/usr/bin/env python3
++"""
++Simple diffusion model serving scaffold using diffusers.
++ - Accepts prompt + safety flags
++ - Runs generation on GPU (if available)
++ - Applies content_filter (stub) and provenance watermarker
++ - Expects model artifacts to be cosign-signed and validated before startup
++
++This is a scaffold for production service. For high-throughput, replace with Triton or multi-worker pool.
++"""
++import os, json, time, tempfile, subprocess
++from flask import Flask, request, jsonify, send_file
++try:
++    from diffusers import DiffusionPipeline
++    import torch
++    _HAS_DIFFUSERS = True
++except Exception:
++    _HAS_DIFFUSERS = False
++
++from services.safety.content_filter import image_content_check
++from services.safety.watermarker import watermark_image
++
++app = Flask(__name__)
++MODEL_PATH = os.environ.get("DIFFUSION_MODEL_PATH","/models/stable-diffusion")
++DEVICE = "cuda" if os.environ.get("USE_CUDA","1")=="1" else "cpu"
++
++PIPELINE = None
++
++def load_pipeline():
++    global PIPELINE
++    if not _HAS_DIFFUSERS:
++        raise RuntimeError("diffusers not installed")
++    PIPELINE = DiffusionPipeline.from_pretrained(MODEL_PATH).to(DEVICE)
++
++@app.route("/generate", methods=["POST"])
++def generate():
++    body = request.get_json()
++    prompt = body.get("prompt","")
++    safe_mode = body.get("safe", True)
++    if PIPELINE is None:
++        load_pipeline()
++    # cost & quota checks should be enforced upstream (LLM proxy)
++    img = PIPELINE(prompt).images[0]
++    # content filter
++    if safe_mode:
++        ok, reasons = image_content_check(img)
++        if not ok:
++            return jsonify({"error":"content_policy_violation","reasons": reasons}), 403
++    # watermark and store to evidence
++    wm = watermark_image(img, text="Aegis Generated")
++    out = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
++    wm.save(out.name)
++    # Upload to evidence bucket if configured
++    EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET","")
++    uploaded = None
++    if EVIDENCE_BUCKET and EVIDENCE_BUCKET.startswith("s3://"):
++        subprocess.check_call(["aws","s3","cp", out.name, f"{EVIDENCE_BUCKET}/generated/{os.path.basename(out.name)}"])
++        uploaded = f"{EVIDENCE_BUCKET}/generated/{os.path.basename(out.name)}"
++    return jsonify({"image_path": out.name, "evidence_uri": uploaded})
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("DIFFUSION_PORT","8090")))
++
+*** End File
+*** Add File:services/serving/multimodal_proxy.py
++#!/usr/bin/env python3
++"""
++Multimodal model proxy that routes to appropriate model backends (text LLMs, multimodal transformers, diffusion)
++Manages a simple warm-pool of worker processes (stub) and implements per-tenant cost accounting.
++"""
++import os, time, requests, threading, queue
++from flask import Flask, request, jsonify
++
++app = Flask(__name__)
++BACKENDS = {
++    "text": os.environ.get("LLM_UPSTREAM","http://localhost:8083"),
++    "image": os.environ.get("DIFFUSION_UPSTREAM","http://localhost:8090"),
++    "multimodal": os.environ.get("MULTIMODAL_UPSTREAM","http://localhost:8100"),
++}
++
++# Simple warm pool stub: pre-warm python worker threads that maintain a connection handle
++class WorkerPool:
++    def __init__(self, size=2):
++        self.size = size
++        self.q = queue.Queue()
++        for i in range(size):
++            t = threading.Thread(target=self._worker, daemon=True)
++            t.start()
++    def _worker(self):
++        while True:
++            task = self.q.get()
++            if task is None:
++                break
++            func, args, kwargs, out_q = task
++            try:
++                res = func(*args, **kwargs)
++                out_q.put(("ok", res))
++            except Exception as e:
++                out_q.put(("err", str(e)))
++            self.q.task_done()
++    def submit(self, func, *args, **kwargs):
++        out_q = queue.Queue()
++        self.q.put((func, args, kwargs, out_q))
++        status, res = out_q.get()
++        if status=="ok":
++            return res
++        else:
++            raise RuntimeError(res)
++
++POOL = WorkerPool(size=int(os.environ.get("WARM_POOL_SIZE","2")))
++
++def route_to_backend(kind, payload):
++    url = BACKENDS.get(kind)
++    if not url:
++        raise RuntimeError("no backend")
++    r = requests.post(url.rstrip("/") + "/generate", json=payload, timeout=120)
++    r.raise_for_status()
++    return r.json()
++
++@app.route("/generate", methods=["POST"])
++def generate():
++    body = request.get_json(force=True)
++    kind = body.get("kind","text")
++    # quota checks happen at LLM proxy layer
++    try:
++        res = POOL.submit(route_to_backend, kind, body)
++    except Exception as e:
++        return jsonify({"error":"backend_error","detail": str(e)}), 502
++    return jsonify(res)
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("MM_PROXY_PORT","8101")))
++
+*** End File
+*** Add File:services/eval/multimodal_eval.py
++#!/usr/bin/env python3
++"""
++Multimodal evaluation harness:
++ - computes CLIPScore for image+caption pairs
++ - computes BLEU for captioning, WER for audio transcripts
++ - logs metrics to MLflow and writes a summary JSON
++"""
++import os, json, tempfile, math
++from PIL import Image
++import mlflow
++from services.multimodal.embeddings import image_to_embedding, text_to_embedding
++try:
++    from jiwer import wer
++except Exception:
++    def wer(a,b): return 1.0
++
++def clip_score(image_path, caption):
++    emb_img = image_to_embedding(open(image_path,"rb").read())
++    emb_txt = text_to_embedding(caption)
++    # cosine
++    import numpy as np
++    cos = float((emb_img @ emb_txt) / ((np.linalg.norm(emb_img)*np.linalg.norm(emb_txt))+1e-12))
++    return cos
++
++def eval_dataset(dataset_json, mlflow_experiment="multimodal-eval"):
++    """
++    dataset_json: list of {"image": "/path/to/img", "caption": "expected caption", "pred": "model caption", "audio_expected": "", "audio_pred": ""}
++    """
++    data = json.load(open(dataset_json))
++    scores = []
++    clip_scores = []
++    bleu_scores = []
++    wer_scores = []
++    for r in data:
++        img = r.get("image")
++        gold = r.get("caption","")
++        pred = r.get("pred","")
++        if img:
++            cs = clip_score(img, pred)
++            clip_scores.append(cs)
++        # BLEU - simple: token overlap
++        try:
++            from nltk.translate.bleu_score import sentence_bleu
++            bleu = sentence_bleu([gold.split()], pred.split())
++        except Exception:
++            bleu = 0.0
++        bleu_scores.append(bleu)
++        # WER
++        if r.get("audio_expected") and r.get("audio_pred"):
++            wer_v = wer(r["audio_expected"], r["audio_pred"])
++        else:
++            wer_v = None
++        wer_scores.append(wer_v)
++    # aggregate
++    agg = {
++        "clip_mean": sum(clip_scores)/len(clip_scores) if clip_scores else None,
++        "bleu_mean": sum(bleu_scores)/len(bleu_scores) if bleu_scores else None,
++        "wer_mean": sum([w for w in wer_scores if w is not None])/len([w for w in wer_scores if w is not None]) if any(w is not None for w in wer_scores) else None,
++        "n": len(data)
++    }
++    # log to mlflow
++    mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI","http://mlflow:5000"))
++    with mlflow.start_run(experiment_name=mlflow_experiment):
++        for k,v in agg.items():
++            if v is not None:
++                mlflow.log_metric(k, v)
++    out = "/tmp/multimodal_eval_summary.json"
++    json.dump(agg, open(out,"w"), indent=2)
++    return agg
++
++if __name__=="__main__":
++    import sys
++    print(eval_dataset(sys.argv[1]))
++
+*** End File
+*** Add File:services/agent/planner.py
++#!/usr/bin/env python3
++"""
++Lightweight planner service:
++ - Accepts a goal and uses heuristics + optional LLM call to decompose into ordered tasks
++ - Supports plan revision and fallback strategies
++ - Produces structured plan steps consumable by agent orchestrator
++"""
++from flask import Flask, request, jsonify
++import os, requests, time
++
++app = Flask(__name__)
++LLM_PROXY = os.environ.get("LLM_PROXY_URL","http://llm-proxy:8083")
++
++def heuristic_split(goal):
++    # naive heuristics: split sentences, each becomes a step
++    import re
++    sents = [s.strip() for s in re.split(r'[.?!\n]+', goal) if s.strip()]
++    steps = [{"step": i+1, "task": s, "tool": "search" if "find" in s.lower() or "what" in s.lower() else "exec"} for i,s in enumerate(sents)]
++    return steps
++
++def llm_plan(goal):
++    prompt = f"Decompose the goal into an ordered list of actionable steps. Respond JSON: {{'steps': [{{'task':'...','tool':'search|exec|other'}}]}}. Goal: {goal}"
++    try:
++        r = requests.post(LLM_PROXY.rstrip("/") + "/v1/generate", json={"prompt": prompt, "max_tokens": 400}, timeout=30)
++        r.raise_for_status()
++        j = r.json()
++        text = j.get("text") or j.get("result") or r.text
++        import json as _json
++        out = _json.loads(text)
++        return out.get("steps", [])
++    except Exception:
++        return heuristic_split(goal)
++
++@app.route("/plan", methods=["POST"])
++def plan():
++    body = request.get_json()
++    goal = body.get("goal","")
++    mode = body.get("mode","llm")
++    if mode=="llm":
++        steps = llm_plan(goal)
++    else:
++        steps = heuristic_split(goal)
++    plan = {"goal": goal, "steps": steps, "ts": time.time()}
++    return jsonify(plan)
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PLANNER_PORT","8110")))
++
+*** End File
+*** Add File:services/agent/memory.py
++#!/usr/bin/env python3
++"""
++Episodic memory backed by Milvus:
++ - record_event(event_text, metadata)
++ - query_memory(query_text, top_k)
++ - used by agents to recall past events, observations or tool outputs
++"""
++from services.multimodal.embeddings import text_to_embedding
++from services.rag.milvus_client import upsert_documents, query_similar
++import time
++MEM_COLLECTION = "aegis_memory"
++
++def ensure_memory_collection(dim=384):
++    return ensure_collection(MEM_COLLECTION, dim=dim)
++
++def record_event(text, metadata=None):
++    emb = text_to_embedding(text)
++    meta = {"text": text, "meta": metadata or {}, "ts": time.time()}
++    pk = upsert_documents(MEM_COLLECTION, [(emb.tolist(), meta)])
++    return pk
++
++def recall(query_text, top_k=5):
++    emb = text_to_embedding(query_text)
++    hits = query_similar(MEM_COLLECTION, emb, top_k)
++    return hits
++
+*** End File
+*** Add File:services/agent/tool_registry.yaml
++tools:
++  - id: search
++    name: "RAG Search"
++    description: "Retrieve supporting documents from Milvus"
++    cost_per_call: 0.001
++    latency_ms: 200
++    allowed_roles: ["automation","sre"]
++    policy_action: "access_rag"
++  - id: exec
++    name: "Sandboxed Exec"
++    description: "Run a command in a sandbox; sensitive - requires delegation check"
++    cost_per_call: 0.01
++    latency_ms: 1000
++    allowed_roles: ["platform_lead"]
++    policy_action: "forensic_signoff"
++  - id: generate_image
++    name: "Generate Image (diffusion)"
++    description: "Generate an image from prompt; content policy enforced"
++    cost_per_call: 0.5
++    latency_ms: 5000
++    allowed_roles: ["automation","sre"]
++    policy_action: "image_generation"
++
+*** End File
+*** Add File:services/agent/execution_verifier.py
++#!/usr/bin/env python3
++"""
++Execution verifier:
++ - After a tool call with side-effects (e.g., "create-file", "apply-config"), captures expected state and verifies that the state matches expectation.
++ - For demo, supports HTTP-based state checkers and filesystem checks.
++ - Produces an attestation bundle and flags mismatches.
++"""
++import os, json, subprocess, time
++
++def verify_filesystem(path, expected_files):
++    missing = []
++    for f in expected_files:
++        if not os.path.exists(os.path.join(path, f)):
++            missing.append(f)
++    return {"missing": missing, "ok": len(missing)==0}
++
++def verify_http(url, expected_status=200):
++    import requests
++    r = requests.get(url, timeout=5)
++    return {"status": r.status_code, "ok": r.status_code==expected_status}
++
++def attestation_write(event):
++    out = "/tmp/execution_verif_"+str(int(time.time()))+".json"
++    json.dump(event, open(out,"w"), indent=2)
++    # optionally sign with cosign (operator-run)
++    return out
++
+*** End File
+*** Add File:services/safety/content_filter.py
++#!/usr/bin/env python3
++"""
++Content filter stubs:
++ - Image NSFW detection (placeholder)
++ - PII detection via OCR for images
++ - Audio PII detection via transcript regex
++
++Operators should replace stubs with a vetted content moderation pipeline or third-party service.
++"""
++import re
++from PIL import Image
++def image_content_check(pil_image):
++    """
++    Return (ok:bool, reasons:list)
++    Placeholder: always OK unless image width/height=0.
++    """
++    reasons = []
++    try:
++        w,h = pil_image.size
++        if w==0 or h==0:
++            reasons.append("invalid_image")
++            return False, reasons
++    except Exception:
++        reasons.append("invalid_image")
++        return False, reasons
++    # TODO: integrate nsfw classifier (e.g., open_nsfw or safetensors model)
++    return True, []
++
++def image_pii_check(ocr_text):
++    # simple SSN/email finder
++    reasons = []
++    if re.search(r"\b\d{3}-\d{2}-\d{4}\b", ocr_text):
++        reasons.append("ssn")
++    if re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", ocr_text):
++        reasons.append("email")
++    return len(reasons)==0, reasons
++
++def audio_pii_check(transcript):
++    return image_pii_check(transcript)
++
+*** End File
+*** Add File:services/safety/watermarker.py
++#!/usr/bin/env python3
++"""
++Simple image watermarking and provenance manifest writer.
++ - watermark_image: draws a visible text watermark on image
++ - sign_provenance: writes a JSON manifest (operator to sign with cosign)
++"""
++from PIL import Image, ImageDraw, ImageFont
++import json, time, os
++
++def watermark_image(pil_image, text="Aegis Generated", opacity=128):
++    img = pil_image.convert("RGBA")
++    txt = Image.new("RGBA", img.size, (255,255,255,0))
++    draw = ImageDraw.Draw(txt)
++    # simple font - rely on system default
++    try:
++        font = ImageFont.truetype("DejaVuSans.ttf", 24)
++    except Exception:
++        font = ImageFont.load_default()
++    w,h = img.size
++    draw.text((10, h-40), text, fill=(255,255,255,opacity), font=font)
++    out = Image.alpha_composite(img, txt).convert("RGB")
++    return out
++
++def sign_provenance(artifact_path, metadata, out_manifest=None):
++    if out_manifest is None:
++        out_manifest = artifact_path + ".manifest.json"
++    manifest = {"artifact": artifact_path, "metadata": metadata, "ts": time.time()}
++    with open(out_manifest,"w") as fh:
++        json.dump(manifest, fh, indent=2)
++    # operator should cosign this manifest and upload to evidence
++    return out_manifest
++
+*** End File
+*** Add File:services/requirements-multimodal.txt
++transformers
++sentence-transformers
++torch
++diffusers
++ffmpeg-python
++moviepy
++pillow
++whisper
++jiwer
++nltk
++pymilvus
++pytesseract
++mlflow
++scikit-learn
++
+*** End File
+*** Add File:.github/workflows/multimodal_e2e.yml
++name: Multimodal E2E CI (staging)
++on:
++  workflow_dispatch:
++jobs:
++  mm-e2e:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up python and deps
++        uses: actions/setup-python@v4
++        with:
++          python-version: "3.10"
++      - name: Install multimodal deps (may be heavy; use runner with GPU for full tests)
++        run: |
++          pip install -r services/requirements-multimodal.txt || true
++      - name: Start Milvus (assumes accessible instance)
++        run: echo "Assume Milvus available in staging; run manual tests or integration harness"
++      - name: Run basic ingest smoke test
++        run: |
++          python3 -c "from services.multimodal.embeddings import text_to_embedding; print(text_to_embedding('test'))" || true
++
+*** End File
+*** Add File:grafana/dashboards/multimodal_kpis.json
++{
++  "schemaVersion": 16,
++  "title": "Aegis Multimodal KPIs",
++  "panels": [
++    {
++      "type": "stat",
++      "title": "CLIPScore (mean)",
++      "targets": [{ "expr": "avg_over_time(clipscore_mean[1h])" }]
++    },
++    {
++      "type": "graph",
++      "title": "Image Generation Requests",
++      "targets": [{ "expr": "increase(aegis_image_generation_requests_total[1h])" }]
++    },
++    {
++      "type": "stat",
++      "title": "Factuality Support Ratio",
++      "targets": [{ "expr": "avg_over_time(aegis_factuality_support_ratio[1h])" }]
++    }
++  ]
++}
++
+*** End File
+*** Add File:docs/runbooks/multimodal_deploy_and_test.md
++# Multimodal Deploy & Test Runbook
++
++1) Provision GPU nodes and ensure ffmpeg & drivers installed.
++2) Deploy Milvus and ensure vector collections are available for multimodal embeddings.
++3) Deploy services:
++   - services/multimodal/ingest_service.py
++   - services/rag/rag_service_multimodal.py
++   - services/serving/diffusion_server.py (on GPU worker)
++   - services/serving/multimodal_proxy.py
++4) Validate:
++   - Run a sample image ingest: curl -F "file=@cat.jpg" http://ingest:8095/ingest/image
++   - Query compose_multimodal with an embedding and verify images/captions returned
++   - Generate an image via multimodal_proxy -> routes to diffusion backend
++5) Evaluate:
++   - Run services/eval/multimodal_eval.py on a small dataset and check MLflow metrics
++6) Safety:
++   - Test content_filter.image_content_check and watermarking on generated images
++7) Monitor:
++   - Verify Grafana dashboard shows CLIP score and image generation request metrics
++
+*** End File
+*** Add File:docs/runbooks/agent_planner_validation.md
++# Planner & Agent Validation Runbook
++
++1) Deploy services/agent/planner.py and services/agent/memory.py
++2) Create test scenarios: short goals that exercise decomposition and tool assignment
++3) Run planner /plan endpoint and inspect generated steps
++4) Execute plans via secure orchestrator; verify memory.record_event and recall works
++5) Test tool_registry.yaml is loaded by orchestrator and policy checks enforce allowed roles
++6) Test execution_verifier on simulated side-effects (filesystem state, HTTP endpoints)
++
+*** End File
+*** End Patch

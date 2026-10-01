@@ -1,0 +1,496 @@
+*** Begin Patch
+*** Add File:ops/azure/register_azure_ad_app.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Create an Azure AD App registration for the Excel Add-in and output values to stdout.
++# Requires `az` CLI logged in with sufficient privileges.
++#
++# Usage:
++#   ./ops/azure/register_azure_ad_app.sh <app-display-name> <reply-url>
++APP_NAME=${1:-"Aegis Excel Addin"}
++REPLY_URL=${2:-"https://aegis-proxy.example.com/addin/taskpane.html"}
++
++echo "Creating Azure AD app: $APP_NAME"
++APP_JSON=$(az ad app create --display-name "$APP_NAME" --reply-urls "$REPLY_URL" --available-to-other-tenants false --output json)
++APP_ID=$(echo "$APP_JSON" | jq -r .appId)
++OBJ_ID=$(echo "$APP_JSON" | jq -r .id)
++TENANT_ID=$(az account show --query tenantId -o tsv)
++
++echo "Creating service principal for the app"
++az ad sp create --id "$APP_ID" >/dev/null
++
++echo "Creating client secret (valid 2 years)"
++SECRET_JSON=$(az ad app credential reset --id "$APP_ID" --append --years 2 --output json)
++CLIENT_SECRET=$(echo "$SECRET_JSON" | jq -r .password)
++
++OIDC_ISSUER="https://login.microsoftonline.com/${TENANT_ID}/v2.0"
++
++cat <<EOF
++Azure AD App created:
++  client_id: ${APP_ID}
++  tenant_id: ${TENANT_ID}
++  client_secret: (hidden)
++  OIDC_ISSUER: ${OIDC_ISSUER}
++
++IMPORTANT:
++ - Copy the client_id/application id and client_secret to a k8s secret for the Excel proxy deployment.
++ - Grant the app required API permissions or admin consent if needed for SSO flows.
++EOF
++
++echo "CLIENT_ID=${APP_ID}"
++echo "TENANT_ID=${TENANT_ID}"
++echo "CLIENT_SECRET=${CLIENT_SECRET}"
++echo "OIDC_ISSUER=${OIDC_ISSUER}"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/k8s/create_excel_proxy_secrets.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Create Kubernetes secret aesgis-secrets with azure_client_id, azure_client_secret, service_api_key and oidc_issuer
++# Usage:
++#   ./ops/k8s/create_excel_proxy_secrets.sh <namespace> <client_id> <client_secret> <service_api_key> <oidc_issuer>
++NS=${1:-safety}
++CLIENT_ID=${2:-}
++CLIENT_SECRET=${3:-}
++SERVICE_API_KEY=${4:-}
++OIDC_ISSUER=${5:-}
++
++if [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ] || [ -z "$SERVICE_API_KEY" ] || [ -z "$OIDC_ISSUER" ]; then
++  echo "Usage: $0 <namespace> <client_id> <client_secret> <service_api_key> <oidc_issuer>"
++  exit 2
++fi
++
++kubectl -n "$NS" create secret generic aegis-secrets \
++  --from-literal=azure_client_id="$CLIENT_ID" \
++  --from-literal=azure_client_secret="$CLIENT_SECRET" \
++  --from-literal=service_api_key="$SERVICE_API_KEY" \
++  --from-literal=oidc_issuer="$OIDC_ISSUER" \
++  --dry-run=client -o yaml | kubectl apply -f -
++
++echo "Created secret 'aegis-secrets' in namespace $NS"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/excel/dlp_rules.py
++"""Simple DLP and safety checks used by the Excel backend proxy.
++This module is intentionally conservative and must be extended for your compliance needs.
++"""
++import re
++
++# Simple regexes for common PII patterns (SSN, credit cards, emails). These are examples only.
++SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
++CC_RE = re.compile(r"\b(?:\d[ -]*?){13,16}\b")
++EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
++PHONE_RE = re.compile(r"\b(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4}\b")
++
++def contains_pii(text: str) -> bool:
++    if not text:
++        return False
++    if SSN_RE.search(text): return True
++    if CC_RE.search(text): return True
++    if EMAIL_RE.search(text): return True
++    if PHONE_RE.search(text): return True
++    return False
++
++def redact(text: str) -> str:
++    # Basic redaction strategy: replace matches with [REDACTED]
++    t = SSN_RE.sub("[REDACTED_SSN]", text)
++    t = CC_RE.sub("[REDACTED_CC]", t)
++    t = EMAIL_RE.sub("[REDACTED_EMAIL]", t)
++    t = PHONE_RE.sub("[REDACTED_PHONE]", t)
++    return t
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/excel/backend_proxy_enhanced.py
++"""Enhanced Aegis Excel Backend Proxy with rate limiting, DLP, and safety gating hooks.
++ - Adds per-user in-memory rate limiting (token-bucket style) for Add-in traffic (simple fallback; use API gateway for production).
++ - Applies DLP checks on prompts and blocks or redacts per policy.
++ - Optionally enforces a safety pre-check by calling the verifier service before forwarding to RAG to avoid costly RAG calls on obviously sensitive content.
++"""
++import os
++import time
++import json
++from fastapi import FastAPI, Header, HTTPException, Request, Response
++from pydantic import BaseModel
++import requests
++from cachetools import TTLCache
++from typing import Dict, Any
++from services.excel.dlp_rules import contains_pii, redact
++from jose import jwt, JWTError
++
++# Configuration (env)
++RATE_LIMIT_PER_MIN = int(os.environ.get("EXCEL_RATE_LIMIT_PER_MIN", "60"))  # per user
++VERIFIER_URL = os.environ.get("VERIFIER_URL", "http://verifier.safety.svc:8080/verify")
++SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY", "")
++AEGIS_RAG_URL = os.environ.get("AEGIS_RAG_URL", "http://rag-service.svc:8080/infer")
++OIDC_ISSUER = os.environ.get("OIDC_ISSUER", "")
++CLIENT_ID = os.environ.get("CLIENT_ID", "")
++
++app = FastAPI(title="Aegis Excel Proxy (enhanced)")
++
++# Simple in-memory counters: key => (count, window_start)
++RATE_CACHE = TTLCache(maxsize=100000, ttl=60*60)  # entries expire after 1h
++
++def check_rate_limit(user_id: str):
++    now = int(time.time())
++    window = now // 60
++    key = f"{user_id}:{window}"
++    val = RATE_CACHE.get(key, 0)
++    if val >= RATE_LIMIT_PER_MIN:
++        return False
++    RATE_CACHE[key] = val + 1
++    return True
++
++def validate_bearer_token(token: str):
++    # minimal validation; use full JWKS validation in production
++    try:
++        # decode without verification to extract sub (for demo). Real implementation must verify signature using JWKS.
++        payload = jwt.decode(token, options={"verify_signature": False})
++        return payload
++    except JWTError:
++        raise HTTPException(status_code=401, detail="Invalid token")
++
++class InferRequest(BaseModel):
++    prompt: str
++    mode: str = "evidence_required"
++    top_k: int = 5
++
++@app.post("/api/rag/infer")
++def rag_infer(req: InferRequest, authorization: str = Header(None)):
++    if not authorization or not authorization.startswith("Bearer "):
++        raise HTTPException(status_code=401, detail="Missing Authorization header")
++    token = authorization.split(" ",1)[1]
++    user = validate_bearer_token(token)
++    user_id = user.get("sub") or user.get("email") or "unknown"
++
++    # Rate limiting
++    if not check_rate_limit(user_id):
++        raise HTTPException(status_code=429, detail="Rate limit exceeded")
++
++    # DLP: block if PII present; otherwise redact to minimize exposure
++    if contains_pii(req.prompt):
++        # Block and ask user to remove sensitive data or automatically redact and continue
++        raise HTTPException(status_code=400, detail="Prompt contains sensitive PII. Remove or request data redaction.")
++
++    # Optional safety pre-check: call verifier on short claim to decide whether to proceed
++    # This is a lightweight heuristic to avoid calling heavy RAG on obviously malicious prompts.
++    try:
++        vh = requests.post(VERIFIER_URL, json={"claim": req.prompt, "evidence": []}, headers={"Authorization": f"Bearer {SERVICE_API_KEY}"}, timeout=3)
++        if vh.status_code == 200:
++            vj = vh.json()
++            # if verifier says 'contradict' or 'insufficient' with very low confidence, still allow; conservative gating left to Aegis RAG
++    except Exception:
++        # verifier unresponsive -> proceed but log
++        pass
++
++    # Forward to Aegis RAG
++    payload = {"prompt": req.prompt, "mode": req.mode, "top_k": req.top_k, "requester": user_id}
++    headers = {"Authorization": f"Bearer {SERVICE_API_KEY}", "Content-Type": "application/json"}
++    r = requests.post(AEGIS_RAG_URL, json=payload, headers=headers, timeout=30)
++    if r.status_code != 200:
++        raise HTTPException(status_code=502, detail="Upstream RAG error")
++    resp = r.json()
++
++    # Provide lightweight provenance redaction: strip long docs if PII suspected
++    for p in resp.get("retrieved", []):
++        if contains_pii(p.get("text","")):
++            p["text"] = redact(p["text"])
++
++    # Log minimal audit event (do not store tokens)
++    try:
++        with open("/tmp/aegis_excel_proxy.log", "a") as f:
++            f.write(json.dumps({"ts": int(time.time()), "user": user_id, "prompt": req.prompt[:100], "verifier": resp.get("verifier", {})}) + "\n")
++    except Exception:
++        pass
++
++    return resp
++
++@app.post("/api/enqueue")
++def enqueue_for_review(body: Dict[str, Any], authorization: str = Header(None)):
++    if not authorization or not authorization.startswith("Bearer "):
++        raise HTTPException(status_code=401, detail="Missing Authorization header")
++    token = authorization.split(" ",1)[1]
++    user = validate_bearer_token(token)
++    user_id = user.get("sub") or user.get("email") or "unknown"
++    if not check_rate_limit(user_id):
++        raise HTTPException(status_code=429, detail="Rate limit exceeded")
++    # DLP on payload
++    if contains_pii(body.get("text", "")) or contains_pii(body.get("output","")):
++        raise HTTPException(status_code=400, detail="Content contains sensitive PII; cannot enqueue")
++    # forward
++    headers = {"Content-Type":"application/json"}
++    payload = dict(body)
++    payload["reported_by"] = user_id
++    try:
++        r = requests.post(os.environ.get("HUMAN_QUEUE_URL", "http://human-queue.safety.svc:80/enqueue"), json=payload, headers=headers, timeout=10)
++        r.raise_for_status()
++    except Exception as e:
++        raise HTTPException(status_code=502, detail=f"Human queue error: {e}")
++    return r.json()
++
++@app.get("/.well-known/health")
++def health():
++    return {"status":"ok"}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/excel/k8s/backend-deployment-enhanced.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-excel-proxy-enhanced
++  namespace: safety
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: aegis-excel-proxy-enhanced
++  template:
++    metadata:
++      labels:
++        app: aegis-excel-proxy-enhanced
++    spec:
++      containers:
++        - name: proxy
++          image: us.gcr.io/aegis/excel-proxy-enhanced:latest
++          ports:
++            - containerPort: 8000
++          env:
++            - name: SERVICE_API_KEY
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-secrets
++                  key: service_api_key
++            - name: OIDC_ISSUER
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-secrets
++                  key: oidc_issuer
++            - name: CLIENT_ID
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-secrets
++                  key: azure_client_id
++            - name: VERIFIER_URL
++              value: "http://verifier.safety.svc:8080/verify"
++            - name: AEGIS_RAG_URL
++              value: "http://rag-service.svc:8080/infer"
++      imagePullSecrets:
++        - name: regcred
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: aegis-excel-proxy-enhanced
++  namespace: safety
++spec:
++  selector:
++    app: aegis-excel-proxy-enhanced
++  ports:
++    - port: 443
++      targetPort: 8000
++      protocol: TCP
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/excel/addin/sideload_instructions.md
++Office Add-in Sideload / Publish Instructions (short)
++
++1) Host your add-in files (taskpane.html and taskpane.js) on an HTTPS endpoint accessible to your org (we provide k8s static host manifest). Example URL: https://aegis.example.com/addin/taskpane.html
++
++2) Edit services/excel/addin/manifest.xml: set <SourceLocation DefaultValue="https://aegis.example.com/addin/taskpane.html"/>
++
++Sideload for testing (Office Desktop / Online):
++ - For Office 365 tenant admin: upload the manifest via the Microsoft 365 admin center under Settings -> Integrated apps -> Add-ins -> Deploy Add-in.
++ - For individual sideload (desktop Windows): place manifest in %USERPROFILE%\AppData\Local\Microsoft\Office\16.0\WEF\ and restart Word/Excel.
++
++Publishing enterprise add-in:
++ - Use Microsoft 365 admin center and upload the XML manifest to the tenant app catalog; assign to users/groups.
++ - Ensure Azure AD app registration (ops/azure/register_azure_ad_app.sh) created and CLIENT_ID & OIDC_ISSUER configured in the proxy's k8s secret.
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/grafana/import_dashboard.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Import Grafana dashboard JSON into a running Grafana instance using API key.
++# Usage:
++#  ./ops/grafana/import_dashboard.sh <grafana_url> <api_key> <dashboard_json_path>
++GRAFANA_URL=${1:-http://grafana.example.com}
++API_KEY=${2:-}
++DASH_JSON=${3:-monitoring/grafana/sustainability_full_dashboard.json}
++
++if [ -z "$API_KEY" ]; then
++  echo "Provide API key as second argument"; exit 2
++fi
++
++TMP=$(mktemp)
++cat "$DASH_JSON" > "$TMP"
++curl -s -X POST "${GRAFANA_URL}/api/dashboards/db" -H "Authorization: Bearer ${API_KEY}" -H "Content-Type: application/json" -d @"$TMP"
++rm -f "$TMP"
++echo "Imported dashboard to ${GRAFANA_URL}"
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/k8s/telemetry_daemonset.yaml
++apiVersion: apps/v1
++kind: DaemonSet
++metadata:
++  name: aegis-telemetry
++  namespace: monitoring
++spec:
++  selector:
++    matchLabels:
++      app: aegis-telemetry
++  template:
++    metadata:
++      labels:
++        app: aegis-telemetry
++    spec:
++      hostNetwork: true
++      containers:
++        - name: telemetry
++          image: us.gcr.io/aegis/telemetry-exporter:latest
++          env:
++            - name: TELEMETRY_POLL_SECS
++              value: "5"
++            - name: TELEMETRY_METRICS_PORT
++              value: "9400"
++          ports:
++            - containerPort: 9400
++              hostPort: 9400
++          resources:
++            requests:
++              cpu: "100m"
++              memory: "128Mi"
++      tolerations:
++        - operator: "Exists"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/human_queue/config/rater_autoscaler_config.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: rater-autoscaler-config
++  namespace: safety
++data:
++  TARGET_PER_REPLICA: "20"
++  MAX_REPLICAS: "20"
++  MIN_REPLICAS: "1"
++  POLL_SECS: "15"
++
++Note: Update services/human_queue/autoscaler.py to read these values from this ConfigMap; apply and restart autoscaler pod after changes.
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/ci/verifier_finetune_and_gate_prod.yml
++name: Finetune Verifier & Gate (Prod CI)
++on:
++  workflow_dispatch:
++
++jobs:
++  finetune:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.10'
++      - name: Install deps
++        run: |
++          python -m pip install --upgrade pip
++          pip install transformers datasets accelerate scikit-learn
++      - name: Write training data (from secret)
++        env:
++          DATA_JSONL: ${{ secrets.VERIFIER_TRAIN_DATA }}
++        run: |
++          if [ -n "${DATA_JSONL}" ]; then
++            echo "${DATA_JSONL}" > train.jsonl
++          else
++            echo "No train data provided via secrets; aborting finetune"
++            exit 0
++          fi
++      - name: Finetune verifier
++        run: |
++          python services/factuality/finetune_verifier.py --data train.jsonl --out_dir out/verifier --model_name facebook/bart-large --epochs 2
++      - name: Upload artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: verifier-artifact
++          path: out/verifier
++
++  deploy-and-gate:
++    needs: finetune
++    runs-on: ubuntu-latest
++    steps:
++      - name: Download artifact
++        uses: actions/download-artifact@v4
++        with:
++          name: verifier-artifact
++      - name: Deploy verifier configmap and deployment
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG }}
++        run: |
++          kubectl -n safety create configmap verifier-model --from-file=out/verifier --dry-run=client -o yaml | kubectl apply -f -
++          kubectl apply -f services/factuality/k8s/verifier-deployment.yaml
++          kubectl -n safety rollout status deployment/verifier --timeout=120s
++      - name: Run verifier gate
++        env:
++          VERIFIER_URL: ${{ secrets.VERIFIER_URL }}
++          VERIFIER_SAMPLES: ops/factuality/verification_samples.jsonl
++          VERIFIER_GATE_THRESHOLD: 0.4
++        run: |
++          python services/factuality/verifier_gate.py
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/README_EXCEL_PROXY_PROD.md
++# Excel Proxy & Add-in Production Rollout Checklist
++
++1) Register Azure AD App
++   - Run: ./ops/azure/register_azure_ad_app.sh "Aegis Excel Addin" "https://aegis-proxy.example.com/addin/taskpane.html"
++   - Note client_id, tenant_id, client_secret and OIDC_ISSUER.
++
++2) Create k8s secret for Add-in proxy
++   - Run:
++     ./ops/k8s/create_excel_proxy_secrets.sh safety <client_id> <client_secret> <service_api_key> <oidc_issuer>
++
++3) Build & push images
++   - Build proxy image from services/excel/backend_proxy_enhanced.py and tag us.gcr.io/aegis/excel-proxy-enhanced:latest
++   - Build static add-in image or apply ConfigMap for static files.
++
++4) Deploy
++   - kubectl apply -f services/excel/k8s/backend-deployment-enhanced.yaml
++   - kubectl apply -f services/excel/k8s/addin-static-deployment.yaml
++   - kubectl apply -f monitoring/k8s/telemetry_daemonset.yaml
++   - kubectl apply -f services/human_queue/config/rater_autoscaler_config.yaml
++
++5) Sideload / Publish Add-in
++   - Update manifest.xml SourceLocation to your HTTPS host and publish via Microsoft 365 admin center.
++
++6) Finetune & Gate Verifier
++   - Use GitHub Actions workflow: .github/workflows/verifier_finetune_and_gate_prod.yml
++   - Ensure VERIFIER_TRAIN_DATA secret is populated with domain labeled claim↔evidence JSONL
++
++7) Kernel optimization
++   - Provision GPU self-hosted runners; register with ops/ci/register_self_hosted_runner.sh
++   - Run auto-tune: ops/sustainability/ternary_kernel_build/auto_tune_kernel.sh on GPU hosts (requires bench harness)
++
++8) Compliance & telemetry
++   - Run ops/s3/lifecycle_validator_enhanced.py against buckets and lifecycle policies
++   - Import Grafana dashboard via ops/grafana/import_dashboard.sh and connect telemetry DaemonSet metrics
++
++9) Operational tuning
++   - Edit rater config map (services/human_queue/config/rater_autoscaler_config.yaml) to set TARGET_PER_REPLICA and max replicas
++   - Tune proxy env EXCEL_RATE_LIMIT_PER_MIN via deployment or k8s env to control Add-in usage
++
+*** End Patch
+*** End Patch

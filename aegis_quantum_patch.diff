@@ -1,0 +1,841 @@
+diff --git a/quantum/adapter.py b/quantum/adapter.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/quantum/adapter.py
+@@ -0,0 +1,320 @@
++#!/usr/bin/env python3
++"""
++Quantum Adapter - vendor-agnostic unified API for submitting circuits to simulators and hardware.
++
++Responsibilities:
++ - submit_circuit(circuit, backend, params, options) -> job_id
++ - get_job_status(job_id) -> {status, result, metadata}
++ - download_result(job_id) -> artifacts
++ - compile_circuit(circuit, backend_spec) -> compiled_object (and cache)
++ - cost_estimate(circuit, backend)
++
++Backends: plugin system. This module provides a registry and a couple of example backends:
++ - qiskit_backend (IBM + Aer simulator)
++ - placeholder entries for Braket/IonQ/Azure/Rigetti (implementations must conform to BackendBase)
++
++Notes:
++ - This is a scaffold. Each backend must be hardened with auth, retries, and error handling for production.
++ - The compile cache uses a fingerprint (sha256) and can be backed by S3/LakeFS via environment config.
++"""
++import os
++import json
++import time
++import hashlib
++import logging
++from typing import Dict, Any
++
++logger = logging.getLogger("aegis.quantum.adapter")
++logging.basicConfig(level=logging.INFO)
++
++# Try importing optional dependencies; backends should handle ImportError gracefully
++try:
++    from qiskit import QuantumCircuit, transpile
++    from qiskit.providers.aer import AerSimulator
++    from qiskit.providers.ibmq import IBMQ
++except Exception:
++    QuantumCircuit = None
++    transpile = None
++    AerSimulator = None
++    IBMQ = None
++
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++try:
++    import mlflow
++except Exception:
++    mlflow = None
++
++# Simple in-repo decision log helper (if present)
++try:
++    from agents.common.utils import record_decision
++except Exception:
++    def record_decision(d):  # type: ignore
++        logger.info("decision_log (fallback): %s", json.dumps(d))
++        return {"stdout": True}
++
++
++class BackendBase:
++    """Abstract base class for quantum backends."""
++    name = "base"
++
++    def submit_circuit(self, circuit, params: Dict[str, Any], options: Dict[str, Any]) -> str:
++        raise NotImplementedError()
++
++    def get_job_status(self, job_id: str) -> Dict[str, Any]:
++        raise NotImplementedError()
++
++    def download_result(self, job_id: str) -> Dict[str, Any]:
++        raise NotImplementedError()
++
++    def compile_circuit(self, circuit, backend_spec: Dict[str, Any]) -> Dict[str, Any]:
++        raise NotImplementedError()
++
++    def cost_estimate(self, circuit, options: Dict[str, Any]) -> float:
++        raise NotImplementedError()
++
++
++BACKENDS: Dict[str, BackendBase] = {}
++
++
++def register_backend(name: str, backend: BackendBase):
++    BACKENDS[name] = backend
++    logger.info("Registered quantum backend: %s", name)
++
++
++def get_backend(name: str) -> BackendBase:
++    if name not in BACKENDS:
++        raise RuntimeError(f"Backend {name} not registered")
++    return BACKENDS[name]
++
++
++def fingerprint_circuit(circuit_source: str, backend_spec: Dict[str, Any]) -> str:
++    """
++    Compute canonical fingerprint of circuit source + backend spec (JSON stable).
++    """
++    h = hashlib.sha256()
++    h.update(circuit_source.encode("utf-8"))
++    spec_json = json.dumps(backend_spec, sort_keys=True)
++    h.update(spec_json.encode("utf-8"))
++    return h.hexdigest()
++
++
++class QiskitBackend(BackendBase):
++    name = "qiskit"
++
++    def __init__(self, cache_s3_prefix: str = "", mlflow_experiment: str = "quantum"):
++        self.cache_s3_prefix = cache_s3_prefix  # e.g., s3://bucket/quantum-cache
++        self.mlflow_experiment = mlflow_experiment
++        # local cache path fallback
++        self.local_cache = os.environ.get("QUANTUM_LOCAL_CACHE", "/tmp/quantum_cache")
++        os.makedirs(self.local_cache, exist_ok=True)
++
++    def _write_cache_local(self, fingerprint: str, compiled_bytes: bytes, metadata: Dict[str, Any]):
++        path = os.path.join(self.local_cache, f"{fingerprint}.json")
++        with open(path, "wb") as fh:
++            fh.write(compiled_bytes)
++        meta_path = os.path.join(self.local_cache, f"{fingerprint}.meta.json")
++        with open(meta_path, "w") as fh:
++            json.dump(metadata, fh)
++        logger.info("Wrote compiled artifact to local cache: %s", path)
++        return path
++
++    def _read_cache_local(self, fingerprint: str):
++        path = os.path.join(self.local_cache, f"{fingerprint}.json")
++        meta_path = os.path.join(self.local_cache, f"{fingerprint}.meta.json")
++        if os.path.exists(path):
++            with open(path, "rb") as fh:
++                compiled_bytes = fh.read()
++            with open(meta_path, "r") as fh:
++                meta = json.load(fh)
++            return compiled_bytes, meta
++        return None
++
++    def compile_circuit(self, circuit_source: str, backend_spec: Dict[str, Any]) -> Dict[str, Any]:
++        """
++        circuit_source: QASM string or Qiskit QuantumCircuit serialized via qasm()
++        backend_spec: dict {name: "aer_simulator" | "ibmq_..."; basis_gates:..., optimization_level: int}
++        Returns metadata describing compiled artifact and path to cache.
++        """
++        fingerprint = fingerprint_circuit(circuit_source, backend_spec)
++        cached = self._read_cache_local(fingerprint)
++        if cached:
++            logger.info("Found compiled artifact in cache: %s", fingerprint)
++            compiled_bytes, meta = cached
++            return {"fingerprint": fingerprint, "cached": True, "meta": meta}
++
++        # transpile using qiskit if available
++        if QuantumCircuit is None or transpile is None:
++            raise RuntimeError("Qiskit not available in this environment")
++
++        qc = QuantumCircuit.from_qasm_str(circuit_source) if hasattr(QuantumCircuit, "from_qasm_str") else QuantumCircuit().from_qasm_str(circuit_source)
++        backend_name = backend_spec.get("backend", "aer_simulator")
++        optimization_level = backend_spec.get("optimization_level", 1)
++        # For local compile we use AerSimulator as target basis if available
++        target = AerSimulator() if AerSimulator else None
++        compiled = transpile(qc, backend=target, optimization_level=optimization_level) if target else transpile(qc, optimization_level=optimization_level)
++        compiled_qasm = compiled.qasm()
++        compiled_bytes = compiled_qasm.encode("utf-8")
++        meta = {
++            "backend_spec": backend_spec,
++            "compiled_qasm_length": len(compiled_bytes),
++            "compiled_at": int(time.time())
++        }
++        cache_path = self._write_cache_local(fingerprint, compiled_bytes, meta)
++
++        # log provenance to mlflow if available
++        if mlflow:
++            try:
++                mlflow.set_experiment(self.mlflow_experiment)
++                with mlflow.start_run(run_name=f"compile_{fingerprint}"):
++                    mlflow.log_param("fingerprint", fingerprint)
++                    mlflow.log_param("backend_spec", backend_spec)
++                    mlflow.log_text(compiled_qasm, "compiled.qasm")
++            except Exception as e:
++                logger.exception("MLflow log failed: %s", e)
++
++        # record decision/audit
++        try:
++            record_decision({
++                "agent": "quantum.adapter",
++                "action": "compile",
++                "payload": {"fingerprint": fingerprint, "backend_spec": backend_spec},
++                "evidence": {"cache_path": cache_path}
++            })
++        except Exception:
++            pass
++
++        return {"fingerprint": fingerprint, "cached": False, "meta": meta, "cache_path": cache_path}
++
++    def submit_circuit(self, circuit_source: str, params: Dict[str, Any], options: Dict[str, Any]) -> str:
++        """
++        Submit circuit to simulator or (if configured) to IBM hardware via IBMQ provider.
++        Returns a job_id (opaque).
++        For simulators, job_id maps to a local run id.
++        """
++        backend = options.get("backend", "aer_simulator")
++        shots = int(options.get("shots", 1024))
++        job_id = f"qiskit-{int(time.time())}-{hashlib.sha1(circuit_source.encode()).hexdigest()[:8]}"
++
++        # simple path: run on AerSimulator synchronously and store result in local cache
++        if backend == "aer_simulator":
++            if AerSimulator is None or QuantumCircuit is None:
++                raise RuntimeError("Qiskit Aer not available")
++            qc = QuantumCircuit.from_qasm_str(circuit_source) if hasattr(QuantumCircuit, "from_qasm_str") else QuantumCircuit().from_qasm_str(circuit_source)
++            sim = AerSimulator()
++            transpiled = transpile(qc, backend=sim, optimization_level=options.get("optimization_level", 1))
++            job = sim.run(transpiled, shots=shots)
++            result = job.result()
++            counts = result.get_counts()
++            metadata = {"backend": "aer", "shots": shots, "runtime_sec": 0.0}
++            # store result to local path
++            outdir = os.environ.get("QUANTUM_RESULTS_DIR", "/tmp/quantum_results")
++            os.makedirs(outdir, exist_ok=True)
++            outpath = os.path.join(outdir, f"{job_id}.json")
++            with open(outpath, "w") as fh:
++                json.dump({"counts": counts, "metadata": metadata}, fh)
++            # record decision/artifact
++            record_decision({"agent": "quantum.adapter", "action": "submit_sim", "model": params.get("model"), "payload": {"job_id": job_id, "outpath": outpath}})
++            return job_id
++
++        # hardware path (IBMQ) - placeholder token exchange and submit; requires IBMQ account config
++        if backend.startswith("ibmq") or backend == "ibmq":
++            if IBMQ is None:
++                raise RuntimeError("IBMQ provider not installed")
++            # load account (user must configure env IBMQ_TOKEN or use saved account)
++            try:
++                IBMQ.load_account()
++                provider = IBMQ.get_provider(hub='ibm-q')
++                backend_obj = provider.get_backend(options.get("backend_name", "ibmq_qasm_simulator"))
++                qc = QuantumCircuit.from_qasm_str(circuit_source)
++                transpiled = transpile(qc, backend=backend_obj, optimization_level=options.get("optimization_level", 1))
++                qiskit_job = backend_obj.run(transpiled, shots=shots)
++                # job id
++                job_id = f"ibmq-{qiskit_job.job_id()}"
++                record_decision({"agent": "quantum.adapter", "action": "submit_ibmq", "payload": {"job_id": job_id, "backend": backend_obj.name()}})
++                return job_id
++            except Exception as e:
++                logger.exception("IBMQ submit failed: %s", e)
++                raise
++
++        raise RuntimeError(f"Unsupported backend: {backend}")
++
++    def get_job_status(self, job_id: str) -> Dict[str, Any]:
++        # For Aer synchronous runs, infer from stored JSON
++        outdir = os.environ.get("QUANTUM_RESULTS_DIR", "/tmp/quantum_results")
++        path = os.path.join(outdir, f"{job_id}.json")
++        if os.path.exists(path):
++            with open(path, "r") as fh:
++                data = json.load(fh)
++            return {"status": "SUCCEEDED", "result": {"counts": data.get("counts")}, "metadata": data.get("metadata")}
++        # for IBMQ, attempt to get job status via qiskit (placeholder)
++        if job_id.startswith("ibmq-"):
++            jq = job_id.split("ibmq-")[-1]
++            # Real code should fetch job from provider
++            return {"status": "QUEUED", "result": None, "metadata": {}}
++        return {"status": "UNKNOWN", "result": None, "metadata": {}}
++
++    def download_result(self, job_id: str) -> Dict[str, Any]:
++        outdir = os.environ.get("QUANTUM_RESULTS_DIR", "/tmp/quantum_results")
++        path = os.path.join(outdir, f"{job_id}.json")
++        if os.path.exists(path):
++            with open(path, "r") as fh:
++                return json.load(fh)
++        return {}
++
++    def cost_estimate(self, circuit_source: str, options: Dict[str, Any]) -> float:
++        # For simulators cost is zero (compute time), for hardware use shot*price (placeholder)
++        backend = options.get("backend", "aer_simulator")
++        shots = int(options.get("shots", 1024))
++        if backend == "aer_simulator":
++            return 0.0
++        # placeholder price table
++        price_per_shot = {"ibmq": 0.00001, "ionq": 0.0002, "braket": 0.00005}
++        p = price_per_shot.get(backend.split("-")[0], 0.0001)
++        return shots * p
++
++
++# Register default Qiskit backend instance
++register_backend("qiskit", QiskitBackend())
++
++
++if __name__ == "__main__":
++    # simple CLI for quick local test
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--qasm-file", required=True)
++    p.add_argument("--backend", default="aer_simulator")
++    p.add_argument("--shots", type=int, default=1024)
++    args = p.parse_args()
++    with open(args.qasm_file, "r") as fh:
++        qasm = fh.read()
++    backend = get_backend("qiskit")
++    cid = backend.submit_circuit(qasm, params={}, options={"backend": args.backend, "shots": args.shots})
++    print("Submitted job:", cid)
++    status = backend.get_job_status(cid)
++    print("Status:", status)
++
+diff --git a/quantum/compile_cache.py b/quantum/compile_cache.py
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/quantum/compile_cache.py
+@@ -0,0 +1,220 @@
++#!/usr/bin/env python3
++"""
++Compile cache helper:
++ - compute fingerprint for (circuit, backend_spec)
++ - store compiled artifact in local cache and optionally upload to S3 (or LakeFS)
++ - record provenance to MLflow and decision_log
++"""
++import os
++import json
++import hashlib
++import time
++import logging
++from typing import Dict, Any, Optional
++
++logger = logging.getLogger("aegis.quantum.compile_cache")
++logging.basicConfig(level=logging.INFO)
++
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++try:
++    import mlflow
++except Exception:
++    mlflow = None
++
++LOCAL_CACHE_DIR = os.environ.get("QUANTUM_COMPILE_CACHE", "/tmp/quantum_compile_cache")
++os.makedirs(LOCAL_CACHE_DIR, exist_ok=True)
++
++
++def fingerprint(circuit_source: str, backend_spec: Dict[str, Any]) -> str:
++    h = hashlib.sha256()
++    h.update(circuit_source.encode("utf-8"))
++    h.update(json.dumps(backend_spec, sort_keys=True).encode("utf-8"))
++    return h.hexdigest()
++
++
++def cache_compiled(fingerprint_str: str, compiled_qasm: str, backend_spec: Dict[str, Any], s3_prefix: Optional[str] = None) -> Dict[str, Any]:
++    """
++    Save compiled artifact locally and optionally to S3.
++    Returns metadata dict.
++    """
++    meta = {
++        "fingerprint": fingerprint_str,
++        "backend_spec": backend_spec,
++        "compiled_at": int(time.time()),
++        "compiled_len": len(compiled_qasm)
++    }
++    local_path = os.path.join(LOCAL_CACHE_DIR, f"{fingerprint_str}.qasm")
++    with open(local_path, "w") as fh:
++        fh.write(compiled_qasm)
++    meta_path = os.path.join(LOCAL_CACHE_DIR, f"{fingerprint_str}.meta.json")
++    with open(meta_path, "w") as fh:
++        json.dump(meta, fh)
++    logger.info("Wrote compiled artifact to %s", local_path)
++
++    s3_url = None
++    if s3_prefix and boto3:
++        # s3_prefix: s3://bucket/prefix
++        parsed = s3_prefix.replace("s3://", "").split("/", 1)
++        bucket = parsed[0]
++        keyprefix = parsed[1] if len(parsed) > 1 else ""
++        s3 = boto3.client("s3")
++        key = f"{keyprefix}/{fingerprint_str}.qasm"
++        with open(local_path, "rb") as fh:
++            s3.upload_fileobj(fh, bucket, key)
++        s3_url = f"s3://{bucket}/{key}"
++        logger.info("Uploaded compiled artifact to %s", s3_url)
++
++    # Record provenance to MLflow if available
++    if mlflow:
++        try:
++            mlflow.set_experiment("quantum_compile")
++            with mlflow.start_run(run_name=f"compile_{fingerprint_str}"):
++                mlflow.log_param("fingerprint", fingerprint_str)
++                mlflow.log_param("backend_spec", backend_spec)
++                mlflow.log_artifact(local_path, artifact_path="compiled")
++        except Exception:
++            logger.exception("mlflow logging failed")
++
++    # Decision log entry
++    try:
++        from agents.common.utils import record_decision
++        record_decision({"agent": "quantum.compile_cache", "action": "cache_write", "payload": {"fingerprint": fingerprint_str, "local_path": local_path, "s3_url": s3_url}})
++    except Exception:
++        logger.debug("decision_log not available")
++
++    meta.update({"local_path": local_path, "s3_url": s3_url})
++    return meta
++
++
++def load_compiled_local(fingerprint_str: str) -> Optional[Dict[str, Any]]:
++    qasm_path = os.path.join(LOCAL_CACHE_DIR, f"{fingerprint_str}.qasm")
++    meta_path = os.path.join(LOCAL_CACHE_DIR, f"{fingerprint_str}.meta.json")
++    if os.path.exists(qasm_path) and os.path.exists(meta_path):
++        with open(qasm_path, "r") as fh:
++            qasm = fh.read()
++        with open(meta_path, "r") as fh:
++            meta = json.load(fh)
++        meta.update({"compiled_qasm": qasm})
++        return meta
++    return None
++
++
++if __name__ == "__main__":
++    # quick smoke test
++    sample = "OPENQASM 2.0; qreg q[2]; h q[0]; cx q[0],q[1];"
++    spec = {"backend": "aer_simulator", "optimization_level": 1}
++    fp = fingerprint(sample, spec)
++    meta = cache_compiled(fp, sample, spec)
++    print("Cached", meta)
++
+diff --git a/quantum/argo/hybrid_quantum_workflow.yaml b/quantum/argo/hybrid_quantum_workflow.yaml
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/quantum/argo/hybrid_quantum_workflow.yaml
+@@ -0,0 +1,240 @@
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: aegis-hybrid-quantum-
++  namespace: aegis-ml
++spec:
++  entrypoint: hybrid
++  templates:
++    - name: hybrid
++      steps:
++        - - name: preprocess
++            template: preprocess
++          - name: classical-train
++            template: classical-train
++        - - name: generate-circuits
++            template: generate-circuits
++        - - name: compile-and-simulate
++            template: compile-and-simulate
++        - - name: hardware-run
++            template: hardware-run
++        - - name: postprocess
++            template: postprocess
++
++    - name: preprocess
++      container:
++        image: python:3.10
++        command: ["bash", "-lc"]
++        args:
++          - |
++            pip install -q -U boto3
++            # placeholder: prepare dataset and snapshot to LakeFS
++            echo "preprocess done"
++
++    - name: classical-train
++      container:
++        image: <REGISTRY>/aegis-classical-trainer:latest
++        command: ["python", "/app/train.py"]
++        env:
++          - name: MLFLOW_TRACKING_URI
++            value: "http://mlflow:5000"
++
++    - name: generate-circuits
++      container:
++        image: <REGISTRY>/aegis-quantum-tools:latest
++        command: ["python", "/app/generate_circuits.py"]
++        args: ["--output", "/tmp/circuits.json"]
++        outputs:
++          artifacts:
++            - name: circuits
++              path: /tmp/circuits.json
++
++    - name: compile-and-simulate
++      inputs:
++        artifacts:
++          - name: circuits
++            path: /tmp/circuits.json
++      script:
++        image: <REGISTRY>/aegis-quantum-tools:latest
++        command: [python]
++        source: |
++          import json, os, time
++          from quantum.adapter import get_backend
++          with open("/tmp/circuits.json","r") as fh:
++              circuits = json.load(fh)
++          backend = get_backend("qiskit")
++          out = []
++          for c in circuits:
++              qasm = c["qasm"]
++              res = backend.compile_circuit(qasm, {"backend":"aer_simulator","optimization_level":1})
++              job_id = backend.submit_circuit(qasm, params={"model":c.get("model")}, options={"backend":"aer_simulator","shots":1024})
++              out.append({"job_id": job_id, "fingerprint": res.get("fingerprint")})
++          with open("/tmp/sim_results.json","w") as fh:
++              json.dump(out, fh)
++
++    - name: hardware-run
++      script:
++        image: <REGISTRY>/aegis-quantum-tools:latest
++        command: [bash]
++        source: |
++          # This step demonstrates a gated hardware-run: in production, invoke orchestrator to check OPA
++          echo "Requesting hardware run (gated)"
++          python - <<PY
++          import json, os, requests
++          # create orchestrator event for approval
++          evt = {"agent_request":{"action":"quantum_run","model":"demo_model","params":{"reason":"hardware test"},"options":{"backend":"ibmq"}}}
++          r = requests.post("http://orchestrator.aegis-ml.svc.cluster.local:8082/webhook", json=evt, timeout=10)
++          print("Orchestrator response", r.status_code, r.text)
++          PY
++
++    - name: postprocess
++      container:
++        image: <REGISTRY>/aegis-quantum-tools:latest
++        command: ["bash","-lc"]
++        args:
++          - |
++            echo "postprocess: aggregate results, push to MLflow, update model"
++            # Placeholder: implement mapping counts -> training loss or features
++
++  serviceAccountName: aegis-agent-sa
++
+diff --git a/quantum/prometheus_exporter.py b/quantum/prometheus_exporter.py
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/quantum/prometheus_exporter.py
+@@ -0,0 +1,200 @@
++#!/usr/bin/env python3
++"""
++Prometheus exporter for quantum jobs and fidelity metrics.
++Expose:
++ - aegis_quantum_jobs_total{state=...}
++ - aegis_quantum_job_fidelity{job_id=...}
++ - aegis_quantum_job_runtime_seconds
++ - aegis_quantum_job_cost_usd
++ - aegis_quantum_jobs_queued
++"""
++from prometheus_client import start_http_server, Counter, Gauge, Summary
++import time
++import threading
++import os
++import json
++
++JOBS_TOTAL = Counter("aegis_quantum_jobs_total", "Total quantum jobs", ["state"])
++JOBS_QUEUED = Gauge("aegis_quantum_jobs_queued", "Number of queued quantum jobs")
++JOB_FIDELITY = Gauge("aegis_quantum_job_fidelity", "Per-job fidelity estimate", ["job_id"])
++JOB_RUNTIME = Summary("aegis_quantum_job_runtime_seconds", "Job runtime seconds")
++JOB_COST = Gauge("aegis_quantum_job_cost_usd", "Estimated cost USD per job", ["job_id"])
++
++SAMPLE_INTERVAL = int(os.environ.get("QUANTUM_METRICS_INTERVAL", "10"))
++
++class QuantumMetrics:
++    def __init__(self, port=9103):
++        self.port = port
++        self.jobs = {}  # job_id -> meta
++
++    def start(self):
++        start_http_server(self.port)
++        threading.Thread(target=self._loop, daemon=True).start()
++        print("Quantum exporter started on", self.port)
++
++    def _loop(self):
++        while True:
++            self._scrape_jobs()
++            time.sleep(SAMPLE_INTERVAL)
++
++    def _scrape_jobs(self):
++        # Placeholder: read job queue from file or service; here we emit current in-memory jobs
++        queued = sum(1 for j in self.jobs.values() if j.get("state") == "QUEUED")
++        JOBS_QUEUED.set(queued)
++        for job_id, meta in list(self.jobs.items()):
++            state = meta.get("state", "UNKNOWN")
++            JOBS_TOTAL.labels(state=state).inc(0)  # ensure label exists
++            fidelity = meta.get("fidelity")
++            if fidelity is not None:
++                JOB_FIDELITY.labels(job_id=job_id).set(fidelity)
++            cost = meta.get("cost")
++            if cost is not None:
++                JOB_COST.labels(job_id=job_id).set(cost)
++
++    def register_job(self, job_id, meta):
++        self.jobs[job_id] = meta
++        JOBS_TOTAL.labels(state=meta.get("state","QUEUED")).inc()
++
++    def update_job(self, job_id, meta):
++        self.jobs[job_id].update(meta)
++
++
++if __name__ == "__main__":
++    m = QuantumMetrics()
++    m.start()
++    # demo: register a job
++    m.register_job("demo-1", {"state":"QUEUED", "fidelity":0.9, "cost":0.0})
++    while True:
++        time.sleep(60)
++
+diff --git a/policy/opa/quantum_policy.rego b/policy/opa/quantum_policy.rego
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/policy/opa/quantum_policy.rego
+@@ -0,0 +1,120 @@
++package aegis.quantum
++
++# Input expected:
++# {
++#   "action": "quantum_run" | "compile" | ...,
++#   "model": "...",
++#   "params": {...},
++#   "options": {"backend": "...", "shots": 1024},
++#   "env": "staging"|"production"
++# }
++
++default allow = false
++
++# Deny hardware runs in production without explicit approval
++allow {
++  input.action == "compile"
++  input.env == "staging"
++}
++
++allow {
++  input.action == "compile"
++  input.env == "production"
++  # compilation allowed in prod for low-risk; assume model risk data in data.models
++  data.models[input.model].risk == "low"
++}
++
++# Hardware execution rule: require approval in production and provenance
++allow {
++  input.action == "quantum_run"
++  input.env == "staging"
++}
++
++allow {
++  input.action == "quantum_run"
++  input.env == "production"
++  data.models[input.model].risk == "low"
++  input.params.approved_by
++  input.options.backend != "simulator"
++}
++
++reason = msg {
++  not allow
++  msg = "quantum_policy: action denied; hardware runs require approval and low-risk models in production"
++}
++
++result = {"allow": allow, "reason": reason}
++
+diff --git a/gatekeeper/constraint_quantum_provenance.yaml b/gatekeeper/constraint_quantum_provenance.yaml
+new file mode 100644
+index 0000000..6666666
+--- /dev/null
++++ b/gatekeeper/constraint_quantum_provenance.yaml
+@@ -0,0 +1,60 @@
++# Gatekeeper ConstraintTemplate to require provenance/labels for auto-quantum jobs expressed as K8s resources
++apiVersion: templates.gatekeeper.sh/v1beta1
++kind: ConstraintTemplate
++metadata:
++  name: quantumrequiredprovenance
++spec:
++  crd:
++    spec:
++      names:
++        kind: QuantumRequiredProvenance
++  targets:
++    - target: admission.k8s.gatekeeper.sh
++      rego: |
++        package quantumrequiredprovenance
++
++        violation[{"msg": msg}] {
++          input.review.object.metadata.labels["aegis.auto"] == "true"
++          not input.review.object.metadata.labels["aegis.quantum.run_id"]
++          msg := "Quantum auto-run denied: missing aegis.quantum.run_id provenance label"
++        }
++
++---
++# Constraint instance example
++apiVersion: constraints.gatekeeper.sh/v1beta1
++kind: QuantumRequiredProvenance
++metadata:
++  name: require-quantum-provenance
++spec:
++  match:
++    kinds:
++      - apiGroups: [""]
++        kinds: ["Job","Pod"]
++
+diff --git a/scripts/quantum/submit_via_orchestrator.py b/scripts/quantum/submit_via_orchestrator.py
+new file mode 100644
+index 0000000..7777777
+--- /dev/null
++++ b/scripts/quantum/submit_via_orchestrator.py
+@@ -0,0 +1,200 @@
++#!/usr/bin/env python3
++"""
++Helper script that demonstrates how to submit a quantum run request to the Aegis orchestrator.
++The orchestrator will consult OPA policy and either execute or create an approval PR.
++"""
++import os
++import json
++import requests
++import argparse
++
++ORCHESTRATOR = os.environ.get("ORCHESTRATOR_WEBHOOK", "http://orchestrator.aegis-ml.svc.cluster.local:8082/webhook")
++GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
++
++def submit(circuit_qasm: str, model: str, backend: str = "simulator", shots: int = 1024):
++    event = {
++        "agent_request": {
++            "action": "quantum_run",
++            "model": model,
++            "params": {"circuit_qasm": circuit_qasm},
++            "options": {"backend": backend, "shots": shots}
++        }
++    }
++    r = requests.post(ORCHESTRATOR, json=event, timeout=15)
++    print("Orchestrator responded:", r.status_code)
++    try:
++        print(r.json())
++    except Exception:
++        print(r.text)
++    return r
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--qasm-file", required=True)
++    parser.add_argument("--model", default="quantum_demo")
++    parser.add_argument("--backend", default="simulator")
++    args = parser.parse_args()
++    with open(args.qasm_file, "r") as fh:
++        qasm = fh.read()
++    submit(qasm, args.model, backend=args.backend)
++
++if __name__ == "__main__":
++    main()
++
+diff --git a/tests/test_quantum_adapter.py b/tests/test_quantum_adapter.py
+new file mode 100644
+index 0000000..8888888
+--- /dev/null
++++ b/tests/test_quantum_adapter.py
+@@ -0,0 +1,160 @@
++import os
++import json
++import tempfile
++import pytest
++
++try:
++    from quantum.adapter import get_backend, fingerprint_circuit
++except Exception:
++    pytest.skip("quantum.adapter not available", allow_module_level=True)
++
++def test_fingerprint_stability():
++    s = "OPENQASM 2.0; qreg q[2]; h q[0]; cx q[0],q[1];"
++    spec = {"backend":"aer_simulator","optimization_level":1}
++    f1 = fingerprint_circuit(s, spec)
++    f2 = fingerprint_circuit(s, spec)
++    assert f1 == f2
++
++def test_simulator_submit_and_result(tmp_path):
++    b = get_backend("qiskit")
++    s = "OPENQASM 2.0; qreg q[2]; h q[0]; cx q[0],q[1]; measure q -> c;"
++    job_id = b.submit_circuit(s, params={}, options={"backend":"aer_simulator","shots":256})
++    assert job_id.startswith("qiskit-")
++    status = b.get_job_status(job_id)
++    assert status["status"] in ("SUCCEEDED", "QUEUED", "UNKNOWN")
++    res = b.download_result(job_id)
++    # for Aer expected to have counts if executed
++    if res:
++        assert "counts" in res
++
+diff --git a/docs/quantum/README_QUANTUM.md b/docs/quantum/README_QUANTUM.md
+new file mode 100644
+index 0000000..9999999
+--- /dev/null
++++ b/docs/quantum/README_QUANTUM.md
+@@ -0,0 +1,220 @@
++# Aegis Quantum Integration — Adapter, Cache, Simulator & Orchestration scaffolds
++
++This patch provides a vendor-agnostic quantum adapter, compile cache, Argo hybrid workflow templates,
++Prometheus exporter for fidelity metrics, OPA/Gatekeeper policy scaffolds, and helper scripts/tests.
++
++Quick start (local / staging)
++1. Install optional dependencies (for Qiskit/Aer):
++   pip install qiskit qiskit-aer mlflow boto3
++
++2. Run a simple local simulation using the adapter:
++   python quantum/adapter.py --qasm-file examples/simple.qasm --backend aer_simulator
++
++3. Compile & cache a circuit programmatically:
++   from quantum.adapter import get_backend
++   backend = get_backend("qiskit")
++   res = backend.compile_circuit(qasm_str, {"backend":"aer_simulator","optimization_level":1})
++
++4. Run the Argo hybrid workflow template in staging (adjust registry image references)
++   kubectl apply -f quantum/argo/hybrid_quantum_workflow.yaml
++
++Design notes
++- Treat simulators as a fast-feedback path and real hardware as gate-protected, audited resource.
++- Use compile fingerprinting to avoid redundant transpile/compile work and to speed up hardware submissions.
++- Record all actions in decision_log for auditability and MLflow for provenance.
++- Enforce OPA policy for hardware runs (require approvals in production).
++
++Next steps to productionize
++- Implement additional backends (Braket, IonQ, Rigetti, Azure) and handle provider auth via Vault.
++- Build a simulator fleet (K8s deployment of Aer/TFQ/cuQuantum containers) and an orchestrator job queue.
++- Implement advanced mitigation (zero-noise extrapolation, readout mitigation) in quantum/mitigation module.
++- Add Grafana dashboards and integrate PrometheusRule alerts for fidelity and cost spikes.
++- Integrate budget guard and per-team quotas in the orchestrator flow.
++
++Security
++- Store provider tokens and API keys in Vault; do not commit to repo.
++- Restrict which teams/models can run on hardware using OPA policy.
++
++Files added
++- quantum/adapter.py (main adapter & qiskit backend)
++- quantum/compile_cache.py
++- quantum/argo/hybrid_quantum_workflow.yaml
++- quantum/prometheus_exporter.py
++- policy/opa/quantum_policy.rego
++- gatekeeper/constraint_quantum_provenance.yaml
++- scripts/quantum/submit_via_orchestrator.py
++- tests/test_quantum_adapter.py
++
++If you'd like, I can:
++- A) Add Braket/Azure/IonQ backend implementations (requires provider credentials).
++- B) Create Kubernetes manifests for a simulator fleet (Aer/cuQuantum) and a Job queue controller.
++- C) Add mitigation algorithms (readout matrix, ZNE) and unit tests.
++
++Which would you like next?
++

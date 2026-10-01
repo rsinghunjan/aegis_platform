@@ -1,0 +1,509 @@
+*** Begin Patch
+*** Add File:ops/carbon/gpu_sampler.py
++#!/usr/bin/env python3
++"""
++Collect per-GPU power samples using NVIDIA NVML when available and write JSONL samples
++to NODE_POWER_DIR. Each line contains a timestamped sample including host and GPU watts.
++
++This is intended to run as a cron or sidecar collector on nodes with GPUs.
++"""
++import os
++import time
++import json
++from datetime import datetime
++
++NODE_POWER_DIR = os.environ.get("NODE_POWER_DIR", "/var/log/node_power")
++INSTANCE_TYPE = os.environ.get("INSTANCE_TYPE", os.environ.get("AEGIS_INSTANCE_TYPE", "generic"))
++HOST_SAMPLE_INTERVAL = float(os.environ.get("HOST_SAMPLE_INTERVAL", "5.0"))
++
++os.makedirs(NODE_POWER_DIR, exist_ok=True)
++
++try:
++    import psutil
++except Exception:
++    psutil = None
++
++try:
++    import pynvml
++    pynvml.nvmlInit()
++    NVML_AVAILABLE = True
++except Exception:
++    NVML_AVAILABLE = False
++
++def sample_once(node_name=None):
++    ts = datetime.utcnow().isoformat() + "Z"
++    host_watts = None
++    try:
++        if psutil:
++            # best-effort host CPU power: sum CPU percent * nominal watt (approx)
++            # This is a heuristic when no direct host power sensor available.
++            cpu_percent = psutil.cpu_percent(interval=0.1)
++            host_watts = round((cpu_percent / 100.0) * 200.0, 2)  # assume max 200W host
++    except Exception:
++        host_watts = None
++    gpu_samples = []
++    if NVML_AVAILABLE:
++        try:
++            device_count = pynvml.nvmlDeviceGetCount()
++            for i in range(device_count):
++                h = pynvml.nvmlDeviceGetHandleByIndex(i)
++                try:
++                    p = pynvml.nvmlDeviceGetPowerUsage(h) / 1000.0  # mW -> W
++                except Exception:
++                    p = None
++                try:
++                    name = pynvml.nvmlDeviceGetName(h).decode()
++                except Exception:
++                    name = f"gpu{i}"
++                gpu_samples.append({"gpu_id": i, "gpu_name": name, "gpu_watts": p})
++        except Exception:
++            gpu_samples = []
++
++    sample = {
++        "ts": ts,
++        "node": node_name,
++        "instance_type": INSTANCE_TYPE,
++        "host_watts": host_watts,
++        "gpus": gpu_samples
++    }
++    fname = os.path.join(NODE_POWER_DIR, f"node_power_{node_name or 'local'}.jsonl")
++    with open(fname, "a") as fh:
++        fh.write(json.dumps(sample) + "\n")
++    return sample
++
++def run_daemon(node_name=None, interval=HOST_SAMPLE_INTERVAL):
++    while True:
++        try:
++            s = sample_once(node_name=node_name)
++            # print minimal heartbeat
++            print("sampled:", s.get("node"), s.get("ts"))
++        except Exception as e:
++            print("sample error:", e)
++        time.sleep(interval)
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--node", default=os.uname()[1])
++    p.add_argument("--once", action="store_true")
++    p.add_argument("--interval", type=float, default=HOST_SAMPLE_INTERVAL)
++    args = p.parse_args()
++    if args.once:
++        print(sample_once(node_name=args.node))
++    else:
++        run_daemon(node_name=args.node, interval=args.interval)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/aggregate_calibration.py
++#!/usr/bin/env python3
++"""
++Aggregate per-node JSONL samples to build a calibration DB.
++ - Scans NODE_POWER_DIR for node_power_*.jsonl
++ - Aggregates per instance_type and per gpu_name statistics: count, mean, std
++ - Computes relative uncertainty for host & GPU readings
++ - Stores CARBON_CALIB_PATH (default /etc/aegis/carbon_calibration.json)
++ - Includes PUE defaults and optional manual overrides from env
++"""
++import os
++import json
++import math
++from collections import defaultdict
++from datetime import datetime
++
++NODE_POWER_DIR = os.environ.get("NODE_POWER_DIR", "/var/log/node_power")
++CARBON_CALIB_PATH = os.environ.get("CARBON_CALIB_PATH", "/etc/aegis/carbon_calibration.json")
++DEFAULT_PUE = float(os.environ.get("DEFAULT_PUE", "1.2"))
++PUE_UNCERTAINTY = float(os.environ.get("PUE_UNCERTAINTY", "0.05"))  # 5%
++
++def stats(xs):
++    n = len(xs)
++    if n == 0:
++        return {"count": 0, "mean": 0.0, "std": 0.0}
++    mean = sum(xs) / n
++    var = sum((x - mean) ** 2 for x in xs) / n
++    return {"count": n, "mean": mean, "std": math.sqrt(var)}
++
++def build_calibration():
++    inst_map = defaultdict(lambda: {"host": [], "gpus": defaultdict(list)})
++    if not os.path.exists(NODE_POWER_DIR):
++        print("NODE_POWER_DIR missing:", NODE_POWER_DIR)
++        return {}
++    for fn in os.listdir(NODE_POWER_DIR):
++        if not fn.startswith("node_power_") or not fn.endswith(".jsonl"):
++            continue
++        path = os.path.join(NODE_POWER_DIR, fn)
++        try:
++            with open(path) as fh:
++                for line in fh:
++                    try:
++                        s = json.loads(line)
++                    except Exception:
++                        continue
++                    inst = s.get("instance_type", "generic")
++                    host = s.get("host_watts")
++                    if host:
++                        inst_map[inst]["host"].append(float(host))
++                    for g in s.get("gpus", []):
++                        gname = g.get("gpu_name", "gpu")
++                        gw = g.get("gpu_watts")
++                        if gw:
++                            inst_map[inst]["gpus"][gname].append(float(gw))
++        except Exception:
++            continue
++
++    out = {"ts": datetime.utcnow().isoformat() + "Z", "calibration": {}, "pue_default": DEFAULT_PUE, "pue_uncertainty": PUE_UNCERTAINTY}
++    for inst, data in inst_map.items():
++        host_stats = stats(data["host"])
++        gpu_stats = {}
++        for gname, samples in data["gpus"].items():
++            gpu_stats[gname] = stats(samples)
++        # compute relative uncertainties (std / mean)
++        host_rel_unc = (host_stats["std"] / host_stats["mean"]) if host_stats["mean"] else 1.0
++        gpu_rel_unc_map = {g: (gpu_stats[g]["std"] / gpu_stats[g]["mean"]) if gpu_stats[g]["mean"] else 1.0 for g in gpu_stats}
++        out["calibration"][inst] = {"host": host_stats, "host_rel_unc": host_rel_unc, "gpus": gpu_stats, "gpu_rel_unc": gpu_rel_unc_map}
++    os.makedirs(os.path.dirname(CARBON_CALIB_PATH), exist_ok=True)
++    with open(CARBON_CALIB_PATH, "w") as fh:
++        json.dump(out, fh, indent=2)
++    print("Wrote calibration DB to", CARBON_CALIB_PATH)
++    return out
++
++if __name__ == "__main__":
++    build_calibration()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/emission_calculator.py
++#!/usr/bin/env python3
++"""
++Compute energy & emissions for a job given calibration DB and region.
++Performs uncertainty propagation from power measurement uncertainty, EF uncertainty and PUE uncertainty.
++"""
++import os
++import json
++import math
++from datetime import datetime
++from ops.carbon.electricitymap_client import get_emission_factor
++
++CARBON_CALIB_PATH = os.environ.get("CARBON_CALIB_PATH", "/etc/aegis/carbon_calibration.json")
++DEFAULT_WATTS = float(os.environ.get("DEFAULT_WATTS", "400.0"))
++EF_UNCERTAINTY = float(os.environ.get("EF_UNCERTAINTY", "0.15"))  # 15% default emission factor uncertainty
++
++def load_calib():
++    if os.path.exists(CARBON_CALIB_PATH):
++        return json.load(open(CARBON_CALIB_PATH))
++    return {}
++
++def estimate_job_emissions(instance_type, duration_seconds, region=None, gpu_names=None, include_uncertainty=True):
++    calib = load_calib()
++    inst = calib.get("calibration", {}).get(instance_type)
++    pue = calib.get("pue_default", 1.2)
++    pue_unc = calib.get("pue_uncertainty", 0.05)
++    if not inst:
++        power_watts = DEFAULT_WATTS
++        power_unc_rel = 0.5
++    else:
++        host_mean = inst.get("host", {}).get("mean", 0.0) or 0.0
++        gpu_mean_sum = 0.0
++        gpu_unc_sqr = 0.0
++        if gpu_names:
++            for g in gpu_names:
++                gw = inst.get("gpus", {}).get(g, {}).get("mean", 0.0) or 0.0
++                gu = inst.get("gpu_rel_unc", {}).get(g, 1.0)
++                gpu_mean_sum += gw
++                gpu_unc_sqr += (gu ** 2) * (gw ** 2)
++        else:
++            # sum all GPUs
++            for gname, ginfo in inst.get("gpus", {}).items():
++                gw = ginfo.get("mean", 0.0) or 0.0
++                gu = inst.get("gpu_rel_unc", {}).get(gname, 1.0)
++                gpu_mean_sum += gw
++                gpu_unc_sqr += (gu ** 2) * (gw ** 2)
++        power_watts = host_mean + gpu_mean_sum
++        # compute relative uncertainty: sqrt( (host_rel * host_mean / total)^2 + sum((gpu_rel*gw/total)^2) )
++        host_rel = inst.get("host_rel_unc", 1.0)
++        if power_watts > 0:
++            host_contrib = (host_rel * (host_mean / power_watts)) ** 2
++            gpu_contrib = gpu_unc_sqr / (power_watts ** 2) if power_watts > 0 else 0.0
++            power_unc_rel = math.sqrt(host_contrib + gpu_contrib)
++        else:
++            power_unc_rel = 1.0
++
++    # energy in kWh
++    energy_kwh = (power_watts * (duration_seconds / 3600.0)) / 1000.0
++    ef = get_emission_factor(region)
++    kgco2e = energy_kwh * ef * pue
++
++    # uncertainty propagation: relative uncertainties combined
++    if include_uncertainty:
++        # rel_unc_total = sqrt( power_unc_rel^2 + ef_unc^2 + pue_unc^2 )
++        rel_unc_total = math.sqrt(power_unc_rel ** 2 + EF_UNCERTAINTY ** 2 + pue_unc ** 2)
++        kgco2e_unc = kgco2e * rel_unc_total
++    else:
++        kgco2e_unc = None
++
++    report = {
++        "ts": datetime.utcnow().isoformat() + "Z",
++        "instance_type": instance_type,
++        "duration_seconds": duration_seconds,
++        "power_watts": power_watts,
++        "energy_kwh": energy_kwh,
++        "emission_factor_kgCO2_per_kWh": ef,
++        "pue": pue,
++        "kgCO2e_estimate": kgco2e,
++        "kgCO2e_uncertainty": kgco2e_unc,
++        "power_relative_uncertainty": power_unc_rel
++    }
++    return report
++
++if __name__ == "__main__":
++    import argparse, json
++    p = argparse.ArgumentParser()
++    p.add_argument("--instance-type", default="generic")
++    p.add_argument("--duration", type=float, default=3600.0)
++    p.add_argument("--region", default=None)
++    p.add_argument("--out", default="/tmp/job_emissions.json")
++    args = p.parse_args()
++    rep = estimate_job_emissions(args.instance_type, args.duration, region=args.region)
++    with open(args.out, "w") as fh:
++        json.dump(rep, fh, indent=2)
++    print("Wrote", args.out)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/emission_scheduler_advisor.py
++#!/usr/bin/env python3
++"""
++Simple emissions-aware placement advisor.
++ - Given a job with candidate instance_types (or node labels) and expected duration, recommends:
++    * preferred instance_type/node selector
++    * whether to delay job to a lower-emissions time window (time-of-use)
++ - Uses calibration DB + ElectricityMap client to estimate emissions per candidate
++ - This is advisory output; integrate into submit_job wrapper to enact recommendations.
++"""
++import os
++import json
++from datetime import datetime, timedelta
++from ops.carbon.emission_calculator import estimate_job_emissions
++from ops.carbon.electricitymap_client import get_emission_factor
++
++def recommend(candidates, duration_seconds, region_hint=None):
++    """
++    candidates: list of dicts: {"instance_type": "...", "node_label_selector": {"a": "b"}, "region": "DE"}
++    returns recommendation dict
++    """
++    results = []
++    now = datetime.utcnow()
++    # simple time-of-use windows: check current and +1h, +2h
++    windows = [0, 3600, 7200]
++    for c in candidates:
++        inst = c.get("instance_type", "generic")
++        region = c.get("region", region_hint)
++        best = None
++        for w in windows:
++            est = estimate_job_emissions(inst, duration_seconds, region=region)
++            est["delay_seconds"] = w
++            results.append({"candidate": c, "estimate": est})
++    # pick minimal kgCO2e estimate
++    sorted_results = sorted(results, key=lambda x: x["estimate"]["kgCO2e_estimate"] or 1e9)
++    best = sorted_results[0] if sorted_results else None
++    return {"chosen": best, "candidates": sorted_results}
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--candidates", required=True, help='JSON list of candidates')
++    p.add_argument("--duration", type=float, default=3600)
++    p.add_argument("--region", default=None)
++    args = p.parse_args()
++    cands = json.loads(args.candidates)
++    rec = recommend(cands, args.duration, region_hint=args.region)
++    print(json.dumps(rec, indent=2))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/infra/submit_job_emission_aware.py
++#!/usr/bin/env python3
++"""
++Wrapper that advises on emissions-aware placement and applies nodeSelector to a Kubernetes manifest.
++ - Reads manifest path and candidate instance types or node selectors from manifest annotations or CLI
++ - Calls emission_scheduler_advisor.recommend and patches the manifest to add nodeSelector
++ - Optionally delays the job by sleeping until recommendation delay expires
++
++This is a pragmatic wrapper that can be used in CI/job submission flows; for production integrate with a scheduler plugin.
++"""
++import os
++import sys
++import json
++import time
++import yaml
++import subprocess
++from ops.carbon.emission_scheduler_advisor import recommend
++
++def patch_manifest_with_node_selector(manifest_path, selector):
++    docs = list(yaml.safe_load_all(open(manifest_path)))
++    changed = False
++    for d in docs:
++        if not isinstance(d, dict):
++            continue
++        # find pod template spec
++        if "spec" in d and isinstance(d["spec"], dict):
++            tpl = d["spec"].get("template") or d["spec"]
++            if tpl and isinstance(tpl, dict):
++                podspec = tpl.get("spec") or tpl
++                podspec.setdefault("nodeSelector", {}).update(selector)
++                changed = True
++    if changed:
++        with open(manifest_path, "w") as fh:
++            yaml.safe_dump_all(docs, fh)
++    return changed
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--manifest", required=True)
++    p.add_argument("--candidates", default='[{"instance_type":"generic","node_label_selector":{"aegis/rt":"true"}}]')
++    p.add_argument("--duration", type=float, default=3600)
++    p.add_argument("--region", default=None)
++    p.add_argument("--apply", action="store_true", help="kubectl apply after patch")
++    args = p.parse_args()
++    candidates = json.loads(args.candidates)
++    rec = recommend(candidates, args.duration, region_hint=args.region)
++    chosen = rec.get("chosen")
++    if not chosen:
++        print("No recommendation available; applying manifest unmodified")
++        if args.apply:
++            subprocess.check_call(["kubectl","apply","-f",args.manifest])
++        sys.exit(0)
++    selector = chosen["candidate"].get("node_label_selector", {})
++    delay = chosen["estimate"].get("delay_seconds", 0)
++    print("Recommendation: selector=", selector, "delay(s)=", delay)
++    if selector:
++        patched = patch_manifest_with_node_selector(args.manifest, selector)
++        if patched:
++            print("Patched manifest with nodeSelector")
++    if delay and delay > 0:
++        print(f"Delaying job submission by {delay} seconds as advisory")
++        time.sleep(delay)
++    if args.apply:
++        subprocess.check_call(["kubectl","apply","-f",args.manifest])
++        print("Applied manifest")
++    else:
++        print("Run with --apply to actually submit the manifest")
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/generate_corporate_emissions_report.py
++#!/usr/bin/env python3
++"""
++Aggregate signed emissions reports and produce a corporate summary (CSV/JSON).
++ - Collects emissions reports from a path or S3 prefix
++ - Aggregates totals and outputs signed summary (attempts to sign with KMS/Vault if configured)
++ - Optionally uploads to S3 (requires boto3 and AWS credentials)
++"""
++import os
++import json
++import glob
++import csv
++import subprocess
++from datetime import datetime
++
++def collect_reports(path_pattern):
++    files = glob.glob(path_pattern)
++    reports = []
++    for f in files:
++        try:
++            j = json.load(open(f))
++            reports.append((f,j))
++        except Exception:
++            continue
++    return reports
++
++def aggregate(reports):
++    total_kg = 0.0
++    total_kwh = 0.0
++    rows = []
++    for fname, r in reports:
++        kg = r.get("kgCO2e", 0.0) or 0.0
++        kwh = r.get("energy_kwh", 0.0) or 0.0
++        total_kg += kg
++        total_kwh += kwh
++        rows.append({"file": fname, "job_id": r.get("job_id"), "kgCO2e": kg, "kWh": kwh, "ts": r.get("ts")})
++    summary = {"ts": datetime.utcnow().isoformat()+"Z", "total_kgCO2e": total_kg, "total_kWh": total_kwh, "count": len(rows), "rows": rows}
++    return summary
++
++def sign_if_possible(path):
++    if os.environ.get("EVIDENCE_SIGN_BACKEND"):
++        try:
++            subprocess.check_call(["python", "ops/evidence/sign_with_kms_or_vault.py", path])
++            return path + ".sig"
++        except Exception:
++            return None
++    return None
++
++def upload_to_s3(path, bucket, key_prefix):
++    try:
++        import boto3
++    except Exception:
++        raise RuntimeError("boto3 required to upload to S3")
++    s3 = boto3.client("s3")
++    key = f"{key_prefix}/{os.path.basename(path)}"
++    s3.upload_file(path, bucket, key)
++    return f"s3://{bucket}/{key}"
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--reports", required=True, help="glob pattern for emissions reports, e.g. /tmp/*emissions.json")
++    p.add_argument("--out", default="/tmp/corporate_emissions_summary.json")
++    p.add_argument("--s3-bucket", default=None)
++    p.add_argument("--s3-prefix", default="emissions_reports")
++    args = p.parse_args()
++    reps = collect_reports(args.reports)
++    summary = aggregate(reps)
++    with open(args.out, "w") as fh:
++        json.dump(summary, fh, indent=2)
++    sig = sign_if_possible(args.out)
++    print("Wrote corporate summary", args.out, "sig:", sig)
++    if args.s3_bucket:
++        url = upload_to_s3(args.out, args.s3_bucket, args.s3_prefix)
++        print("Uploaded to", url)
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/emissions_production_report.yml
++name: Emissions Production Report (scheduled)
++on:
++  schedule:
++    - cron: '0 8 * * *'  # daily at 08:00 UTC
++  workflow_dispatch:
++
++jobs:
++  daily-emissions:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.11'
++      - name: Install deps
++        run: |
++          python -m pip install --upgrade pip
++          pip install requests boto3
++      - name: Collect and aggregate emissions (demo pattern)
++        env:
++          REPORT_GLOB: ${{ secrets.REPORT_GLOB }}  # e.g. /tmp/*emissions.json or s3 fetch step if required
++          EVIDENCE_SIGN_BACKEND: ${{ secrets.EVIDENCE_SIGN_BACKEND }}
++          AWS_REGION: ${{ secrets.AWS_REGION }}
++        run: |
++          # For demo, assume reports are checked into repo or generated in CI; production should fetch from artifact store.
++          python ops/carbon/generate_corporate_emissions_report.py --reports "${REPORT_GLOB}" --out /tmp/corp_emissions.json --s3-bucket "${{ secrets.CORP_REPORT_BUCKET }}" --s3-prefix "daily"
++      - name: Upload emitted report
++        uses: actions/upload-artifact@v4
++        with:
++          name: corporate-emissions
++          path: /tmp/corp_emissions.json*
++
+*** End Patch
+*** End Patch

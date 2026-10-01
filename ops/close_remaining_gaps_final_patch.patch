@@ -1,0 +1,451 @@
+*** Begin Patch
+*** Add File:ops/carbon/attribution_scale_test.py
++#!/usr/bin/env python3
++"""
++Attribution scale test
++
++Purpose:
++ - Launch representative mixed GPU workloads (supports MIG-aware images)
++ - Collect DCGM / Prometheus metrics, pid_map files and attribution outputs
++ - Compute per-workflow attribution accuracy against Prometheus per-pod power
++ - Produce a JSON report with summary statistics (mean absolute error, per-wf diffs)
++
++Usage:
++  python ops/carbon/attribution_scale_test.py --prom http://prometheus:9090 --telemetry /var/lib/aegis/telemetry --attrib /var/lib/aegis/carbon_by_workflow
++
++Notes:
++ - Requires node-side collectors: dcgm-exporter, pid_mapper, node_gpu_reporter
++ - This is an automated experiment runner for staging clusters
++"""
++import os
++import argparse
++import json
++import time
++from statistics import mean
++from ops.carbon.dcgm_validation import collect as collect_prom_metrics, read_pid_maps
++
++def load_attribution(attrib_dir):
++    recs = []
++    if not os.path.exists(attrib_dir):
++        return recs
++    for fname in sorted([f for f in os.listdir(attrib_dir) if f.endswith(".jsonl")])[-200:]:
++        path = os.path.join(attrib_dir, fname)
++        try:
++            with open(path) as fh:
++                for line in fh:
++                    recs.append(json.loads(line))
++        except Exception:
++            continue
++    return recs
++
++def compute_error(prom_map, attrib_recs):
++    errs = []
++    per_wf = {}
++    for r in attrib_recs:
++        wf = r.get("workflow")
++        a = float(r.get("avg_power_w", 0.0))
++        # find representative pod in prom_map: heuristic lookup
++        candidates = [p for p in prom_map.keys() if p.startswith(wf)]
++        if not candidates:
++            # try wildcard matching
++            candidates = [p for p in prom_map.keys() if wf in p]
++        prom_v = prom_map[candidates[0]]["avg_power_w"] if candidates else 0.0
++        err = abs(a - prom_v)
++        errs.append(err)
++        per_wf.setdefault(wf, []).append({"attrib": a, "prom": prom_v, "err": err})
++    summary = {"mae": mean(errs) if errs else None, "samples": len(errs)}
++    return summary, per_wf
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--prom", default=os.environ.get("PROM_URL","http://prometheus:9090"))
++    p.add_argument("--telemetry", default=os.environ.get("TELEMETRY_DIR","/var/lib/aegis/telemetry"))
++    p.add_argument("--attrib", default=os.environ.get("CARBON_ATTR_OUT","/var/lib/aegis/carbon_by_workflow"))
++    p.add_argument("--out", default="/tmp/aegis_attribution_scale_report.json")
++    args = p.parse_args()
++
++    # collect prom/pod metrics
++    prom_map = collect_prom_metrics()
++    # read pid maps (not used here directly but sanity)
++    pid_map = read_pid_maps(args.telemetry)
++    # load attribution records
++    attrib_recs = load_attribution(args.attrib)
++
++    summary, per_wf = compute_error(prom_map, attrib_recs)
++    report = {"ts": int(time.time()), "summary": summary, "per_workflow_sample": {k:v[:3] for k,v in per_wf.items()}}
++    with open(args.out, "w") as fh:
++        json.dump(report, fh, indent=2)
++    print("wrote", args.out)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/auto_calibrate_cost.py
++#!/usr/bin/env python3
++"""
++Automatic cost->kWh calibrator orchestration.
++
++ - Calls AWS cost calibrator with operator-provided observed_kwh (from telemetry) and date range
++ - Writes calibration JSON used by provider integrations
++ - Optionally updates a ConfigMap in kube-system with new kwh_per_usd
++"""
++import os
++import argparse
++import json
++from ops.carbon.aws_cost_calibrator import query_cost
++
++OUT_FILE = os.environ.get("COST_CAL_FILE","/var/lib/aegis/carbon_cost_cal.json")
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--start", required=True)
++    p.add_argument("--end", required=True)
++    p.add_argument("--observed_kwh", required=True, type=float)
++    p.add_argument("--apply-configmap", action="store_true", help="Patch kube-system configmap with new conv")
++    args = p.parse_args()
++    cost = query_cost(args.start, args.end)
++    conv = args.observed_kwh / max(1e-6, cost)
++    out = {"start": args.start, "end": args.end, "cost_usd": cost, "observed_kwh": args.observed_kwh, "kwh_per_usd": conv, "ts": int(os.time()) if hasattr(__import__("time"),"time") else 0}
++    os.makedirs(os.path.dirname(OUT_FILE), exist_ok=True)
++    with open(OUT_FILE, "w") as fh:
++        json.dump(out, fh, indent=2)
++    print("wrote", OUT_FILE)
++    if args.apply_configmap:
++        try:
++            from kubernetes import client, config
++            config.load_kube_config()
++            core = client.CoreV1Api()
++            name="aegis-carbon-calibration"
++            ns="kube-system"
++            body = client.V1ConfigMap(metadata=client.V1ObjectMeta(name=name), data={"kwh_per_usd": str(conv)})
++            try:
++                core.replace_namespaced_config_map(name, ns, body)
++            except client.exceptions.ApiException:
++                core.create_namespaced_config_map(ns, body)
++            print("applied ConfigMap aegis-carbon-calibration")
++        except Exception as e:
++            print("failed to apply configmap:", e)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/gatekeeper/flip_enforcement.py
++#!/usr/bin/env python3
++"""
++Flip Gatekeeper constraints from dry-run -> enforce after validation.
++
++Usage:
++  python ops/gatekeeper/flip_enforcement.py --constraint require-carbon-check --mode enforce
++"""
++import argparse
++from kubernetes import client, config
++
++def patch_constraint(name, action):
++    try:
++        config.load_kube_config()
++    except Exception:
++        config.load_incluster_config()
++    api = client.CustomObjectsApi()
++    # constraints are in group constraints.gatekeeper.sh
++    grp = "constraints.gatekeeper.sh"
++    ver = "v1beta1"
++    kind = None
++    # fetch constraint to determine kind
++    # naive approach: list constraints and match by name
++    for ckind in ["RequiredCarbon","K8sRequiredCarbon","K8srequiredcarbon","RequiredCarbonPolicy"]:
++        try:
++            api.patch_cluster_custom_object(grp, ver, ckind.lower(), name, {"spec": {"enforcementAction": action}})
++            print("patched", name, "to", action)
++            return True
++        except Exception:
++            continue
++    # fallback: use kubectl
++    import subprocess
++    subprocess.run(["kubectl","patch","constraint", name, "-p", f'{{"spec":{{"enforcementAction":"{action}"}}}}', "--type=merge"], check=False)
++    return True
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--constraint", required=True)
++    p.add_argument("--mode", choices=["dry","enforce"], default="dry")
++    args = p.parse_args()
++    action = "dryrun" if args.mode=="dry" else "deny"
++    patch_constraint(args.constraint, action)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/milvus/e2e_snapshot_restore.py
++#!/usr/bin/env python3
++"""
++Milvus snapshot & restore E2E test runner
++
++ - Triggers a snapshot (backup) using milvus_ha_backup
++ - Spins up a temporary restore Job that reads backup files and reimports into a new collection
++ - Validates that counts / sample queries match
++"""
++import os
++import json
++import tempfile
++from ops.multimodal.milvus_ha_backup import backup_collection
++from pymilvus import Collection, connections, utility
++import numpy as np
++
++MILVUS_HOST = os.environ.get("MILVUS_HOST","127.0.0.1")
++MILVUS_PORT = os.environ.get("MILVUS_PORT","19530")
++BACKUP_DIR = os.environ.get("MILVUS_BACKUP_DIR","/var/lib/aegis/milvus_backups")
++TEST_COLLECTION = "e2e_restore_test"
++
++def restore_and_validate():
++    # Ensure backup exists
++    backup_collection()
++    # Load backup arrays
++    emb_file = os.path.join(BACKUP_DIR, f"{TEST_COLLECTION}_embs.npy")
++    meta_file = os.path.join(BACKUP_DIR, f"{TEST_COLLECTION}_meta.json")
++    if not (os.path.exists(emb_file) and os.path.exists(meta_file)):
++        print("backup files missing; using default backup")
++        # fallback: try any emb file
++        cand = [f for f in os.listdir(BACKUP_DIR) if f.endswith("_embs.npy")]
++        if not cand:
++            raise RuntimeError("no backup file found")
++        emb_file = os.path.join(BACKUP_DIR, cand[0])
++        meta_file = emb_file.replace("_embs.npy","_meta.json")
++    embs = np.load(emb_file)
++    with open(meta_file) as fh:
++        metas = json.load(fh)
++    # connect to milvus and create a new collection to restore
++    connections.connect(host=MILVUS_HOST, port=MILVUS_PORT)
++    col_name = TEST_COLLECTION + "_restored"
++    # remove if exists
++    if utility.has_collection(col_name):
++        utility.drop_collection(col_name)
++    # create collection
++    from pymilvus import CollectionSchema, FieldSchema, DataType, Collection
++    dim = embs.shape[1]
++    fields = [
++        FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
++        FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=dim),
++        FieldSchema(name="meta", dtype=DataType.VARCHAR, max_length=4096)
++    ]
++    schema = CollectionSchema(fields)
++    col = Collection(col_name, schema)
++    col.insert([embs.tolist(), [json.dumps(m) for m in metas]])
++    col.flush()
++    print("restored collection", col_name, "count:", col.num_entities)
++    # run a few sample searches
++    q = embs[:1].tolist()
++    res = col.search(q, "embedding", param={"metric_type":"IP","params":{"nprobe":10}}, limit=3, output_fields=["meta"])
++    print("sample search result length", len(res[0]))
++    return {"restored_count": col.num_entities, "sample_hits": len(res[0])}
++
++if __name__=="__main__":
++    print(restore_and_validate())
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/multimodal/s3_tiering_test.py
++#!/usr/bin/env python3
++"""
++S3 tiering test helper:
++ - Verifies lifecycle policy exists on bucket
++ - Uploads small test objects (tags) and verifies policy applied (by reading policy)
++ - Note: actual transition to IA/Glacier cannot be forced immediately — this verifies policy presence
++"""
++import os
++import boto3
++import json
++
++BUCKET = os.environ.get("FEATURESTORE_S3","")
++POLICY_FILE = os.environ.get("S3_TIER_POLICY_FILE","ops/multimodal/s3_tiering_policy.json")
++
++def check_policy(bucket):
++    s3 = boto3.client("s3")
++    try:
++        res = s3.get_bucket_lifecycle_configuration(Bucket=bucket)
++        return {"ok": True, "rules": res.get("Rules", [])}
++    except Exception as e:
++        return {"ok": False, "error": str(e)}
++
++def upload_test_objects(bucket, n=3):
++    s3 = boto3.client("s3")
++    keys = []
++    for i in range(n):
++        key = f"tiering_test/test_obj_{int(time.time())}_{i}.txt"
++        s3.put_object(Bucket=bucket, Key=key, Body=b"hello")
++        keys.append(key)
++    return keys
++
++def main():
++    if not BUCKET:
++        print("FEATURESTORE_S3 not set")
++        return
++    pol = check_policy(BUCKET)
++    print("policy_check:", json.dumps(pol, indent=2))
++    if pol.get("ok"):
++        print("policy present; uploading test objects")
++        keys = upload_test_objects(BUCKET)
++        print("uploaded keys:", keys)
++    else:
++        print("no lifecycle policy; apply one with ops/multimodal/s3_tiering_policy.json")
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/multimodal/clock_skew_test.py
++#!/usr/bin/env python3
++"""
++Clock skew test:
++ - Queries nodes via Kubernetes and checks time skew vs local time
++ - Optionally writes a synthetic telemetry event with provider timestamp to test alignment
++"""
++import time
++from kubernetes import client, config
++
++def main():
++    try:
++        config.load_incluster_config()
++    except Exception:
++        config.load_kube_config()
++    core = client.CoreV1Api()
++    nodes = core.list_node().items
++    local = time.time()
++    issues = []
++    for n in nodes:
++        name = n.metadata.name
++        conds = n.status.conditions or []
++        hb = None
++        for c in conds:
++            if c.type == "Ready":
++                hb = c.last_heartbeat_time
++                break
++        if hb:
++            skew = abs(local - hb.timestamp())
++            if skew > 2:
++                issues.append({"node": name, "skew_s": skew})
++    print({"checked": len(nodes), "issues": issues})
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/generative/llm_hpa.yaml
++apiVersion: autoscaling/v2
++kind: HorizontalPodAutoscaler
++metadata:
++  name: aegis-llm-hpa
++  namespace: aegis-system
++spec:
++  scaleTargetRef:
++    apiVersion: apps/v1
++    kind: Deployment
++    name: aegis-llm-inference
++  minReplicas: 2
++  maxReplicas: 10
++  metrics:
++    - type: Resource
++      resource:
++        name: cpu
++        target:
++          type: Utilization
++          averageUtilization: 60
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/generative/hallucination_benchmark.py
++#!/usr/bin/env python3
++"""
++Run hallucination benchmark across a dataset.
++ - Loads a JSONL dataset of queries with ground-truth doc ids and expected answer support
++ - Runs retrieval + generation + NLI verify pipeline and reports precision/recall of verifier
++
++Usage:
++  python ops/generative/hallucination_benchmark.py --data data/halluc_bench.jsonl --out /tmp/bench_report.json
++"""
++import os
++import argparse
++import json
++import requests
++from ops.generative.hallucination_verifier_integration import verify_with_nli
++
++RETRIEVER = os.environ.get("RETRIEVER_URL","http://retriever.default.svc.cluster.local/retrieve")
++LLM = os.environ.get("LLM_ADAPTER","http://aegis-llm-adapter.aegis-system.svc.cluster.local/generate")
++
++def run_one(q):
++    # call retriever
++    r = requests.post(RETRIEVER, json={"texts":[q["query"]], "k":5}, timeout=10)
++    docs = r.json().get("results", [])
++    # call LLM (synchronous)
++    g = requests.post(LLM, json={"prompt": q.get("prompt","") + "\n" + q["query"]}, timeout=30)
++    ans = g.text
++    # verify using NLI integration
++    res = verify_with_nli(ans, docs)
++    return {"id": q.get("id"), "pass": res.get("pass"), "score": res.get("details")}
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--data", required=True)
++    p.add_argument("--out", default="/tmp/hallucination_bench_report.json")
++    args = p.parse_args()
++    results=[]
++    with open(args.data) as fh:
++        for line in fh:
++            q = json.loads(line)
++            try:
++                results.append(run_one(q))
++            except Exception as e:
++                results.append({"id": q.get("id"), "error": str(e)})
++    with open(args.out,"w") as fh:
++        json.dump(results, fh, indent=2)
++    print("wrote", args.out)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/generative/rlhf/rlhf_distributed_workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: aegis-rlhf-distributed-
++spec:
++  entrypoint: rlhf-dist
++  templates:
++    - name: rlhf-dist
++      steps:
++        - - name: collect-prefs
++            template: collect-prefs
++        - - name: train-reward
++            template: train-reward
++        - - name: suspend-for-approval
++            template: suspend
++        - - name: train-policy
++            template: train-policy
++        - - name: validate-policy
++            template: validate
++        - - name: manual-promote
++            template: manual-promote
++
++    - name: collect-prefs
++      container:
++        image: python:3.11-slim
++        command: [sh,-c]
++        args: ["python ops/generative/rlhf/reward_trainer.py"]
++
++    - name: train-reward
++      container:
++        image: ghcr.io/yourorg/rlhf-train:latest
++        command: [sh,-c]
++        args: ["python train_reward_model.py --data /data/prefs --out /out/reward"]
++      volumeMounts:
++       
+

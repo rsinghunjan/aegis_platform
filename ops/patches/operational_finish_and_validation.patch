@@ -1,0 +1,442 @@
+*** Begin Patch
+*** Add File:ops/deploy/deploy_all.sh
++#!/usr/bin/env bash
++set -euo pipefail
++
++# Deploy all k8s manifests for Aegis retriever/CAS/NLI and supporting infra.
++echo "Applying k8s manifests..."
++kubectl apply -f k8s/hardened_services.yaml
++kubectl apply -f k8s/prometheus_rules.yaml || true
++
++echo "Ensure NLI model(s) downloaded (may be slow)..."
++python ops/nli/model_manager.py --ensure || true
++
++echo "Warm NLI pool (best-effort)..."
++python ops/nli/warm_pool.py || true
++
++echo "Run runtime validation job locally (in-cluster job also available)..."
++kubectl apply -f k8s/runtime_validation_job.yaml
++
++echo "Deploy complete. Check pods in aegis-retriever namespace:"
++kubectl get pods -n aegis-retriever
++
++echo "If using Prometheus, ensure scrape config picks up aegis metrics."
++echo "If GPU nodes required for NLI, ensure node labels and tolerations are present."
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/runtime_validation_job.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: runtime-validation
++  namespace: aegis-retriever
++spec:
++  template:
++    metadata:
++      name: runtime-validation
++    spec:
++      serviceAccountName: aegis-retriever-sa
++      restartPolicy: Never
++      containers:
++      - name: validator
++        image: python:3.11-slim
++        command: ["python","/workspace/ops/ci/runtime_validator.py"]
++        volumeMounts:
++          - name: repo
++            mountPath: /workspace
++      volumes:
++        - name: repo
++          hostPath:
++            path: /workspace  # CI runners should mount repository checkout here or adjust path
++            type: DirectoryOrCreate
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/ci/runtime_validator.py
++#!/usr/bin/env python3
++"""
++Runtime validator (in-cluster) that checks deployed pods for:
++ - securityContext (runAsNonRoot, readOnlyRootFilesystem)
++ - seccomp annotation presence on pod templates
++ - resource requests/limits on containers
++ - readiness/liveness probe presence
++ - nli-service nodeSelector/tolerations for GPU scheduling
++
++Writes results to /tmp/runtime_validation.json and exits non-zero on problems.
++"""
++import json
++import sys
++from kubernetes import client, config
++
++NS = "aegis-retriever"
++PROBLEMS = []
++OUT = "/tmp/runtime_validation.json"
++
++def load_k8s():
++    try:
++        config.load_incluster_config()
++    except Exception:
++        config.load_kube_config()
++    return client.AppsV1Api(), client.CoreV1Api()
++
++def inspect():
++    apps, core = load_k8s()
++    deps = apps.list_namespaced_deployment(NS).items
++    findings = []
++    for d in deps:
++        meta = d.metadata.name
++        spec = d.spec.template
++        ann = spec.metadata.annotations or {}
++        sc = spec.spec.security_context or {}
++        if "seccomp.security.alpha.kubernetes.io/pod" not in ann:
++            PROBLEMS.append(f"{meta}: missing seccomp pod annotation")
++        for c in spec.spec.containers:
++            cname = c.name
++            sc_c = c.security_context or {}
++            if not sc_c.read_only_root_filesystem:
++                PROBLEMS.append(f"{meta}/{cname}: readOnlyRootFilesystem not set")
++            # resources
++            r = c.resources or {}
++            if not (r.requests and r.limits):
++                PROBLEMS.append(f"{meta}/{cname}: resources.requests/limits missing")
++            # probes
++            if not (c.readiness_probe or c.liveness_probe):
++                PROBLEMS.append(f"{meta}/{cname}: missing readiness/liveness probe")
++        # special check for nli-service scheduling
++        if d.metadata.name == "nli-service":
++            node_selector = spec.spec.node_selector or {}
++            if not node_selector.get("nvidia.com/gpu.present"):
++                PROBLEMS.append("nli-service: nodeSelector for GPU nodes not present; ensure GPU nodepool")
++    # pod-level checks
++    pods = core.list_namespaced_pod(NS).items
++    for p in pods:
++        for cs in p.status.container_statuses or []:
++            if not cs.ready:
++                PROBLEMS.append(f"pod {p.metadata.name} container {cs.name} not ready")
++    findings = {"problems": PROBLEMS, "checked_deployments": [d.metadata.name for d in deps], "checked_pods": [p.metadata.name for p in pods]}
++    with open(OUT, "w") as fh:
++        json.dump(findings, fh, indent=2)
++    if PROBLEMS:
++        print("Runtime validation found problems:", PROBLEMS)
++        sys.exit(2)
++    print("Runtime validation ok.")
++
++if __name__ == "__main__":
++    inspect()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/scaling/capacity_planner.py
++#!/usr/bin/env python3
++"""
++Capacity planner: runs load tests at increasing load and suggests CALC_POOL_WORKERS and HPA targets.
++Produces /tmp/capacity_plan.json with recommendations and measured latencies.
++"""
++import json
++import subprocess
++import time
++from datetime import datetime
++
++OUT = "/tmp/capacity_plan.json"
++
++def run_load_test(concurrency, calc_q=100, nli_q=50):
++    # uses ops/scaling/load_test.py but allows configuration via environment
++    cmd = f"python ops/scaling/load_test.py"
++    # run and collect /tmp/load_test_report.json
++    subprocess.call(cmd, shell=True)
++    time.sleep(1)
++    try:
++        rpt = json.load(open("/tmp/load_test_report.json"))
++    except Exception:
++        rpt = {}
++    return rpt
++
++def recommend(rpts):
++    # crude logic: if calc p95 > 0.5s, increase calc workers; if nli p95 > 0.5s, increase nli replicas
++    rec = {"ts": datetime.utcnow().isoformat()+"Z", "runs": rpts, "recommendations": []}
++    calc_p95 = rpts[-1].get("calc",{}).get("p95")
++    nli_p95 = rpts[-1].get("nli",{}).get("p95")
++    if calc_p95 and calc_p95 > 0.5:
++        rec["recommendations"].append({"target":"calc_pool", "action":"increase_CALC_POOL_WORKERS", "reason": f"p95={calc_p95}"})
++    if nli_p95 and nli_p95 > 0.5:
++        rec["recommendations"].append({"target":"nli-service", "action":"increase_replicas_or_gpu", "reason": f"p95={nli_p95}"})
++    return rec
++
++def main():
++    runs = []
++    for c in (5,10,20):
++        print("Running load test concurrency", c)
++        rpt = run_load_test(concurrency=c)
++        runs.append(rpt)
++    plan = recommend(runs)
++    with open(OUT, "w") as fh:
++        json.dump(plan, fh, indent=2)
++    print("Wrote capacity plan:", OUT)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/math/worker_fuzzer_ci_wrapper.py
++#!/usr/bin/env python3
++"""
++CI wrapper to run a short worker fuzzer and fail the job if crashes or invalid outputs are detected.
++Intended to be run in CI after deployment/change.
++"""
++import json
++import subprocess
++import sys
++
++def run_fuzzer():
++    subprocess.call("python ops/math/worker_fuzzer.py", shell=True)
++    # inspect findings
++    found = False
++    try:
++        with open("/tmp/worker_fuzzer_findings.jsonl") as fh:
++            for _ in fh:
++                found = True
++                break
++    except Exception:
++        pass
++    if found:
++        print("Worker fuzzer detected anomalies. See /tmp/worker_fuzzer_findings.jsonl")
++        return 2
++    print("Worker fuzzer no findings.")
++    return 0
++
++if __name__ == "__main__":
++    sys.exit(run_fuzzer())
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/formal/invariant_assistant.py
++#!/usr/bin/env python3
++"""
++Invariant assistant: generate candidate invariants from counterexamples and propose to invariant registry.
++ - Uses simple heuristics to turn continuous fuzz counterexamples into template invariants
++ - Adds to invariant_registry and schedules targeted prover runs
++"""
++import json
++import os
++from datetime import datetime
++from ops.formal.invariant_registry import add_invariant
++import subprocess
++
++INPUT = "/tmp/continuous_fuzz_counterexamples.jsonl"
++OUT = "/tmp/invariants_proposed.json"
++
++def heuristic_from_mutant(mut):
++    inv = {}
++    speed = mut.get("speed")
++    if speed is not None:
++        inv["max_speed"] = {"type":"numeric_limit","variable":"speed","op":"le","value": round(max(5.0, speed*1.1),2), "description":"auto-proposed speed cap"}
++    if mut.get("lateral_accel") and mut["lateral_accel"]>2.0:
++        inv["max_lateral_accel"] = {"type":"numeric_limit","variable":"lateral_accel","op":"le","value": round(mut["lateral_accel"]*1.1,2)}
++    return inv
++
++def run():
++    proposed = {}
++    if not os.path.exists(INPUT):
++        print("No fuzz counterexamples found.")
++        return
++    for line in open(INPUT):
++        rec = json.loads(line)
++        mut = rec.get("mutant",{})
++        cand = heuristic_from_mutant(mut)
++        for k,v in cand.items():
++            key = f"auto_{k}_{int(datetime.utcnow().timestamp())}"
++            add_invariant(key, v)
++            proposed[key] = v
++    with open(OUT, "w") as fh:
++        json.dump(proposed, fh, indent=2)
++    # schedule targeted prover
++    try:
++        subprocess.call("python ops/formal/targeted_prover.py", shell=True)
++    except Exception:
++        pass
++    print("Proposed invariants written to", OUT)
++
++if __name__ == "__main__":
++    run()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/process/notify_human.py
++#!/usr/bin/env python3
++"""
++Notify human reviewers of entries in the human review queue.
++ - Reads ops/process/human_review_queue and sends an HTTP POST to a configured webhook (e.g., Slack) or prints to stdout.
++ - Config via env: HUMAN_REVIEW_WEBHOOK (optional)
++"""
++import os
++import json
++from ops.process.human_review_queue import list_reviews, pop_review
++import requests
++
++WEBHOOK = os.environ.get("HUMAN_REVIEW_WEBHOOK", "")
++
++def notify(item):
++    text = f"Human review required: {item.get('id')} - issues: {item.get('issues')}\nText: {item.get('text')}\nMetadata: {item.get('metadata')}"
++    if WEBHOOK:
++        try:
++            requests.post(WEBHOOK, json={"text": text}, timeout=5)
++            return True
++        except Exception:
++            pass
++    print(text)
++    return False
++
++def run_once(pop=False):
++    q = list_reviews()
++    for item in q:
++        notify(item)
++        if pop:
++            popped = pop_review()
++            print("Popped:", popped and popped.get("id"))
++
++if __name__ == "__main__":
++    run_once(pop=False)
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/cronjobs/human-review-notifier.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: human-review-notifier
++  namespace: aegis-retriever
++spec:
++  schedule: "*/15 * * * *"
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          serviceAccountName: aegis-retriever-sa
++          containers:
++            - name: notifier
++              image: python:3.11-slim
++              command: ["python","/workspace/ops/process/notify_human.py"]
++              env:
++                - name: HUMAN_REVIEW_WEBHOOK
++                  value: ""
++              volumeMounts:
++                - name: repo
++                  mountPath: /workspace
++          restartPolicy: OnFailure
++          volumes:
++            - name: repo
++              hostPath:
++                path: /workspace
++                type: DirectoryOrCreate
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/ci/benchmark_cost_guard.py
++#!/usr/bin/env python3
++"""
++Guard that prevents expensive full-suite benchmark runs from exceeding configured nightly budgets.
++ - Reads ops/ci/benchmark_config.json to estimate cost and compares to ENV NIGHTLY_BUDGET_OVERRIDE (optional)
++ - Exits non-zero if cost would exceed allowed budget
++"""
++import json
++import os
++import sys
++
++CFG = "ops/ci/benchmark_config.json"
++
++def main(mode="nightly"):
++    cfg = json.load(open(CFG))
++    if mode == "pr":
++        shard = "pr_smoke"
++    else:
++        shard = "nightly_full"
++    est = cfg["shards"][shard]["cost_estimate"]
++    budget = float(os.environ.get("NIGHTLY_BUDGET_OVERRIDE", cfg["budget"]["nightly_max_cost"]))
++    if est > budget:
++        print(f"Estimated cost {est} exceeds budget {budget}. Aborting.")
++        sys.exit(2)
++    print("Budget ok for shard", shard)
++
++if __name__ == "__main__":
++    import sys
++    main("nightly" if len(sys.argv)==1 else sys.argv[1])
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/edge/dispatch_device_tests.py
++#!/usr/bin/env python3
++"""
++Dispatch device tests to device agents with rate limiting and collection.
++ - DEVICE_LIST env var or file; sends /v1/benchmark request and collects to /tmp/device_dispatch_reports.json
++ - This script supports batching and retries for flaky networks.
++"""
++import os
++import requests
++import json
++import time
++from datetime import datetime
++
++DEVICES = os.environ.get("DEVICE_LIST", "")
++OUT = "/tmp/device_dispatch_reports.json"
++
++def load_devices():
++    if os.path.exists(DEVICES):
++        with open(DEVICES) as fh:
++            return [l.strip() for l in fh if l.strip()]
++    return [d.strip() for d in DEVICES.split(",") if d.strip()]
++
++def call_device(d):
++    for attempt in range(3):
++        try:
++            r = requests.post(d.rstrip("/") + "/v1/benchmark", json={}, timeout=30)
++            if r.status_code==200:
++                return {"device": d, "ok": True, "result": r.json()}
++        except Exception as e:
++            last = str(e)
++        time.sleep(1)
++    return {"device": d, "ok": False, "error": last}
++
++def run():
++    devices = load_devices()
++    reports = {"ts": datetime.utcnow().isoformat()+"Z", "devices": []}
++    for d in devices:
++        reports["devices"].append(call_device(d))
++    with open(OUT,"w") as fh:
++        json.dump(reports, fh, indent=2)
++    print("wrote", OUT)
++
++if __name__ == "__main__":
++    run()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/ci/additional_readme.md
++Operational playbook (quick)
++--------------------------------
++- Apply hardened manifests:
++  kubectl apply -f k8s/hardened_services.yaml
++  kubectl apply -f k8s/prometheus_rules.yaml
++
++- Deploy runtime validation job or run locally:
++  kubectl apply -f k8s/runtime_validation_job.yaml
++  Check /tmp/runtime_validation.json in the job pod logs (or run ops/ci/runtime_validator.py locally)
++
++- Ensure NLI model:
++  python ops/nli/model_manager.py --ensure
++  Run warm pool: python ops/nli/warm_pool.py
++
++- Run load tests and capacity planner:
++  python ops/scaling/load_test.py
++  python ops/scaling/capacity_planner.py
++
++- Run worker fuzzer and triage:
++  python ops/math/worker_fuzzer.py
++  python ops/formal/invariant_assistant.py
++
++- Dispatch device tests:
++  Set DEVICE_LIST env var and run python ops/edge/dispatch_device_tests.py
++
+*** End Patch
+*** End Patch

@@ -1,0 +1,628 @@
+*** Begin Patch
+*** Add File: fleet/controller/app.py
++#!/usr/bin/env python3
++"""
++Aegis Fleet Controller (prototype, production-starter)
++- REST API using FastAPI to manage devices, releases, rollouts and telemetry
++- Features:
++  - Device registration (device groups, metadata)
++  - Release creation (bundle URL + manifest metadata)
++  - Rollout orchestration (device groups, staged canaries, percentage)
++  - Device bundle assignment endpoint (agents poll to learn their bundle)
++  - Telemetry ingest and simple health evaluation -> automated rollback
++
++This is a minimal, single-process controller intended as an operator/development scaffold.
++For production, split services, add auth (mTLS/OAuth), scale behind k8s, and persist to a managed DB.
++"""
++import time
++import json
++import sqlite3
++import threading
++import uuid
++from typing import Optional
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++from pathlib import Path
++
++DB_PATH = Path("/var/lib/aegis/controller/controller.db")
++DB_PATH.parent.mkdir(parents=True, exist_ok=True)
++
++def init_db():
++    conn = sqlite3.connect(DB_PATH)
++    cur = conn.cursor()
++    cur.execute(
++        "CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, group_name TEXT, metadata TEXT, registered_at REAL)"
++    )
++    cur.execute(
++        "CREATE TABLE IF NOT EXISTS releases (release_id TEXT PRIMARY KEY, bundle_url TEXT, manifest TEXT, created_at REAL, active INTEGER DEFAULT 1)"
++    )
++    cur.execute(
++        "CREATE TABLE IF NOT EXISTS rollouts (rollout_id TEXT PRIMARY KEY, release_id TEXT, group_name TEXT, pct INTEGER, status TEXT, created_at REAL)"
++    )
++    cur.execute(
++        "CREATE TABLE IF NOT EXISTS telemetry (id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT, payload TEXT, created_at REAL)"
++    )
++    cur.execute(
++        "CREATE TABLE IF NOT EXISTS rollout_state (k TEXT PRIMARY KEY, v TEXT)"
++    )
++    conn.commit()
++    return conn
++
++conn = init_db()
++
++app = FastAPI(title="Aegis Fleet Controller (prototype)")
++
++class RegisterReq(BaseModel):
++    device_id: str
++    group: Optional[str] = "default"
++    metadata: Optional[dict] = {}
++
++class ReleaseReq(BaseModel):
++    bundle_url: str
++    manifest: dict
++
++class RolloutReq(BaseModel):
++    release_id: str
++    group: str = "default"
++    pct: int = 5  # start percent, controller will manage progression
++    step_seconds: int = 300
++
++@app.post("/api/v1/devices/register")
++def register_device(r: RegisterReq):
++    cur = conn.cursor()
++    cur.execute("INSERT OR REPLACE INTO devices (device_id, group_name, metadata, registered_at) VALUES (?, ?, ?, ?)",
++                (r.device_id, r.group, json.dumps(r.metadata), time.time()))
++    conn.commit()
++    return {"ok": True}
++
++@app.post("/api/v1/releases")
++def create_release(r: ReleaseReq):
++    release_id = str(uuid.uuid4())
++    cur = conn.cursor()
++    cur.execute("INSERT INTO releases (release_id, bundle_url, manifest, created_at) VALUES (?, ?, ?, ?)",
++                (release_id, r.bundle_url, json.dumps(r.manifest), time.time()))
++    conn.commit()
++    return {"release_id": release_id}
++
++@app.get("/api/v1/releases/{release_id}")
++def get_release(release_id: str):
++    cur = conn.cursor()
++    cur.execute("SELECT bundle_url, manifest, active FROM releases WHERE release_id=?", (release_id,))
++    row = cur.fetchone()
++    if not row:
++        raise HTTPException(status_code=404, detail="release not found")
++    bundle_url, manifest_json, active = row
++    return {"release_id": release_id, "bundle_url": bundle_url, "manifest": json.loads(manifest_json), "active": bool(active)}
++
++@app.post("/api/v1/rollouts")
++def start_rollout(r: RolloutReq):
++    # Create rollout record and spawn orchestrator thread that increases pct across time
++    rollout_id = str(uuid.uuid4())
++    cur = conn.cursor()
++    cur.execute("INSERT INTO rollouts (rollout_id, release_id, group_name, pct, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
++                (rollout_id, r.release_id, r.group, r.pct, "running", time.time()))
++    conn.commit()
++
++    def orchestrate(rollout_id, step_seconds):
++        try:
++            while True:
++                cur = conn.cursor()
++                cur.execute("SELECT pct, status, release_id, group_name FROM rollouts WHERE rollout_id=?", (rollout_id,))
++                row = cur.fetchone()
++                if not row:
++                    return
++                pct, status, release_id, group = row
++                if status != "running":
++                    return
++                # increment rollout
++                new_pct = min(100, pct + 10)
++                cur.execute("UPDATE rollouts SET pct=? WHERE rollout_id=?", (new_pct, rollout_id))
++                conn.commit()
++                # evaluate health; if unhealthy -> rollback
++                if evaluate_health(release_id, group):
++                    cur.execute("UPDATE rollouts SET status='rolled_back' WHERE rollout_id=?", (rollout_id,))
++                    # mark release inactive
++                    cur.execute("UPDATE releases SET active=0 WHERE release_id=?", (release_id,))
++                    conn.commit()
++                    return
++                if new_pct >= 100:
++                    cur.execute("UPDATE rollouts SET status='completed' WHERE rollout_id=?", (rollout_id,))
++                    conn.commit()
++                    return
++                time.sleep(step_seconds)
++        except Exception as e:
++            app.logger.exception("orchestrator failed: %s", e)
++
++    t = threading.Thread(target=orchestrate, args=(rollout_id, r.step_seconds), daemon=True)
++    t.start()
++    return {"rollout_id": rollout_id}
++
++def evaluate_health(release_id: str, group_name: str) -> bool:
++    """
++    Basic health evaluation:
++    - compute error rate for devices in 'group_name' which recently picked this release
++    - If error rate exceeds threshold, return True (indicates unhealthy -> rollback)
++    This is a placeholder. Replace with real metrics evaluation (latency, error_count, service checks).
++    """
++    cur = conn.cursor()
++    # naive: check telemetry payloads in last N seconds for "error" string
++    window = time.time() - 300
++    cur.execute("SELECT COUNT(1) FROM telemetry WHERE created_at>? AND payload LIKE '%error%'", (window,))
++    errors = cur.fetchone()[0]
++    cur.execute("SELECT COUNT(1) FROM telemetry WHERE created_at>?", (window,))
++    total = cur.fetchone()[0] or 1
++    err_rate = errors / float(total)
++    # rollback threshold 0.2 (20%) for prototype
++    return err_rate > 0.2
++
++@app.post("/api/v1/devices/{device_id}/telemetry")
++def ingest_telemetry(device_id: str, payload: dict):
++    cur = conn.cursor()
++    cur.execute("INSERT INTO telemetry (device_id, payload, created_at) VALUES (?, ?, ?)", (device_id, json.dumps(payload), time.time()))
++    conn.commit()
++    return {"ok": True}
++
++@app.get("/api/v1/devices/{device_id}/bundle")
++def device_bundle(device_id: str):
++    """
++    Agent polls this endpoint to learn which bundle (if any) it should download.
++    Logic:
++      - find latest active release
++      - find rollouts targeting the device group and compute if this device is included by sampling on device_id hash
++    """
++    cur = conn.cursor()
++    cur.execute("SELECT group_name FROM devices WHERE device_id=?", (device_id,))
++    row = cur.fetchone()
++    group = row[0] if row else "default"
++    # find latest active release
++    cur.execute("SELECT release_id, bundle_url, manifest FROM releases WHERE active=1 ORDER BY created_at DESC LIMIT 1")
++    r = cur.fetchone()
++    if not r:
++        return {"bundle": None}
++    release_id, bundle_url, manifest = r
++    # check rollout for this group
++    cur.execute("SELECT pct, status FROM rollouts WHERE release_id=? AND group_name=? ORDER BY created_at DESC LIMIT 1", (release_id, group))
++    rr = cur.fetchone()
++    if not rr:
++        # no rollout configured for this group -> do not deliver
++        return {"bundle": None}
++    pct, status = rr
++    # deterministic sampling by hashing device_id
++    import hashlib
++    h = hashlib.sha256(device_id.encode()).hexdigest()
++    numeric = int(h[:8], 16) % 100
++    if numeric < int(pct):
++        return {"bundle": {"release_id": release_id, "bundle_url": bundle_url, "manifest": json.loads(manifest)}}
++    return {"bundle": None}
++
++@app.get("/healthz")
++def health():
++    return {"status": "ok"}
++
++if __name__ == "__main__":
++    import uvicorn
++    uvicorn.run(app, host="0.0.0.0", port=8080)
++
+*** End Patch
+*** Begin Patch
+*** Add File: fleet/controller/Dockerfile
++FROM python:3.10-slim
++WORKDIR /app
++COPY app.py /app/app.py
++RUN pip install fastapi uvicorn[standard] pydantic
++EXPOSE 8080
++CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
++
+*** End Patch
+*** Begin Patch
+*** Add File: fleet/controller/k8s/deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-fleet-controller
++  namespace: aegis
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-fleet-controller
++  template:
++    metadata:
++      labels:
++        app: aegis-fleet-controller
++    spec:
++      containers:
++        - name: controller
++          image: aegis/fleet-controller:latest
++          ports:
++            - containerPort: 8080
++          resources:
++            requests:
++              cpu: "100m"
++              memory: "128Mi"
++            limits:
++              cpu: "500m"
++              memory: "512Mi"
++
+*** End Patch
+*** Begin Patch
+*** Add File: provisioning/vault_pki_setup.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Enable Vault PKI and create a root/intermediate CA for device mTLS cert issuance.
++# Requires VAULT_ADDR and VAULT_TOKEN env vars with privileges.
++
++ROOT_ROLE="aegis-pki-root"
++INT_ROLE="aegis-pki-intermediate"
++DEV_ROLE="aegis-device-role"
++CA_TTL="${1:-87600h}" # 10 years
++
++vault secrets enable pki || true
++vault secrets tune -max-lease-ttl=${CA_TTL} pki || true
++vault write -field=certificate pki/root/generate/internal common_name="aegis-issuer" ttl=${CA_TTL} > root_ca.pem
++
++# create intermediate for issuing device certs
++vault secrets enable -path=pki_int pki || true
++vault secrets tune -max-lease-ttl=43800h pki_int
++csr=$(vault write -format=json pki_int/intermediate/generate/internal common_name="aegis-intermediate" ttl="43800h" | jq -r '.data.csr')
++vault write -format=json pki/root/sign-intermediate csr="$csr" | jq -r '.data.certificate' > intermediate.cert.pem
++vault write pki_int/intermediate/set-signed certificate=@intermediate.cert.pem
++
++# create role for device certificates (subject constraints)
++vault write pki_int/roles/${DEV_ROLE} allowed_domains="devices.aegis" allow_subdomains=true max_ttl="720h"
++echo "Vault PKI configured. Root/intermediate created and device role ${DEV_ROLE} ready."
++
+*** End Patch
+*** Begin Patch
+*** Add File: provisioning/device_issue_cert.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Example: obtain device cert from Vault PKI using token that has 'pki_int/roles/<role>/issue' capability.
++# Usage: ./device_issue_cert.sh --common-name device-123.devices.aegis --role aegis-device-role
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --common-name) CN="$2"; shift 2;;
++    --role) ROLE="$2"; shift 2;;
++    *) echo "usage"; exit 2;;
++  esac
++done
++
++: "${CN:?common-name required}"
++: "${ROLE:?role required}"
++
++vault write -format=json pki_int/issue/${ROLE} common_name="${CN}" ttl="720h" > cert.json
++jq -r '.data.certificate' cert.json > device_cert.pem
++jq -r '.data.private_key' cert.json > device_key.pem
++jq -r '.data.issuing_ca' cert.json > issuing_ca.pem
++echo "Wrote device_cert.pem device_key.pem issuing_ca.pem"
++
+*** End Patch
+*** Begin Patch
+*** Add File: rekor/sign_and_rekor.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Sign manifest.json using AWS KMS (if configured) or local openssl, then submit to Rekor
++#
++MANIFEST="$1"
++OUT_SIG="${2:-manifest.sig}"
++REKOR_URL="${REKOR_URL:-https://rekor.sigstore.dev}"
++
++if [ -n "${AWS_KMS_KEY_ID:-}" ]; then
++  echo "Signing with AWS KMS key ${AWS_KMS_KEY_ID}"
++  # aws kms sign returns DER signature; base64 encode to file
++  aws kms sign --key-id "${AWS_KMS_KEY_ID}" --message-type RAW --sign --message fileb://${MANIFEST} --output text --query Signature | base64 --decode > "${OUT_SIG}"
++else
++  echo "Signing with local openssl (private.pem required)"
++  openssl dgst -sha256 -sign private.pem -out "${OUT_SIG}" "${MANIFEST}"
++fi
++
++echo "Uploading to Rekor (transparency log)..."
++# Create Rekor entry JSON. For simplicity we use the 'rekor' CLI if available else call REST API
++if command -v rekor-cli >/dev/null 2>&1; then
++  rekor-cli upload --artifact "${MANIFEST}" --signature "${OUT_SIG}" || true
++else
++  echo "rekor-cli not found; please use rekor-cli to submit entry or install it."
++fi
++
++echo "signed -> ${OUT_SIG}"
++
+*** End Patch
+*** Begin Patch
+*** Add File: ci/.github/workflows/edge_build_matrix_with_runners.yml
++name: Edge Build Matrix (cross-platform)
++on:
++  workflow_dispatch:
++
++jobs:
++  build-x86:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run x86 build
++        run: |
++          ./scripts/build_for_target.sh x86_64 out/x86_64
++      - name: Upload artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: bundle-x86_64
++          path: out/x86_64
++
++  build-arm64:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run arm64 build (emulated)
++        run: |
++          ./scripts/build_for_target.sh arm64 out/arm64
++      - name: Upload artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: bundle-arm64
++          path: out/arm64
++
++  build-jetson:
++    runs-on: [self-hosted, jetson]
++    steps:
++      - uses: actions/checkout@v4
++      - name: Jetson hardware build (TensorRT)
++        run: |
++          ./scripts/build_for_target.sh jetson out/jetson
++      - name: Upload artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: bundle-jetson
++          path: out/jetson
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/build_for_target.sh
++#!/usr/bin/env bash
++set -euo pipefail
++TARGET="$1"
++OUT="$2"
++mkdir -p "$OUT"
++echo "Building for target $TARGET -> $OUT"
++if [ "$TARGET" = "jetson" ]; then
++  # assumes running on Jetson with TensorRT available
++  python3 -c "open('$OUT/model.plan','wb').write(b'PLAN')" || true
++elif [ "$TARGET" = "arm64" ]; then
++  cp model.onnx "$OUT/" || true
++else
++  cp model.onnx "$OUT/" || true
++fi
++echo "placeholder build complete"
++
+*** End Patch
+*** Begin Patch
+*** Add File: edge/agent/Dockerfile
++FROM python:3.10-slim
++RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl tar gzip sqlite3 && rm -rf /var/lib/apt/lists/*
++WORKDIR /app
++COPY agent.py /app/agent.py
++RUN pip install requests cryptography prometheus_client
++# create non-root user
++RUN groupadd -r aegis && useradd -r -g aegis aegis && mkdir -p /var/lib/aegis/agent /etc/aegis && chown -R aegis:aegis /var/lib/aegis /etc/aegis /app
++USER aegis
++ENV AGENT_WORKDIR=/var/lib/aegis/agent
++EXPOSE 9100
++CMD ["python", "/app/agent.py"]
++
+*** End Patch
+*** Begin Patch
+*** Add File: edge/seccomp/agent-seccomp.json
++{
++  "defaultAction": "SCMP_ACT_ERRNO",
++  "syscalls": [
++    {
++      "names": [
++        "read",
++        "write",
++        "exit",
++        "clock_gettime",
++        "futex",
++        "getrandom",
++        "recvfrom",
++        "sendto",
++        "close",
++        "open",
++        "stat",
++        "lseek",
++        "mmap",
++        "munmap",
++        "brk",
++        "rt_sigreturn",
++        "rt_sigaction",
++        "rt_sigprocmask"
++      ],
++      "action": "SCMP_ACT_ALLOW"
++    }
++  ]
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File: monitoring/prometheus/remote_write_config.md
++# Prometheus remote_write guidance
++
++Example prometheus.yml snippet to configure remote_write to your central metrics ingestion (Cortex/Thanos/Prometheus remote-write endpoint):
++
++remote_write:
++  - url: "https://metrics.example.com/api/v1/receive"
++    bearer_token: /etc/prometheus/secrets/remote_write_token
++    queue_config:
++      max_samples_per_send: 1000
++      batch_send_deadline: 5s
++    timeout: 30s
++
++For intermittent connectivity:
++- Configure Prometheus with local persistent storage and remote_write retry/backoff.
++- Alternatively, run a small "metrics-relay" on the device to buffer push events and call remote_write when online.
++
+*** End Patch
+*** Begin Patch
+*** Add File: telemetry/ingest/telemetry_schema.sql
++-- Telemetry schema for central ingestion (Postgres)
++CREATE TABLE IF NOT EXISTS edge_telemetry (
++  id BIGSERIAL PRIMARY KEY,
++  device_id TEXT NOT NULL,
++  event_time TIMESTAMP WITH TIME ZONE NOT NULL,
++  payload JSONB,
++  processed_at TIMESTAMP WITH TIME ZONE DEFAULT now()
++);
++
++CREATE INDEX IF NOT EXISTS idx_edge_telemetry_device ON edge_telemetry(device_id);
++CREATE INDEX IF NOT EXISTS idx_edge_telemetry_event_time ON edge_telemetry(event_time);
++
+*** End Patch
+*** Begin Patch
+*** Add File: telemetry/ingest/ingest_telemetry.py
++#!/usr/bin/env python3
++"""
++Consume telemetry items (e.g., exported from agent or controller) and write into Postgres with simple aggregations.
++"""
++import argparse
++import json
++import psycopg2
++import time
++
++def parse_args():
++    p = argparse.ArgumentParser()
++    p.add_argument("--file", required=True, help="NDJSON telemetry file")
++    p.add_argument("--pg-dsn", required=True, help="Postgres DSN e.g. postgresql://user:pass@host/db")
++    return p.parse_args()
++
++def main():
++    args = parse_args()
++    conn = psycopg2.connect(args.pg_dsn)
++    cur = conn.cursor()
++    with open(args.file) as fh:
++        for line in fh:
++            obj = json.loads(line)
++            device = obj.get("device_id")
++            ts = obj.get("timestamp", time.time())
++            payload = json.dumps(obj.get("payload", {}))
++            cur.execute("INSERT INTO edge_telemetry (device_id, event_time, payload) VALUES (%s, to_timestamp(%s), %s)", (device, ts, payload))
++    conn.commit()
++    cur.close()
++    conn.close()
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: tests/edge/benchmark.py
++#!/usr/bin/env python3
++"""
++Edge benchmarking harness:
++- Run repeated inference requests against local runtime endpoint and measure latency / throughput / memory
++"""
++import time, requests, psutil, argparse, statistics
++
++def parse_args():
++    p = argparse.ArgumentParser()
++    p.add_argument("--url", default="http://localhost:8080/infer")
++    p.add_argument("--n", type=int, default=50)
++    return p.parse_args()
++
++def main():
++    args = parse_args()
++    latencies = []
++    for i in range(args.n):
++        payload = {"tensor": [[[0.0]*224]*224]}  # small synthetic
++        t0 = time.time()
++        r = requests.post(args.url, json=payload, timeout=30)
++        t = time.time() - t0
++        latencies.append(t)
++    print("requests:", args.n)
++    print("p50", statistics.quantiles(latencies, n=100)[49])
++    print("p95", statistics.quantiles(latencies, n=100)[94])
++    print("mean", statistics.mean(latencies))
++    mem = psutil.virtual_memory()
++    print("memory used:", mem.used, "free:", mem.available)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: tests/edge/power_profile.sh
++#!/usr/bin/env bash
++#
++# Simple Jetson/NVIDIA power sampling using nvidia-smi (if available) or tegrastats on Jetson
++DURATION=${1:-30}
++INTERVAL=${2:-2}
++END=$((SECONDS + DURATION))
++while [ $SECONDS -lt $END ]; do
++  if command -v nvidia-smi >/dev/null 2>&1; then
++    nvidia-smi --query-gpu=power.draw,temperature.gpu --format=csv,noheader,nounits
++  elif command -v tegrastats >/dev/null 2>&1; then
++    tegrastats --interval ${INTERVAL} --logfile /tmp/tegrastats.log --duration ${DURATION}
++    tail -n 20 /tmp/tegrastats.log
++    break
++  else
++    echo "no nvidia-smi or tegrastats available"
++    sleep ${INTERVAL}
++  fi
++  sleep ${INTERVAL}
++done
++
+*** End Patch
+*** Begin Patch
+*** Add File: runbooks/edge_rollback.md
++# Runbook: Automated Rollback for Edge Rollouts
++
++Trigger: On rollout when controller health evaluation exceeds threshold (error rate > 20% within 5m)
++
++Steps:
++1. Controller marks rollout as 'rolled_back' and sets release.active = 0 (automated)
++2. Controller posts an incident to PagerDuty/Slack with:
++   - release_id, rollout_id, group affected, current pct
++   - recent telemetry summary (error_rate, sample logs)
++3. Notify SRE on-call; SRE validates metrics and inspects device logs.
++4. If rollback incomplete (some devices still running bundle), issue a 'revoke' command to controller which instructs agents to stop container and remove bundle.
++5. Post-mortem: collect artifacts (controller telemetry rows, device logs, bundle manifest), store in incident folder, and schedule RCA.
++
++Prevention:
++- Add more canary steps, reduce step pct and increase observation time.
++- Add synthetic canary tests executed by controller for each rollout before increasing pct.
++
+*** End Patch
+*** Begin Patch
+*** Add File: monitoring/prometheus/rollback_rules.yaml
++apiVersion: monitoring.coreos.com/v1
++kind: PrometheusRule
++metadata:
++  name: aegis-edge-rollback-rules
++  namespace: monitoring
++spec:
++  groups:
++    - name: edge.rollback.rules
++      rules:
++        - alert: EdgeHighErrorRate
++          expr: sum(rate(edge_agent_errors_total[5m])) by (device) / sum(rate(edge_agent_requests_total[5m])) by (device) > 0.2
++          for: 2m
++          labels:
++            severity: critical
++          annotations:
++            summary: "High error rate on edge device"
++            runbook: "/runbooks/edge_rollback.md"
++
+*** End Patch
+*** Begin Patch
+*** Add File: docs/edge_production_notes.md
++Edge production notes / checklist
++- Controller: run behind TLS with mTLS auth for management API in production. Use Cloud LoadBalancer + API gateway.
++- Auth: use Vault PKI for device cert issuance and controller TLS certificates. Rotate certs regularly.
++- Signing: use KMS/HSM for signing bundle manifests. Record signing events into Rekor transparency log.
++- CI runners: provision self-hosted Jetson runners with labels for GitHub Actions. Secure them in a private network.
++- Hardening: ensure agent runs as non-root, use seccomp and capability drops, enable read-only rootfs if possible.
++- Telemetry: accept telemetry in central Postgres/TimescaleDB; index by device and time; retention policy for old data.
++- Tests: maintain hardware lab for acceptance testing; run power/memory benchmarks and QA suite before fleet rollout.
++
+*** End Patch
+*** End Patch

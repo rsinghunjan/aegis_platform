@@ -1,0 +1,613 @@
+*** Begin Patch
+*** Add File:iam/least_privilege_kms_policy.json
++{
++  "Version": "2012-10-17",
++  "Statement": [
++    {
++      "Sid": "AllowSignAndDescribeOnly",
++      "Effect": "Allow",
++      "Action": [
++        "kms:Sign",
++        "kms:Verify",
++        "kms:GetPublicKey",
++        "kms:DescribeKey"
++      ],
++      "Resource": "<KMS_KEY_ARN>"
++    },
++    {
++      "Sid": "AllowGenerateDataKeyIfNeeded",
++      "Effect": "Allow",
++      "Action": [
++        "kms:GenerateDataKey",
++        "kms:Encrypt",
++        "kms:Decrypt"
++      ],
++      "Resource": "<KMS_KEY_ARN>"
++    }
++  ]
++}
++
++# Replace <KMS_KEY_ARN> with your key ARN. Attach this policy to the IAM role assumed by CI signing principals.
++
+*** End File
+*** Add File:.github/workflows/cosign_oidc_enforce_rekor.yml
++name: Sign with AWS KMS via OIDC, upload to Rekor and enforce Rekor presence
++on:
++  workflow_dispatch:
++    inputs:
++      artifact_path:
++        description: 'Path to artifact in repo (relative)'
++        required: true
++        default: 'artifact.bin'
++      kms_key_arn:
++        description: 'AWS KMS key ARN to use (kms key for signing)'
++        required: true
++      rekor_server:
++        description: 'Rekor URL (https://rekor.example.com)'
++        required: true
++jobs:
++  sign-and-check:
++    runs-on: ubuntu-latest
++    permissions:
++      id-token: write
++      contents: read
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Configure AWS credentials via OIDC (assume role)
++        uses: aws-actions/configure-aws-credentials@v2
++        with:
++          role-to-assume: ${{ secrets.AWS_SIGN_ROLE_ARN }}
++          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
++
++      - name: Install cosign & jq
++        run: |
++          sudo apt-get update -y
++          sudo apt-get install -y jq
++          curl -sSL -o cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
++          chmod +x cosign
++          sudo mv cosign /usr/local/bin/cosign
++
++      - name: Sign artifact using AWS KMS
++        env:
++          ARTIFACT_PATH: ${{ github.event.inputs.artifact_path }}
++          KMS_KEY_ARN: ${{ github.event.inputs.kms_key_arn }}
++          REKOR_URL: ${{ github.event.inputs.rekor_server }}
++        run: |
++          if [ ! -f "$ARTIFACT_PATH" ]; then
++            echo "Artifact not found: $ARTIFACT_PATH"
++            exit 1
++          fi
++          KMS_URI="aws-kms://$KMS_KEY_ARN"
++          echo "Signing $ARTIFACT_PATH with COSIGN KMS URI $KMS_URI"
++          cosign sign-blob --kms "$KMS_URI" --output-signature "${ARTIFACT_PATH}.sig" "$ARTIFACT_PATH"
++          ls -l "${ARTIFACT_PATH}.sig"
++
++      - name: Upload signature and artifact to Rekor (and verify)
++        env:
++          ARTIFACT_PATH: ${{ github.event.inputs.artifact_path }}
++          REKOR_URL: ${{ github.event.inputs.rekor_server }}
++        run: |
++          if [ ! -f "${ARTIFACT_PATH}.sig" ]; then
++            echo "Signature missing; abort"
++            exit 1
++          fi
++          echo "Uploading to Rekor at $REKOR_URL"
++          cosign upload-blob --rekor-url "$REKOR_URL" --signature "${ARTIFACT_PATH}.sig" "$ARTIFACT_PATH" || true
++          # Verify Rekor entry exists: check index retrieve using base64 digest
++          DIGEST=$(openssl dgst -sha256 -binary "$ARTIFACT_PATH" | openssl base64 -A)
++          echo "digest(base64)=$DIGEST"
++          SLEEP=2; ATTEMPTS=5
++          for i in $(seq 1 $ATTEMPTS); do
++            echo "Checking Rekor (attempt $i)..."
++            if curl -fsS "${REKOR_URL}/api/v1/index/retrieve?hash=${DIGEST}" | jq -e '. | length > 0' >/dev/null 2>&1; then
++              echo "Rekor entry found"
++              exit 0
++            fi
++            sleep $SLEEP
++          done
++          echo "Rekor entry not found after ${ATTEMPTS} attempts; failing workflow"
++          exit 1
++
++      - name: Persist signature as artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: cosign-signature
++          path: ${{ github.event.inputs.artifact_path }}.sig
++
+*** End File
+*** Add File:services/verifier/async_worker/requirements.txt
++celery[redis]
++redis
++requests
++psycopg2-binary
++boto3
++prometheus-client
++
+*** End File
+*** Add File:services/verifier/async_worker/celery_worker.py
++"""
++Celery worker to perform async verification tasks (NLI / verifier).
++ - Tasks:
++   - verify_generated_output: run NLI verifier (or call verifier service) and persist results
++   - if verifier fails, create an A2A approval request (via existing a2a_client)
++   - emit Prometheus metrics
++"""
++import os
++from celery import Celery
++import requests
++import time
++import json
++from prometheus_client import Counter
++
++BROKER = os.environ.get("CELERY_BROKER_URL", "redis://redis:6379/0")
++RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", "redis://redis:6379/1")
++VERIFIER_API = os.environ.get("VERIFIER_SVC", "http://verifier:80/verify")
++A2A_API = os.environ.get("A2A_API", "http://approver:8080/request")
++MCP_API = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++
++app = Celery("verifier_worker", broker=BROKER, backend=RESULT_BACKEND)
++
++VERIFY_COUNTER = Counter("aegis_async_verify_requests_total", "Async verify requests")
++FAIL_COUNTER = Counter("aegis_async_verify_fail_total", "Async verify failures")
++
++def create_approval(model_id, artifact_uri, reason, metadata=None):
++    payload = {
++        "model_id": model_id,
++        "artifact_uri": artifact_uri,
++        "approver": "system",
++        "decision": "request_review",
++        "comment": reason
++    }
++    try:
++        # The approver service requires authentication in prod; this is a best-effort call
++        r = requests.post(A2A_API, json=payload, timeout=5.0)
++        if r.ok:
++            return r.json().get("id")
++    except Exception:
++        pass
++    return None
++
++@app.task(bind=True, name="verify_generated_output")
++def verify_generated_output(self, model_id, run_id, output_text, retrieved_docs):
++    VERIFY_COUNTER.inc()
++    try:
++        r = requests.post(VERIFIER_API, json={"text": output_text, "retrieved_docs": retrieved_docs}, timeout=30.0)
++        r.raise_for_status()
++        res = r.json()
++    except Exception as e:
++        FAIL_COUNTER.inc()
++        # In case of verifier unavailable, create approval request
++        approval_id = create_approval(model_id, f"run://{run_id}", f"verifier_unavailable: {e}")
++        # record pending state to MCP (best-effort)
++        try:
++            requests.post(f"{MCP_API.rstrip('/')}/models/{model_id}/context", json={"model_id": model_id, "evaluation": {"run_id": run_id, "verifier": "unavailable", "approval_id": approval_id}}, timeout=5.0)
++        except Exception:
++            pass
++        return {"allow": False, "reason": "verifier_unavailable", "approval_id": approval_id}
++
++    if not res.get("allow", True):
++        FAIL_COUNTER.inc()
++        approval_id = create_approval(model_id, f"run://{run_id}", "verifier_reject", {"score": res.get("score")})
++        # persist to MCP
++        try:
++            requests.post(f"{MCP_API.rstrip('/')}/models/{model_id}/context", json={"model_id": model_id, "evaluation": {"run_id": run_id, "verifier": res, "approval_id": approval_id}}, timeout=5.0)
++        except Exception:
++            pass
++        return {"allow": False, "approval_id": approval_id, "score": res.get("score")}
++
++    # Persist success to MCP
++    try:
++        requests.post(f"{MCP_API.rstrip('/')}/models/{model_id}/context", json={"model_id": model_id, "evaluation": {"run_id": run_id, "verifier": res}}, timeout=5.0)
++    except Exception:
++        pass
++    return {"allow": True, "score": res.get("score")}
++
+*** End File
+*** Add File:services/verifier/async_worker/Dockerfile
++FROM python:3.10-slim
++WORKDIR /app
++COPY requirements.txt .
++RUN pip install --no-cache-dir -r requirements.txt
++COPY celery_worker.py /app/celery_worker.py
++CMD ["celery", "-A", "celery_worker", "worker", "--loglevel=info"]
++
+*** End File
+*** Add File:k8s/verifier/async-worker-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: verifier-async-worker
++  namespace: default
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: verifier-async-worker
++  template:
++    metadata:
++      labels:
++        app: verifier-async-worker
++    spec:
++      containers:
++      - name: celery
++        image: aegis/verifier-async-worker:latest
++        env:
++        - name: CELERY_BROKER_URL
++          value: "redis://redis:6379/0"
++        - name: CELERY_RESULT_BACKEND
++          value: "redis://redis:6379/1"
++        - name: VERIFIER_SVC
++          value: "http://verifier:80/verify"
++        - name: A2A_API
++          value: "http://approver:8080/request"
++        - name: AEGIS_MCP_API
++          value: "http://mcp:8082"
++        resources:
++          requests:
++            cpu: "250m"
++            memory: "512Mi"
++          limits:
++            cpu: "1000m"
++            memory: "2Gi"
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: verifier-async-worker
++  namespace: default
++spec:
++  selector:
++    app: verifier-async-worker
++  ports:
++  - port: 80
++    targetPort: 8080
++  type: ClusterIP
++
+*** End File
+*** Add File:k8s/redis/redis-deploy.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: redis
++  namespace: default
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: redis
++  template:
++    metadata:
++      labels:
++        app: redis
++    spec:
++      containers:
++      - name: redis
++        image: redis:6.2-alpine
++        ports:
++        - containerPort: 6379
++        resources:
++          requests:
++            cpu: 50m
++            memory: 128Mi
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: redis
++  namespace: default
++spec:
++  selector:
++    app: redis
++  ports:
++  - port: 6379
++    targetPort: 6379
++  type: ClusterIP
++
+*** End File
+*** Add File:langchain_runtime/preflight_async.py
++"""
++Async-capable preflight wrapper.
++ - performs moderation and PII redaction synchronously
++ - if verifier is heavy, submits verification to async worker and returns pending state
++ - when PII redaction occurs, it optionally encrypts & stores original via encrypt service and attaches pointer
++"""
++import os, requests, time, uuid, logging
++from .a2a_client import request_approval
++
++LOG = logging.getLogger("aegis.preflight_async")
++
++MOD_SVC = os.environ.get("MODERATION_SVC", "http://moderation:80")
++PII_SVC = os.environ.get("PII_SVC", "http://pii:80")
++ENCRYPT_SVC = os.environ.get("ENCRYPT_SVC", "http://encrypt-service:8080/encrypt")
++ASYNC_WORKER_API = os.environ.get("ASYNC_WORKER_API", "http://verifier-async-worker:80")
++AEGIS_MCP_API = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++
++def call_moderation(text):
++    try:
++        r = requests.post(f"{MOD_SVC.rstrip('/')}/moderate_text", json={"text": text}, timeout=3.0)
++        r.raise_for_status()
++        return r.json()
++    except Exception as e:
++        LOG.warning("moderation call failed: %s", e)
++        return {"nsfw": False}
++
++def call_pii_scan(text):
++    try:
++        r = requests.post(f"{PII_SVC.rstrip('/')}/scan_text", json={"text": text}, timeout=3.0)
++        r.raise_for_status()
++        return r.json()
++    except Exception as e:
++        LOG.warning("pii scan failed: %s", e)
++        return {"count": 0, "pii": []}
++
++def call_pii_redact(text):
++    try:
++        r = requests.post(f"{PII_SVC.rstrip('/')}/redact_text", json={"text": text}, timeout=5.0)
++        r.raise_for_status()
++        return r.json()
++    except Exception as e:
++        LOG.warning("pii redact failed: %s", e)
++        return {"redacted": text, "pii": []}
++
++def encrypt_and_store_original(file_bytes, filename, metadata=None):
++    try:
++        r = requests.post(ENCRYPT_SVC, files={"file": (filename, file_bytes)}, timeout=30.0)
++        r.raise_for_status()
++        return r.json().get("s3_key")
++    except Exception as e:
++        LOG.warning("encrypt store failed: %s", e)
++        return None
++
++def submit_async_verifier(model_id, run_id, output_text, retrieved_docs):
++    # call the async worker REST endpoint which will schedule the verify task
++    try:
++        payload = {"model_id": model_id, "run_id": run_id, "text": output_text, "retrieved_docs": retrieved_docs}
++        r = requests.post(f"{ASYNC_WORKER_API.rstrip('/')}/verify", json=payload, timeout=5.0)
++        if r.ok:
++            return r.json()  # expected to return {"task_id": "..."}
++    except Exception as e:
++        LOG.warning("async verify submit failed: %s", e)
++    return None
++
++def run_preflight_async(model_id, run_id, input_text, generated_output, retrieved_docs, options=None):
++    options = options or {}
++
++    # 1) input moderation
++    mod_in = call_moderation(input_text)
++    if mod_in.get("nsfw", False):
++        approval_id = request_approval(model_id, f"run://{run_id}", "input contains NSFW", {"stage": "input", "hits": mod_in.get("hits")})
++        return {"allow": False, "pending": True, "approval_id": approval_id, "reason": "input_nsfw"}
++
++    # 2) PII scan/redact (sync)
++    pii_scan = call_pii_scan(generated_output)
++    if pii_scan.get("count", 0) > 0:
++        # encrypt & store original via encrypt service
++        s3_key = encrypt_and_store_original(generated_output.encode("utf-8"), f"{run_id}.txt", metadata={"pii": pii_scan})
++        redacted = call_pii_redact(generated_output).get("redacted")
++        # attach pointer to MCP evidence
++        try:
++            requests.post(f"{AEGIS_MCP_API.rstrip('/')}/models/{model_id}/context", json={"model_id": model_id, "evaluation": {"run_id": run_id, "pii_original_s3": s3_key}}, timeout=5.0)
++        except Exception:
++            pass
++    else:
++        redacted = generated_output
++
++    # 3) moderation on redacted output
++    mod_out = call_moderation(redacted)
++    if mod_out.get("nsfw", False):
++        approval_id = request_approval(model_id, f"run://{run_id}", "output contains NSFW", {"stage": "output", "hits": mod_out.get("hits")})
++        return {"allow": False, "pending": True, "approval_id": approval_id, "reason": "output_nsfw"}
++
++    # 4) submit verifier async (to avoid blocking UX)
++    submit = submit_async_verifier(model_id, run_id, redacted, retrieved_docs or [])
++    if submit:
++        # return pending and let async worker create A2A if verifier fails
++        return {"allow": False, "pending": True, "task": submit}
++    # fallback: if async submission failed, attempt direct call (best effort)
++    try:
++        r = requests.post(f"{os.environ.get('VERIFIER_SVC','http://verifier:80')}/verify", json={"text": redacted, "retrieved_docs": retrieved_docs or []}, timeout=10.0)
++        if r.ok and r.json().get("allow", True):
++            return {"allow": True, "output": redacted}
++        else:
++            approval_id = request_approval(model_id, f"run://{run_id}", "verifier_reject", {"score": r.json().get("score")})
++            return {"allow": False, "pending": True, "approval_id": approval_id}
++    except Exception:
++        approval_id = request_approval(model_id, f"run://{run_id}", "verifier_unavailable")
++        return {"allow": False, "pending": True, "approval_id": approval_id}
++
+*** End File
+*** Add File:services/pii/encrypt_service/requirements.txt
++boto3
++fastapi
++uvicorn[standard]
++python-multipart
++
+*** End File
+*** Add File:services/pii/encrypt_service/app.py
++#!/usr/bin/env python3
++"""
++Encrypt and store original artifacts via KMS and S3.
++POST /encrypt (multipart file) -> returns s3_key pointer
++"""
++import os
++from fastapi import FastAPI, File, UploadFile, HTTPException
++import boto3
++import uuid
++
++app = FastAPI(title="Aegis Encrypt Service")
++S3_BUCKET = os.environ.get("ORIGINALS_S3_BUCKET")
++KMS_KEY_ID = os.environ.get("ORIGINALS_KMS_KEY_ID")
++REGION = os.environ.get("AWS_REGION", "us-east-1")
++
++if not S3_BUCKET or not KMS_KEY_ID:
++    app.logger = None
++
++@app.post("/encrypt")
++async def encrypt(file: UploadFile = File(...)):
++    body = await file.read()
++    if not S3_BUCKET or not KMS_KEY_ID:
++        raise HTTPException(status_code=500, detail="Storage not configured")
++    s3 = boto3.client("s3", region_name=REGION)
++    kms = boto3.client("kms", region_name=REGION)
++    # Generate a data key
++    dk = kms.generate_data_key(KeyId=KMS_KEY_ID, KeySpec="AES_256")
++    plaintext_key = dk["Plaintext"]
++    ciphertext_key = dk["CiphertextBlob"]
++    # Encrypt object with data key locally (simple xor not recommended; use proper envelope encryption with aws-sdk)
++    # For brevity, we upload plaintext encrypted with KMS via S3 server-side encryption using KMS (SSE-KMS)
++    s3_key = f"originals/{uuid.uuid4().hex}/{file.filename}"
++    s3.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=body, ServerSideEncryption='aws:kms', SSEKMSKeyId=KMS_KEY_ID)
++    return {"s3_key": s3_key}
++
+*** End File
+*** Add File:services/pii/encrypt_service/Dockerfile
++FROM python:3.10-slim
++WORKDIR /app
++COPY requirements.txt .
++RUN pip install --no-cache-dir -r requirements.txt
++COPY app.py /app/app.py
++EXPOSE 8080
++CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
++
+*** End File
+*** Add File:k8s/pii/encrypt-service-deploy.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: encrypt-service
++  namespace: default
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: encrypt-service
++  template:
++    metadata:
++      labels:
++        app: encrypt-service
++    spec:
++      containers:
++      - name: encrypt
++        image: aegis/encrypt-service:latest
++        env:
++        - name: ORIGINALS_S3_BUCKET
++          value: "aegis-originals"
++        - name: ORIGINALS_KMS_KEY_ID
++          value: "<KMS_KEY_ID>"
++        - name: AWS_REGION
++          value: "us-east-1"
++        resources:
++          requests:
++            cpu: 100m
++            memory: 128Mi
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: encrypt-service
++  namespace: default
++spec:
++  selector:
++    app: encrypt-service
++  ports:
++  - port: 8080
++    targetPort: 8080
++  type: ClusterIP
++
+*** End File
+*** Add File:scripts/rt_benchmark.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Run a real-time (RT) benchmark on a node and post results to MCP
++# Requires cyclictest installed on node (from rt-tests package)
++#
++OUT="/tmp/rt_benchmark_$(date +%s).json"
++AEGIS_MCP_API=${AEGIS_MCP_API:-http://mcp:8082}
++MODEL_ID=${1:-"rt-benchmark"}
++
++if command -v cyclictest >/dev/null 2>&1; then
++  # run short cyclictest; adjust parameters for your lab
++  cyclictest -m -p 80 -n -i 100 -l 10000 > /tmp/cyclictest.out || true
++  MAX_LAT=$(grep "max" /tmp/cyclictest.out | awk '{print $2}' | tr -d 'ms' || true)
++  echo "{\"max_latency_ms\": \"${MAX_LAT}\"}" > "$OUT"
++else
++  echo "{\"note\": \"cyclictest not installed, please install rt-tests\"}" > "$OUT"
++fi
++
++# post to MCP (best-effort)
++if [ -f "$OUT" ]; then
++  curl -sS -X POST "$AEGIS_MCP_API/models/${MODEL_ID}/context" -H "Content-Type: application/json" --data-binary @"$OUT" || true
++  echo "Posted benchmark to MCP: $OUT"
++fi
++
++cat "$OUT"
++
+*** End File
+*** Add File:k8s/hil/hil-signoff-job.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: hil-signoff
++  namespace: default
++spec:
++  template:
++    spec:
++      containers:
++      - name: hil-run
++        image: aegis/hil-runner:latest
++        command: ["/bin/sh","-c"]
++        args:
++          - |
++            set -e
++            SCENARIO=${SCENARIO:-safety_scenario}
++            /app/hil_runner.py "$SCENARIO" /app/test_script.sh
++            # After run, call scripts to sign evidence and request A2A approval (operator should configure)
++      restartPolicy: Never
++  backoffLimit: 1
++
+*** End File
+*** Add File:docs/safety/hil_signoff_workflow.md
++# HIL Sign‑off Workflow
++
++This document describes the automated + human steps required for HIL sign‑off before promoting models to field devices.
++
++1) Prepare HIL scenario
++ - Define scenario id and associated test script that exercises the system and produces logs.
++ - Ensure HIL harness captures telemetry, video and logs and stores them to artifact location (S3/LakeFS).
++
++2) Schedule HIL job
++ - Use k8s/hil/hil-signoff-job.yaml to run the HIL scenario in the lab cluster (or run hil/hil_runner.py locally/in CI).
++ - The job writes a JSON result artifact and stores logs in configured artifact store.
++
++3) Produce evidence pack
++ - Evidence pack must include:
++   - scenario id, run id, test script, input data, telemetry, logs, signed artifacts (.sig), and any analysis reports.
++   - signatures: cosign-signed artifact + Rekor entry.
++
++4) Encrypt and store originals
++ - If evidence contains PII or raw sensor data, run scripts/encrypt_and_store_original.sh to encrypt originals and upload to restricted bucket.
++ - Store pointer to encrypted original in MCP evidence record.
++
++5) Create A2A approval request
++ - Submit an A2A approval request referencing evidence pack (use approver service).
++ - The approver must be a qualified engineer/authority and must sign the approval record (approver service will KMS-sign approval).
++
++6) Audit & retention
++ - Approved evidence packs are stored in MCP and archived per retention policy.
++ - Rejected evidence triggers remediation and retest.
++
++7) Promotion
++ - Only after A2A approval and signed evidence should the model be promoted to OTA rollouts.
++
++Notes:
++ - Maintain traceability: link FMEA entries to each HIL run and evidence pack.
++ - Keep a register of approvers and their qualification records alongside approvals.
++
+*** End File
+*** End Patch

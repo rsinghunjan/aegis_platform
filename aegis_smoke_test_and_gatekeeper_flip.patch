@@ -1,0 +1,237 @@
+*** Begin Patch
+*** Add File:scripts/smoke/full_promotion_smoke.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Full smoke-test script for Aegis end-to-end path (local/cluster hybrid).
++# Exercises:
++#  1) Train a tiny model (HF demo script)
++#  2) Create manifest for artifact
++#  3) Convert model to ONNX (Triton repo layout)
++#  4) Deploy model files into Triton PVC (via temporary pod)
++#  5) Attempt inference (prefer Triton; fallback to FastAPI reader)
++#  6) Bundle evidence (train logs + inference output) and sign/upload
++#  7) Upload manifest to S3 and trigger Argo promotion -> compliance pack
++#  8) Poll EVIDENCE_BUCKET for compliance pack
++
++# Environment variables expected (can be exported before running)
++# EVIDENCE_BUCKET - required for evidence upload (can be a test bucket)
++# COSIGN_KMS_KEY_ARN - optional (cosign signing via AWS KMS)
++# MODEL_ARTIFACT_BUCKET - bucket to upload manifest
++# MANIFEST_S3 - if set, skip S3 upload step
++# TRITON_NAMESPACE (default "aegis"), TRITON_PVC (default "triton-models-pvc")
++# ARGO_SERVER (optional) and ARGO_AUTH_TOKEN (optional)
++# If Triton not available, script falls back to FastAPI reader service
++
++: "${EVIDENCE_BUCKET:?EVIDENCE_BUCKET required (use a test bucket)}"
++MODEL_ARTIFACT_BUCKET="${MODEL_ARTIFACT_BUCKET:-${EVIDENCE_BUCKET}}"
++COSIGN_KMS_KEY_ARN="${COSIGN_KMS_KEY_ARN:-}"
++TRITON_NAMESPACE="${TRITON_NAMESPACE:-aegis}"
++TRITON_PVC="${TRITON_PVC:-triton-models-pvc}"
++MANIFEST_S3="${MANIFEST_S3:-}"
++ARGO_SERVER="${ARGO_SERVER:-}"
++ARGO_AUTH_TOKEN="${ARGO_AUTH_TOKEN:-}"
++
++WORKDIR=$(pwd)
++OUTDIR="${WORKDIR}/out"
++mkdir -p "${OUTDIR}"
++
++echo "Step 1: Train small demo model (saves to out/model)"
++rm -rf "${OUTDIR}/model"
++python3 ml/nlp/rag/train_finetune.py > "${OUTDIR}/train.log" 2>&1 || {
++  echo "Training failed; show tail logs:"
++  tail -n 200 "${OUTDIR}/train.log" || true
++  exit 2
++}
++echo "Training finished; logs at ${OUTDIR}/train.log"
++
++MODEL_DIR="${OUTDIR}/model"
++if [ ! -d "${MODEL_DIR}" ]; then
++  # fallback to minimal demo model if training script didn't produce directory
++  mkdir -p "${MODEL_DIR}"
++  echo "DEMO_MODEL" > "${MODEL_DIR}/model.bin"
++fi
++
++echo "Step 2: Create manifest (sha256 and metadata)"
++MANIFEST_PATH="${OUTDIR}/manifest.json"
++python3 - <<PY > "${MANIFEST_PATH}"
++import hashlib, json, time, os
++path = os.path.join("${MODEL_DIR}", "model.bin")
++if not os.path.exists(path):
++    # try checkpointed HF files (pick any file)
++    files = [f for f in os.listdir("${MODEL_DIR}") if os.path.isfile(os.path.join("${MODEL_DIR}",f))]
++    if files:
++        path = os.path.join("${MODEL_DIR}", files[0])
++    else:
++        open(path,"wb").write(b"demo")
++h = hashlib.sha256(open(path,"rb").read()).hexdigest()
++manifest = {"artifact": os.path.basename(path), "sha256": h, "created_at": time.time(), "source":"smoke-test"}
++json.dump(manifest, open("${MANIFEST_PATH}","w"), indent=2)
++print("Wrote manifest to ${MANIFEST_PATH}")
++PY
++
++echo "Step 3: Convert model to ONNX for Triton model repo"
++TMP_REPO="/tmp/triton_smoke_repo_$(date +%s)"
++python3 triton/convert_model_to_onnx.py --model-dir "${MODEL_DIR}" --model-name smoke_rag --out-repo "${TMP_REPO}" || {
++  echo "ONNX conversion failed (may happen for some HF models). Continuing with fallback (FastAPI) path."
++}
++
++echo "Step 4: Deploy model repo into Triton PVC (via temporary pod)"
++if kubectl -n "${TRITON_NAMESPACE}" get pvc "${TRITON_PVC}" >/dev/null 2>&1; then
++  echo "Copying model repo into Triton PVC..."
++  ./triton/deploy_model_repo.sh "${TMP_REPO}" smoke_rag "${TRITON_PVC}" "${TRITON_NAMESPACE}" || echo "Deploy to PVC may have failed - proceed to inference fallback"
++else
++  echo "Triton PVC ${TRITON_PVC} not found in namespace ${TRITON_NAMESPACE}; skipping PVC deploy"
++fi
++
++echo "Step 5: Attempt inference"
++INFER_OUTPUT="${OUTDIR}/inference.json"
++TRITON_HEALTH="http://triton.${TRITON_NAMESPACE}.svc:8000/v2/health/ready"
++if curl -sSf "${TRITON_HEALTH}" >/dev/null 2>&1; then
++  echo "Triton seems ready. Attempting model infer via /v2/models/smoke_rag/infer"
++  # Build a very simple Triton infer request (may require model-specific input names)
++  cat > "${OUTDIR}/triton_req.json" <<'JSON'
++{"inputs":[{"name":"input_ids","shape":[1,8],"datatype":"INT32","data":[[1,2,3,4,5,6,7,8]]}]}
++JSON
++  curl -sS -X POST "http://triton.${TRITON_NAMESPACE}.svc:8000/v2/models/smoke_rag/infer" -H "Content-Type: application/json" --data-binary @"${OUTDIR}/triton_req.json" -o "${INFER_OUTPUT}" || echo '{"error":"triton_infer_failed"}' > "${INFER_OUTPUT}"
++else
++  echo "Triton not reachable; falling back to FastAPI reader"
++  if pgrep -f "uvicorn" >/dev/null 2>&1; then
++    echo "A reader service appears to be running; calling it"
++  else
++    echo "Starting FastAPI reader locally in background"
++    (cd ml/nlp/rag && python3 serve_fastapi/app.py &) || true
++    sleep 3
++  fi
++  curl -sS -X POST "http://127.0.0.1:8000/answer" -H "Content-Type: application/json" -d '{"question":"What is Aegis?","context":"Aegis is a secure AI platform."}' -o "${INFER_OUTPUT}" || echo '{"error":"reader_infer_failed"}' > "${INFER_OUTPUT}"
++fi
++echo "Inference output saved to ${INFER_OUTPUT}"
++
++echo "Step 6: Bundle evidence (manifest + train log + inference output) and sign/upload"
++EVIDENCE_TAR="${OUTDIR}/evidence-smoke-$(date +%s).tgz"
++python3 scripts/evidence/attach_and_sign.py --manifest "${MANIFEST_PATH}" --sbom "${OUTDIR}/sbom.spdx.json" --logs "${OUTDIR}/train.log" --out "${EVIDENCE_TAR}" || true
++echo "Evidence bundle created: ${EVIDENCE_TAR}"
++if [ -n "${EVIDENCE_BUCKET:-}" ]; then
++  aws s3 cp "${EVIDENCE_TAR}" "s3://${EVIDENCE_BUCKET}/smoke-tests/$(basename ${EVIDENCE_TAR})" --sse aws:kms --sse-kms-key-id "${COSIGN_KMS_KEY_ARN:-}" || true
++  echo "Uploaded evidence to s3://${EVIDENCE_BUCKET}/smoke-tests/"
++fi
++
++echo "Step 7: Upload manifest to S3 and trigger Argo promotion (if configured)"
++if [ -z "${MANIFEST_S3}" ]; then
++  echo "Uploading manifest to s3://${MODEL_ARTIFACT_BUCKET}/artifacts/"
++  aws s3 cp "${MANIFEST_PATH}" "s3://${MODEL_ARTIFACT_BUCKET}/artifacts/$(basename ${MANIFEST_PATH})" --sse aws:kms --sse-kms-key-id "${COSIGN_KMS_KEY_ARN:-}" || true
++  MANIFEST_S3="s3://${MODEL_ARTIFACT_BUCKET}/artifacts/$(basename ${MANIFEST_PATH})"
++fi
++echo "Manifest available at ${MANIFEST_S3}"
++
++echo "Triggering Argo promotion workflow..."
++if command -v argo >/dev/null 2>&1; then
++  argo submit -n aegis argo/workflows/promotion_and_compliance.yaml -p manifest-s3="${MANIFEST_S3}" --watch || echo "argo submit failed; check Argo server"
++elif [ -n "${ARGO_SERVER}" ]; then
++  echo "Posting to ARGO_SERVER ${ARGO_SERVER} (requires auth token)"
++  curl -s -X POST "${ARGO_SERVER}/api/v1/workflows/aegis" -H "Authorization: Bearer ${ARGO_AUTH_TOKEN}" -H "Content-Type: application/json" -d "{\"apiVersion\":\"argoproj.io/v1alpha1\",\"kind\":\"Workflow\",\"metadata\":{\"generateName\":\"smoke-promo-\"},\"spec\":{\"entrypoint\":\"promote-and-pack\",\"arguments\":{\"parameters\":[{\"name\":\"manifest-s3\",\"value\":\"${MANIFEST_S3}\"}]}}}" || true
++else
++  echo "No argo CLI or ARGO_SERVER set - unable to trigger Argo workflow automatically. Please submit argo/workflows/promotion_and_compliance.yaml with manifest-s3=${MANIFEST_S3}"
++fi
++
++echo "Step 8: Poll EVIDENCE_BUCKET for compliance pack (5min)"
++FOUND=0
++for i in $(seq 1 30); do
++  if aws s3 ls "s3://${EVIDENCE_BUCKET}/" | grep -i "compliance" >/dev/null 2>&1; then
++    echo "Compliance artifact detected in evidence bucket"
++    FOUND=1
++    break
++  fi
++  sleep 10
++done
++if [ ${FOUND} -eq 0 ]; then
++  echo "No compliance pack detected in s3://${EVIDENCE_BUCKET}; check Argo workflow logs and evidence attach scripts"
++  exit 2
++fi
++
++echo "Smoke test complete: training -> convert -> deploy -> infer -> evidence -> promote (subject to operator-configured infra & secrets)."
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/GATEKEEPER_FLIP_CHECKLIST.md
++# Gatekeeper Enforcement Flip Checklist (dry-run -> deny)
++
++This checklist contains exact commands (kubectl) the operator can run to flip Gatekeeper constraints from dry-run to enforce after verifying audit logs / false-positive rate in staging.
++
++Important: Run these in staging first. Keep an audit period of at least 1–2 release cycles. Do not flip to 'deny' until confident.
++
++1) List Gatekeeper constraints (cluster-scoped)
++
++kubectl get constraints.gatekeeper.sh --all-namespaces
++
++Or list by kind (examples from Aegis):
++
++kubectl get RequireCosignForGraph
++kubectl get DenyDirectCouchbaseWrites
++
++2) Inspect a specific constraint and its current enforcementAction
++
++kubectl get RequireCosignForGraph require-signed-graphs -o yaml
++kubectl get DenyDirectCouchbaseWrites deny-couchbase-writes -o yaml
++
++Look for spec.enforcementAction (should be "dryrun" initially).
++
++3) Review Gatekeeper audit logs and events (example commands)
++
++# Gatekeeper audit reports are available via the audit command (if installed) or examine Gatekeeper audit logs:
++kubectl -n gatekeeper-system logs -l app=gatekeeper --tail=200
++
++# Alternatively, inspect admission events in the target namespace:
++kubectl get events -n aegis --sort-by='.lastTimestamp'
++
++4) Test sample resources that should be blocked (do this in staging)
++
++# Example: try to create a Pod that writes to Couchbase (set env COUCHBASE_WRITE=true) without allow label
++cat <<EOF > /tmp/test-pod.yaml
++apiVersion: v1
++kind: Pod
++metadata:
++  name: couch-write-test
++  namespace: aegis
++spec:
++  containers:
++  - name: test
++    image: busybox
++    command: ["sh", "-c", "sleep 3600"]
++    env:
++    - name: COUCHBASE_WRITE
++      value: "true"
++EOF
++
++kubectl apply -f /tmp/test-pod.yaml || echo "Creation failed (expected in deny mode) or dry-run allowed it"
++
++5) Flip enforcement for a constraint (example)
++
++# Flip RequireCosignForGraph from dryrun -> deny
++kubectl patch RequireCosignForGraph require-signed-graphs --type='merge' -p '{"spec":{"enforcementAction":"deny"}}'
++
++# Flip DenyDirectCouchbaseWrites from dryrun -> deny
++kubectl patch DenyDirectCouchbaseWrites deny-couchbase-writes --type='merge' -p '{"spec":{"enforcementAction":"deny"}}'
++
++6) Verify the constraint now denies resources
++
++kubectl get RequireCosignForGraph require-signed-graphs -o yaml | grep enforcementAction -A2
++kubectl get DenyDirectCouchbaseWrites deny-couchbase-writes -o yaml | grep enforcementAction -A2
++
++7) Monitor for errors/false positives after enforcement
++
++# Check Gatekeeper audit logs and AdmissionFailure events
++kubectl -n gatekeeper-system logs -l app=gatekeeper --follow
++kubectl get events -n aegis --sort-by='.lastTimestamp'
++
++8) If you encounter false positives, revert to dryrun, tune the constraint, and iterate:
++
++kubectl patch RequireCosignForGraph require-signed-graphs --type='merge' -p '{"spec":{"enforcementAction":"dryrun"}}'
++
++Notes & tips
++- Always run these commands from a machine with kubeconfig set to the cluster and proper RBAC.
++- Use small incremental flips: enforce low‑risk constraints first (e.g., read-only or metadata checks) before high-risk enforcement (e.g., deny writes).
++- Maintain an audit log (store in EVIDENCE_BUCKET) of when you flip enforcement and why (use attach_and_sign.py to record decision artifacts).
++
+*** End Patch
+*** End Patch

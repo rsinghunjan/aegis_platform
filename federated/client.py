@@ -32,11 +32,13 @@ class SklearnNumPyClient(fl.client.NumPyClient):
         self.X = X
         self.y = y
         # initialize a model with appropriate classes for partial_fit
-        self.model = SGDClassifier(loss="log", max_iter=1, tol=None)
+        self.model = SGDClassifier(loss="log_loss", max_iter=1, tol=None)
         # perform an initial partial_fit to create coef_ shape
         self.model.partial_fit(self.X[:2], self.y[:2], classes=np.array([0, 1]))
 
-    def get_parameters(self) -> List[np.ndarray]:
+    def get_parameters(
+        self, config: dict = None
+    ) -> List[np.ndarray]:
         return _sklearn_get_weights(self.model)
 
     def fit(self, parameters: List[np.ndarray], config: dict) -> Tuple[List[np.ndarray], int, dict]:

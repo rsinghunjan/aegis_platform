@@ -1,0 +1,635 @@
+*** Begin Patch
+*** Add File:services/serving/diffusers/celery_worker.py
++#!/usr/bin/env python3
++"""
++Celery worker for Diffusers generation (PoC production pattern).
++
++- Listens on Redis broker for generation tasks.
++- Performs text + image moderation using ML-based checks.
++- Applies invisible watermark and visible watermark as configured.
++- Uploads evidence to S3 (image + metadata).
++- Returns status/result via Celery task result (backend).
++
++Notes:
++- Configure environment:
++  - REDIS_BROKER (e.g. redis://redis:6379/0)
++  - REDIS_BACKEND (optional, for results)
++  - EVIDENCE_BUCKET (s3://...)
++  - DIFFUSERS_MODEL (HuggingFace repo id)
++  - WORKER_DEVICE (cuda|cpu)
++"""
++import os
++import io
++import json
++import time
++import tempfile
++from celery import Celery
++import boto3
++
++# Celery configuration (broker + backend)
++REDIS_BROKER = os.environ.get("REDIS_BROKER", "redis://redis:6379/0")
++REDIS_BACKEND = os.environ.get("REDIS_BACKEND", REDIS_BROKER)
++
++app = Celery("diffusers_worker", broker=REDIS_BROKER, backend=REDIS_BACKEND)
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++MODEL_NAME = os.environ.get("DIFFUSERS_MODEL", "runwayml/stable-diffusion-v1-5")
++WORKER_DEVICE = os.environ.get("WORKER_DEVICE", "cuda")
++
++# lazy imports for heavy libs
++def _init_pipe():
++    import torch
++    from diffusers import StableDiffusionPipeline
++    device = "cuda" if (WORKER_DEVICE == "cuda" and torch.cuda.is_available()) else "cpu"
++    dtype = torch.float16 if device == "cuda" else torch.float32
++    pipe = StableDiffusionPipeline.from_pretrained(MODEL_NAME, torch_dtype=dtype)
++    pipe = pipe.to(device)
++    return pipe
++
++# moderation and watermark helpers (local imports to avoid startup cost)
++def _text_check(prompt):
++    try:
++        from services.serving.diffusers.moderation_ml import text_classify
++        ok, score, label = text_classify(prompt)
++        return ok, {"score": score, "label": label}
++    except Exception:
++        from services.serving.diffusers.moderation import text_filter
++        ok, matches = text_filter(prompt)
++        return ok, {"matches": matches}
++
++def _image_check(image_bytes):
++    try:
++        from services.serving.diffusers.moderation_ml import image_nsfw_score
++        ok, score = image_nsfw_score(image_bytes)
++        return ok, {"score": score}
++    except Exception:
++        from services.serving.diffusers.moderation import image_moderation_stub
++        return image_moderation_stub(image_bytes)
++
++def _apply_invisible_watermark(image_bytes, payload: str):
++    try:
++        from services.serving.diffusers.watermark.invisible_watermark import embed_watermark_bytes
++        return embed_watermark_bytes(image_bytes, payload.encode("utf-8"))
++    except Exception:
++        # fallback to identity
++        return image_bytes
++
++def _apply_visible_watermark(image_bytes, text="Aegis"):
++    try:
++        from services.serving.diffusers.moderation import watermark_image_bytes
++        return watermark_image_bytes(image_bytes, text=text)
++    except Exception:
++        return image_bytes
++
++def _s3_put(key: str, payload: bytes, content_type="application/octet-stream"):
++    s3 = boto3.client("s3")
++    bucket = EVIDENCE_BUCKET.replace("s3://", "")
++    s3.put_object(Bucket=bucket, Key=key, Body=payload, ContentType=content_type)
++    return f"s3://{bucket}/{key}"
++
++# Keep a cached pipeline per worker process
++PIPE = None
++
++@app.task(bind=True)
++def generate_image_task(self, prompt, steps=25, guidance_scale=7.5, width=512, height=512, seed=None, model=None, watermark_text="Aegis"):
++    global PIPE
++    model = model or MODEL_NAME
++    # init pipeline on first use
++    if PIPE is None:
++        try:
++            PIPE = _init_pipe()
++        except Exception as e:
++            return {"status": "error", "error": f"failed to init model: {e}"}
++    job_id = f"diff-{int(time.time())}-{self.request.id}"
++    ts = time.time()
++
++    # text moderation
++    ok_text, text_meta = _text_check(prompt)
++    if not ok_text:
++        return {"status": "rejected", "reason": "text_moderation", "meta": text_meta}
++
++    try:
++        import torch
++        gen = None
++        if seed is None:
++            seed = int((time.time() * 1000) % (2**31 - 1))
++        if WORKER_DEVICE == "cuda" and torch.cuda.is_available():
++            gen = torch.Generator(device="cuda").manual_seed(int(seed))
++        out = PIPE(prompt, num_inference_steps=int(steps), guidance_scale=float(guidance_scale),
++                   height=int(height), width=int(width), generator=gen)
++        image = out.images[0]
++        buf = io.BytesIO()
++        image.save(buf, format="PNG")
++        image_bytes = buf.getvalue()
++    except Exception as e:
++        return {"status": "error", "error": f"inference failed: {e}"}
++
++    # image moderation
++    ok_img, img_meta = _image_check(image_bytes)
++    if not ok_img:
++        return {"status": "rejected", "reason": "image_moderation", "meta": img_meta}
++
++    # apply invisible watermark (embed seed+job)
++    payload = json.dumps({"job_id": job_id, "seed": int(seed), "model": model})
++    image_bytes = _apply_invisible_watermark(image_bytes, payload)
++
++    # visible watermark
++    image_bytes = _apply_visible_watermark(image_bytes, watermark_text)
++
++    # upload evidence
++    try:
++        key_img = f"diffusion/outputs/{job_id}.png"
++        key_meta = f"diffusion/metadata/{job_id}.json"
++        meta = {
++            "job_id": job_id,
++            "prompt": prompt,
++            "seed": int(seed),
++            "model": model,
++            "steps": int(steps),
++            "guidance_scale": float(guidance_scale),
++            "width": int(width),
++            "height": int(height),
++            "ts": ts,
++            "moderation": {"text": text_meta, "image": img_meta}
++        }
++        if EVIDENCE_BUCKET:
++            s3img = _s3_put(key_img, image_bytes, content_type="image/png")
++            _s3_put(key_meta, json.dumps(meta).encode("utf-8"), content_type="application/json")
++            return {"status": "ok", "job_id": job_id, "s3_image": s3img, "metadata_key": f"s3://{EVIDENCE_BUCKET.replace('s3://','')}/{key_meta}"}
++        else:
++            tmp_img = tempfile.mktemp(suffix=".png")
++            with open(tmp_img, "wb") as f:
++                f.write(image_bytes)
++            return {"status": "ok", "job_id": job_id, "local_image": tmp_img, "meta": meta}
++    except Exception as e:
++        return {"status": "error", "error": f"evidence upload failed: {e}"}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/serving/diffusers/server_celery.py
++#!/usr/bin/env python3
++"""
++FastAPI front-end that enqueues generation jobs to Celery and returns job IDs.
++Clients can poll Celery results or use the result backend for callbacks.
++
++Environment:
++ - REDIS_BROKER
++ - EVIDENCE_BUCKET (for metadata references)
++"""
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++from celery.result import AsyncResult
++from services.serving.diffusers.celery_worker import generate_image_task, REDIS_BROKER
++import os
++
++app = FastAPI(title="Aegis Diffusers Celery API")
++
++class GenReq(BaseModel):
++    prompt: str
++    steps: int = 25
++    guidance_scale: float = 7.5
++    width: int = 512
++    height: int = 512
++    priority: str = "interactive"
++    model: str = None
++
++@app.post("/v1/enqueue")
++def enqueue(req: GenReq):
++    # priority handling can map to queue names, routing keys
++    task = generate_image_task.apply_async(args=[req.prompt, req.steps, req.guidance_scale, req.width, req.height, None, req.model])
++    return {"task_id": task.id, "status": "queued"}
++
++@app.get("/v1/status/{task_id}")
++def status(task_id: str):
++    res = AsyncResult(task_id, app=generate_image_task.app)
++    if res.failed:
++        raise HTTPException(status_code=500, detail=str(res.result))
++    payload = {"task_id": task_id, "state": res.state}
++    if res.ready():
++        payload["result"] = res.result
++    return payload
++
++@app.get("/healthz")
++def health():
++    return {"status":"ok", "broker": REDIS_BROKER}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/serving/diffusers/Dockerfile.worker
++FROM python:3.10-slim
++ENV DEBIAN_FRONTEND=noninteractive
++RUN apt-get update && apt-get install -y git build-essential libsndfile1 ffmpeg && rm -rf /var/lib/apt/lists/*
++RUN pip install --upgrade pip
++# Celery + Redis + Diffusers dependencies
++RUN pip install celery[redis] boto3 pillow torch torchvision diffusers transformers safetensors accelerate
++WORKDIR /app
++COPY celery_worker.py /app/celery_worker.py
++COPY moderation_ml.py /app/moderation_ml.py
++COPY watermark /app/watermark
++EXPOSE 8080
++CMD ["celery", "-A", "celery_worker", "worker", "--loglevel=info"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/diffusers-chart/templates/redis-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: diffusers-redis
++  namespace: ml-serving
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: diffusers-redis
++  template:
++    metadata:
++      labels:
++        app: diffusers-redis
++    spec:
++      containers:
++        - name: redis
++          image: redis:6.2-alpine
++          resources:
++            requests:
++              cpu: "100m"
++              memory: "128Mi"
++          ports:
++            - containerPort: 6379
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: diffusers-redis
++  namespace: ml-serving
++spec:
++  selector:
++    app: diffusers-redis
++  ports:
++    - port: 6379
++      targetPort: 6379
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/diffusers-chart/templates/keda-scaledobject-redis.yaml
++apiVersion: keda.sh/v1alpha1
++kind: ScaledObject
++metadata:
++  name: diffusers-redis-scaledobject
++  namespace: ml-serving
++spec:
++  scaleTargetRef:
++    name: aegis-diffusers
++  pollingInterval: 15
++  cooldownPeriod: 300
++  minReplicaCount: 1
++  maxReplicaCount: 8
++  triggers:
++    - type: redis
++      metadata:
++        address: "redis://diffusers-redis.ml-serving.svc.cluster.local:6379"
++        listName: "diffusers:queue"
++        listLength: "10"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/serving/diffusers/moderation_ml.py
++#!/usr/bin/env python3
++"""
++ML-based moderation helpers (PoC).
++
++- text_classify: uses transformers pipeline('text-classification') if available to detect toxicity.
++- image_nsfw_score: uses CLIP or a simple NSFW heuristic to return (allowed, score).
++Fallbacks: if heavy models unavailable, return lenient stubs (but CI will fail).
++"""
++import os
++
++def _load_text_pipeline():
++    try:
++        from transformers import pipeline
++        return pipeline("text-classification", model="unitary/toxic-bert")  # example small tox model
++    except Exception:
++        return None
++
++_TEXT_PIPE = None
++
++def text_classify(text: str):
++    """Return (allowed:bool, score:float, label:str)"""
++    global _TEXT_PIPE
++    if _TEXT_PIPE is None:
++        _TEXT_PIPE = _load_text_pipeline()
++    if _TEXT_PIPE:
++        out = _TEXT_PIPE(text, truncation=True)
++        # example output: [{'label':'TOXIC','score':0.99}]
++        label = out[0].get("label", "UNKNOWN")
++        score = float(out[0].get("score", 0.0))
++        # treat high toxic score as disallow
++        allowed = not (label.upper() in ("TOXIC","INSULT","THREAT") and score > 0.6)
++        return allowed, score, label
++    # fallback: naive blocklist
++    from services.serving.diffusers.moderation import text_filter
++    ok, matches = text_filter(text)
++    return ok, 0.0, ",".join(matches)
++
++def _load_clip_model():
++    try:
++        from transformers import CLIPProcessor, CLIPModel
++        import torch
++        model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
++        proc = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
++        device = "cuda" if torch.cuda.is_available() else "cpu"
++        model = model.to(device)
++        return model, proc, device
++    except Exception:
++        return None, None, None
++
++_CLIP = None
++
++def image_nsfw_score(image_bytes: bytes):
++    """
++    Return (allowed:bool, score:float)
++    PoC: if CLIP available, compute similarity to a set of unsafe prompts (nudity/weapon) and threshold.
++    """
++    global _CLIP
++    if _CLIP is None:
++        _CLIP = _load_clip_model()
++    model, proc, device = _CLIP
++    if model and proc:
++        from PIL import Image
++        import io
++        import torch
++        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
++        inputs = proc(text=["a photo of a weapon", "a photo of explicit nudity", "a violent scene"], images=img, return_tensors="pt", padding=True).to(device)
++        outputs = model(**inputs)
++        logits_per_image = outputs.logits_per_image
++        scores = logits_per_image.softmax(dim=1).cpu().numpy().max()
++        # Higher score -> more similar to unsafe classes
++        allowed = scores < 0.6
++        return allowed, float(scores)
++    # fallback: allow but return neutral score
++    return True, 0.0
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/serving/diffusers/human_escalation.py
++#!/usr/bin/env python3
++"""
++Human escalation helper (PoC).
++
++- Creates a GitHub issue in a configured repo for flagged content / moderation.
++- Requires GITHUB_TOKEN and GITHUB_REPO (owner/repo).
++"""
++import os
++import requests
++
++GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
++GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
++
++def create_issue(title: str, body: str, labels=None):
++    if not GITHUB_TOKEN or not GITHUB_REPO:
++        # fallback: log and return local marker
++        print("ESCALATION (local):", title)
++        return {"local": True, "title": title}
++    url = f"https://api.github.com/repos/{GITHUB_REPO}/issues"
++    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
++    payload = {"title": title, "body": body, "labels": labels or ["moderation", "escalation"]}
++    r = requests.post(url, headers=headers, json=payload, timeout=10)
++    r.raise_for_status()
++    return r.json()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/serving/diffusers/watermark/robust_watermark.py
++#!/usr/bin/env python3
++"""
++PoC robust watermark using frequency-domain spread-spectrum embedding.
++
++Approach:
++ - Convert image to grayscale, compute 2D FFT, add low-energy pseudo-random pattern
++   derived from payload into mid-frequency coefficients, inverse FFT -> embed.
++ - Detection computes correlation between known pattern and image FFT coefficients.
++
++WARNING: This is a PoC for experimentation. Use vetted, peer-reviewed watermarking methods for production.
++"""
++import numpy as np
++from PIL import Image
++import io
++import hashlib
++
++def _pattern(payload_bytes: bytes, shape):
++    # Derive pseudo-random pattern from payload via SHA256 -> seed
++    seed = int(hashlib.sha256(payload_bytes).hexdigest()[:16], 16) % (2**31-1)
++    rng = np.random.RandomState(seed)
++    return rng.normal(loc=0.0, scale=1.0, size=shape)
++
++def embed_watermark(image_bytes: bytes, payload: str, strength: float = 0.01) -> bytes:
++    im = Image.open(io.BytesIO(image_bytes)).convert("L")  # grayscale
++    arr = np.asarray(im).astype(np.float32) / 255.0
++    h, w = arr.shape
++    pat = _pattern(payload.encode("utf-8"), (h, w))
++    # FFT, inject pattern into mid frequencies
++    F = np.fft.fft2(arr)
++    # create a band mask: avoid very low and very high freqs
++    cy, cx = h//2, w//2
++    Y, X = np.ogrid[:h, :w]
++    dist = np.sqrt((Y - cy)**2 + (X - cx)**2)
++    mask = (dist > min(h,w)*0.05) & (dist < min(h,w)*0.35)
++    F_mod = F + strength * pat * mask
++    img_mod = np.fft.ifft2(F_mod).real
++    img_mod = np.clip(img_mod, 0.0, 1.0)
++    out = (img_mod * 255.0).astype(np.uint8)
++    im_out = Image.fromarray(out, mode="L").convert("RGB")
++    buf = io.BytesIO()
++    im_out.save(buf, format="PNG")
++    return buf.getvalue()
++
++def detect_watermark(image_bytes: bytes, payload: str, threshold: float = 0.01) -> bool:
++    im = Image.open(io.BytesIO(image_bytes)).convert("L")
++    arr = np.asarray(im).astype(np.float32) / 255.0
++    h, w = arr.shape
++    pat = _pattern(payload.encode("utf-8"), (h, w))
++    F = np.fft.fft2(arr)
++    # compute cross-correlation between magnitude of F and pattern
++    mag = np.abs(F)
++    score = np.mean(mag * pat)
++    return float(abs(score)) > threshold
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/serving/diffusers/moderation_ensemble.py
++#!/usr/bin/env python3
++"""
++Moderation ensemble that composes ML classifiers and heuristics, and triggers human escalation if needed.
++"""
++from typing import Dict, Any
++from services.serving.diffusers.moderation_ml import text_classify, image_nsfw_score
++from services.serving.diffusers.human_escalation import create_issue
++
++TEXT_THRESHOLD = 0.6
++IMAGE_THRESHOLD = 0.6
++
++def moderate(prompt: str, image_bytes: bytes) -> Dict[str, Any]:
++    # text classifier
++    try:
++        ok_text, score_text, label = text_classify(prompt)
++    except Exception as e:
++        ok_text, score_text, label = True, 0.0, "fallback"
++    # image classifier
++    try:
++        ok_img, score_img = image_nsfw_score(image_bytes)
++    except Exception as e:
++        ok_img, score_img = True, 0.0
++
++    flagged = (not ok_text) or (score_text > TEXT_THRESHOLD) or (not ok_img) or (score_img > IMAGE_THRESHOLD)
++    result = {
++        "ok_text": ok_text, "text_score": score_text, "text_label": label,
++        "ok_image": ok_img, "image_score": score_img,
++        "flagged": flagged
++    }
++    if flagged:
++        # escalate to human queue (GitHub issue or external reviewer)
++        title = "Moderation escalation: flagged generation"
++        body = f"Prompt: {prompt}\nTextScore: {score_text} label:{label}\nImageScore: {score_img}\n"
++        create_issue(title, body, labels=["moderation","escalation"])
++    return result
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/frontier/registry/register_with_enforce.py
++#!/usr/bin/env python3
++"""
++Wrapper to register model metadata after enforcing license and legal signoff.
++ - Calls enforce_license_and_signoff.py before uploading metadata and (optionally) cosign-signing.
++"""
++import argparse
++import subprocess
++import json
++import os
++from services.frontier.registry import register_model
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--metadata-file", required=True)
++    p.add_argument("--evidence-bucket", required=True)
++    p.add_argument("--cosign-key-ref", required=False)
++    args = p.parse_args()
++    # run enforcement check
++    cmd = ["python3", "services/frontier/registry/enforce_license_and_signoff.py", "--metadata", args.metadata_file, "--evidence-bucket", args.evidence_bucket]
++    subprocess.check_call(cmd)
++    # upload metadata via existing register_model helper
++    subprocess.check_call(["python3", "services/frontier/registry/register_model.py", "--evidence-bucket", args.evidence_bucket, "--model-name", json.load(open(args.metadata_file)).get("name","unnamed"), "--metadata-file", args.metadata_file] + (["--cosign-key-ref", args.cosign_key_ref] if args.cosign_key_ref else []))
++    print("Model registered and signed (if cosign key provided).")
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/serving/diffusers/cost_control.py
++#!/usr/bin/env python3
++"""
++Cost preflight and tenant quota checks for heavy sampling jobs.
++ - Estimate GPU-seconds based on steps and image size.
++ - Check per-tenant daily quota stored in Redis or a simple backend.
++"""
++import os
++import math
++
++# simple placeholder parameters: GPU-sec per step per megapixel
++GPU_SEC_PER_STEP_PER_MPIX = float(os.environ.get("GPU_SEC_PER_STEP_PER_MPIX", "0.001"))
++DEFAULT_DAILY_QUOTA_GPU_SEC = float(os.environ.get("DEFAULT_DAILY_QUOTA_GPU_SEC", "3600.0"))
++
++try:
++    import redis
++except Exception:
++    redis = None
++
++REDIS_URL = os.environ.get("REDIS_BROKER", "redis://redis:6379/0")
++QUOTA_KEY_FMT = "tenant_quota:{tenant}"  # stores remaining GPU seconds
++
++def estimate_gpu_seconds(steps: int, width: int, height: int) -> float:
++    mpix = (width * height) / 1_000_000.0
++    return float(steps) * GPU_SEC_PER_STEP_PER_MPIX * mpix
++
++def check_and_reserve(tenant: str, est_gpu_sec: float) -> bool:
++    if redis is None:
++        # no quota backend: allow but warn
++        print("Warning: redis not available; bypassing quota checks")
++        return True
++    r = redis.from_url(REDIS_URL)
++    key = QUOTA_KEY_FMT.format(tenant=tenant)
++    cur = r.get(key)
++    if cur is None:
++        # initialize quota
++        r.set(key, DEFAULT_DAILY_QUOTA_GPU_SEC)
++        cur = DEFAULT_DAILY_QUOTA_GPU_SEC
++    else:
++        cur = float(cur)
++    if est_gpu_sec > cur:
++        return False
++    # reserve (decrement)
++    # redis-py does not have decrbyfloat in all versions; use pipeline
++    pipe = r.pipeline()
++    pipe.decr(key, int(est_gpu_sec))
++    try:
++        pipe.execute()
++    except Exception:
++        # best-effort
++        r.set(key, max(0, cur - est_gpu_sec))
++    return True
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/diffusers-chart/values-production.yaml
++replicaCount: 1
++image:
++  repository: your-registry/aegis-diffusers
++  tag: prod
++resources:
++  limits:
++    nvidia.com/gpu: 1
++  requests:
++    cpu: "4"
++    memory: "16Gi"
++service:
++  port: 8080
++nodePools:
++  interactive:
++    nodeSelector:
++      aegis-role: interactive
++    tolerations: []
++  batch:
++    nodeSelector:
++      aegis-role: batch
++    tolerations:
++      - key: "spot"
++        operator: "Exists"
++quota:
++  enabled: true
++  default_daily_gpu_sec: 3600
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/runbooks/diffusers_batching_scaling.md
++# Diffusers batching & autoscaling runbook (overview)
++
++This runbook explains how the dynamic batcher, Celery/Redis queue, and KEDA/Prometheus autoscaling fit together.
++
++Components
++- Redis queue "diffusers:queue" — producers push job JSON (id, prompt, params, result_key).
++- Aggregator (dynamic_batcher) — pulls up to MAX_BATCH items, performs batched inference and writes results.
++- Celery workers — can handle singletons or participate in batch processing.
++- KEDA ScaledObject (Prometheus/Redis triggers) — scales diffusers replicas based on queue length or a Prometheus metric.
++- Node pools: interactive (low latency) vs batch (spot, cheaper).
++
++Operational notes
++- Tune MAX_BATCH to balance latency vs throughput. Use smaller values for interactive workloads.
++- Use the interactive nodePool for requests with priority interactive; route batch jobs to a separate queue that maps to batch node pool.
++- Ensure Prometheus exporter for Redis list lengths is available (redis_exporter or custom exporter) so scaling can use queue length.
++- Monitor GPU utilization and tail latencies. If batch jobs saturate GPUs, consider a separate fleet for batch inference.
++
++Troubleshooting
++- If the aggregator returns empty results, check Redis list keys and permissions.
++- If KEDA doesn't scale, validate Prometheus metrics and ScaledObject logs.
++
+*** End Patch

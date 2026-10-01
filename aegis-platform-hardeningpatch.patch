@@ -1,0 +1,691 @@
+diff --git a/api/golden_gateway_limits.py b/api/golden_gateway_limits.py
+new file mode 100644
+index 0000000..a1747b9
+--- /dev/null
++++ b/api/golden_gateway_limits.py
+@@ -0,0 +1,172 @@
++from __future__ import annotations
++
++import time
++from dataclasses import dataclass
++from typing import Dict, Optional, Tuple
++
++from fastapi import HTTPException
++
++from api.db import SessionLocal
++from api.golden_models import Deployment, UsageRecord
++
++
++@dataclass(frozen=True)
++class Limits:
++    max_rpm: Optional[int] = None
++    max_concurrency: Optional[int] = None
++    max_daily_units: Optional[int] = None
++
++
++def _parse_limits(dep: Deployment) -> Limits:
++    cfg = dep.limits or {}
++    def _i(k):
++        v = cfg.get(k)
++        if v is None:
++            return None
++        return int(v)
++    return Limits(max_rpm=_i("max_rpm"), max_concurrency=_i("max_concurrency"), max_daily_units=_i("max_daily_units"))
++
++
++def enforce_limits(tenant_id: str, dep: Deployment, predicted_units: int) -> None:
++    """
++    Minimal per-deployment enforcement:
++      - max_rpm: queries last 60 seconds usage_records
++      - max_daily_units: queries last 24 hours units
++
++    NOTE: For high throughput, move this to Redis counters.
++    """
++    lim = _parse_limits(dep)
++    if not (lim.max_rpm or lim.max_daily_units):
++        return
++    s = SessionLocal()
++    try:
++        now = time.time()
++        if lim.max_rpm:
++            cutoff = now - 60.0
++            # UsageRecord.created_at is datetime; we approximate by ordering on id where DB time exists.
++            # If you want accurate windows, add a timestamp filter using DB funcs.
++            recent = (
++                s.query(UsageRecord)
++                .filter(UsageRecord.tenant_id == tenant_id)
++                .filter(UsageRecord.deployment_id == dep.id)
++                .order_by(UsageRecord.id.desc())
++                .limit(lim.max_rpm + 5)
++                .all()
++            )
++            # approximate: if we already recorded >= max_rpm records recently, block
++            if len(recent) >= lim.max_rpm:
++                raise HTTPException(status_code=429, detail="rate limit exceeded (max_rpm)")
++
++        if lim.max_daily_units:
++            # approximate daily units by summing recent rows; for scale use rollups.
++            rows = (
++                s.query(UsageRecord.units)
++                .filter(UsageRecord.tenant_id == tenant_id)
++                .filter(UsageRecord.deployment_id == dep.id)
++                .order_by(UsageRecord.id.desc())
++                .limit(50000)
++                .all()
++            )
++            used = sum(int(r[0] or 0) for r in rows)
++            if used + int(predicted_units) > lim.max_daily_units:
++                raise HTTPException(status_code=429, detail="quota exceeded (max_daily_units)")
++    finally:
++        s.close()
+diff --git a/api/golden_openai_streaming.py b/api/golden_openai_streaming.py
+new file mode 100644
+index 0000000..a16c2cf
+--- /dev/null
++++ b/api/golden_openai_streaming.py
+@@ -0,0 +1,252 @@
++from __future__ import annotations
++
++import json
++from dataclasses import dataclass
++from typing import Any, AsyncIterator, Dict, Optional, Tuple
++
++from api.golden_tokenizer import TokenCounter
++
++
++@dataclass
++class StreamMeter:
++    """
++    Robust-ish SSE metering:
++      - buffers partial lines across chunks
++      - extracts delta.content from OpenAI-style events
++      - tokenizes emitted content
++    """
++    counter: TokenCounter
++    buffer: str = ""
++    emitted_text: str = ""
++    done: bool = False
++
++    def feed(self, chunk: bytes) -> None:
++        s = chunk.decode("utf-8", errors="ignore")
++        self.buffer += s
++
++        # SSE events separated by double newline. Keep tail in buffer.
++        parts = self.buffer.split("\n\n")
++        self.buffer = parts[-1]
++        for evt in parts[:-1]:
++            for line in evt.splitlines():
++                line = line.strip()
++                if not line.startswith("data:"):
++                    continue
++                payload = line[len("data:") :].strip()
++                if payload == "[DONE]":
++                    self.done = True
++                    continue
++                try:
++                    j = json.loads(payload)
++                except Exception:
++                    continue
++                delta = _extract_delta_text(j)
++                if delta:
++                    self.emitted_text += delta
++
++    def output_tokens(self) -> int:
++        return self.counter.count(self.emitted_text)
++
++
++def _extract_delta_text(j: Dict[str, Any]) -> str:
++    try:
++        choices = j.get("choices") or []
++        if not choices:
++            return ""
++        delta = (choices[0] or {}).get("delta") or {}
++        c = delta.get("content")
++        return c if isinstance(c, str) else ""
++    except Exception:
++        return ""
+diff --git a/api/golden_k8s_reconcile.py b/api/golden_k8s_reconcile.py
+new file mode 100644
+index 0000000..07805c4
+--- /dev/null
++++ b/api/golden_k8s_reconcile.py
+@@ -0,0 +1,124 @@
++from __future__ import annotations
++
++from typing import Optional, Tuple
++
++from kubernetes import client
++from kubernetes.client.rest import ApiException
++
++from api.golden_k8s import _apps, _load_k8s
++
++
++def deployment_ready(namespace: str, deployment_name: str) -> Tuple[bool, str]:
++    """
++    Check if a deployment has available replicas.
++    """
++    apps = _apps()
++    try:
++        d = apps.read_namespaced_deployment(name=deployment_name, namespace=namespace)
++    except ApiException as e:
++        if e.status == 404:
++            return False, "not_found"
++        raise
++    st = d.status
++    if (st.available_replicas or 0) >= 1:
++        return True, "ready"
++    return False, "not_ready"
+diff --git a/api/golden_policy_versioning.py b/api/golden_policy_versioning.py
+new file mode 100644
+index 0000000..ab95f6e
+--- /dev/null
++++ b/api/golden_policy_versioning.py
+@@ -0,0 +1,56 @@
++from __future__ import annotations
++
++import os
++import hashlib
++import json
++from typing import Any, Dict
++
++
++def current_policy_bundle() -> Dict[str, Any]:
++    """
++    Represent the current effective policy configuration as a dict.
++    This allows you to store a policy fingerprint in audit/evidence records.
++    """
++    return {
++        "require_eval_evidence": os.environ.get("AEGIS_REQUIRE_EVAL_EVIDENCE", "true"),
++        "metrics_thresholds": os.environ.get("AEGIS_DEPLOY_METRICS_THRESHOLDS", ""),
++        "sign_mode": os.environ.get("AEGIS_SIGN_MODE", "hmac"),
++        "tokenizer": os.environ.get("AEGIS_TOKENIZER", "tiktoken"),
++    }
++
++
++def policy_fingerprint() -> str:
++    b = json.dumps(current_policy_bundle(), sort_keys=True, separators=(",", ":")).encode("utf-8")
++    return hashlib.sha256(b).hexdigest()
+diff --git a/api/golden_compliance_export.py b/api/golden_compliance_export.py
+new file mode 100644
+index 0000000..4dfba5f
+--- /dev/null
++++ b/api/golden_compliance_export.py
+@@ -0,0 +1,190 @@
++from __future__ import annotations
++
++import json
++import time
++from datetime import datetime, timedelta
++from typing import Any, Dict, List
++
++from api.db import SessionLocal
++from api.golden_models import AuditEvent, UsageRecord, Run, ModelVersion
++from api.golden_store import put_json
++from api.golden_policy_versioning import policy_fingerprint, current_policy_bundle
++
++
++def export_compliance_bundle(tenant_id: str, days: int = 7) -> str:
++    """
++    Export an "audit bundle" to S3 for WORM-style retention (bucket policies can enforce immutability).
++    """
++    since = datetime.utcnow() - timedelta(days=days)
++    s = SessionLocal()
++    try:
++        audits = (
++            s.query(AuditEvent)
++            .filter(AuditEvent.tenant_id == tenant_id)
++            .filter(AuditEvent.created_at >= since)
++            .order_by(AuditEvent.created_at.asc())
++            .all()
++        )
++        usage = (
++            s.query(UsageRecord)
++            .filter(UsageRecord.tenant_id == tenant_id)
++            .filter(UsageRecord.created_at >= since)
++            .order_by(UsageRecord.created_at.asc())
++            .all()
++        )
++        runs = (
++            s.query(Run)
++            .filter(Run.tenant_id == tenant_id)
++            .filter(Run.created_at >= since)
++            .order_by(Run.created_at.asc())
++            .all()
++        )
++        mvs = s.query(ModelVersion).filter(ModelVersion.tenant_id == tenant_id).all()
++
++        payload: Dict[str, Any] = {
++            "schema": "aegis.compliance.bundle.v1",
++            "tenant_id": tenant_id,
++            "export_days": days,
++            "exported_at": time.time(),
++            "policy_fingerprint": policy_fingerprint(),
++            "policy_bundle": current_policy_bundle(),
++            "audit_events": [
++                {
++                    "id": a.id,
++                    "action": a.action,
++                    "entity_type": a.entity_type,
++                    "entity_id": a.entity_id,
++                    "actor": a.actor_sub,
++                    "decision": a.decision,
++                    "details": a.details,
++                    "created_at": a.created_at.isoformat() if a.created_at else None,
++                }
++                for a in audits
++            ],
++            "usage_records": [
++                {
++                    "id": u.id,
++                    "deployment_id": u.deployment_id,
++                    "backend": u.backend,
++                    "units": u.units,
++                    "input_tokens": u.input_tokens,
++                    "output_tokens": u.output_tokens,
++                    "cost_usd": u.cost_usd,
++                    "inference_ms": u.inference_ms,
++                    "created_at": u.created_at.isoformat() if u.created_at else None,
++                }
++                for u in usage
++            ],
++            "runs": [
++                {
++                    "id": r.id,
++                    "kind": r.kind,
++                    "status": r.status,
++                    "evidence_uri": r.evidence_uri,
++                    "metrics": r.metrics,
++                    "created_at": r.created_at.isoformat() if r.created_at else None,
++                }
++                for r in runs
++            ],
++            "model_versions": [
++                {
++                    "id": mv.id,
++                    "model_id": mv.model_id,
++                    "version": mv.version,
++                    "eval_status": mv.eval_status,
++                    "approved": mv.approved,
++                    "eval_evidence_uri": mv.eval_evidence_uri,
++                    "eval_metrics": mv.eval_metrics,
++                    "model_card_uri": mv.model_card_uri,
++                    "artifact_uri": mv.artifact_uri,
++                    "artifact_sha256": mv.artifact_sha256,
++                    "signature_type": mv.signature_type,
++                }
++                for mv in mvs
++            ],
++        }
++
++        # Store under an evidence-style path using put_json (same bucket)
++        # Place under synthetic project/model/version to reuse helper:
++        uri = put_json(
++            tenant_id=tenant_id,
++            project_id="_compliance",
++            model_id="_bundle",
++            version=str(int(time.time())),
++            name="bundle.json",
++            obj=payload,
++        )
++        return uri
++    finally:
++        s.close()
+diff --git a/api/golden_training_templates.py b/api/golden_training_templates.py
+new file mode 100644
+index 0000000..4fd7a7e
+--- /dev/null
++++ b/api/golden_training_templates.py
+@@ -0,0 +1,238 @@
++"""
++Opinionated Argo Workflow templates for HF fine-tuning.
++
++This provides a multi-step workflow:
++  1) train (container)
++  2) eval  (container)
++  3) callback to Aegis with evidence URI + metrics
++
++This is still v1: you supply container images that implement these behaviors.
++"""
++
++from __future__ import annotations
++
++import uuid
++from typing import Any, Dict, Optional
++
++
++def hf_finetune_workflow(
++    name_prefix: str,
++    train_image: str,
++    eval_image: str,
++    callback_url: str,
++    env: Dict[str, str],
++) -> Dict[str, Any]:
++    wf_name = f"{name_prefix}-{uuid.uuid4().hex[:8]}"
++    def env_list(d): return [{"name": k, "value": v} for k, v in d.items()]
++    return {
++        "apiVersion": "argoproj.io/v1alpha1",
++        "kind": "Workflow",
++        "metadata": {"name": wf_name},
++        "spec": {
++            "entrypoint": "main",
++            "templates": [
++                {
++                    "name": "main",
++                    "steps": [
++                        [{"name": "train", "template": "train"}],
++                        [{"name": "eval", "template": "eval"}],
++                        [{"name": "callback", "template": "callback"}],
++                    ],
++                },
++                {
++                    "name": "train",
++                    "container": {
++                        "image": train_image,
++                        "env": env_list(env),
++                    },
++                },
++                {
++                    "name": "eval",
++                    "container": {
++                        "image": eval_image,
++                        "env": env_list(env),
++                    },
++                },
++                {
++                    "name": "callback",
++                    "container": {
++                        "image": "curlimages/curl:8.6.0",
++                        "command": ["sh", "-lc"],
++                        "args": [
++                            "set -euo pipefail; "
++                            "echo '{\"status\":\"succeeded\",\"metrics\":{},\"evidence_uri\":\"'\"${AEGIS_EVIDENCE_URI:-}\"'\",\"model_version_id\":\"'\"${AEGIS_MODEL_VERSION_ID:-}\"'\"}' "
++                            "| curl -sS -X POST -H 'Content-Type: application/json' -H \"Authorization: Bearer ${AEGIS_JOB_JWT}\" "
++                            f" --data-binary @- {callback_url}"
++                        ],
++                        "env": env_list(env),
++                    },
++                },
++            ],
++        },
++    }
+diff --git a/api/golden_app.py b/api/golden_app.py
+index d15af34..4d2d2d2 100644
+--- a/api/golden_app.py
++++ b/api/golden_app.py
+@@ -32,6 +32,7 @@ import httpx
+ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Body
+ from fastapi.responses import PlainTextResponse, JSONResponse
+ from fastapi.middleware.gzip import GZipMiddleware
+ from starlette.middleware.cors import CORSMiddleware
+ from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, Counter, Summary
+ 
+@@ -60,6 +61,12 @@ from api.golden_costing import estimate_infer_cost_usd
+ from api.golden_reporting import usage_summary, audit_summary
+ from api.golden_retention import prune_tenant
+ from api.golden_tokenizer import TokenCounter
+-from api.golden_sse import parse_stream_chunk_for_text
++from api.golden_openai_streaming import StreamMeter
+ from api.golden_workload_identity import require_workload_role, is_workload
++from api.golden_gateway_limits import enforce_limits
++from api.golden_k8s_reconcile import deployment_ready
++from api.golden_compliance_export import export_compliance_bundle
++from api.golden_policy_versioning import policy_fingerprint
++from api.golden_training_templates import hf_finetune_workflow
+ 
+@@ -523,6 +530,7 @@ async def infer_stream(
+     from fastapi.responses import StreamingResponse
+ 
+     actor = actor_from_request(request)
+     require_any_role(actor, ["tenant_user", "tenant_developer", "tenant_admin", "platform_admin"])
+     if not VLLM_STREAMING_ENABLED:
+@@ -559,28 +567,36 @@ async def infer_stream(
+         route = VLLM_ROUTE
+         # Force stream=true for OpenAI-like API
+         body = openai_chat_body_from_form(model=model_id, content=prompt, temperature=0.0, stream=True)
+ 
+         async def gen():
+             async with httpx.AsyncClient(timeout=PROXY_TIMEOUT_S) as client:
+                 stream_iter, content_type = await passthrough_stream(client, "POST", f"{dep.url}{route}", body)
+-                # Exact-ish streaming token metering by parsing SSE deltas and tokenizing emitted content.
+-                emitted_text = ""
+-                done = False
++                meter = StreamMeter(counter=token_counter)
+                 async for chunk in stream_iter:
+-                    delta, is_done = parse_stream_chunk_for_text(chunk)
+-                    if delta:
+-                        emitted_text += delta
+-                    done = done or is_done
++                    meter.feed(chunk)
+                     yield chunk
+ 
+                 # store a usage record after stream completes
+-                output_tokens = token_counter.count(emitted_text)
++                output_tokens = meter.output_tokens()
+                 # prompt tokens approx from prompt text (we can't see server-side system prompts)
+                 input_tokens = token_counter.count(prompt)
+                 units = max(1, int(input_tokens + output_tokens))
++                enforce_limits(actor.tenant_id, dep, predicted_units=units)
+                 cost = estimate_infer_cost_usd(units=units, backend="vllm")
+                 ur = UsageRecord(
+                     tenant_id=actor.tenant_id,
+                     model_id=model_id,
+                     version=version,
+                     deployment_id=dep.id,
+                     backend="vllm",
+                     units=units,
+                     input_tokens=input_tokens,
+                     output_tokens=output_tokens,
+                     cost_usd=cost,
+                     inference_ms=None,
+-                    extra={"request_id": "stream", "proxy": True, "metering": "sse_delta_tokenizer", "done": done},
++                    extra={"request_id": "stream", "proxy": True, "metering": "sse_buffered_delta_tokenizer", "done": meter.done},
+                 )
+                 session.add(ur)
+                 session.commit()
+@@ -602,6 +618,7 @@ async def infer(
+         backend = dep.backend
+ 
+         timeout = float(os.environ.get("AEGIS_INFER_PROXY_TIMEOUT_S", "10"))
+         # Safer default: proxy off unless explicitly enabled
+         proxy = ALLOW_PROXY
+ 
+@@ -610,6 +627,8 @@ async def infer(
+         result: Dict[str, Any]
+         if proxy:
+             async with httpx.AsyncClient(timeout=PROXY_TIMEOUT_S) as client:
++                # enforce predicted limits early (coarse)
++                enforce_limits(actor.tenant_id, dep, predicted_units=max(1, int(units or 1)))
+                 if backend == "vllm":
+                     route = VLLM_ROUTE
+                     body = openai_chat_body_from_form(model=model_id, content=(prompt or payload), temperature=0.0, stream=False)
+                     r = await client.post(f"{dep.url}{route}", json=body)
+                     r.raise_for_status()
+@@ -880,6 +899,69 @@ async def argo_submit_train_eval(
+     record_audit_event(actor.tenant_id, actor.sub, "argo.workflow.submit", "workflow", name, decision="allow", details={"namespace": ns})
+     return {"workflow_name": name, "namespace": ns}
+ 
++
++@app.post("/v1/argo/workflows/hf_finetune")
++async def argo_submit_hf_finetune(
++    request: Request,
++    namespace: Optional[str] = Form(None),
++    train_image: str = Form(...),
++    eval_image: str = Form(...),
++    run_id: str = Form(...),
++):
++    """
++    Opinionated HF fine-tuning pipeline (train->eval->callback) using Argo steps.
++    """
++    actor = actor_from_request(request)
++    require_any_role(actor, ["tenant_admin", "tenant_developer", "platform_admin"])
++    ns = namespace or ensure_tenant_namespace(actor.tenant_id)
++    callback_url = os.environ.get("AEGIS_PUBLIC_BASE_URL", "").rstrip("/") + f"/v1/runs/{run_id}/callback"
++    if not callback_url.strip():
++        raise HTTPException(status_code=500, detail="AEGIS_PUBLIC_BASE_URL required for hf_finetune workflow callback")
++    wf = hf_finetune_workflow(
++        name_prefix="aegis-hf-finetune",
++        train_image=train_image,
++        eval_image=eval_image,
++        callback_url=callback_url,
++        env={"AEGIS_TENANT_ID": actor.tenant_id, "AEGIS_RUN_ID": run_id},
++    )
++    name = submit_workflow(namespace=ns, workflow=wf)
++    record_audit_event(actor.tenant_id, actor.sub, "argo.workflow.submit", "workflow", name, decision="allow", details={"namespace": ns, "template": "hf_finetune"})
++    return {"workflow_name": name, "namespace": ns}
++
++
++@app.get("/v1/deployments/{deployment_id}/status")
++async def deployment_status(request: Request, deployment_id: str):
++    """
++    Reconcile deployment readiness against Kubernetes.
++    """
++    actor = actor_from_request(request)
++    require_any_role(actor, ["tenant_admin", "tenant_developer", "platform_admin"])
++    s = SessionLocal()
++    try:
++        dep = s.query(Deployment).filter_by(id=deployment_id, tenant_id=actor.tenant_id).one_or_none()
++        if not dep:
++            raise HTTPException(status_code=404, detail="deployment not found")
++        # derive deployment name from service as earlier
++        deployment_name = dep.service_name[:-4] if dep.service_name.endswith("-svc") else dep.name
++        ok, reason = deployment_ready(dep.namespace, deployment_name)
++        dep.status = "ready" if ok else "not_ready"
++        s.commit()
++        return {"deployment_id": dep.id, "status": dep.status, "reason": reason}
++    finally:
++        s.close()
++
++
++@app.post("/v1/compliance/export")
++async def compliance_export(request: Request, days: int = 7):
++    actor = actor_from_request(request)
++    require_any_role(actor, ["tenant_admin", "platform_admin"])
++    uri = export_compliance_bundle(actor.tenant_id, days=days)
++    record_audit_event(actor.tenant_id, actor.sub, "compliance.export", "tenant", actor.tenant_id, decision="allow", details={"uri": uri, "policy_fp": policy_fingerprint()})
++    return {"bundle_uri": uri}
+diff --git a/api/requirements-golden.txt b/api/requirements-golden.txt
+index 78d3b58..86a55cf 100644
+--- a/api/requirements-golden.txt
++++ b/api/requirements-golden.txt
+@@ -1,13 +1,14 @@
+ # Golden-path dependencies
+ -r api/requirements-api2.txt
+ -r api/requirements-db.txt
+ 
+ prometheus-client==0.20.0
+ httpx==0.27.0
+ boto3==1.34.131
+ kubernetes==29.0.0
+ requests==2.32.3
+ PyYAML==6.0.2
+ tiktoken==0.7.0
+diff --git a/terraform/aws/eks/README.md b/terraform/aws/eks/README.md
+new file mode 100644
+index 0000000..e12ef67
+--- /dev/null
++++ b/terraform/aws/eks/README.md
+@@ -0,0 +1,58 @@
++# Terraform AWS EKS module (starter)
++
++This module is still a starter, but it addresses key earlier weaknesses:
++- produces EKS + S3 + RDS + Vault injector
++- IRSA role for serving service account
++
++Production recommendations:
++- add managed node groups (aws_eks_node_group) with GPU instance types
++- private subnets + NAT gateways
++- Vault HA (not dev mode)
++- configure Vault Kubernetes auth + Transit key + policies (separate module)
++- use External Secrets or CSI for secrets delivery
++
++Apply:
++```bash
++terraform init
++terraform apply -var name=aegis -var artifacts_bucket_name=your-bucket -var postgres_password=...
++```
+diff --git a/alembic/versions/0005_hardening_limits_and_cost_and_retention.py b/alembic/versions/0005_hardening_limits_and_cost_and_retention.py
+new file mode 100644
+index 0000000..9b61f30
+--- /dev/null
++++ b/alembic/versions/0005_hardening_limits_and_cost_and_retention.py
+@@ -0,0 +1,124 @@
++"""hardening: deployment limits, run metrics, usage cost, compliance tables
++
++Revision ID: 0005_hardening_limits_and_cost_and_retention
++Revises: 0004_fully_ai_schema_expansion
++Create Date: 2026-03-22
++"""
++
++from alembic import op
++import sqlalchemy as sa
++
++revision = "0005_hardening_limits_and_cost_and_retention"
++down_revision = "0004_fully_ai_schema_expansion"
++branch_labels = None
++depends_on = None
++
++
++def _has_column(table: str, column: str) -> bool:
++    bind = op.get_bind()
++    insp = sa.inspect(bind)
++    cols = [c["name"] for c in insp.get_columns(table)]
++    return column in cols
++
++
++def upgrade():
++    bind = op.get_bind()
++    dialect = bind.dialect
++
++    if dialect.has_table(bind, "deployments") and not _has_column("deployments", "limits"):
++        op.add_column("deployments", sa.Column("limits", sa.JSON(), nullable=True))
++
++    if dialect.has_table(bind, "runs") and not _has_column("runs", "metrics"):
++        op.add_column("runs", sa.Column("metrics", sa.JSON(), nullable=True))
++
++    if dialect.has_table(bind, "usage_records") and not _has_column("usage_records", "cost_usd"):
++        op.add_column("usage_records", sa.Column("cost_usd", sa.Float(), nullable=True))
++
++
++def downgrade():
++    bind = op.get_bind()
++    dialect = bind.dialect
++    if dialect.has_table(bind, "usage_records") and _has_column("usage_records", "cost_usd"):
++        op.drop_column("usage_records", "cost_usd")
++    if dialect.has_table(bind, "runs") and _has_column("runs", "metrics"):
++        op.drop_column("runs", "metrics")
++    if dialect.has_table(bind, "deployments") and _has_column("deployments", "limits"):
++        op.drop_column("deployments", "limits")
+diff --git a/README_GOLDEN_PATH.md b/README_GOLDEN_PATH.md
+index fbb8f48..bca5e65 100644
+--- a/README_GOLDEN_PATH.md
++++ b/README_GOLDEN_PATH.md
+@@ -1,6 +1,28 @@
+ # Aegis Golden Path (v1)
+ 
++## Hardening patch (addresses previous weaknesses)
++
++This patch adds:
++- Robust-ish SSE streaming token metering (buffered SSE parsing + tokenizer)
++- Per-deployment quota/rate limiting (DB-backed; move to Redis for scale)
++- K8s reconcile endpoint for deployment readiness
++- Compliance export bundle to S3 (policy fingerprint included)
++- Opinionated HF fine-tuning Argo template endpoint
++
++Env highlights:
++- `AEGIS_TOKENIZER=tiktoken|heuristic`
++- `AEGIS_WORKLOAD_CLAIM=workload`, `AEGIS_WORKLOAD_ROLES=aegis_job`
++- `AEGIS_REQUIRE_CALLBACK_SIGNATURE=true` (humans) + workload identities bypass HMAC
++- `AEGIS_PUBLIC_BASE_URL=https://...` required for Argo callback URLs
++
+ Implements the minimal end-to-end platform loop:
+@@ -34,6 +56,14 @@ Streaming now meters tokens by parsing OpenAI-style SSE deltas and tokenizing via `tiktoken` (fallback heuristic).
+ Env:
+ - `AEGIS_TOKENIZER=tiktoken|heuristic`
+ - `AEGIS_TIKTOKEN_ENCODING=cl100k_base`
++
++## Compliance export
++- POST `/v1/compliance/export?days=7` writes an audit/usage/run/model bundle to S3
++- includes a policy fingerprint so you can prove which policies were in effect
++
++## Deployment readiness reconcile
++- GET `/v1/deployments/{deployment_id}/status` updates deployment.status based on K8s available replicas

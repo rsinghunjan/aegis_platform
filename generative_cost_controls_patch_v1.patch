@@ -1,0 +1,477 @@
+*** Begin Patch
+*** Add File: llm/quota.lua
++-- Redis Lua token bucket
++-- KEYS[1] = bucket_key (e.g. "quota:{tenant}:{model}")
++-- ARGV[1] = requested_tokens (integer)
++-- ARGV[2] = capacity (integer)
++-- ARGV[3] = refill_per_sec (float)
++-- ARGV[4] = now_ms (integer)
++--
++-- Returns:
++-- {1, remaining_tokens} on success
++-- {0, remaining_tokens} on failure
++local key = KEYS[1]
++local req = tonumber(ARGV[1])
++local capacity = tonumber(ARGV[2])
++local refill = tonumber(ARGV[3])
++local now_ms = tonumber(ARGV[4])
++
++local state = redis.call("HMGET", key, "tokens", "last_ts")
++local tokens = tonumber(state[1]) or capacity
++local last_ts = tonumber(state[2]) or now_ms
++
++local elapsed = math.max(0, now_ms - last_ts)
++-- refill amount (may be fractional)
++local refill_amount = (elapsed / 1000.0) * refill
++tokens = math.min(capacity, tokens + refill_amount)
++
++if tokens >= req then
++  tokens = tokens - req
++  redis.call("HMSET", key, "tokens", tostring(tokens), "last_ts", tostring(now_ms))
++  -- optional TTL to forget inactive buckets
++  redis.call("PEXPIRE", key, 86400000) -- 1 day
++  return {1, tostring(tokens)}
++else
++  -- write back current tokens and last_ts
++  redis.call("HMSET", key, "tokens", tostring(tokens), "last_ts", tostring(now_ms))
++  redis.call("PEXPIRE", key, 86400000)
++  return {0, tostring(tokens)}
++end
++
+*** End Patch
+*** Begin Patch
+*** Add File: llm/gateway_quota_middleware.py
++#!/usr/bin/env python3
++"""
++Gateway quota middleware
++ - Atomically charges tokens per request using a Redis Lua token-bucket (llm/quota.lua)
++ - Exposes Prometheus metrics for consumed tokens and rejections
++ - Example usage: call check_and_consume(model_id, tenant_id, tokens) at start of request handling
++"""
++import os
++import time
++import redis
++import pkgutil
++from prometheus_client import Counter, Gauge
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
++redis_client = redis.from_url(REDIS_URL)
++
++# Load Lua script
++_quota_lua = pkgutil.get_data(__name__, "quota.lua")
++if _quota_lua is None:
++    # fallback read file on disk
++    try:
++        _quota_lua = open(os.path.join(os.path.dirname(__file__), "quota.lua"), "rb").read()
++    except Exception:
++        _quota_lua = b""
++_quota_sha = None
++try:
++    if _quota_lua:
++        _quota_sha = redis_client.script_load(_quota_lua)
++except Exception:
++    _quota_sha = None
++
++# Prometheus metrics
++MET_TOKENS_CONSUMED = Counter("aegis_gateway_tokens_consumed_total", "Tokens consumed by gateway", ["model", "tenant"])
++MET_TOKENS_REJECTED = Counter("aegis_gateway_tokens_rejected_total", "Tokens rejected due to quota", ["model", "tenant"])
++MET_MODEL_THROTTLED = Gauge("aegis_model_throttled", "Model throttle state 1=throttled", ["model"])
++
++DEFAULT_CAPACITY = int(os.environ.get("QUOTA_DEFAULT_CAPACITY", "10000"))
++DEFAULT_REFILL = float(os.environ.get("QUOTA_DEFAULT_REFILL_PER_SEC", "1000"))
++
++def _eval_quota(bucket_key, requested, capacity, refill):
++    now_ms = int(time.time() * 1000)
++    try:
++        if _quota_sha:
++            res = redis_client.evalsha(_quota_sha, 1, bucket_key, requested, capacity, refill, now_ms)
++        else:
++            # fallback to EVAL with script contents
++            script = open(os.path.join(os.path.dirname(__file__), "quota.lua")).read()
++            res = redis_client.eval(script, 1, bucket_key, requested, capacity, refill, now_ms)
++        # res: [int(0/1), remaining_tokens_str]
++        ok = int(res[0]) == 1
++        remaining = float(res[1])
++        return ok, remaining
++    except redis.exceptions.ResponseError as e:
++        # script not loaded or other error -> deny conservative
++        return False, 0.0
++
++def check_and_consume(model_id: str, tenant_id: str, requested_tokens: int = 1,
++                      capacity: int = None, refill_per_sec: float = None) -> bool:
++    """
++    Attempt to consume tokens for (tenant, model). Returns True if allowed, False otherwise.
++    Also increments Prometheus counters.
++    """
++    if capacity is None:
++        capacity = DEFAULT_CAPACITY
++    if refill_per_sec is None:
++        refill_per_sec = DEFAULT_REFILL
++    bucket_key = f"quota:{tenant_id}:{model_id}"
++    # check if model is globally throttled key set by auto_throttle_manager
++    throttle_key = f"model:throttle:{model_id}"
++    if redis_client.get(throttle_key):
++        MET_TOKENS_REJECTED.labels(model=model_id, tenant=tenant_id).inc()
++        MET_MODEL_THROTTLED.labels(model=model_id).set(1)
++        return False
++    ok, remaining = _eval_quota(bucket_key, requested_tokens, capacity, refill_per_sec)
++    if ok:
++        MET_TOKENS_CONSUMED.labels(model=model_id, tenant=tenant_id).inc(requested_tokens)
++    else:
++        MET_TOKENS_REJECTED.labels(model=model_id, tenant=tenant_id).inc()
++    # set throttle gauge to 0 if not throttled
++    MET_MODEL_THROTTLED.labels(model=model_id).set(0)
++    return ok
++
++# Example FastAPI dependency
++def quota_dependency(required_tokens: int = 1):
++    from fastapi import Request, HTTPException
++    async def dep(request: Request):
++        model = request.headers.get("X-Model-Id") or request.query_params.get("model")
++        tenant = request.headers.get("X-Tenant-Id") or request.query_params.get("tenant") or "default"
++        if not model:
++            raise HTTPException(status_code=400, detail="model id required")
++        allowed = check_and_consume(model, tenant, required_tokens)
++        if not allowed:
++            raise HTTPException(status_code=429, detail="quota exceeded")
++    return dep
++
++if __name__ == "__main__":
++    # quick local test
++    print("Testing quota consume...")
++    print(check_and_consume("test-model","tenantA",1,capacity=10,refill_per_sec=1))
++
+*** End Patch
+*** Begin Patch
+*** Add File: prometheus/alerts-billing.rules.yaml
++groups:
++- name: aegis-billing-alerts
++  rules:
++  - alert: BillingSpikeDetected
++    expr: increase(aegis_gateway_tokens_consumed_total[5m]) > 100000
++    for: 5m
++    labels:
++      severity: page
++    annotations:
++      summary: "Large billing spike detected"
++      description: "Total tokens consumed across models increased rapidly in the last 5 minutes."
++
++  - alert: ModelHighTokenRate
++    expr: increase(aegis_gateway_tokens_consumed_total{model=~".+"}[5m]) / 300 > 1000
++    for: 5m
++    labels:
++      severity: warning
++    annotations:
++      summary: "High token rate for one or more models"
++      description: "Investigate model token consumption and consider throttling."
++
++  - alert: ModelQuotaExhausted
++    expr: increase(aegis_gateway_tokens_rejected_total{model=~".+"}[5m]) > 10
++    for: 10m
++    labels:
++      severity: warning
++    annotations:
++      summary: "Quota rejections observed"
++      description: "Clients are being rejected due to quota exhaustion — check quotas and potential runaway models."
++
+*** End Patch
+*** Begin Patch
+*** Add File: grafana/dashboards/generative_costs.json
++{
++  "title": "Aegis Generative Costs",
++  "panels": [
++    {
++      "type": "graph",
++      "title": "Tokens consumed (per model)",
++      "targets": [
++        {
++          "expr": "sum by (model) (increase(aegis_gateway_tokens_consumed_total[5m]))",
++          "legendFormat": "{{model}}"
++        }
++      ],
++      "id": 1
++    },
++    {
++      "type": "graph",
++      "title": "Token rejections (per model)",
++      "targets": [
++        {
++          "expr": "sum by (model) (increase(aegis_gateway_tokens_rejected_total[5m]))",
++          "legendFormat": "{{model}}"
++        }
++      ],
++      "id": 2
++    },
++    {
++      "type": "stat",
++      "title": "Top 10 costliest models (est.)",
++      "targets": [
++        {
++          "expr": "topk(10, sum by (model) (increase(aegis_gateway_tokens_consumed_total[1h])))",
++          "legendFormat": "{{model}}"
++        }
++      ],
++      "id": 3
++    }
++  ]
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File: billing/alert_reconcile_worker.py
++#!/usr/bin/env python3
++"""
++Billing reconciliation + alert worker
++ - Polls Prometheus for token usage per model and compares to recorded invoices (S3/Redis)
++ - Emits alerts to OPERATOR_NOTIFY_WEBHOOK if anomalies detected
++ - Runs periodically (cron or k8s CronJob)
++"""
++import os
++import time
++import json
++import requests
++import boto3
++from urllib.parse import urljoin
++
++PROM_URL = os.environ.get("PROM_URL", "http://prometheus.monitoring.svc:9090")
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++OPERATOR_WEBHOOK = os.environ.get("OPERATOR_NOTIFY_WEBHOOK")
++
++def prom_query(expr):
++    r = requests.get(f"{PROM_URL}/api/v1/query", params={"query": expr}, timeout=10)
++    r.raise_for_status()
++    return r.json().get("data", {}).get("result", [])
++
++def fetch_recent_token_usage(minutes=60):
++    expr = f"sum by (model) (increase(aegis_gateway_tokens_consumed_total[{minutes}m]))"
++    res = prom_query(expr)
++    usage = {}
++    for item in res:
++        model = item["metric"].get("model","unknown")
++        val = float(item["value"][1])
++        usage[model] = val
++    return usage
++
++def fetch_invoices_from_s3(prefix="billing/invoices/"):
++    if not COMPLIANCE_BUCKET:
++        return {}
++    s3 = boto3.client("s3")
++    objs = s3.list_objects_v2(Bucket=COMPLIANCE_BUCKET, Prefix=prefix)
++    inv = {}
++    for o in objs.get("Contents", []):
++        key = o["Key"]
++        tmp = f"/tmp/{key.replace('/','_')}"
++        s3.download_file(COMPLIANCE_BUCKET, key, tmp)
++        batch = json.load(open(tmp))
++        for rec in batch:
++            model = rec.get("model","unknown")
++            inv.setdefault(model, 0.0)
++            inv[model] += rec.get("tokens", 0)
++    return inv
++
++def detect_anomalies():
++    usage = fetch_recent_token_usage(60)
++    invoices = fetch_invoices_from_s3()
++    anomalies = []
++    for model, tokens in usage.items():
++        inv_tokens = invoices.get(model, 0)
++        # if usage >> invoices by large margin (tunable)
++        if tokens > max(1000, inv_tokens * 2):
++            anomalies.append({"model": model, "usage_tokens": tokens, "invoice_tokens": inv_tokens})
++    if anomalies and OPERATOR_WEBHOOK:
++        try:
++            requests.post(OPERATOR_WEBHOOK, json={"event":"billing_anomalies","items": anomalies}, timeout=5)
++        except Exception:
++            pass
++    return anomalies
++
++if __name__ == "__main__":
++    print("Running billing reconcile worker...")
++    a = detect_anomalies()
++    print("Anomalies:", json.dumps(a, indent=2))
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/auto_throttle_manager.py
++#!/usr/bin/env python3
++"""
++Auto-throttle manager
++ - Monitors Prometheus for per-model token rate / estimated cost
++ - If a model exceeds configured thresholds, marks it throttled in Redis and calls model_registry to update state
++ - When metrics return to acceptable range for cooldown window, removes throttle
++ - Writes actions to COMPLIANCE_BUCKET
++"""
++import os
++import time
++import json
++import redis
++import requests
++import boto3
++from urllib.parse import urljoin
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
++PROM_URL = os.environ.get("PROM_URL", "http://prometheus.monitoring.svc:9090")
++MODEL_REGISTRY_API = os.environ.get("MODEL_REGISTRY_API")
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++OPERATOR_WEBHOOK = os.environ.get("OPERATOR_NOTIFY_WEBHOOK")
++THRESH_TOKENS_PER_SEC = float(os.environ.get("THRESH_TOKENS_PER_SEC", "2000"))
++COOLDOWN_SEC = int(os.environ.get("THROTTLE_COOLDOWN_SEC", "300"))
++POLL_SEC = int(os.environ.get("THROTTLE_POLL_SEC", "30"))
++
++redis_client = redis.from_url(REDIS_URL)
++s3 = boto3.client("s3") if COMPLIANCE_BUCKET else None
++
++def prom_query(expr):
++    r = requests.get(f"{PROM_URL}/api/v1/query", params={"query": expr}, timeout=10)
++    r.raise_for_status()
++    return r.json().get("data", {}).get("result", [])
++
++def get_model_token_rates(window="1m"):
++    expr = f"sum by (model) (rate(aegis_gateway_tokens_consumed_total[{window}]))"
++    res = prom_query(expr)
++    out = {}
++    for item in res:
++        model = item["metric"].get("model","unknown")
++        rate = float(item["value"][1])
++        out[model] = rate
++    return out
++
++def set_throttle(model, reason):
++    key = f"model:throttle:{model}"
++    redis_client.set(key, "1", ex=3600)
++    # notify model registry if available
++    if MODEL_REGISTRY_API:
++        try:
++            requests.post(f"{MODEL_REGISTRY_API}/models/throttle", json={"model": model, "throttled": True, "reason": reason}, timeout=5)
++        except Exception:
++            pass
++    # record in compliance
++    rec = {"model": model, "action": "throttle", "reason": reason, "ts": int(time.time())}
++    if s3:
++        key = f"throttle/actions/{model}_{int(time.time())}.json"
++        try:
++            s3.put_object(Bucket=COMPLIANCE_BUCKET, Key=key, Body=json.dumps(rec))
++        except Exception:
++            pass
++    if OPERATOR_WEBHOOK:
++        try:
++            requests.post(OPERATOR_WEBHOOK, json=rec, timeout=5)
++        except Exception:
++            pass
++
++def clear_throttle(model):
++    key = f"model:throttle:{model}"
++    redis_client.delete(key)
++    if MODEL_REGISTRY_API:
++        try:
++            requests.post(f"{MODEL_REGISTRY_API}/models/throttle", json={"model": model, "throttled": False}, timeout=5)
++        except Exception:
++            pass
++    rec = {"model": model, "action": "unthrottle", "ts": int(time.time())}
++    if s3:
++        key = f"throttle/actions/{model}_{int(time.time())}.json"
++        try:
++            s3.put_object(Bucket=COMPLIANCE_BUCKET, Key=key, Body=json.dumps(rec))
++        except Exception:
++            pass
++    if OPERATOR_WEBHOOK:
++        try:
++            requests.post(OPERATOR_WEBHOOK, json=rec, timeout=5)
++        except Exception:
++            pass
++
++def monitor_loop():
++    print("Starting auto-throttle manager...")
++    while True:
++        try:
++            rates = get_model_token_rates(window="1m")
++            for model, rate in rates.items():
++                if rate >= THRESH_TOKENS_PER_SEC:
++                    # throttle
++                    set_throttle(model, f"token_rate {rate} >= {THRESH_TOKENS_PER_SEC}")
++                else:
++                    # if previously throttled and now below threshold, clear throttle
++                    key = f"model:throttle:{model}"
++                    if redis_client.get(key):
++                        # ensure cooldown window: only unthrottle if below threshold for COOLDOWN_SEC
++                        # record timestamp when throttled exists as ttl check (simplified)
++                        clear_throttle(model)
++        except Exception as e:
++            print("Error in throttle manager:", e)
++        time.sleep(POLL_SEC)
++
++if __name__ == "__main__":
++    monitor_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File: tests/simulate_gateway_requests.py
++#!/usr/bin/env python3
++"""
++Simulate many requests to a gateway endpoint to exercise quota behavior.
++Usage:
++  python tests/simulate_gateway_requests.py --url http://gateway:8080/generate --model test-model --tenant tenantA --concurrency 50 --requests 1000
++"""
++import argparse, requests, concurrent.futures, time
++
++def make_request(url, model, tenant):
++    try:
++        headers = {"X-Model-Id": model, "X-Tenant-Id": tenant}
++        r = requests.post(url, headers=headers, json={"prompt":"hello"}, timeout=10)
++        return r.status_code, r.text[:200]
++    except Exception as e:
++        return 0, str(e)
++
++def run(url, model, tenant, total, concurrency):
++    ok=0; fail=0
++    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
++        futures = [ex.submit(make_request, url, model, tenant) for _ in range(total)]
++        for f in concurrent.futures.as_completed(futures):
++            code, body = f.result()
++            if code == 200:
++                ok += 1
++            else:
++                fail += 1
++    return ok, fail
++
++if __name__=="__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--url", required=True)
++    p.add_argument("--model", default="test-model")
++    p.add_argument("--tenant", default="tenantA")
++    p.add_argument("--concurrency", type=int, default=50)
++    p.add_argument("--requests", type=int, default=500)
++    args = p.parse_args()
++    start = time.time()
++    ok, fail = run(args.url, args.model, args.tenant, args.requests, args.concurrency)
++    print("Done in", time.time()-start, "ok=", ok, "fail=", fail)
++
+*** End Patch
+*** Begin Patch
+*** Add File: .github/workflows/cost_control_simulation.yml
++name: Cost Control Simulation
++on:
++  workflow_dispatch:
++    inputs:
++      gateway_url:
++        required: true
++      model:
++        required: false
++        default: "test-model"
++      tenant:
++        required: false
++        default: "tenantA"
++
++jobs:
++  simulate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        run: python -m pip install --upgrade pip && pip install requests
++      - name: Run request storm
++        run: |
++          python tests/simulate_gateway_requests.py --url "${{ github.event.inputs.gateway_url }}" --model "${{ github.event.inputs.model }}" --tenant "${{ github.event.inputs.tenant }}" --concurrency 50 --requests 1000
++
+*** End Patch
+*** End Patch

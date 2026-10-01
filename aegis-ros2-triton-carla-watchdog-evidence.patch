@@ -1,0 +1,557 @@
+*** Begin Patch
+*** Add File:robots/ros2_bridge/bridge.py
++#!/usr/bin/env python3
++"""
++ROS2 -> Aegis bridge
++ - subscribes to sensor topics and uploads payloads to object store (LakeFS/S3)
++ - writes per-run metadata to MCP
++ - publishes approval requests to A2A when human sign-off is needed
++
++Environment variables:
++ - AEGIS_MCP_API (e.g. http://mcp:8082)
++ - AEGIS_INGEST_API (optional HTTP ingest receiver)
++ - A2A_API (e.g. http://approver:8085)
++ - S3_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION (for S3)
++ - LAKEFS_ENDPOINT, LAKEFS_ACCESS_KEY, LAKEFS_SECRET_KEY, LAKEFS_REPO, LAKEFS_BRANCH (optional)
++"""
++import os
++import time
++import json
++import uuid
++import base64
++import logging
++import requests
++import boto3
++import rclpy
++from rclpy.node import Node
++from sensor_msgs.msg import Image, PointCloud2
++
++logging.basicConfig(level=logging.INFO)
++LOG = logging.getLogger("aegis.ros2_bridge")
++
++AEGIS_MCP_API = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++AEGIS_INGEST_API = os.environ.get("AEGIS_INGEST_API", "")
++A2A_API = os.environ.get("A2A_API", "http://approver:8085")
++
++S3_BUCKET = os.environ.get("S3_BUCKET", "")
++AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
++LAKEFS_ENDPOINT = os.environ.get("LAKEFS_ENDPOINT", "")
++LAKEFS_REPO = os.environ.get("LAKEFS_REPO", "aegis-data")
++LAKEFS_BRANCH = os.environ.get("LAKEFS_BRANCH", "main")
++
++if S3_BUCKET:
++    s3 = boto3.client("s3", region_name=AWS_REGION)
++else:
++    s3 = None
++
++def upload_to_s3_bytes(key: str, b: bytes) -> str:
++    """Upload bytes to S3 and return s3://bucket/key"""
++    if not s3:
++        raise RuntimeError("S3 not configured")
++    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=b)
++    return f"s3://{S3_BUCKET}/{key}"
++
++def make_mcp_record(model_id: str, run_id: str, artifact_uri: str, meta: dict):
++    return {
++        "model_id": model_id,
++        "version": meta.get("model_version", ""),
++        "artifacts": [{"uri": artifact_uri}],
++        "evaluation": {"run_id": run_id, "meta": meta},
++        "approvals": []
++    }
++
++class AegisBridge(Node):
++    def __init__(self):
++        super().__init__("aegis_ros2_bridge")
++        qos = 10
++        self.create_subscription(Image, "/camera/image_raw", self.on_image, qos)
++        self.create_subscription(PointCloud2, "/lidar/points", self.on_lidar, qos)
++        LOG.info("Aegis ROS2 bridge started")
++
++    def _store_payload(self, topic: str, data: bytes, meta: dict) -> str:
++        """Store to S3 (preferred) and return URI; try LAKEFS if configured via API (simple stub)"""
++        ts = int(time.time() * 1000)
++        run_id = meta.get("run_id", str(uuid.uuid4()))
++        key = f"ingest/{topic}/{run_id}-{ts}.bin"
++        try:
++            uri = upload_to_s3_bytes(key, data)
++            LOG.info("Uploaded payload to %s", uri)
++            return uri
++        except Exception as e:
++            LOG.warning("S3 upload failed: %s", e)
++            # fallback: attempt to POST to ingest endpoint
++            if AEGIS_INGEST_API:
++                try:
++                    r = requests.post(AEGIS_INGEST_API, json={"topic": topic, "meta": meta, "data_b64": base64.b64encode(data).decode("ascii")}, timeout=3.0)
++                    r.raise_for_status()
++                    return r.json().get("uri", "")
++                except Exception as e2:
++                    LOG.warning("HTTP ingest failed: %s", e2)
++            raise
++
++    def _publish_mcp(self, model_id: str, run_id: str, artifact_uri: str, meta: dict):
++        rec = make_mcp_record(model_id, run_id, artifact_uri, meta)
++        try:
++            url = f"{AEGIS_MCP_API.rstrip('/')}/models/{model_id}/context"
++            r = requests.post(url, json=rec, timeout=5.0)
++            r.raise_for_status()
++            LOG.info("Posted MCP record for %s", model_id)
++        except Exception as e:
++            LOG.warning("MCP publish failed: %s", e)
++
++    def _request_approval(self, model_id: str, artifact_uri: str, requester: str = "ros2-bridge"):
++        try:
++            payload = {"id": str(uuid.uuid4()), "type": "approval_request", "model_id": model_id, "artifact_uri": artifact_uri, "requester": requester, "ts": int(time.time())}
++            r = requests.post(f"{A2A_API.rstrip('/')}/request", json=payload, timeout=5.0)
++            r.raise_for_status()
++            LOG.info("Approval request posted for %s", model_id)
++        except Exception as e:
++            LOG.warning("Approval request failed: %s", e)
++
++    def on_image(self, msg: Image):
++        meta = {"frame_id": msg.header.frame_id, "encoding": msg.encoding, "topic": "/camera/image_raw", "timestamp": int(time.time())}
++        try:
++            data = bytes(msg.data)
++            uri = self._store_payload("camera", data, {"run_id": str(uuid.uuid4()), **meta})
++            # attach MCP record for a per-capture artifact (lightweight)
++            self._publish_mcp(model_id="unknown-model", run_id=meta.get("run_id",""), artifact_uri=uri, meta=meta)
++            # request approval if configured (example: human-in-the-loop trigger)
++            if os.environ.get("A2A_AUTO_REQ", "false").lower() == "true":
++                self._request_approval("unknown-model", uri)
++        except Exception as e:
++            LOG.warning("on_image error: %s", e)
++
++    def on_lidar(self, msg: PointCloud2):
++        meta = {"frame_id": msg.header.frame_id, "topic": "/lidar/points", "timestamp": int(time.time())}
++        try:
++            # convert PointCloud2 raw to bytes; for demo we don't parse layout
++            raw = bytes(msg.data) if hasattr(msg, "data") else b""
++            uri = self._store_payload("lidar", raw, {"run_id": str(uuid.uuid4()), **meta})
++            self._publish_mcp(model_id="unknown-model", run_id=meta.get("run_id",""), artifact_uri=uri, meta=meta)
++        except Exception as e:
++            LOG.warning("on_lidar error: %s", e)
++
++def main():
++    rclpy.init()
++    node = AegisBridge()
++    try:
++        rclpy.spin(node)
++    except KeyboardInterrupt:
++        LOG.info("Shutdown requested")
++    finally:
++        node.destroy_node()
++        rclpy.shutdown()
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:robots/triton/Chart.yaml
++apiVersion: v2
++name: triton-inference
++description: NVIDIA Triton inference server Helm chart for low-latency model serving (ONNX example)
++version: 0.2.0
++appVersion: "2.30.0"
++
+*** End File
+*** Add File:robots/triton/values.yaml
++replicaCount: 1
++image:
++  repository: nvcr.io/nvidia/tritonserver
++  tag: 23.05-py3
++resources:
++  limits:
++    nvidia.com/gpu: 1
++  requests:
++    cpu: 500m
++    memory: 2Gi
++modelRepository: /models
++service:
++  type: ClusterIP
++  port: 8000
++  metricsPort: 8002
++serviceMonitor:
++  enabled: true
++  interval: 15s
++latencySLO:
++  p95_ms: 20
++  p99_ms: 50
++
+*** End File
+*** Add File:robots/triton/templates/deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: triton-inference
++  labels:
++    app: triton-inference
++spec:
++  replicas: {{ .Values.replicaCount }}
++  selector:
++    matchLabels:
++      app: triton-inference
++  template:
++    metadata:
++      labels:
++        app: triton-inference
++    spec:
++      containers:
++      - name: triton
++        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
++        args: ["tritonserver", "--model-repository={{ .Values.modelRepository }}", "--http-port={{ .Values.service.port }}", "--metrics-port={{ .Values.service.metricsPort }}"]
++        ports:
++        - containerPort: {{ .Values.service.port }}
++        - containerPort: {{ .Values.service.metricsPort }}
++        resources:
++{{ toYaml .Values.resources | indent 8 }}
++        volumeMounts:
++        - name: models
++          mountPath: {{ .Values.modelRepository }}
++      volumes:
++      - name: models
++        emptyDir: {}
++      nodeSelector:
++        nvidia.com/gpu.present: "true"
++
+*** End File
+*** Add File:robots/triton/templates/service.yaml
++apiVersion: v1
++kind: Service
++metadata:
++  name: triton-inference
++spec:
++  selector:
++    app: triton-inference
++  ports:
++  - name: http
++    port: {{ .Values.service.port }}
++    targetPort: {{ .Values.service.port }}
++  - name: metrics
++    port: {{ .Values.service.metricsPort }}
++    targetPort: {{ .Values.service.metricsPort }}
++  type: {{ .Values.service.type }}
++
+*** End File
+*** Add File:robots/triton/templates/servicemonitor.yaml
++{{- if .Values.serviceMonitor.enabled }}
++apiVersion: monitoring.coreos.com/v1
++kind: ServiceMonitor
++metadata:
++  name: triton-inference
++spec:
++  selector:
++    matchLabels:
++      app: triton-inference
++  endpoints:
++  - port: metrics
++    interval: {{ .Values.serviceMonitor.interval }}
++{{- end }}
++
+*** End File
+*** Add File:robots/triton/push_onnx_model.py
++#!/usr/bin/env python3
++"""
++Push an ONNX model directory into Triton's model-repository layout.
++Example usage:
++  python push_onnx_model.py --model-name mymodel --onnx model.onnx --out-dir /tmp/models
++"""
++import os, argparse, shutil, json
++from pathlib import Path
++
++def layout_model(model_name: str, onnx_path: str, out_dir: str):
++    base = Path(out_dir) / model_name
++    version_dir = base / "1"
++    version_dir.mkdir(parents=True, exist_ok=True)
++    shutil.copy(onnx_path, version_dir / "model.onnx")
++    # create config.pbtxt (simplified)
++    config = {
++        "name": model_name,
++        "platform": "onnxruntime_onnx",
++        "max_batch_size": 1,
++        "input": [{"name": "INPUT__0", "data_type": "TYPE_FP32", "dims": [-1, 3, 224, 224]}],
++        "output": [{"name": "OUTPUT__0", "data_type": "TYPE_FP32", "dims": [-1, 1000]}]
++    }
++    with open(base / "config.pbtxt", "w") as f:
++        f.write(json.dumps(config))
++    print("Model laid out at", base)
++
++if __name__ == "__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--model-name", required=True)
++    p.add_argument("--onnx", required=True)
++    p.add_argument("--out-dir", required=True)
++    args = p.parse_args()
++    layout_model(args.model_name, args.onnx, args.out_dir)
++
+*** End File
+*** Add File:robots/triton/latency_test.py
++#!/usr/bin/env python3
++"""
++Simple Triton latency tester (HTTP inference) and Prometheus metrics exporter (Pushgateway optional).
++Requires python-requests.
++"""
++import os, time, requests
++from statistics import mean, median
++
++TRITON_URL = os.environ.get("TRITON_URL", "http://triton-inference:8000/v2/models/mymodel/infer")
++PUSHGATEWAY = os.environ.get("PUSHGATEWAY", "")
++
++def measure(n=50):
++    latencies = []
++    for i in range(n):
++        t0 = time.time()
++        try:
++            r = requests.post(TRITON_URL, json={"inputs": []}, timeout=5.0)
++        except Exception:
++            latencies.append(9999.0)
++            continue
++        latencies.append((time.time() - t0) * 1000.0)
++    return latencies
++
++if __name__ == "__main__":
++    l = measure(20)
++    print("p95 ~", sorted(l)[int(len(l) * 0.95)])
++    print("p99 ~", sorted(l)[int(len(l) * 0.99)])
++    if PUSHGATEWAY:
++        try:
++            requests.post(f"http://{PUSHGATEWAY}/metrics/job/triton_latency", data=f"triton_p95 {sorted(l)[int(len(l)*0.95)]}\n")
++        except Exception:
++            pass
++
+*** End File
+*** Add File:robots/simulation/run_carla_scenario.py
++#!/usr/bin/env python3
++"""
++Run a CARLA scenario and store logs to S3/LakeFS. Attach scenario metadata to MCP record.
++Usage:
++  python run_carla_scenario.py --scenario safety_scenario --model-id <model_id>
++"""
++import os, time, json, argparse
++from pathlib import Path
++import requests
++import boto3
++
++AEGIS_MCP_API = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++S3_BUCKET = os.environ.get("S3_BUCKET", "")
++AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
++ARTIFACT_UPLOAD_URL = os.environ.get("ARTIFACT_UPLOAD_URL", "")
++
++if S3_BUCKET:
++    s3 = boto3.client("s3", region_name=AWS_REGION)
++else:
++    s3 = None
++
++def upload_file(path: str, key: str):
++    if s3:
++        s3.upload_file(path, S3_BUCKET, key)
++        return f"s3://{S3_BUCKET}/{key}"
++    if ARTIFACT_UPLOAD_URL:
++        with open(path, "rb") as fh:
++            r = requests.post(ARTIFACT_UPLOAD_URL, files={"file": fh}, timeout=20)
++            r.raise_for_status()
++            return r.json().get("url", "")
++    return ""
++
++def run_scenario(scenario: str, model_id: str, duration: int = 30):
++    out_dir = Path("/tmp/carla_runs")
++    out_dir.mkdir(parents=True, exist_ok=True)
++    run_id = f"{scenario}-{int(time.time())}"
++    metrics_path = out_dir / f"{run_id}.json"
++    # placeholder: integrate with CARLA Python API in production
++    metrics = {"scenario": scenario, "run_id": run_id, "model_id": model_id, "status": "completed", "timestamp": time.time()}
++    with open(metrics_path, "w") as f:
++        json.dump(metrics, f)
++    key = f"simulation/{model_id}/{run_id}.json"
++    uri = upload_file(str(metrics_path), key)
++    # attach to MCP
++    try:
++        rec = {"model_id": model_id, "version": "", "artifacts": [{"uri": uri}], "evaluation": {"run_id": run_id, "scenario": scenario}, "approvals": []}
++        r = requests.post(f"{AEGIS_MCP_API.rstrip('/')}/models/{model_id}/context", json=rec, timeout=10)
++        r.raise_for_status()
++    except Exception as e:
++        print("Failed to post MCP record:", e)
++    print("Scenario finished, artifacts:", uri)
++    return uri
++
++if __name__ == "__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--scenario", required=True)
++    p.add_argument("--model-id", required=True)
++    p.add_argument("--duration", type=int, default=30)
++    args = p.parse_args()
++    run_scenario(args.scenario, args.model_id, args.duration)
++
+*** End File
+*** Add File:robots/watchdog/watchdog.py
++#!/usr/bin/env python3
++"""
++Runtime watchdog: polls inference health and model confidence metrics,
++and triggers a safe-stop via operator API if thresholds breached.
++Environment:
++ - HEALTH_ENDPOINT (e.g. http://triton-inference:8000/v2/health/ready)
++ - METRICS_ENDPOINT (Prometheus /metrics or pushgateway)
++ - SAFE_STOP_API (operator endpoint to request safe stop)
++ - CONFIDENCE_THRESHOLD (float)
++"""
++import os, time, requests
++import logging
++
++logging.basicConfig(level=logging.INFO)
++LOG = logging.getLogger("aegis.watchdog")
++
++HEALTH_ENDPOINT = os.environ.get("HEALTH_ENDPOINT", "http://triton-inference:8000/v2/health/ready")
++SAFE_STOP_API = os.environ.get("SAFE_STOP_API", "")
++CONF_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.5"))
++
++def check_health():
++    try:
++        r = requests.get(HEALTH_ENDPOINT, timeout=2.0)
++        return r.status_code == 200
++    except Exception:
++        return False
++
++def get_confidence():
++    # placeholder: in production query Prometheus or model metrics endpoint for recent confidence
++    # For demo, read env override
++    v = os.environ.get("LATEST_CONFIDENCE", None)
++    if v:
++        return float(v)
++    return 1.0
++
++def request_safe_stop(reason: str):
++    if not SAFE_STOP_API:
++        LOG.warning("SAFE_STOP_API not configured, cannot request safe stop: %s", reason)
++        return
++    try:
++        r = requests.post(SAFE_STOP_API, json={"reason": reason}, timeout=5.0)
++        r.raise_for_status()
++        LOG.info("Safe-stop requested: %s", reason)
++    except Exception as e:
++        LOG.error("Safe-stop request failed: %s", e)
++
++def main():
++    while True:
++        healthy = check_health()
++        if not healthy:
++            LOG.error("Health check failed; requesting safe-stop")
++            request_safe_stop("health_check_failed")
++            time.sleep(5)
++            continue
++        conf = get_confidence()
++        if conf < CONF_THRESHOLD:
++            LOG.error("Confidence %s below threshold %s; requesting safe-stop", conf, CONF_THRESHOLD)
++            request_safe_stop(f"low_confidence_{conf}")
++        time.sleep(2)
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:robots/opa/robot_safety.rego
++package aegis.robot.safety
++
++default allow = false
++
++# allow runs only when the latest confidence metric is >= configured threshold
++allow {
++  input.latest_metrics.confidence >= input.policy.confidence_threshold
++}
++
++deny_reason[msg] {
++  not allow
++  msg = sprintf("confidence too low: %v", [input.latest_metrics.confidence])
++}
++
+*** End File
+*** Add File:robots/safety/evidence_pack.py
++#!/usr/bin/env python3
++"""
++Build an evidence pack for compliance containing:
++ - model artifact (URI)
++ - MCP JSON (local path or URL)
++ - cosign signature file(s)
++ - SLSA attestation file(s)
++ - simulation logs and scenario IDs
++ - test results (adversarial / regression)
++ - produce a zip and optionally upload to compliance vault
++
++Environment:
++ - MCP_JSON_PATH, SLSA_PATH, COSIGN_SIG_PATH, SIM_LOG_DIR, TEST_RESULTS_PATH
++ - COMPLIANCE_UPLOAD_URL (optional)
++"""
++import os
++import zipfile
++from pathlib import Path
++import requests
++
++MCP_JSON_PATH = os.environ.get("MCP_JSON_PATH", "mcp_record.json")
++SLSA_PATH = os.environ.get("SLSA_PATH", "slsa-attestation.json")
++COSIGN_SIG_PATH = os.environ.get("COSIGN_SIG_PATH", "")
++SIM_LOG_DIR = os.environ.get("SIM_LOG_DIR", "/tmp/carla_runs")
++TEST_RESULTS_PATH = os.environ.get("TEST_RESULTS_PATH", "")
++OUTPUT_ZIP = os.environ.get("EVIDENCE_OUT", "/tmp/evidence_pack.zip")
++COMPLIANCE_UPLOAD_URL = os.environ.get("COMPLIANCE_UPLOAD_URL", "")
++
++def collect_and_zip():
++    out = Path(OUTPUT_ZIP)
++    with zipfile.ZipFile(out, "w") as z:
++        if Path(MCP_JSON_PATH).exists():
++            z.write(MCP_JSON_PATH, arcname="mcp.json")
++        if Path(SLSA_PATH).exists():
++            z.write(SLSA_PATH, arcname="slsa-attestation.json")
++        if COSIGN_SIG_PATH and Path(COSIGN_SIG_PATH).exists():
++            z.write(COSIGN_SIG_PATH, arcname=Path(COSIGN_SIG_PATH).name)
++        simdir = Path(SIM_LOG_DIR)
++        if simdir.exists():
++            for f in simdir.glob("**/*"):
++                if f.is_file():
++                    z.write(f, arcname=f"simulation/{f.relative_to(simdir)}")
++        if TEST_RESULTS_PATH and Path(TEST_RESULTS_PATH).exists():
++            z.write(TEST_RESULTS_PATH, arcname=Path(TEST_RESULTS_PATH).name)
++    print("Evidence pack created at", out)
++    if COMPLIANCE_UPLOAD_URL:
++        with open(out, "rb") as fh:
++            try:
++                r = requests.post(COMPLIANCE_UPLOAD_URL, files={"file": fh}, timeout=20)
++                r.raise_for_status()
++                print("Uploaded evidence pack to compliance vault")
++            except Exception as e:
++                print("Upload failed:", e)
++
++if __name__ == "__main__":
++    collect_and_zip()
++
+*** End File
+*** Add File:.github/workflows/carla_ci.yml
++name: CARLA scenario CI
++on:
++  workflow_dispatch:
++jobs:
++  carla-sim:
++    runs-on: ubuntu-latest
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Start CARLA Docker (headless)
++        run: |
++          docker run -d --name carla -p 2000:2000 carlasim/carla:0.9.13
++
++      - name: Run CARLA scenario and attach to MCP
++        env:
++          AEGIS_MCP_API: ${{ secrets.AEGIS_MCP_API }}
++          S3_BUCKET: ${{ secrets.S3_BUCKET }}
++          AWS_REGION: ${{ secrets.AWS_REGION }}
++        run: |
++          python robots/simulation/run_carla_scenario.py --scenario ci_basic --model-id ${{ github.event.inputs.model_id || 'multimodal_demo' }}
++
++      - name: Build evidence pack and upload
++        env:
++          MCP_JSON_PATH: /tmp/mcp_record.json
++          SIM_LOG_DIR: /tmp/carla_runs
++          COMPLIANCE_UPLOAD_URL: ${{ secrets.COMPLIANCE_UPLOAD_URL || '' }}
++        run: |
++          python robots/safety/evidence_pack.py
++
+*** End File
+*** End Patch

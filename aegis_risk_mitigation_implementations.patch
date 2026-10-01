@@ -1,0 +1,503 @@
+*** Begin Patch
+*** Add File:scripts/run_staging_e2e_demo.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Run the full staging E2E demo (ingest → GE → Feast offline → train → sign → A/B rollout → evidence)
++# and deliver the evidence bundle to the configured evidence bucket for legal/security review.
++#
++# Requirements:
++# - kubectl, argo CLI and aws CLI (if uploading to S3) configured in environment
++# - KUBECONFIG in env or running in-cluster
++# - MODEL_ARTIFACT_BUCKET (optional) and EVIDENCE_BUCKET (optional) env vars
++EVIDENCE_BUCKET="${EVIDENCE_BUCKET:-}"
++NAMESPACE="${NAMESPACE:-aegis}"
++WORKFLOW_MANIFEST="${WORKFLOW_MANIFEST:-demo/argo/demo_pipeline.yaml}"
++ARGO_TIMEOUT="${ARGO_TIMEOUT:-1800}" # seconds
++
++function submit_workflow() {
++  echo "Submitting Argo workflow: $WORKFLOW_MANIFEST"
++  argo submit "$WORKFLOW_MANIFEST" -n "$NAMESPACE" --watch --wait || {
++    echo "Argo workflow failed or timed out"
++    return 2
++  }
++  return 0
++}
++
++function collect_evidence_local() {
++  # Evidence collector writes to /tmp by default in demo manifests
++  EVIDENCE_LOCAL="/tmp/aegis_demo_evidence.tar.gz"
++  if [ -f "$EVIDENCE_LOCAL" ]; then
++    echo "Found local evidence bundle at $EVIDENCE_LOCAL"
++    echo "$EVIDENCE_LOCAL"
++    return 0
++  fi
++  echo "Local evidence bundle not found at $EVIDENCE_LOCAL"
++  return 1
++}
++
++function upload_evidence() {
++  local file="$1"
++  if [ -n "$EVIDENCE_BUCKET" ]; then
++    echo "Uploading evidence to s3://$EVIDENCE_BUCKET/"
++    aws s3 cp "$file" "s3://$EVIDENCE_BUCKET/$(basename $file)" || {
++      echo "Upload failed"
++      return 2
++    }
++    echo "Uploaded: s3://$EVIDENCE_BUCKET/$(basename $file)"
++    return 0
++  else
++    echo "EVIDENCE_BUCKET not set; keeping local artifact: $file"
++    return 0
++  fi
++}
++
++echo "Starting Aegis staging E2E demo..."
++submit_workflow
++echo "Collecting evidence..."
++EVIDENCE_PATH="$(collect_evidence_local || true)"
++if [ -n "$EVIDENCE_PATH" ]; then
++  upload_evidence "$EVIDENCE_PATH"
++else
++  echo "Evidence not found locally. Attempting to fetch from MODEL_ARTIFACT_BUCKET if configured..."
++  if [ -n "${MODEL_ARTIFACT_BUCKET:-}" ]; then
++    # Try to list recent evidence objects
++    echo "Listing recent objects in s3://$MODEL_ARTIFACT_BUCKET/quantum/ (or evidence path)"
++    aws s3 ls "s3://$MODEL_ARTIFACT_BUCKET/" --recursive | tail -n 20 || true
++  fi
++fi
++
++echo "E2E demo job completed. Please share the evidence bundle with legal/security for review."
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/feast/production-values.yaml
++# Production values for Aegis Feast Helm chart (example - customize per environment)
++global:
++  modelArtifactBucket: "your-prod-bucket"
++image:
++  repository: registry.example.com/aegis/feast
++  tag: v1.0.0
++offlineStore:
++  s3:
++    bucket: "your-prod-bucket"
++    prefix: feast/offline
++onlineStore:
++  type: redis
++  redis:
++    # points to redis cluster headless service
++    host: redis-headless.aegis.svc
++    port: 6379
++job:
++  resources:
++    requests:
++      cpu: "1"
++      memory: "2Gi"
++    limits:
++      cpu: "4"
++      memory: "8Gi"
++prometheus:
++  enabled: true
++  serviceMonitor:
++    enabled: true
++    interval: "15s"
++rbac:
++  create: true
++serviceAccount:
++  name: feast-service-account
++
+*** End Patch
+*** Begin Patch
+*** Add File:redis/README_HELM_INSTALL.md
++# Redis Cluster install (Bitnami chart) - Example install commands
++
++# Create namespace
++kubectl create ns aegis || true
++
++# Add bitnami repo if not present
++helm repo add bitnami https://charts.bitnami.com/bitnami
++helm repo update
++
++# Install Redis cluster with production values (ensure redis-creds secret exists)
++helm install redis-cluster bitnami/redis-cluster -n aegis -f redis/redis-cluster-helm-values-production.yaml
++
++# Validate
++kubectl -n aegis get statefulset -l app.kubernetes.io/name=redis-cluster
++
+*** End Patch
+*** Begin Patch
+*** Add File:argo/benchmarks/feast_redis_benchmark.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: aegis-feast-redis-bench-
++  namespace: aegis
++spec:
++  entrypoint: run-bench
++  templates:
++    - name: run-bench
++      steps:
++        - - name: redis-p95
++            template: redis-bench
++        - - name: feast-lookup
++            template: feast-lookup
++
++    - name: redis-bench
++      container:
++        image: python:3.10-slim
++        command: [sh, -c]
++        args:
++          - pip install redis && python3 benchmarks/redis_latency_bench.py --host redis-headless.aegis.svc --port 6379 --duration 30 --qps 200
++
++    - name: feast-lookup
++      container:
++        image: python:3.10-slim
++        command: [sh, -c]
++        args:
++          - pip install redis requests && python3 - <<'PY'
++import redis, time, json
++r=redis.StrictRedis(host='redis-headless.aegis.svc', port=6379, decode_responses=True)
++start=time.time()
++lat=[]
++for i in range(100):
++    t0=time.time()
++    try:
++        r.get('nonexistent:key')
++    except:
++        pass
++    lat.append((time.time()-t0)*1000.0)
++    time.sleep(0.01)
++print(json.dumps({"samples":len(lat),"p95": sorted(lat)[int(len(lat)*0.95)-1] if len(lat)>=20 else max(lat)}))
++PY
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/hsm/vendor_validation_suite.py
++#!/usr/bin/env python3
++"""
++HSM vendor validation suite
++ - Runs healthchecks, repeated sign latency tests, optional rotation test (vendor-specific placeholder)
++ - Produces JSON report and uploads to EVIDENCE_BUCKET if configured
++
++Usage:
++  python3 ops/hsm/vendor_validation_suite.py --runs 10
++"""
++import time, json, os, statistics, argparse
++
++def run_sign_latency_test(runs=10):
++    out=[]
++    for i in range(runs):
++        t0 = time.time()
++        try:
++            from production.policy.signing.sign_with_retry import sign_payload
++            sig, meta = sign_payload(b"validation-payload-"+str(i).encode(), None)
++            ok = bool(sig)
++        except Exception as e:
++            ok = False
++            meta = {"error": str(e)}
++        latency = time.time()-t0
++        out.append({"ok": ok, "latency_s": latency, "meta": meta})
++        time.sleep(0.2)
++    return out
++
++def rotation_placeholder():
++    # Vendor rotation must be implemented per HSM vendor CLI/API.
++    return {"rotation": "skipped", "reason": "vendor CLI not configured in this environment"}
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--runs", type=int, default=10)
++    args = p.parse_args()
++    report = {"start": time.time(), "runs": args.runs}
++    # healthcheck
++    try:
++        import subprocess
++        rc = subprocess.run(["python3","ops/hsm/hsm_healthcheck.py","--json"], capture_output=True, text=True, check=False)
++        report["healthcheck_raw"] = rc.stdout
++    except Exception as e:
++        report["healthcheck_error"] = str(e)
++    # latency tests
++    report["sign_tests"] = run_sign_latency_test(args.runs)
++    # rotation (placeholder)
++    report["rotation"] = rotation_placeholder()
++    report["summary"] = {
++        "ok_rate": sum(1 for r in report["sign_tests"] if r["ok"]) / max(1,args.runs),
++        "p50": statistics.median([r["latency_s"] for r in report["sign_tests"]]),
++        "p95": sorted([r["latency_s"] for r in report["sign_tests"]])[int(args.runs*0.95)-1] if args.runs>=20 else max([r["latency_s"] for r in report["sign_tests"]])
++    }
++    out_path = "/tmp/hsm_vendor_validation_{}.json".format(int(time.time()))
++    with open(out_path,"w") as f:
++        json.dump(report, f, indent=2)
++    print("Wrote report:", out_path)
++    # upload if configured
++    bucket = os.environ.get("EVIDENCE_BUCKET","")
++    if bucket and os.environ.get("AWS_ACCESS_KEY_ID"):
++        import boto3
++        key = "evidence/hsm_validation/{}".format(os.path.basename(out_path))
++        s3=boto3.client("s3")
++        s3.upload_file(out_path, bucket, key)
++        print("Uploaded to s3://%s/%s" % (bucket, key))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/hsm/hsm_validation_workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: aegis-hsm-validation-
++  namespace: aegis
++spec:
++  entrypoint: hsm-validate
++  templates:
++    - name: hsm-validate
++      steps:
++        - - name: run-validation
++            template: validation
++
++    - name: validation
++      container:
++        image: python:3.10-slim
++        command: [sh, -c]
++        args:
++          - pip install boto3 && python3 ops/hsm/vendor_validation_suite.py --runs 20
++
+*** End Patch
+*** Begin Patch
+*** Add File:federation/secure_aggregation_crypten.py
++#!/usr/bin/env python3
++"""
++Secure aggregation adapter using CrypTen when available.
++ - Expects client updates as lists of floats and returns aggregated weights.
++ - If CrypTen is not available, falls back to secure (but plain) aggregation (FedAvg with optional DP).
++Security note: CrypTen usage requires careful multi-party orchestration; this adapter provides a single-process demo/integration point.
++"""
++import os, json
++
++def try_use_crypten(updates):
++    try:
++        import torch, crypten
++        crypten.init()
++        # Convert updates to torch tensors and crypten encrypted tensors
++        t_updates = []
++        for u in updates:
++            import torch
++            t = torch.tensor(u["weights"], dtype=torch.float32)
++            t_updates.append(t)
++        # Simulate secure aggregation in single process: encrypt all tensors, sum and decrypt
++        encs = [crypten.cryptensor(t) for t in t_updates]
++        s = encs[0]
++        for e in encs[1:]:
++            s = s + e
++        out = s.get_plain_text().tolist()
++        return {"weights": out, "method": "crypten_sum"}
++    except Exception as e:
++        return {"error": str(e)}
++
++def secure_aggregate(updates, dp_noise_std=0.0):
++    # Try crypten path first
++    res = try_use_crypten(updates)
++    if res and "weights" in res:
++        return res
++    # fallback to FedAvg
++    total_n = sum(u.get("n",1) for u in updates) or 1
++    length = len(updates[0]["weights"]) if updates else 0
++    agg = [0.0]*length
++    for u in updates:
++        frac = u.get("n",1)/total_n
++        for i,w in enumerate(u["weights"]):
++            agg[i] += w*frac
++    # DP noise
++    if dp_noise_std and dp_noise_std>0:
++        import random
++        agg = [v + random.gauss(0, dp_noise_std) for v in agg]
++    return {"weights": agg, "method": "fedavg_fallback"}
++
+*** End Patch
+*** Begin Patch
+*** Update File:federation/server.py
+@@
+-def fedavg(updates, dp_noise_std=0.0):
+-    # updates: list of {"weights":[...], "n":int}
+-    if not updates:
+-        return None
+-    total_n = sum(u["n"] for u in updates)
+-    length = len(updates[0]["weights"])
+-    agg = [0.0]*length
+-    for u in updates:
+-        w = u["weights"]
+-        frac = u["n"]/total_n
+-        for i in range(length):
+-            agg[i] += w[i]*frac
+-    if dp_noise_std and dp_noise_std>0:
+-        import random, math
+-        for i in range(length):
+-            agg[i] += random.gauss(0, dp_noise_std)
+-    return {"weights": agg, "timestamp": time.time(), "total_n": total_n}
++def fedavg(updates, dp_noise_std=0.0):
++    # updates: list of {"weights":[...], "n":int}
++    if not updates:
++        return None
++    # Attempt to use CrypTen-based secure aggregation adapter if available
++    try:
++        from federation.secure_aggregation_crypten import secure_aggregate
++        res = secure_aggregate(updates, dp_noise_std=dp_noise_std)
++        if res and "weights" in res:
++            res["timestamp"] = time.time()
++            return res
++    except Exception:
++        # fallback to classic fedavg
++        pass
++    total_n = sum(u.get("n",1) for u in updates)
++    length = len(updates[0]["weights"])
++    agg = [0.0]*length
++    for u in updates:
++        w = u["weights"]
++        frac = u.get("n",1)/total_n
++        for i in range(length):
++            agg[i] += w[i]*frac
++    if dp_noise_std and dp_noise_std>0:
++        import random
++        for i in range(length):
++            agg[i] += random.gauss(0, dp_noise_std)
++    return {"weights": agg, "timestamp": time.time(), "total_n": total_n}
+*** End Patch
+*** Begin Patch
+*** Add File:observability/metric_cardinality_cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: metric-cardinality-audit
++  namespace: monitoring
++spec:
++  schedule: "0 * * * *"
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          containers:
++            - name: metric-audit
++              image: python:3.10-slim
++              command: ["bash","-lc"]
++              args:
++                - pip install requests && python3 observability/metric_cardinality_audit.py
++          restartPolicy: OnFailure
++
+*** End Patch
+*** Begin Patch
+*** Add File:observability/prometheus/remote_write_retention_example.yaml
++# Example remote_write with retention & relabeling tuned for cost control
++remote_write:
++- url: "http://thanos-receive.aegis.svc:19291/api/v1/receive"
++  remote_timeout: 30s
++  queue_config:
++    max_samples_per_send: 1000
++    capacity: 2000
++  write_relabel_configs:
++    - source_labels: [request_id]
++      action: drop
++    - source_labels: [user_id]
++      regex: ".*"
++      action: replace
++      replacement: "user_aggregated"
++  # basic_auth example using secret; replace with your secret
++  basic_auth:
++    username: "__token__"
++    password:
++      name: prometheus-remote-write-secret
++      key: token
++
+*** End Patch
+*** Begin Patch
+*** Add File:compliance/erase_and_manifest_runbook.md
++# Erasure runbook (safe staged approach)
++
++1) Run discovery:
++   python3 ops/erasure/discover_backups.py --bucket ${MODEL_ARTIFACT_BUCKET} --out /tmp/backup_inventory.json
++   Review /tmp/backup_inventory.json and confirm prefixes to erase.
++2) Dry-run delete (list only):
++   Use aws s3 ls to confirm object keys to be deleted.
++3) Execute erasure for a small prefix in staging:
++   python3 ops/erasure/erase_and_manifest.py --bucket ${MODEL_ARTIFACT_BUCKET} --prefix "staging/to-delete/" --manifest-out /tmp/erasure_manifest.json
++4) Review manifest and signature; upload manifest to evidence bucket (automated by script).
++5) For production DSR, add all discovered backup/archives prefixes and run erasure one-by-one, uploading manifests and collecting evidence for legal.
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/e2e_and_bench.yml
++name: E2E demo + Bench + HSM validation
++on:
++  workflow_dispatch:
++
++jobs:
++  e2e-demo:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup kubectl & argo
++        run: |
++          sudo apt-get update && sudo apt-get install -y jq
++          curl -sLO https://github.com/argoproj/argo-workflows/releases/download/v3.5.6/argo-linux-amd64.gz
++          gunzip argo-linux-amd64.gz && chmod +x argo-linux-amd64 && sudo mv argo-linux-amd64 /usr/local/bin/argo
++      - name: Run staging demo (requires KUBECONFIG secret set in repo)
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG }}
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++        run: |
++          export KUBECONFIG=/github/workspace/kubeconfig
++          echo "$KUBECONFIG" | base64 --decode > /github/workspace/kubeconfig || true
++          bash scripts/run_staging_e2e_demo.sh
++
++  feast-bench:
++    runs-on: ubuntu-latest
++    needs: e2e-demo
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run Feast & Redis benchmarks (requires cluster)
++        run: |
++          pip install redis boto3
++          python3 benchmarks/redis_latency_bench.py --host redis-headless.aegis.svc --port 6379 --duration 20 --qps 200 || true
++
++  hsm-validate:
++    runs-on: ubuntu-latest
++    needs: [e2e-demo]
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run HSM vendor validation script (dry)
++        run: |
++          python3 ops/hsm/vendor_validation_suite.py --runs 10 || true
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/acceptance_criteria_mitigations.md
++# Acceptance criteria for risk mitigations
++
++1) HSM signing / rotation failures
++ - HSM healthcheck runs every 5 minutes (cronjob) and reports to Prometheus.
++ - Vendor rotation script executed in staging and generated a validation report.
++ - Fallback (cosign) used only when HSM unavailable and recorded in HSM fallback audit logs.
++ - Evidence bundle contains HSM validation report and rotation logs.
++
++2) Over-automation (unsafe rollouts)
++ - Gatekeeper policy blocks any Deployment with label model.risk=high unless annotation aegis/approved=true is present.
++ - Argo manual approval workflow used in demo promotion pipelines; approvals API records audit trails.
++ - Canary rollouts include pause steps requiring either annotation or manual resume.
++
++3) Incomplete erasure coverage
++ - Backup discovery inventory covers all known S3 prefixes and external endpoints.
++ - Erasure run produces signed manifest uploaded to evidence bucket for every erased prefix.
++ - Legal team validated manifest format and manifest signatures in at least one test DSR.
++
++4) Telemetry cost blowup
++ - Prometheus scrapes apply relabeling to drop request_id and aggregate user_id/model_id labels.
++ - Recording rules compute P95 and other aggregates; remote_write sends only relabeled data to Thanos.
++ - Metric cardinality audit job runs hourly and alerts if cardinality > threshold.
++
++5) Legal & compliance
++ - A DPA/BAA draft exists in repository and a first internal review with legal completed.
++ - Evidence bundle creation is automated and uploaded nightly to EVIDENCE_BUCKET.
++
+*** End Patch
+*** End Patch

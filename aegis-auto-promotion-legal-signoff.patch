@@ -1,0 +1,371 @@
+*** Begin Patch
+*** Add File:policies/delegation_matrix.yaml
++actions:
++  deploy_low_risk:
++    description: "Deploy changes with no user-data or financial impact (config bumps, non-critical infra)."
++    automation: "auto"
++    required_evidence:
++      - build_signed
++      - unit_tests
++  deploy_high_risk:
++    description: "Deploy changes that affect model outputs, user-facing behavior, or billing."
++    automation: "human_required"
++    required_evidence:
++      - build_signed
++      - integration_tests
++      - legal_signoff
++  forensic_signoff:
++    description: "Legal signoff on forensic evidence (watermark / chain-of-custody)."
++    automation: "human_required"
++    required_evidence:
++      - attestation_bundle
++      - legal_ticket
++  finance_autoblock:
++    description: "Auto-block tenant for finance reconciliation failures."
++    automation: "auto_with_audit"
++    required_evidence:
++      - reconcile_report
++      - reconciliation_log
++  rollback_production:
++    description: "Automated rollback to a previous stable version after failed canary."
++    automation: "auto_with_audit"
++    required_evidence:
++      - failing_canary_report
++      - attestation_bundle
++
+*** End File
+*** Add File:policies/auto_policy_catalog.yaml
++actions:
++  deploy_low_risk:
++    required_roles: ["automation"]
++    approval: "auto"
++    evidence_requirements:
++      - "build_signed"
++      - "unit_tests"
++  deploy_high_risk:
++    required_roles: ["platform_lead"]
++    approval: "manual"
++    evidence_requirements:
++      - "build_signed"
++      - "integration_tests"
++      - "legal_signoff"
++  finance_autoblock:
++    required_roles: ["finance"]
++    approval: "manual"
++    evidence_requirements:
++      - "reconcile_report"
++  rollback_production:
++    required_roles: ["automation","sre"]
++    approval: "auto_with_audit"
++    evidence_requirements:
++      - "failing_canary_report"
++      - "attestation_bundle"
++
+*** End File
+*** Add File:.github/workflows/auto_merge_policy.yml
++name: PR Policy Auto-Merge
++
++# This workflow runs on pull_request and consults the policy engine to decide whether to auto-merge low-risk PRs.
++# WARNING: Only enable auto-merge for repositories/teams you trust. Uses GITHUB_TOKEN for merge.
++on:
++  pull_request:
++    types: [opened, synchronize, reopened, labeled]
++
++jobs:
++  evaluate_and_maybe_merge:
++    runs-on: ubuntu-latest
++    permissions:
++      contents: write   # required to merge
++      pull-requests: write
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Gather context
++        id: ctx
++        run: |
++          echo "::set-output name=pr_number::${{ github.event.pull_request.number }}"
++          echo "::set-output name=actor::${{ github.actor }}"
++          echo "::set-output name=repo::${{ github.repository }}"
++
++      - name: Query policy engine
++        id: policy
++        env:
++          POLICY_ENGINE_URL: ${{ secrets.POLICY_ENGINE_URL }} # e.g., https://policy.example.internal/evaluate
++        run: |
++          ACTION=$(jq -r .pull_request.title <<< '${{ toJson(github.event) }}' | awk '{print tolower($0)}')
++          # Heuristic: if title contains "canary" treat as deploy_low_risk else deploy_high_risk
++          if echo "${{ github.event.pull_request.title }}" | grep -qiE 'canary|bump|chore|docs|typo'; then
++            ACTION_KEY="deploy_low_risk"
++          else
++            ACTION_KEY="deploy_high_risk"
++          fi
++          PAYLOAD="{\"action\":\"${ACTION_KEY}\",\"actor\":\"${{ github.actor }}\"}"
++          echo "Policy payload: $PAYLOAD"
++          RESP=$(curl -sSf -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "${POLICY_ENGINE_URL}")
++          echo "::set-output name=resp::$RESP"
++      - name: Decide & Merge
++        env:
++          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: |
++          RESP='${{ steps.policy.outputs.resp }}'
++          echo "Policy response: $RESP"
++          ALLOW=$(echo "$RESP" | jq -r .allow)
++          APPROVAL=$(echo "$RESP" | jq -r .policy.approval)
++          PR_NUM=${{ steps.ctx.outputs.pr_number }}
++          if [ "$ALLOW" = "true" ] && [ "$APPROVAL" = "auto" ]; then
++            echo "Auto-merge permitted by policy. Merging PR $PR_NUM"
++            curl -sSf -X PUT -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" \
++              "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUM/merge" \
++              -d '{"merge_method":"squash"}'
++          else
++            echo "PR requires manual approval. Labeling PR."
++            curl -sSf -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" \
++              "https://api.github.com/repos/${{ github.repository }}/issues/$PR_NUM/labels" \
++              -d '{"labels":["requires-approval"]}'
++            curl -sSf -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" \
++              "https://api.github.com/repos/${{ github.repository }}/issues/$PR_NUM/comments" \
++              -d "{\"body\":\"This PR requires manual approval per policy (approval=${APPROVAL}). Please follow the review process.\"}"
++          fi
++
+*** End File
+*** Add File:services/legal/webhook_receiver.py
++#!/usr/bin/env python3
++"""
++Legal signoff webhook receiver.
++
++Endpoints:
++ - POST /legal/callback
++    Payload: { "artifact_id": "<id>", "signed_by": "<legal_name>", "notes": "<optional>" }
++    Behavior: verifies payload, writes signoff metadata to Vault (if configured), creates signed manifest with cosign,
++              uploads manifest+sig to EVIDENCE_BUCKET, and returns success.
++
++Environment:
++ - COSIGN_KEY_REF: KMS reference used by cosign to sign the manifest
++ - EVIDENCE_BUCKET: s3://bucket or gs://bucket
++ - VAULT_SIGNOFF_PATH: optional, path to write signoff JSON via `vault` CLI (e.g., secret/data/aegis/legal_signoffs)
++ - ALLOW_INSECURE: if "true" will accept unsigned or unauthenticated callbacks (NOT recommended)
++"""
++import os
++import json
++import tempfile
++import subprocess
++from flask import Flask, request, jsonify
++
++app = Flask(__name__)
++
++COSIGN_KEY_REF = os.environ.get("COSIGN_KEY_REF", "")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++VAULT_SIGNOFF_PATH = os.environ.get("VAULT_SIGNOFF_PATH", "")
++ALLOW_INSECURE = os.environ.get("ALLOW_INSECURE", "false").lower() == "true"
++
++def write_vault_record(artifact_id, meta):
++    if not VAULT_SIGNOFF_PATH:
++        return False
++    try:
++        # Vault CLI: vault kv put <path> artifact=<artifact_id> metadata='<json>'
++        subprocess.check_call(["vault", "kv", "put", VAULT_SIGNOFF_PATH, f"artifact={artifact_id}", f"metadata={json.dumps(meta)}"])
++        return True
++    except Exception as e:
++        app.logger.warning("Vault write failed: %s", e)
++        return False
++
++def cosign_sign(path):
++    if not COSIGN_KEY_REF:
++        raise RuntimeError("COSIGN_KEY_REF not configured")
++    subprocess.check_call(["cosign", "sign", "--key", COSIGN_KEY_REF, path])
++    return path + ".sig"
++
++def upload_to_evidence(path):
++    if not EVIDENCE_BUCKET:
++        raise RuntimeError("EVIDENCE_BUCKET not configured")
++    if EVIDENCE_BUCKET.startswith("s3://"):
++        subprocess.check_call(["aws", "s3", "cp", path, f"{EVIDENCE_BUCKET}/{os.path.basename(path)}"])
++        return f"{EVIDENCE_BUCKET}/{os.path.basename(path)}"
++    elif EVIDENCE_BUCKET.startswith("gs://"):
++        subprocess.check_call(["gsutil", "cp", path, f"{EVIDENCE_BUCKET}/{os.path.basename(path)}"])
++        return f"{EVIDENCE_BUCKET}/{os.path.basename(path)}"
++    else:
++        raise RuntimeError("Unsupported EVIDENCE_BUCKET scheme")
++
++@app.route("/legal/callback", methods=["POST"])
++def legal_callback():
++    payload = request.get_json(force=True)
++    artifact_id = payload.get("artifact_id")
++    signer = payload.get("signed_by")
++    notes = payload.get("notes", "")
++    if not artifact_id or not signer:
++        return jsonify({"error":"artifact_id and signed_by required"}), 400
++
++    manifest = {
++        "artifact_id": artifact_id,
++        "signed_by": signer,
++        "notes": notes,
++        "ts": __import__("time").time()
++    }
++    tmp = tempfile.mkdtemp()
++    path = os.path.join(tmp, f"legal_signoff_{artifact_id}.json")
++    with open(path, "w") as f:
++        json.dump(manifest, f, indent=2)
++
++    # sign manifest
++    try:
++        sig = None
++        if COSIGN_KEY_REF:
++            cosign_sign(path)
++            sig = path + ".sig"
++    except Exception as e:
++        app.logger.error("cosign sign failed: %s", e)
++        return jsonify({"error":"sign failed", "detail":str(e)}), 500
++
++    # upload manifest (and sig) to evidence
++    try:
++        uploaded = upload_to_evidence(path)
++        if sig:
++            upload_to_evidence(sig)
++    except Exception as e:
++        app.logger.error("upload failed: %s", e)
++        return jsonify({"error":"upload failed", "detail":str(e)}), 500
++
++    recorded = write_vault_record(artifact_id, {"manifest": uploaded, "signed_by": signer, "ts": manifest["ts"]})
++    return jsonify({"ok": True, "uploaded": uploaded, "signed": bool(sig), "vault_recorded": recorded})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=8088)
++
+*** End File
+*** Add File:ops/attestation/reproducibility_check.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Attestation reproducibility check:
++# - Given an artifact id and a rebuild command (CI replay), run the replay build,
++# - verify cosign signature for produced artifact, and compare digest with stored bundle.
++#
++# Usage:
++#  ops/attestation/reproducibility_check.sh --artifact-uri s3://bucket/attestation-123.tar.gz --rebuild-cmd "./ci/rebuild.sh"
++#
++ARTIFACT_URI=""
++REBUILD_CMD=""
++TMPDIR=$(mktemp -d)
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --artifact-uri) ARTIFACT_URI="$2"; shift 2;;
++    --rebuild-cmd) REBUILD_CMD="$2"; shift 2;;
++    *) echo "Unknown $1"; exit 2;;
++  esac
++done
++
++if [ -z "$ARTIFACT_URI" ] || [ -z "$REBUILD_CMD" ]; then
++  echo "Usage: $0 --artifact-uri <s3://...|gs://...> --rebuild-cmd '<cmd>'"
++  exit 2
++fi
++
++echo "Downloading artifact $ARTIFACT_URI to $TMPDIR"
++if [[ "$ARTIFACT_URI" == s3://* ]]; then
++  aws s3 cp "$ARTIFACT_URI" "$TMPDIR/art.tar.gz"
++elif [[ "$ARTIFACT_URI" == gs://* ]]; then
++  gsutil cp "$ARTIFACT_URI" "$TMPDIR/art.tar.gz"
++else
++  curl -sSfL "$ARTIFACT_URI" -o "$TMPDIR/art.tar.gz"
++fi
++
++echo "Verifying cosign signature if present (requires COSIGN_KEY_REF or pubkey)"
++if command -v cosign >/dev/null 2>&1; then
++  echo "Attempting cosign verify (best effort) - if key ref available"
++  set +e
++  cosign verify "$TMPDIR/art.tar.gz" >/dev/null 2>&1 || true
++  set -e
++else
++  echo "cosign not in PATH; skipping verify"
++fi
++
++echo "Running rebuild command (replay)"
++# run rebuild in a subdir
++pushd "$TMPDIR" >/dev/null
++# NOTE: rebuild command should produce an attestation or artifact in same format
++eval "$REBUILD_CMD"
++popd >/dev/null
++
++echo "Compare artifacts (digest) - operator must adapt to your rebuild outputs"
++# Example: compute sha256 for original vs rebuilt artifact if rebuilt produced art_rebuilt.tar.gz
++if [ -f "$TMPDIR/art.tar.gz" ] && [ -f "$TMPDIR/art_rebuilt.tar.gz" ]; then
++  sha1=$(sha256sum "$TMPDIR/art.tar.gz" | awk '{print $1}')
++  sha2=$(sha256sum "$TMPDIR/art_rebuilt.tar.gz" | awk '{print $1}')
++  echo "original: $sha1"
++  echo "rebuilt : $sha2"
++  if [ "$sha1" = "$sha2" ]; then
++    echo "REPRODUCIBLE: digests match"
++    exit 0
++  else
++    echo "NOT REPRODUCIBLE: digests differ"
++    exit 3
++  fi
++else
++  echo "Rebuilt artifact not found; please adapt rebuild command to produce art_rebuilt.tar.gz"
++  exit 4
++fi
++
+*** End File
+*** Add File:tests/attestation/test_reproducibility.py
++import os
++import subprocess
++import pytest
++
++REPRO_CMD = os.environ.get("REPRO_CMD", "./ops/attestation/reproducibility_check.sh")
++ART_URI = os.environ.get("ARTIFACT_URI", "")
++
++def test_reproducibility_invocation():
++    if not ART_URI:
++        pytest.skip("ARTIFACT_URI not configured (set env var ARTIFACT_URI to run)")
++    cmd = [REPRO_CMD, "--artifact-uri", ART_URI, "--rebuild-cmd", "./ci/rebuild.sh"]
++    ret = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
++    print(ret.stdout)
++    print(ret.stderr)
++    assert ret.returncode == 0, "Reproducibility check failed (non-zero exit)"
++
+*** End File
+*** Add File:docs/runbooks/auto_promotion_runbook.md
++````markdown name=docs/runbooks/auto_promotion_runbook.md
++# Auto-Promotion Runbook (Operator-facing)
++
++Purpose
++- Describe the safe auto-promotion flow for low-risk changes and the safeguards for high-risk changes.
++
++Pre-requisites
++- Policy engine reachable at POLICY_ENGINE_URL and seeded with the delegation_matrix/auto_policy_catalog.yaml
++- COSIGN_KEY_REF and EVIDENCE_BUCKET configured
++- GitHub repo configured with the auto-merge GH Action (.github/workflows/auto_merge_policy.yml)
++- Vault path for signoffs (optional)
++
++Flow (high-level)
++1. Developer creates PR (Advisor agent may create generated PR)
++2. PR Action runs:
++   - Policy engine evaluated; if "auto" approval and role checks pass, the action will merge the PR automatically.
++   - Otherwise, PR is labeled `requires-approval` and human reviewer must approve/merge.
++3. On merge for a canary-enabled deployment:
++   - Canary controller applies canary (GitOps or manifest update).
++   - Acceptance tests run (automated). If pass, promotion occurs per policy.
++   - If canary fails, automatic rollback is created and attestation evidence is generated and uploaded.
++4. Legal signoff:
++   - If the policy requires legal_signoff, the auto_signoff_controller or webhook_receiver is used to create a ticket for legal.
++   - Legal must record signoff (close/COMMENT with "SIGNED") or post to LEGAL_WEBHOOK. On signoff, Aegis will cosign a signoff manifest and upload to evidence bucket.
++
++Operator checks before enabling auto-mode
++- Confirm policy rules are conservative: only low-risk actions set to "auto".
++- Run 100 dry-run promotions in staging and confirm rollback and attestation behaviors.
++- Ensure WORM bucket and cosign signing verify cleanly (cosign verify).
++- Confirm that vault kill-switch is set and tested.
++
++Emergency (kill-switch)
++- To disable all automation: vault kv put secret/aegis/kill_switch value=on
++- Verify automation aborts by attempting a known low-risk auto flow and ensuring it stops.
++
++Audit
++- Attestation bundles, signoff manifests and evidence uploads must be verifiable via cosign and stored in WORM bucket.
++- Use ops/attestation/reproducibility_check.sh to validate rebuilds and store results.
++````
++
+*** End File
+*** End Patch

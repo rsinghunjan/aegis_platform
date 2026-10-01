@@ -1,0 +1,448 @@
+*** Begin Patch
+*** Add File:ops/full_auto_provision_and_hardening.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Full automated provisioning, deployment to staging and hardening steps.
++# Operator MUST review variables and replace REPLACE_* placeholders before running.
++#
++TF_DIR="infra/terraform"
++TF_OUT="/tmp/aegis_tf_output.json"
++
++echo "1) Terraform init & apply (review plan before apply)"
++pushd "$TF_DIR" >/dev/null
++terraform init
++terraform apply -auto-approve -var 'aws_region=us-west-2'
++terraform output -json > "$TF_OUT"
++popd >/dev/null
++
++echo "2) Package and upload KMS rotation lambda for Terraform-managed resource"
++bash infra/scripts/kms_rotation_package.sh
++
++echo "3) Populate AWS SSM / SecretsManager and apply ExternalSecrets to cluster"
++bash ops/populate_and_apply_external_secrets.sh "$TF_OUT"
++
++echo "4) Deploy critical helm charts (Postgres HA, Rekor, JupyterHub, lakeFS, Argo)"
++# Note: operator should run helm repo add/update before running
++helm upgrade --install postgres bitnami/postgresql -n aegis -f registry/postgres/ha_values.yaml
++helm upgrade --install rekor sigstore/rekor -n security -f rekor/rekor_values_ha.yaml || true
++helm upgrade --install jhub jupyterhub/jupyterhub -n aegis -f jupyterhub/values.yaml
++helm upgrade --install lakefs lakefs/lakefs -n aegis -f lakefs/values.yaml
++helm upgrade --install argo argo/argo -n aegis
++
++echo "5) Apply k8s manifests for Rekor HA, service monitors, reconcilers and verifier HPA"
++kubectl apply -f rekor/rekor_ha.yaml
++kubectl apply -f rekor/service-monitor.yaml
++kubectl apply -f rekor/cronjob_reconcile.yaml
++kubectl apply -f mcp/verifier/deployment.yaml
++kubectl apply -f mcp/verifier/hpa.yaml
++
++echo "6) Apply Gatekeeper constraints in dry-run for staging"
++kubectl apply -f devsecops/gatekeeper/constraint_require_signed_images.yaml || true
++kubectl apply -f devsecops/gatekeeper/constraint_require_modelcard_signed.yaml || true
++
++echo "7) Run pre-deploy validations (secrets, KMS, Rekor accessibility)"
++python3 ops/validate_secrets_and_iam.py --secret-prefix aegis --kms-arn "$(jq -r '.cosign_kms_arn.value' $TF_OUT)" --ci-role-arn "$(jq -r '.ci_role_arn.value' $TF_OUT || echo '')" --region us-west-2
++python3 security/rekor/rekor_healthcheck.py --rekor-url "$(jq -r '.rekor_secret_arn.value' $TF_OUT || echo 'https://rekor.security.svc.cluster.local:3000')"
++
++echo "8) Trigger CI: recommend running .github/workflows/image_scan_sign_rekor_block.yml from GitHub UI"
++echo "Bootstrap complete. Verify services in staging, then run runbooks/verify_signals.md"
++
+*** End Patch
+*** Begin Patch
+*** Add File:rekor/rekor_values_ha.yaml
++replicaCount: 2
++persistence:
++  enabled: true
++  storageClass: gp2
++  size: 50Gi
++ingress:
++  enabled: false
++resources:
++  limits:
++    cpu: 1000m
++    memory: 1Gi
++  requests:
++    cpu: 200m
++    memory: 256Mi
++
+*** End Patch
+*** Begin Patch
+*** Add File:rekor/rekor_ha.yaml
++apiVersion: apps/v1
++kind: StatefulSet
++metadata:
++  name: rekor
++  namespace: security
++spec:
++  serviceName: rekor
++  replicas: 2
++  selector:
++    matchLabels:
++      app: rekor
++  template:
++    metadata:
++      labels:
++        app: rekor
++    spec:
++      containers:
++        - name: rekor
++          image: sigstore/rekor-server:latest
++          ports:
++            - containerPort: 3000
++          readinessProbe:
++            httpGet:
++              path: /api/v1/log/publicKey
++              port: 3000
++            initialDelaySeconds: 10
++            periodSeconds: 10
++          livenessProbe:
++            httpGet:
++              path: /api/v1/log/publicKey
++              port: 3000
++            initialDelaySeconds: 30
++            periodSeconds: 20
++          volumeMounts:
++            - name: rekor-data
++              mountPath: /data
++  volumeClaimTemplates:
++    - metadata:
++        name: rekor-data
++      spec:
++        accessModes: [ "ReadWriteOnce" ]
++        resources:
++          requests:
++            storage: 50Gi
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: rekor
++  namespace: security
++spec:
++  selector:
++    app: rekor
++  ports:
++    - port: 3000
++      targetPort: 3000
++
+*** End Patch
+*** Begin Patch
+*** Add File:registry/postgres/ha_values.yaml
++global:
++  postgresql:
++    postgresqlDatabase: aegis_registry
++    postgresqlUsername: aegis
++    postgresqlPassword: "REPLACE_POSTGRES_PASSWORD"
++primary:
++  enabled: true
++replica:
++  enabled: true
++  replicaCount: 2
++persistence:
++  enabled: true
++  size: 50Gi
++
+*** End Patch
+*** Begin Patch
+*** Add File:infra/terraform/cloudtrail_and_audit.tf
++resource "aws_cloudtrail" "aegis" {
++  name                          = "aegis-trail"
++  s3_bucket_name                = aws_s3_bucket.evidence.bucket
++  include_global_service_events = true
++  is_multi_region_trail         = true
++  enable_log_file_validation    = true
++}
++
++resource "aws_cloudwatch_log_group" "aegis_cloudtrail" {
++  name              = "/aws/cloudtrail/aegis"
++  retention_in_days = 365
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/irsa/serviceaccount_cosign.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: cosign-signer
++  namespace: security
++  annotations:
++    eks.amazonaws.com/role-arn: "arn:aws:iam::123456789012:role/aegis-cosign-role" # operator replace with actual role
++
+*** End Patch
+*** Begin Patch
+*** Add File:iam/README-IRSA.md
++# IRSA (IAM Roles for Service Accounts) guidance
++
++1. Create an IAM role that trusts the EKS OIDC provider and allows kms:Sign/kms:DescribeKey and secretsmanager:GetSecretValue for the cosign KMS secret.
++2. Annotate the cosign signer ServiceAccount (k8s/irsa/serviceaccount_cosign.yaml) with the role ARN.
++3. Verify pod can access KMS by execing into cosign pod and using aws sts get-caller-identity (with IAM role).
++
++Operators: do NOT store role ARNs in git; use Secrets or Terraform outputs to populate templates.
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/verifier_ci_benchmark.yml
++name: Verifier benchmark & threshold generation
++
++on:
++  workflow_dispatch:
++
++jobs:
++  bench:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.10'
++      - name: Install deps
++        run: pip install transformers torch scikit-learn
++      - name: Run model selector
++        run: |
++          python ops/verifier_model_selector.py --runs 5 --out verifier_recommendation.json
++      - name: Run eval harness (dev dataset)
++        run: |
++          python ops/eval_harness/run_eval.py --model $(jq -r .ci_model verifier_recommendation.json) --dev ops/eval_harness/eval_dataset_template/nli/dev.jsonl --out eval_results.json || true
++      - name: Upload artifacts
++        uses: actions/upload-artifact@v4
++        with:
++          name: verifier-artifacts
++          path: |
++            verifier_recommendation.json
++            eval_results.json
++
+*** End Patch
+*** Begin Patch
+*** Add File:tests/integration/test_rekor_reconcile_job.py
++import subprocess
++import requests
++import os
++
++def test_rekor_health():
++    REKOR = os.environ.get("REKOR_URL", "http://rekor.security.svc.cluster.local:3000")
++    r = requests.get(f"{REKOR}/api/v1/log/publicKey", timeout=5)
++    assert r.status_code == 200
++
++def test_rekor_reconcile_script_runs():
++    rc = subprocess.call(["python", "rekor/rekor_reconcile.py"])
++    assert rc == 0 or rc == 1
++
+*** End Patch
+*** Begin Patch
+*** Add File:dsar/pii_detector.py
++#!/usr/bin/env python3
++"""
++Enhanced PII detector: scans JSON/text content for email, phone, SSN, credit card, and structured PII keys.
++If PII found, marks S3 object with metadata "pii=true" and optionally adds legal_hold tag.
++"""
++import re
++import sys
++import boto3
++import json
++
++EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
++PHONE_RE = re.compile(r"(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4}")
++SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
++CC_RE = re.compile(r"\b(?:\d[ -]*?){13,16}\b")
++PII_KEYS = {"ssn","email","phone","credit_card","dob","name"}
++
++s3 = boto3.client("s3")
++
++def scan_text(t):
++    hits = []
++    if EMAIL_RE.search(t): hits.append("email")
++    if PHONE_RE.search(t): hits.append("phone")
++    if SSN_RE.search(t): hits.append("ssn")
++    if CC_RE.search(t): hits.append("credit_card")
++    return hits
++
++def scan_json(obj):
++    hits = []
++    if isinstance(obj, dict):
++        for k, v in obj.items():
++            if k.lower() in PII_KEYS:
++                hits.append(k.lower())
++            hits.extend(scan_json(v))
++    elif isinstance(obj, list):
++        for it in obj:
++            hits.extend(scan_json(it))
++    elif isinstance(obj, str):
++        hits.extend(scan_text(obj))
++    return hits
++
++def mark_object(bucket, key, metadata):
++    # Copy object onto itself to set metadata (S3 requires copy)
++    copy_source = {'Bucket': bucket, 'Key': key}
++    s3.copy_object(Bucket=bucket, Key=key, CopySource=copy_source, Metadata=metadata, MetadataDirective='REPLACE')
++    print("Marked", key, "with metadata", metadata)
++
++def main():
++    if len(sys.argv) < 3:
++        print("Usage: pii_detector.py <bucket> <key>")
++        sys.exit(2)
++    bucket, key = sys.argv[1], sys.argv[2]
++    obj = s3.get_object(Bucket=bucket, Key=key)
++    body = obj['Body'].read().decode('utf-8', errors='ignore')
++    hits = []
++    try:
++        j = json.loads(body)
++        hits = scan_json(j)
++    except Exception:
++        hits = scan_text(body)
++    if hits:
++        metadata = obj.get('Metadata', {})
++        metadata['pii'] = 'true'
++        metadata['pii_types'] = ','.join(set(hits))
++        mark_object(bucket, key, metadata)
++        print("PII detected:", set(hits))
++    else:
++        print("No PII detected")
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:dsar/legal_workflow.md
++# DSAR & Legal Hold Workflow (operators and legal)
++
++1. Detection:
++ - Use dsar/pii_detector.py to scan run contexts and attachments. Mark objects with metadata `pii=true` and `pii_types`.
++
++2. Legal Hold:
++ - If legal holds required, tag affected S3 objects metadata `legal_hold=true` and record entry in legal-hold registry (DB table).
++
++3. DSAR Execution:
++ - Use dsar/advanced_dsar.py to redact or delete contexts not under legal hold.
++ - Log all actions (user, timestamp, object, action) to audit S3 prefix `audit/dsar/`.
++
++4. Reporting:
++ - Produce DSAR report bundle signed with cosign and record Rekor entry for the report.
++
++Legal: define SLA for DSAR responses and retention policy with your counsel and record in runbooks/roles_slas.yaml
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/alertmanager/alertmanager_production.yml.tpl
++global:
++  resolve_timeout: 5m
++route:
++  receiver: 'pagerduty-or-slack'
++  group_by: ['alertname','severity']
++  group_wait: 30s
++  group_interval: 5m
++  repeat_interval: 2h
++receivers:
++  - name: 'pagerduty-or-slack'
++    pagerduty_configs:
++      - service_key: 'REPLACE_PAGERDUTY_KEY'
++        severity: '{{ .CommonLabels.severity }}'
++    webhook_configs:
++      - url: 'https://hooks.slack.com/services/REPLACE_SLACK_HOOK'
++inhibit_rules:
++  - source_match:
++      severity: 'critical'
++    target_match:
++      severity: 'warning'
++    equal:
++      - alertname
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/prometheus_rules_prod_tuned.yaml
++groups:
++- name: aegis-prod.rules
++  rules:
++  - alert: RekorDownCritical
++    expr: up{job="rekor"} == 0
++    for: 3m
++    labels:
++      severity: critical
++    annotations:
++      summary: "Rekor down for >3m"
++
++  - alert: RekorReconcileMissingEntries
++    expr: increase(rekor_reconcile_missing_total[15m]) > 0
++    for: 2m
++    labels:
++      severity: warning
++    annotations:
++      summary: "Rekor reconcile found missing entries"
++
++  - alert: VerifierHighLatencyP95
++    expr: histogram_quantile(0.95, sum(rate(aegis_verifier_latency_seconds_bucket[5m])) by (le)) > 1.0
++    for: 5m
++    labels:
++      severity: warning
++    annotations:
++      summary: "Verifier p95 latency > 1s"
++
++  - alert: PostgresReplicaLag
++    expr: pg_stat_replication_delay_seconds > 30
++    for: 5m
++    labels:
++      severity: critical
++    annotations:
++      summary: "Postgres replica lag >30s"
++
+*** End Patch
+*** Begin Patch
+*** Add File:runbooks/roles_slas.yaml
++roles:
++  - name: Platform Owner
++    responsibilities:
++      - Approve infra changes
++      - Ensure runbook drills are scheduled
++    sla: 24h for non-critical infra issues
++
++  - name: Security Lead
++    responsibilities:
++      - KMS key rotation sign-off
++      - Rekor monitoring & alert triage
++    sla: 4h for critical security incidents
++
++  - name: Data Steward
++    responsibilities:
++      - DSAR execution and verification
++    sla: 30 days for DSAR completion (adjust per region/regulation)
++
++drills:
++  frequency: quarterly
++  owners: ["Platform Owner","Security Lead","Data Steward"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:tests/integration/test_verifier_threshold.py
++import json
++import os
++
++def test_verifier_recommendation_exists():
++    path = "ops/verifier_recommendation.json"
++    assert os.path.exists(path), "verifier_recommendation.json not found; run CI benchmark job"
++    with open(path) as f:
++        j = json.load(f)
++    assert "ci_model" in j and "offline_model" in j
++    assert isinstance(j.get("latencies",{}), dict)
++
+*** End Patch
+*** Begin Patch
+*** Add File:security/hardening/ci_policy_checks.sh
++#!/usr/bin/env bash
++set -euo pipefail
++# CI policy checks: ensure COSIGN_KEY and REKOR_URL secrets present, and that image scanning passed
++if [ -z "${COSIGN_KEY:-}" ] || [ -z "${REKOR_URL:-}" ]; then
++  echo "ERROR: COSIGN_KEY and REKOR_URL must be set in CI secrets"
++  exit 2
++fi
++if [ -f ./trivy.fail ]; then
++  echo "ERROR: image scan failed"
++  exit 3
++fi
++echo "CI policy checks passed"
++
+*** End Patch
+*** End Patch

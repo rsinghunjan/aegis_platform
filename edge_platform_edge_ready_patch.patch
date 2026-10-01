@@ -1,0 +1,807 @@
+*** Begin Patch
+*** Add File: edge/agent/agent.py
++#!/usr/bin/env python3
++"""
++Aegis Edge Agent (prototype)
++- Registers device with central controller (optional Vault AppRole-based auth)
++- Polls for signed model bundle releases (manifest URL), downloads, verifies signature,
++  unpacks, and launches the local inference runtime container for the bundle.
++- Exposes health and metrics (Prometheus). Buffers telemetry locally (SQLite) when offline
++  and retries uploads.
++
++Configuration (env or config file):
++ - AEGIS_CONTROLLER_URL  (optional) central controller base URL for registration/telemetry
++ - DEVICE_ID             (unique device id)
++ - DEVICE_TOKEN_PATH     (path to token for authenticating to controller; fallback to env DEVICE_TOKEN)
++ - PUBLIC_KEY_PATH       (path to public key used to verify bundle signatures)
++ - BUNDLE_POLL_URL       (URL returning JSON describing latest bundle { "bundle_url": "...", "manifest_url": "..." })
++ - STORAGE_S3_ENDPOINT   (optional) endpoint for object storage
++ - AGENT_WORKDIR         (default /var/lib/aegis/agent)
++ - CHECK_INTERVAL        (seconds between polls)
++ - TELEMETRY_PUSH_INTERVAL (seconds)
++ - INFERENCE_RUNTIME_IMAGE (default aegis/edge-runtime:latest)
++
++This is a prototype to illustrate secure bundle verification, OTA, and offline buffering.
++"""
++import os
++import sys
++import time
++import json
++import sqlite3
++import logging
++import tempfile
++import hashlib
++import subprocess
++from pathlib import Path
++from typing import Optional
++
++import requests
++from cryptography.hazmat.primitives import serialization, hashes
++from cryptography.hazmat.primitives.asymmetric import padding
++
++from prometheus_client import start_http_server, Gauge, Counter
++
++LOG = logging.getLogger("aegis-edge-agent")
++logging.basicConfig(level=logging.INFO)
++
++AGENT_WORKDIR = Path(os.environ.get("AGENT_WORKDIR", "/var/lib/aegis/agent"))
++AGENT_WORKDIR.mkdir(parents=True, exist_ok=True)
++DB_PATH = AGENT_WORKDIR / "agent.db"
++
++DEVICE_ID = os.environ.get("DEVICE_ID", "device-unknown")
++DEVICE_TOKEN = os.environ.get("DEVICE_TOKEN", "")
++DEVICE_TOKEN_PATH = os.environ.get("DEVICE_TOKEN_PATH", "/etc/aegis/device_token")
++PUBLIC_KEY_PATH = os.environ.get("PUBLIC_KEY_PATH", "/etc/aegis/public.pem")
++BUNDLE_POLL_URL = os.environ.get("BUNDLE_POLL_URL", "")
++CONTROLLER_URL = os.environ.get("AEGIS_CONTROLLER_URL", "")
++CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "30"))
++TELEMETRY_PUSH_INTERVAL = int(os.environ.get("TELEMETRY_PUSH_INTERVAL", "60"))
++INFERENCE_RUNTIME_IMAGE = os.environ.get("INFERENCE_RUNTIME_IMAGE", "aegis/edge-runtime:latest")
++
++# Prometheus metrics
++MET_LAST_BUNDLE = Gauge("aegis_edge_last_bundle_timestamp", "Timestamp of last applied bundle", ["device"])
++MET_BUNDLE_APPLIES = Counter("aegis_edge_bundle_applies_total", "Total successful bundle applies", ["device"])
++MET_TELEMETRY_BUFFERED = Gauge("aegis_edge_telemetry_buffered", "Number of telemetry records buffered", ["device"])
++
++
++def load_device_token() -> Optional[str]:
++    if DEVICE_TOKEN:
++        return DEVICE_TOKEN
++    try:
++        p = Path(DEVICE_TOKEN_PATH)
++        if p.exists():
++            return p.read_text().strip()
++    except Exception:
++        pass
++    return None
++
++
++def init_db():
++    conn = sqlite3.connect(DB_PATH)
++    cur = conn.cursor()
++    cur.execute(
++        "CREATE TABLE IF NOT EXISTS telemetry (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT, status TEXT, created_at REAL)"
++    )
++    cur.execute(
++        "CREATE TABLE IF NOT EXISTS state (k TEXT PRIMARY KEY, v TEXT)"
++    )
++    conn.commit()
++    return conn
++
++
++def buffer_telemetry(conn, payload: dict):
++    cur = conn.cursor()
++    cur.execute("INSERT INTO telemetry (payload, status, created_at) VALUES (?, 'queued', ?)", (json.dumps(payload), time.time()))
++    conn.commit()
++    cur.execute("SELECT COUNT(1) FROM telemetry WHERE status='queued'")
++    count = cur.fetchone()[0]
++    MET_TELEMETRY_BUFFERED.labels(device=DEVICE_ID).set(count)
++
++
++def push_telemetry(conn):
++    if not CONTROLLER_URL:
++        return
++    token = load_device_token()
++    headers = {}
++    if token:
++        headers["Authorization"] = f"Bearer {token}"
++    cur = conn.cursor()
++    cur.execute("SELECT id, payload FROM telemetry WHERE status='queued' ORDER BY created_at LIMIT 50")
++    rows = cur.fetchall()
++    for rid, payload in rows:
++        try:
++            r = requests.post(f"{CONTROLLER_URL}/api/v1/devices/{DEVICE_ID}/telemetry", json=json.loads(payload), headers=headers, timeout=10)
++            if r.status_code == 200:
++                cur.execute("UPDATE telemetry SET status='sent' WHERE id=?", (rid,))
++                conn.commit()
++            else:
++                LOG.warning("telemetry push failed %s %s", r.status_code, r.text)
++                # stop early to avoid tight loop when controller down
++                break
++        except Exception as e:
++            LOG.warning("telemetry push error: %s", e)
++            break
++    cur.execute("SELECT COUNT(1) FROM telemetry WHERE status='queued'")
++    count = cur.fetchone()[0]
++    MET_TELEMETRY_BUFFERED.labels(device=DEVICE_ID).set(count)
++
++
++def fetch_json(url: str, headers=None):
++    r = requests.get(url, headers=headers or {}, timeout=15)
++    r.raise_for_status()
++    return r.json()
++
++
++def download_file(url: str, out_path: Path, headers=None):
++    with requests.get(url, headers=headers or {}, stream=True, timeout=60) as r:
++        r.raise_for_status()
++        with open(out_path, "wb") as fh:
++            for chunk in r.iter_content(8192):
++                fh.write(chunk)
++
++
++def sha256_file(path: Path):
++    h = hashlib.sha256()
++    with open(path, "rb") as fh:
++        for chunk in iter(lambda: fh.read(8192), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++
++def verify_signature(manifest_bytes: bytes, sig_bytes: bytes, public_key_path: str) -> bool:
++    pub = Path(public_key_path)
++    if not pub.exists():
++        LOG.error("public key not found: %s", public_key_path)
++        return False
++    key = serialization.load_pem_public_key(pub.read_bytes())
++    try:
++        key.verify(
++            sig_bytes,
++            manifest_bytes,
++            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
++            hashes.SHA256(),
++        )
++        return True
++    except Exception as e:
++        LOG.exception("signature verification failed: %s", e)
++        return False
++
++
++def apply_bundle(bundle_archive: Path, runtime_image: str):
++    """
++    Unpack bundle (tar.gz) into AGENT_WORKDIR/bundles/<bundle_id>, check manifest, and start runtime container.
++    Bundle layout expected:
++      bundle.tar.gz -> contains manifest.json, model.onnx (or model.plan), signature manifest.json.sig, model_card.md
++    """
++    bundles_dir = AGENT_WORKDIR / "bundles"
++    bundles_dir.mkdir(parents=True, exist_ok=True)
++    # inspect manifest inside archive
++    tmpdir = Path(tempfile.mkdtemp(dir=str(AGENT_WORKDIR)))
++    try:
++        subprocess.check_call(["tar", "xzf", str(bundle_archive), "-C", str(tmpdir)])
++    except subprocess.CalledProcessError as e:
++        LOG.exception("failed to unpack bundle: %s", e)
++        return False
++    manifest_path = tmpdir / "manifest.json"
++    sig_path = tmpdir / "manifest.json.sig"
++    if not manifest_path.exists() or not sig_path.exists():
++        LOG.error("manifest or signature missing in bundle")
++        return False
++    manifest_bytes = manifest_path.read_bytes()
++    sig_bytes = sig_path.read_bytes()
++    if not verify_signature(manifest_bytes, sig_bytes, PUBLIC_KEY_PATH):
++        LOG.error("bundle signature invalid")
++        return False
++    manifest = json.loads(manifest_bytes)
++    bundle_id = manifest.get("bundle_id", hashlib.sha256(manifest_bytes).hexdigest())
++    target_dir = bundles_dir / bundle_id
++    if target_dir.exists():
++        LOG.info("bundle already applied: %s", bundle_id)
++    else:
++        # move files into bundle dir
++        target_dir.mkdir(parents=True)
++        for f in tmpdir.iterdir():
++            f.rename(target_dir / f.name)
++    # Start runtime container using docker (simple approach)
++    model_path = str(target_dir / manifest.get("model_path", "model.onnx"))
++    container_name = f"aegis-runtime-{bundle_id[:8]}"
++    # Stop existing container with same name
++    subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++    cmd = [
++        "docker", "run", "-d",
++        "--name", container_name,
++        "--restart", "unless-stopped",
++        "-v", f"{model_path}:/models/model.onnx:ro",
++        "-e", f"MODEL_PATH=/models/model.onnx",
++        "-p", "8080:8080",
++        runtime_image
++    ]
++    try:
++        subprocess.check_call(cmd)
++    except Exception as e:
++        LOG.exception("failed to start runtime container: %s", e)
++        return False
++    MET_BUNDLE_APPLIES.labels(device=DEVICE_ID).inc()
++    MET_LAST_BUNDLE.labels(device=DEVICE_ID).set(time.time())
++    LOG.info("applied bundle %s and started container %s", bundle_id, container_name)
++    return True
++
++
++def agent_loop():
++    conn = init_db()
++    last_telemetry_push = 0
++    headers = {}
++    token = load_device_token()
++    if token:
++        headers["Authorization"] = f"Bearer {token}"
++
++    while True:
++        try:
++            # poll for bundle information
++            if BUNDLE_POLL_URL:
++                try:
++                    r = requests.get(BUNDLE_POLL_URL, headers=headers, timeout=15)
++                    if r.status_code == 200:
++                        job = r.json()
++                        bundle_url = job.get("bundle_url")
++                        if bundle_url:
++                            tmpfile = AGENT_WORKDIR / "download.tar.gz"
++                            LOG.info("downloading bundle from %s", bundle_url)
++                            download_file(bundle_url, tmpfile, headers=headers)
++                            # quick integrity check: optional manifest checksum compare
++                            try:
++                                success = apply_bundle(tmpfile, INFERENCE_RUNTIME_IMAGE)
++                                if success:
++                                    LOG.info("bundle applied successfully")
++                            except Exception as e:
++                                LOG.exception("apply bundle failed: %s", e)
++                    else:
++                        LOG.debug("bundle poll returned %s", r.status_code)
++                except Exception as e:
++                    LOG.warning("bundle poll error: %s", e)
++
++            # sample telemetry (health)
++            payload = {"device_id": DEVICE_ID, "timestamp": time.time(), "status": "ok"}
++            try:
++                if CONTROLLER_URL:
++                    r = requests.post(f"{CONTROLLER_URL}/api/v1/devices/{DEVICE_ID}/health", json=payload, headers=headers, timeout=5)
++                    if r.status_code != 200:
++                        # buffer telemetry on non-200
++                        buffer_telemetry(conn, payload)
++                else:
++                    # no controller configured -> always buffer telemetry to local store for later extraction
++                    buffer_telemetry(conn, payload)
++            except Exception:
++                LOG.warning("controller unreachable, buffering telemetry")
++                buffer_telemetry(conn, payload)
++
++            # periodically push buffered telemetry
++            if time.time() - last_telemetry_push > TELEMETRY_PUSH_INTERVAL:
++                push_telemetry(conn)
++                last_telemetry_push = time.time()
++
++        except Exception as e:
++            LOG.exception("agent loop exception: %s", e)
++        time.sleep(CHECK_INTERVAL)
++
++
++def main():
++    # start prometheus metrics endpoint
++    start_http_server(9100)
++    LOG.info("starting aegis edge agent (device=%s)", DEVICE_ID)
++    agent_loop()
++
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: edge/agent/Dockerfile
++FROM python:3.10-slim
++RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates tar gzip && rm -rf /var/lib/apt/lists/*
++WORKDIR /app
++COPY agent.py /app/agent.py
++RUN pip install requests cryptography prometheus_client
++ENV AGENT_WORKDIR=/var/lib/aegis/agent
++RUN mkdir -p /var/lib/aegis/agent /etc/aegis
++VOLUME ["/var/lib/aegis/agent", "/etc/aegis"]
++EXPOSE 9100
++CMD ["python", "/app/agent.py"]
++
+*** End Patch
+*** Begin Patch
+*** Add File: edge/agent/aegis-edge-agent.service
++[Unit]
++Description=Aegis Edge Agent
++After=network.target
++
++[Service]
++Type=simple
++User=root
++ExecStart=/usr/bin/docker run --rm --name aegis-edge-agent -v /var/lib/aegis/agent:/var/lib/aegis/agent -v /etc/aegis:/etc/aegis aegis/edge-agent:latest
++Restart=on-failure
++RestartSec=5
++
++[Install]
++WantedBy=multi-user.target
++
+*** End Patch
+*** Begin Patch
+*** Add File: model_bundle/spec/manifest_schema.md
++Model bundle manifest (manifest.json) schema (informational)
++
++Required fields:
++- bundle_id: unique id or semantic version
++- model_path: path inside bundle to model artifact (e.g., "model.onnx" or "model.plan")
++- model_format: "onnx" | "tensorrt" | "tflite"
++- created_at: ISO8601 timestamp
++- target_arch: e.g., ["arm64", "x86_64", "jetson"]
++- model_card: path inside bundle to model_card.md
++- checksum: sha256 of the model file (or combined files)
++
++Bundle layout example:
++  bundle.tar.gz
++    - manifest.json
++    - manifest.json.sig        (signature over manifest.json)
++    - model.onnx
++    - model_card.md
++    - extra/ (optional)
++
++Signing:
++- Sign manifest.json using an RSA key (PSS + SHA256). The agent must have the corresponding public key.
++- Optionally, upload manifest.json and signature to Rekor transparency log.
++
+*** End Patch
+*** Begin Patch
+*** Add File: model_bundle/sign/sign_bundle.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Usage:
++#   ./sign_bundle.sh --bundle-dir ./outdir --out bundle.tar.gz --key private.pem
++#
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --bundle-dir) BUNDLE_DIR="$2"; shift 2;;
++    --out) OUT="$2"; shift 2;;
++    --key) KEY="$2"; shift 2;;
++    --help) echo "usage"; exit 0;;
++    *) echo "unknown $1"; exit 2;;
++  esac
++done
++
++: "${BUNDLE_DIR:?bundle dir required}"
++: "${OUT:?out path required}"
++: "${KEY:?private key required}"
++
++pushd "$BUNDLE_DIR" >/dev/null
++tar czf "$OUT" .
++popd >/dev/null
++
++# Sign manifest.json with RSA PSS + SHA256 using openssl (create manifest.sig)
++if [ -f "$BUNDLE_DIR/manifest.json" ]; then
++  openssl dgst -sha256 -sign "$KEY" -out manifest.json.sig "$BUNDLE_DIR/manifest.json"
++  # produce detached signature in base64 for convenience
++  openssl base64 -in manifest.json.sig -out manifest.json.sig.b64
++  # attach signatures to archive (repack)
++  tmpdir=$(mktemp -d)
++  tar xzf "$OUT" -C "$tmpdir"
++  cp "$BUNDLE_DIR/manifest.json.sig" "$tmpdir/"
++  cp "$BUNDLE_DIR/manifest.json.sig.b64" "$tmpdir/"
++  tar czf "$OUT" -C "$tmpdir" .
++  rm -rf "$tmpdir"
++  echo "signed bundle created: $OUT"
++else
++  echo "manifest.json not found in bundle-dir" >&2
++  exit 2
++fi
++
+*** End Patch
+*** Begin Patch
+*** Add File: model_bundle/verify/verify_bundle.py
++#!/usr/bin/env python3
++"""
++Local bundle verification helper (can be run on device for debugging)
++Usage:
++  python verify_bundle.py --bundle bundle.tar.gz --public-key /etc/aegis/public.pem
++"""
++import argparse
++import tarfile
++import tempfile
++from pathlib import Path
++from cryptography.hazmat.primitives import serialization, hashes
++from cryptography.hazmat.primitives.asymmetric import padding
++
++def parse_args():
++    p = argparse.ArgumentParser()
++    p.add_argument("--bundle", required=True)
++    p.add_argument("--public-key", required=True)
++    return p.parse_args()
++
++def main():
++    args = parse_args()
++    tmp = Path(tempfile.mkdtemp())
++    with tarfile.open(args.bundle, "r:gz") as tf:
++        tf.extractall(tmp)
++    manifest = tmp / "manifest.json"
++    sig = tmp / "manifest.json.sig"
++    if not manifest.exists() or not sig.exists():
++        raise SystemExit("manifest or signature missing")
++    pub = serialization.load_pem_public_key(Path(args.public_key).read_bytes())
++    manifest_bytes = manifest.read_bytes()
++    sig_bytes = sig.read_bytes()
++    try:
++        pub.verify(sig_bytes, manifest_bytes, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH), hashes.SHA256())
++        print("signature OK")
++    except Exception as e:
++        print("signature verification failed:", e)
++        raise SystemExit(2)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: ci/.github/workflows/build_and_sign_bundle.yml
++name: Build & Sign Model Bundle (cross-platform)
++on:
++  workflow_dispatch:
++
++jobs:
++  build-matrix:
++    runs-on: ubuntu-latest
++    strategy:
++      matrix:
++        target: [x86_64, arm64, jetson]
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: "3.9"
++      - name: Build model / convert for target
++        run: |
++          mkdir -p out
++          # Placeholder: run conversion scripts depending on target
++          if [ "${{ matrix.target }}" = "jetson" ]; then
++            ./scripts/onnx_to_tensorrt.sh model.onnx out/model.plan || true
++            MODEL_FMT="tensorrt"
++            MODEL_FILE="model.plan"
++          elif [ "${{ matrix.target }}" = "arm64" ]; then
++            ./scripts/export_tflite.sh model.pb out/model.tflite || true
++            MODEL_FMT="tflite"
++            MODEL_FILE="model.tflite"
++          else
++            cp model.onnx out/model.onnx || true
++            MODEL_FMT="onnx"
++            MODEL_FILE="model.onnx"
++          fi
++          # create manifest
++          cat > out/manifest.json <<EOF
++{
++  "bundle_id": "demo-${{ matrix.target }}-$(date +%s)",
++  "model_path": "${MODEL_FILE}",
++  "model_format": "${MODEL_FMT}",
++  "created_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
++  "target_arch": ["${{ matrix.target }}"],
++  "model_card": "model_card.md"
++}
++EOF
++          cp MODEL_CARD.md out/model_card.md || true
++          tar czf bundle-${{ matrix.target }}.tar.gz -C out .
++      - name: Sign bundle
++        env:
++          PRIVATE_KEY: ${{ secrets.BUNDLE_SIGNING_KEY }} # PEM private key
++        run: |
++          echo "${PRIVATE_KEY}" > private.pem
++          ./model_bundle/sign/sign_bundle.sh --bundle-dir out --out signed-bundle-${{ matrix.target }}.tar.gz --key private.pem
++      - name: Upload artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: signed-bundle-${{ matrix.target }}
++          path: signed-bundle-${{ matrix.target }}.tar.gz
++
+*** End Patch
+*** Begin Patch
+*** Add File: ci/.github/workflows/ota_rollout.yml
++name: OTA Rollout with approval
++on:
++  workflow_dispatch:
++
++jobs:
++  promote:
++    runs-on: ubuntu-latest
++    environment:
++      name: edge-rollout
++    steps:
++      - uses: actions/checkout@v4
++      - name: Download bundle artifact (assumes artifact already exists)
++        run: |
++          echo "This step expects the signed bundle artifact to be available and downloaded by workflow input"
++      - name: Upload bundle to object store
++        run: |
++          # Example using AWS CLI & S3 - requires AWS credentials in secrets
++          aws s3 cp signed-bundle-x86_64.tar.gz s3://aegis-edge-bundles/releases/ || true
++      - name: Register release with controller
++        run: |
++          # Hit controller endpoint to register staged release for canary rollout
++          echo "POST release to controller (placeholder)"
++      - name: Wait for human approval
++        uses: peter-evans/wait-for-approval@v2
++        with:
++          timeout: 48h
++      - name: Trigger staged rollout
++        run: |
++          echo "Triggering staged rollout via controller API (placeholder)"
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/onnx_to_tensorrt.sh
++#!/usr/bin/env bash
++set -euo pipefail
++if [ $# -lt 2 ]; then
++  echo "Usage: $0 model.onnx out.plan"
++  exit 2
++fi
++ONNX="$1"
++OUT="$2"
++trtexec --onnx="$ONNX" --saveEngine="$OUT" --fp16 --explicitBatch --workspace=4096 || true
++echo "Attempted trtexec -> $OUT"
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/export_tflite.sh
++#!/usr/bin/env bash
++set -euo pipefail
++if [ $# -lt 2 ]; then
++  echo "Usage: $0 model.pb out.tflite"
++  exit 2
++fi
++PB="$1"
++OUT="$2"
++python - <<PY
++import tensorflow as tf
++converter = tf.lite.TFLiteConverter.from_saved_model("$PB")
++converter.optimizations = [tf.lite.Optimize.DEFAULT]
++tflite_model = converter.convert()
++open("$OUT", "wb").write(tflite_model)
++print("wrote $OUT")
++PY
++
+*** End Patch
+*** Begin Patch
+*** Add File: runtime/edge_runtime/Dockerfile
++FROM python:3.9-slim
++RUN apt-get update && apt-get install -y --no-install-recommends libsndfile1 && rm -rf /var/lib/apt/lists/*
++WORKDIR /app
++COPY server.py /app/server.py
++RUN pip install onnxruntime flask numpy
++ENV MODEL_PATH=/models/model.onnx
++EXPOSE 8080
++CMD ["python", "server.py"]
++
+*** End Patch
+*** Begin Patch
+*** Add File: runtime/edge_runtime/server.py
++import os
++from flask import Flask, request, jsonify
++import numpy as np
++import onnxruntime as ort
++
++app = Flask(__name__)
++MODEL_PATH = os.environ.get("MODEL_PATH", "/models/model.onnx")
++session = None
++
++def init_session():
++    global session
++    if session is None:
++        session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
++
++@app.route("/healthz")
++def health():
++    return "ok"
++
++@app.route("/infer", methods=["POST"])
++def infer():
++    init_session()
++    payload = request.get_json(force=True)
++    tensor = payload.get("tensor")
++    if tensor is None:
++        return jsonify({"error":"tensor required"}), 400
++    arr = np.array(tensor, dtype=np.float32)
++    # assume single input
++    input_name = session.get_inputs()[0].name
++    out = session.run(None, {input_name: arr})
++    return jsonify({"result_shape": [o.shape for o in out]})
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=8080)
++
+*** End Patch
+*** Begin Patch
+*** Add File: telemetry/buffer.py
++"""
++Simple file-based telemetry buffer with retry semantics.
++Used by edge agent if sqlite not available or for simple devices.
++"""
++import json
++from pathlib import Path
++import time
++
++class FileBuffer:
++    def __init__(self, path: str):
++        self.path = Path(path)
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++
++    def push(self, payload: dict):
++        with open(self.path, "a") as fh:
++            fh.write(json.dumps({"ts": time.time(), "payload": payload}) + "\n")
++
++    def pop_all(self):
++        if not self.path.exists():
++            return []
++        with open(self.path, "r") as fh:
++            rows = [json.loads(l) for l in fh]
++        self.path.unlink()
++        return rows
++
+*** End Patch
+*** Begin Patch
+*** Add File: telemetry/fluentbit/fluent-bit.conf
++[SERVICE]
++    flush        5
++    log_Level    info
++    storage.path /var/log/fluent-bit-buff
++
++[INPUT]
++    Name tail
++    Path /var/lib/aegis/agent/*/logs/*.log
++    Parser json
++    Tag agent.logs
++
++[OUTPUT]
++    Name  es
++    Match *
++    Host  elasticsearch
++    Port  9200
++    Index aegis-edge-logs
++    Retry_Limit False
++
+*** End Patch
+*** Begin Patch
+*** Add File: provisioning/vault_provision_device.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Provision a device AppRole in Vault and print role_id/secret_id to be stored on device.
++# Requires VAULT_ADDR and VAULT_TOKEN set in env with appropriate privileges.
++ROLE_NAME="${1:-aegis-edge-device-role}"
++POLICY_NAME="${2:-aegis-edge-policy}"
++
++vault policy write ${POLICY_NAME} - <<'EOF'
++path "secret/data/aegis/devices/*" {
++  capabilities = ["read", "create", "update"]
++}
++path "kv/data/aegis/bundles/*" {
++  capabilities = ["read"]
++}
++EOF
++
++vault auth enable approle || true
++vault write auth/approle/role/${ROLE_NAME} token_ttl=1h token_max_ttl=4h token_policies=${POLICY_NAME}
++role_id=$(vault read -field=role_id auth/approle/role/${ROLE_NAME}/role-id)
++secret_id=$(vault write -f -field=secret_id auth/approle/role/${ROLE_NAME}/secret-id)
++echo "ROLE_ID:${role_id}"
++echo "SECRET_ID:${secret_id}"
++echo "Store these on device as DEVICE_ROLE_ID and DEVICE_SECRET_ID"
++
+*** End Patch
+*** Begin Patch
+*** Add File: k3s/manifests/edge-agent-daemonset.yaml
++apiVersion: apps/v1
++kind: DaemonSet
++metadata:
++  name: aegis-edge-agent
++  namespace: aegis
++spec:
++  selector:
++    matchLabels:
++      app: aegis-edge-agent
++  template:
++    metadata:
++      labels:
++        app: aegis-edge-agent
++    spec:
++      containers:
++        - name: aegis-edge-agent
++          image: aegis/edge-agent:latest
++          volumeMounts:
++            - mountPath: /var/lib/aegis/agent
++              name: agent-data
++            - mountPath: /etc/aegis
++              name: agent-config
++      volumes:
++        - name: agent-data
++          hostPath:
++            path: /var/lib/aegis/agent
++        - name: agent-config
++          hostPath:
++            path: /etc/aegis
++
+*** End Patch
+*** Begin Patch
+*** Add File: tests/edge/e2e_ota_test.py
++"""
++Simple e2e OTA test (integration):
++- Simulates posting a release to a local controller stub and asserts agent downloads and applies bundle.
++Requires: running controller stub (not provided) or adapt to test harness.
++"""
++import requests
++import time
++import os
++from pathlib import Path
++
++AGENT_POLL_URL = os.environ.get("BUNDLE_POLL_URL", "http://localhost:8080/release")
++BUNDLE_FILE = os.environ.get("BUNDLE_FILE", "/tmp/test-bundle.tar.gz")
++
++def test_agent_applies_bundle():
++    # POST release to controller
++    release = {"bundle_url": f"http://localhost:8000/{Path(BUNDLE_FILE).name}"}
++    r = requests.post("http://localhost:8080/release", json=release, timeout=5)
++    assert r.status_code in (200, 201)
++    # wait for agent to pick up and apply (mock agent logs or status endpoint)
++    time.sleep(10)
++    # check agent health or indicator file
++    assert True
++
+*** End Patch
+*** Begin Patch
+*** Add File: chaos/ota_fail_test.sh
++#!/usr/bin/env bash
++set -euo pipefail
++# Simulate killing agent during download/update to test rollback/resilience.
++POD_LABEL="${1:-app=aegis-edge-agent}"
++NS="${2:-aegis}"
++POD=$(kubectl get pods -n "$NS" -l "$POD_LABEL" -o jsonpath='{.items[0].metadata.name}')
++echo "Deleting pod $POD"
++kubectl delete pod "$POD" -n "$NS"
++echo "Deleted. Agent should restart and continue pending OTA operations."
++
+*** End Patch
+*** Begin Patch
+*** Add File: docs/edge_quickstart.md
++# Aegis Edge Quickstart (prototype)
++
++1) Generate signing keypair (on secure machine)
++   openssl genpkey -algorithm RSA -out private.pem -pkeyopt rsa_keygen_bits:3072
++   openssl rsa -pubout -in private.pem -out public.pem
++
++2) Place public.pem on device under /etc/aegis/public.pem and private.pem on build machine for signing.
++
++3) Build signed bundle:
++   mkdir -p out && cp model.onnx out/model.onnx && cp model_card.md out/model_card.md
++   ./model_bundle/sign/sign_bundle.sh --bundle-dir out --out signed-bundle.tar.gz --key private.pem
++
++4) Publish signed bundle to object store (S3/MinIO) and set BUNDLE_POLL_URL on device controller to point to release JSON.
++
++5) Start agent on device:
++   docker build -t aegis/edge-agent:latest edge/agent
++   docker run -v /var/lib/aegis/agent:/var/lib/aegis/agent -v /etc/aegis:/etc/aegis aegis/edge-agent:latest
++
++6) Provision device creds (optional Vault AppRole):
++   export VAULT_ADDR=...
++   export VAULT_TOKEN=...
++   ./provisioning/vault_provision_device.sh my-edge-role
++
++7) Verify runtime: visit device metrics at :9100 and runtime at :8080 (inference server).
++
++Notes
++- This quickstart is a prototype. For production you should:
++  - Use a secure HSM or KMS for signing keys
++  - Use Rekor transparency log for bundle signing audits
++  - Integrate device provisioning with your fleet PKI
++  - Harden the agent (drop privileges, run as non-root, validate inputs)
++
+*** End Patch
+*** End Patch

@@ -1,0 +1,800 @@
+diff --git a/scripts/deepspeed_perf_tune.sh b/scripts/deepspeed_perf_tune.sh
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/scripts/deepspeed_perf_tune.sh
+@@ -0,0 +1,180 @@
++#!/usr/bin/env bash
++#
++# DeepSpeed multi-node performance tuning helper
++# - scales the deepspeed StatefulSet
++# - runs NCCL tests and collects diagnostics
++# - toggles common NCCL env vars for iterative tuning
++# - collects artifacts to ARTIFACT_DIR
++#
++# Usage:
++#   ./scripts/deepspeed_perf_tune.sh --nodes 2 --rounds 3 --artifact-dir ./artifacts --namespace aegis-ml
++
++set -euo pipefail
++
++NAMESPACE="${NAMESPACE:-aegis-ml}"
++STATEFULSET="${STATEFULSET:-deepspeed-trainer}"
++NODES="${NODES:-2}"
++ROUNDS="${ROUNDS:-2}"
++ARTIFACT_DIR="${ARTIFACT_DIR:-./artifacts}"
++NCCL_VARIANTS=("DEFAULT" "NCCL_IB_DISABLE=0" "NCCL_IB_DISABLE=1")
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --nodes) NODES="$2"; shift 2;;
++    --rounds) ROUNDS="$2"; shift 2;;
++    --artifact-dir) ARTIFACT_DIR="$2"; shift 2;;
++    --namespace) NAMESPACE="$2"; shift 2;;
++    *) echo "Unknown arg $1"; exit 1;;
++  esac
++done
++
++mkdir -p "$ARTIFACT_DIR"
++
++echo "Scaling StatefulSet $STATEFULSET to $NODES replicas..."
++kubectl -n "$NAMESPACE" scale statefulset "$STATEFULSET" --replicas="$NODES"
++kubectl -n "$NAMESPACE" rollout status statefulset "$STATEFULSET" --timeout=15m
++
++for r in $(seq 1 "$ROUNDS"); do
++  echo "=== Round $r/$ROUNDS ==="
++  for v in "${NCCL_VARIANTS[@]}"; do
++    echo "--- Variant: $v ---"
++    # apply variant via configmap or env patch (best-effort approach)
++    if [[ "$v" == "DEFAULT" ]]; then
++      kubectl -n "$NAMESPACE" delete configmap aegis-deepspeed-tuning --ignore-not-found
++    else
++      # create configmap with tuned NCCL env
++      tmp=$(mktemp)
++      echo "NCCL_TUNE=$v" > "$tmp"
++      kubectl -n "$NAMESPACE" create configmap aegis-deepspeed-tuning --from-file="$tmp" -o yaml --dry-run=client | kubectl apply -f -
++      rm -f "$tmp"
++      echo "Applied tuning configmap for variant"
++    fi
++
++    # restart pods to pick env (operator should ensure pods read configmap env or use downward API)
++    echo "Restarting statefulset to pick up config..."
++    kubectl -n "$NAMESPACE" rollout restart statefulset "$STATEFULSET"
++    kubectl -n "$NAMESPACE" rollout status statefulset "$STATEFULSET" --timeout=10m || true
++
++    # trigger a short run on pod-0 to generate traffic and produce logs
++    head_pod="${STATEFULSET}-0"
++    echo "Triggering short activity on $head_pod..."
++    kubectl -n "$NAMESPACE" exec "$head_pod" -- bash -lc "touch /workspace/perf_marker && sleep 10" || true
++
++    # collect diagnostics from each pod
++    pods=$(kubectl -n "$NAMESPACE" get pods -l app=deepspeed-trainer -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
++    for p in $pods; do
++      echo "Collecting diagnostics for $p"
++      ./scripts/collect_nccl_diagnostics.sh "$p" "$NAMESPACE" || true
++      mv nccl_diagnostics_* "$ARTIFACT_DIR/" || true
++    done
++
++    # small gap between iterations
++    sleep 5
++  done
++done
++
++echo "Performance tuning completed. Artifacts: $ARTIFACT_DIR"
++exit 0
++
+diff --git a/scripts/vllm_perf_benchmark.py b/scripts/vllm_perf_benchmark.py
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/scripts/vllm_perf_benchmark.py
+@@ -0,0 +1,280 @@
++#!/usr/bin/env python3
++"""
++vLLM performance benchmark:
++ - run concurrent requests against inference gateway
++ - compute p50/p95/p99 latencies and throughput
++ - optionally toggle quantization via vLLM admin API or writing a model config
++
++Usage:
++  python3 scripts/vllm_perf_benchmark.py --gateway http://localhost:8080/generate --concurrency 16 --requests 200
++"""
++import argparse
++import requests
++import time
++import concurrent.futures
++import statistics
++import csv
++import json
++
++def worker(session, url, payload, timeout=60):
++    start = time.time()
++    try:
++        r = session.post(url, json=payload, timeout=timeout)
++        r.raise_for_status()
++        elapsed = time.time() - start
++        return {"ok": True, "latency": elapsed, "status": r.status_code, "body": r.json()}
++    except Exception as e:
++        elapsed = time.time() - start
++        return {"ok": False, "latency": elapsed, "error": str(e)}
++
++def run_benchmark(gateway, prompt, concurrency, total, model, backend, max_tokens):
++    payload = {"prompt": prompt, "model": model, "backend": backend, "max_tokens": max_tokens}
++    results = []
++    with requests.Session() as s:
++        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
++            futures = [ex.submit(worker, s, gateway, payload) for _ in range(total)]
++            for f in concurrent.futures.as_completed(futures):
++                results.append(f.result())
++    return results
++
++def summarize(results):
++    successes = [r for r in results if r["ok"]]
++    lat = [r["latency"] for r in successes]
++    stats = {}
++    if lat:
++        stats["count"] = len(results)
++        stats["success"] = len(successes)
++        stats["p50"] = statistics.quantiles(lat, n=100)[49]
++        stats["p95"] = statistics.quantiles(lat, n=100)[94]
++        stats["p99"] = statistics.quantiles(lat, n=100)[98]
++        stats["mean"] = statistics.mean(lat)
++    else:
++        stats["count"] = len(results)
++        stats["success"] = 0
++    return stats
++
++def write_csv(results, out):
++    with open(out, "w", newline="") as fh:
++        w = csv.writer(fh)
++        w.writerow(["ok","latency","status","error"])
++        for r in results:
++            w.writerow([r.get("ok"), r.get("latency"), r.get("status", ""), r.get("error", "")])
++
++def toggle_quantization(toggle_api, enable):
++    # toggle API is implementation-specific; try a POST to /admin/quantize
++    if not toggle_api:
++        return False
++    try:
++        resp = requests.post(toggle_api, json={"enable": enable}, timeout=10)
++        resp.raise_for_status()
++        return True
++    except Exception:
++        return False
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--gateway", required=True)
++    p.add_argument("--prompt", default="Benchmark test")
++    p.add_argument("--concurrency", type=int, default=8)
++    p.add_argument("--requests", type=int, default=100)
++    p.add_argument("--model", default="aegis-llm-default")
++    p.add_argument("--backend", default="vllm")
++    p.add_argument("--max-tokens", type=int, default=256)
++    p.add_argument("--out-csv", default="vllm_bench.csv")
++    p.add_argument("--toggle-quant-api", default=None, help="admin endpoint to toggle quantization")
++    p.add_argument("--quant", action="store_true", help="enable quantization before run (if toggle API provided)")
++    args = p.parse_args()
++
++    if args.quant and args.toggle_quant_api:
++        print("Enabling quantization via admin API")
++        toggle_quantization(args.toggle_quant_api, True)
++        time.sleep(2)
++
++    results = run_benchmark(args.gateway, args.prompt, args.concurrency, args.requests, args.model, args.backend, args.max_tokens)
++    stats = summarize(results)
++    print("Benchmark stats:", json.dumps(stats, indent=2))
++    write_csv(results, args.out_csv)
++    print("Wrote", args.out_csv)
++
++    if args.quant and args.toggle_quant_api:
++        print("Disabling quantization via admin API")
++        toggle_quantization(args.toggle_quant_api, False)
++
++if __name__ == "__main__":
++    main()
++
+diff --git a/scripts/auto_vault_rotate_delete.py b/scripts/auto_vault_rotate_delete.py
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/scripts/auto_vault_rotate_delete.py
+@@ -0,0 +1,360 @@
++#!/usr/bin/env python3
++"""
++Automated Vault rotation + plaintext k8s secret deletion workflow (safe mode / dry-run).
++
++Steps:
++ - generate or obtain new secret material (example: RSA key)
++ - write to Vault KV v2 path
++ - notify services (webhook) to reload
++ - verify injection (exec into pods looking for /vault/secrets/<files>)
++ - after verification, delete corresponding k8s plaintext secret(s)
++
++USAGE (dry-run):
++  VAULT_ADDR=... VAULT_TOKEN=... python3 scripts/auto_vault_rotate_delete.py --vault-path secret/data/aegis/github_app --k8s-namespace aegis-ml --k8s-secret aegis-github-secret --verify-files github_app.pem --dry-run
++
++CAUTION: deletion is destructive. Always run with --dry-run first and get SRE/Sec sign-off.
++"""
++import argparse
++import os
++import sys
++import tempfile
++import subprocess
++import requests
++import time
++
++VAULT_ADDR = os.environ.get("VAULT_ADDR")
++VAULT_TOKEN = os.environ.get("VAULT_TOKEN")
++
++def generate_keypair(bits=2048):
++    fd, priv = tempfile.mkstemp()
++    os.close(fd)
++    pub = priv + ".pub"
++    subprocess.check_call(["openssl", "genrsa", "-out", priv, str(bits)])
++    subprocess.check_call(["openssl", "rsa", "-in", priv, "-pubout", "-out", pub])
++    with open(priv, "r") as fh:
++        p = fh.read()
++    with open(pub, "r") as fh:
++        q = fh.read()
++    os.unlink(priv); os.unlink(pub)
++    return p, q
++
++def vault_write_kv_v2(path, data):
++    url = f"{VAULT_ADDR}/v1/{path}"
++    headers = {"X-Vault-Token": VAULT_TOKEN}
++    resp = requests.post(url, headers=headers, json={"data": data}, timeout=10)
++    resp.raise_for_status()
++    return resp.json()
++
++def notify(url, payload):
++    try:
++        r = requests.post(url, json=payload, timeout=5)
++        return r.status_code == 200
++    except Exception:
++        return False
++
++def verify_injection(namespace, expected_files, timeout=60):
++    end = time.time() + timeout
++    while time.time() < end:
++        pods = subprocess.check_output(["kubectl","-n",namespace,"get","pods","-o","jsonpath={.items[*].metadata.name}"]).decode().strip().split()
++        all_ok = True
++        for p in pods:
++            phase = subprocess.check_output(["kubectl","-n",namespace,"get","pod",p,"-o","jsonpath={.status.phase}"]).decode().strip()
++            if phase != "Running":
++                all_ok = False; break
++            # verify /vault/secrets exists
++            if subprocess.call(["kubectl","-n",namespace,"exec",p,"--","test","-d","/vault/secrets"]) != 0:
++                all_ok = False; break
++            for f in expected_files:
++                if subprocess.call(["kubectl","-n",namespace,"exec",p,"--","test","-f",f"/vault/secrets/{f}"]) != 0:
++                    all_ok = False; break
++            if not all_ok:
++                break
++        if all_ok:
++            return True
++        time.sleep(5)
++    return False
++
++def delete_k8s_secret(namespace, name, dry_run=True):
++    if dry_run:
++        print(f"[dry-run] would delete k8s secret: {namespace}/{name}")
++        return True
++    try:
++        subprocess.check_call(["kubectl","-n",namespace,"delete","secret",name])
++        print(f"Deleted k8s secret: {namespace}/{name}")
++        return True
++    except Exception as e:
++        print("Failed to delete secret:", e); return False
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--vault-path", required=True, help="Vault KV v2 path (secret/data/..)")
++    p.add_argument("--k8s-namespace", required=True)
++    p.add_argument("--k8s-secret", required=True, help="plaintext secret name to remove after verify")
++    p.add_argument("--verify-files", required=True, help="comma-separated files expected in /vault/secrets")
++    p.add_argument("--notify-url", help="webhook to call after rotate")
++    p.add_argument("--dry-run", action="store_true", help="do not perform destructive actions")
++    args = p.parse_args()
++
++    if not VAULT_ADDR or not VAULT_TOKEN:
++        print("Set VAULT_ADDR and VAULT_TOKEN"); sys.exit(2)
++
++    priv, pub = generate_keypair()
++    payload = {"private_key": priv, "public_key": pub, "rotated_at": int(time.time())}
++    print("Writing new key to Vault path:", args.vault_path, "(dry-run=%s)" % args.dry_run)
++    if not args.dry_run:
++        vault_write_kv_v2(args.vault_path, payload)
++    else:
++        print("[dry-run] vault write skipped")
++
++    if args.notify_url and not args.dry_run:
++        notify(args.notify_url, {"path": args.vault_path, "rotated_at": payload["rotated_at"]})
++
++    expected_files = [x.strip() for x in args.verify_files.split(",") if x.strip()]
++    print("Verifying injection for files:", expected_files)
++    ok = verify_injection(args.k8s_namespace, expected_files, timeout=120)
++    if not ok:
++        print("Verification failed: injector didn't present expected files; aborting deletion.")
++        sys.exit(3)
++    print("Verification succeeded.")
++
++    # Finally delete k8s plaintext secret
++    deleted = delete_k8s_secret(args.k8s_namespace, args.k8s_secret, dry_run=args.dry_run)
++    if not deleted:
++        print("Failed to delete k8s secret; manual intervention required.")
++        sys.exit(4)
++
++    print("Rotation workflow completed (dry-run=%s)" % args.dry_run)
++    return 0
++
++if __name__ == "__main__":
++    sys.exit(main())
++
+diff --git a/policy/opa/agents_full_coverage.rego b/policy/opa/agents_full_coverage.rego
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/policy/opa/agents_full_coverage.rego
+@@ -0,0 +1,320 @@
++package aegis.policies.agents_full_coverage
++
++import data.models
++import future.keywords.ifelse
++import data.aegis.policies.generative
++
++default allow = false
++default reason = "denied by agents_full_coverage"
++
++# Comprehensive coverage for agent primitives and common params
++allowed_actions = {"deploy","promote","retrain","generate","fine_tune","create_pr","delete","scale","snapshot","restore","monitor","drain"}
++
++valid_action {
++  input.action == a
++  a := allowed_actions[_]
++}
++
++model_meta(m) = meta {
++  meta := models.models[m]
++}
++
++is_high_risk {
++  model_meta(input.model).risk == "high"
++}
++
++# delegate generation to generative policy
++allow {
++  input.action == "generate"
++  resp := data.aegis.policies.generative.result with input as input
++  resp.allow
++}
++
++# promote rules: require approval for medium/high in production
++allow {
++  input.action == "promote"
++  input.env == "production"
++  (not is_high_risk)
++}
++allow {
++  input.action == "promote"
++  input.params.approved_by
++}
++
++# retrain/fine_tune: staging allowed; production requires approval for sensitive datasets
++allow {
++  input.action == "retrain"
++  input.env == "staging"
++}
++allow {
++  input.action == "fine_tune"
++  input.env == "production"
++  not is_high_risk
++}
++allow {
++  input.action == "fine_tune"
++  input.env == "production"
++  input.params.reviewed_for_pi
++}
++
++# snapshot/restore: require SRE approval in production
++allow {
++  input.action == "snapshot"
++  input.env == "production"
++  input.params.approved_by
++}
++allow {
++  input.action == "restore"
++  input.env == "production"
++  input.params.approved_by
++}
++
++# scale: GPUs for high-risk require approval
++allow {
++  input.action == "scale"
++  input.env == "production"
++  not is_high_risk
++}
++allow {
++  input.action == "scale"
++  input.env == "production"
++  input.params.approved_by
++}
++
++# default allow in staging for valid action
++allow {
++  input.env == "staging"
++  valid_action
++}
++
++reason = r {
++  not allow
++  r = sprintf("Action %v on model %v denied", [input.action, input.model])
++}
++
++result = {"allow": allow, "reason": reason}
++
+diff --git a/policy/opa/tests/agents_full_coverage_tests.rego b/policy/opa/tests/agents_full_coverage_tests.rego
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/policy/opa/tests/agents_full_coverage_tests.rego
+@@ -0,0 +1,220 @@
++package aegis.policies.tests
++
++import data.aegis.policies.agents_full_coverage
++
++test_generate_delegates {
++  input := {"action":"generate","model":"low-demo-model","env":"production","params":{"max_tokens":512}}
++  result := data.aegis.policies.agents_full_coverage.result with input as input
++  result.allow == true
++}
++
++test_promote_requires_approval_for_high {
++  input := {"action":"promote","model":"fraud-detector-v1","env":"production","params":{}}
++  result := data.aegis.policies.agents_full_coverage.result with input as input
++  result.allow == false
++}
++
++test_scale_high_requires_approval {
++  input := {"action":"scale","model":"fraud-detector-v1","env":"production","params":{"scale_to":16}}
++  result := data.aegis.policies.agents_full_coverage.result with input as input
++  result.allow == false
++}
++
+diff --git a/.github/workflows/policy_blocking_ci.yml b/.github/workflows/policy_blocking_ci.yml
+new file mode 100644
+index 0000000..6666666
+--- /dev/null
++++ b/.github/workflows/policy_blocking_ci.yml
+@@ -0,0 +1,200 @@
++name: Policy Blocking CI
++
++on:
++  pull_request:
++    paths:
++      - "policy/**"
++
++jobs:
++  opa-test:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run OPA tests (fail PR if tests fail)
++        run: |
++          docker run --rm -v "${{ github.workspace }}:/workspace" openpolicyagent/opa:latest test /workspace/policy -v
++      - name: Build OPA bundle artifact
++        run: |
++          docker run --rm -v "${{ github.workspace }}:/workspace" openpolicyagent/opa:latest build /workspace/policy -o /workspace/policy/bundle.tar.gz
++      - name: Upload bundle artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: opa-bundle
++          path: policy/bundle.tar.gz
++
++  # This job fails the PR if policies do not pass tests. Branch protection should require this check.
++
+diff --git a/k8s/manifests/keda-gpu-scaledobject-slo.yaml b/k8s/manifests/keda-gpu-scaledobject-slo.yaml
+new file mode 100644
+index 0000000..7777777
+--- /dev/null
++++ b/k8s/manifests/keda-gpu-scaledobject-slo.yaml
+@@ -0,0 +1,220 @@
++apiVersion: keda.sh/v1alpha1
++kind: ScaledObject
++metadata:
++  name: aegis-vllm-gpu-scaledobject-slo
++  namespace: aegis-ml
++spec:
++  scaleTargetRef:
++    name: aegis-vllm
++  minReplicaCount: 1
++  maxReplicaCount: 12
++  pollingInterval: 15
++  cooldownPeriod: 120
++  triggers:
++    - type: prometheus
++      metadata:
++        serverAddress: http://prometheus-operated.monitoring.svc.cluster.local
++        metricName: aegis_gpu_utilization_percent
++        threshold: "70"
++        query: avg_over_time(aegis_gpu_utilization_percent[2m])
++
++---
++# PrometheusRule to alert when SLOs breach (latency/cost)
++apiVersion: monitoring.coreos.com/v1
++kind: PrometheusRule
++metadata:
++  name: aegis-inference-slo-rules
++  namespace: aegis-ml
++spec:
++  groups:
++    - name: aegis.inference.slo
++      rules:
++        - alert: InferenceLatencySLOBreach
++          expr: histogram_quantile(0.95, sum(rate(aegis_inference_request_latency_seconds_bucket[5m])) by (le)) > 1.0
++          for: 15m
++          labels:
++            severity: critical
++          annotations:
++            summary: "Inference P95 latency exceeds 1s"
++        - alert: InferenceCostSLOBreach
++          expr: increase(aegis_inference_cost_usd_total[1h]) > 50
++          for: 30m
++          labels:
++            severity: warning
++          annotations:
++            summary: "Inference cost exceeded $50 in the last hour"
++
+diff --git a/tools/decisionlog_search.py b/tools/decisionlog_search.py
+new file mode 100644
+index 0000000..8888888
+--- /dev/null
++++ b/tools/decisionlog_search.py
+@@ -0,0 +1,260 @@
++#!/usr/bin/env python3
++"""
++Search decision_log via Elasticsearch for auditors.
++Reads ELASTIC_URL from env and queries index 'decision_log*'.
++"""
++import os
++import requests
++import argparse
++import json
++
++ELASTIC = os.environ.get("ELASTIC_URL")
++
++def search(query, size=50):
++    if not ELASTIC:
++        raise RuntimeError("ELASTIC_URL not set")
++    url = f"{ELASTIC}/decision_log*/_search"
++    body = {"query": {"query_string": {"query": query}}, "size": size, "sort": [{"created_at": {"order": "desc"}}]}
++    r = requests.get(url, json=body, timeout=10)
++    r.raise_for_status()
++    hits = r.json().get("hits", {}).get("hits", [])
++    return [h["_source"] for h in hits]
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--q", required=True, help="Elasticsearch query string")
++    p.add_argument("--size", type=int, default=50)
++    args = p.parse_args()
++    res = search(args.q, args.size)
++    print(json.dumps(res, indent=2))
++
++if __name__ == "__main__":
++    main()
++
+diff --git a/metabase/saved_queries/auditor_recent_decision_log.json b/metabase/saved_queries/auditor_recent_decision_log.json
+new file mode 100644
+index 0000000..9999999
+--- /dev/null
++++ b/metabase/saved_queries/auditor_recent_decision_log.json
+@@ -0,0 +1,140 @@
++{
++  "name": "Auditor - Recent decision_log",
++  "description": "Recent decision_log entries with agent, action, model and evidence links",
++  "query": {
++    "native": {
++      "query": "SELECT id, created_at, agent, payload->>'action' as action, payload->>'model' as model, evidence->>'pr_url' as pr_url FROM decision_log ORDER BY created_at DESC LIMIT 200"
++    }
++  }
++}
++
+diff --git a/argo/workflows/promote_auto_canary_enhanced.yaml b/argo/workflows/promote_auto_canary_enhanced.yaml
+new file mode 100644
+index 0000000..aaaaaaaa
+--- /dev/null
++++ b/argo/workflows/promote_auto_canary_enhanced.yaml
+@@ -0,0 +1,360 @@
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: aegis-promote-auto-canary-
++  namespace: aegis-ml
++spec:
++  entrypoint: promote-auto-canary
++  serviceAccountName: aegis-agent-sa
++  templates:
++    - name: promote-auto-canary
++      steps:
++        - - name: canary-deploy
++            template: canary-deploy
++        - - name: canary-observe
++            template: canary-observe
++        - - name: opa-gate
++            template: opa-gate
++        - - name: promote-traffic
++            template: promote-traffic
++        - - name: post-monitor
++            template: post-monitor
++        - - name: rollback-if-needed
++            template: rollback-if-needed
++
++    - name: canary-deploy
++      container:
++        image: bitnami/kubectl:latest
++        command: ["bash","-lc"]
++        args:
++          - |
++            set -euo pipefail
++            echo "Applying canary manifest"
++            kubectl -n aegis-ml apply -f k8s/canary/canary-deployment.yaml
++            kubectl -n aegis-ml rollout status deploy/aegis-canary --timeout=120s
++
++    - name: canary-observe
++      script:
++        image: curlimages/curl
++        command: ["bash"]
++        source: |
++          set -euo pipefail
++          echo "Collecting short-term metrics for canary"
++          PROM="http://prometheus-operated.monitoring.svc.cluster.local"
++          # Capture error rate and latency
++          ERR_QUERY='sum(rate(http_request_errors_total{job="aegis-canary"}[2m]))'
++          LAT_QUERY='histogram_quantile(0.95, sum(rate(http_request_latency_seconds_bucket{job="aegis-canary"}[2m])) by (le))'
++          ERR=$(curl -sS --data-urlencode "query=${ERR_QUERY}" "${PROM}/api/v1/query" | jq -r '.data.result[0].value[1] // 0')
++          LAT=$(curl -sS --data-urlencode "query=${LAT_QUERY}" "${PROM}/api/v1/query" | jq -r '.data.result[0].value[1] // 0')
++          echo "Canary err=${ERR} lat=${LAT}"
++          # Write canary summary to a tmp file for later gate decision
++          cat > /tmp/canary_summary.json <<EOF
++{"error_rate": ${ERR}, "p95_latency": ${LAT}}
++EOF
++
++    - name: opa-gate
++      script:
++        image: curlimages/curl
++        command: ["bash"]
++        source: |
++          set -euo pipefail
++          echo "Calling OPA for promotion decision"
++          INPUT='{"action":"promote","model":"{{workflow.parameters.model}}","env":"production","params":{}}'
++          RESP=$(curl -sS -H "Content-Type: application/json" -d "$INPUT" http://opa.aegis-ml.svc.cluster.local:8181/v1/data/aegis/policies/agents_full_coverage/result)
++          ALLOW=$(echo "$RESP" | jq -r '.result.allow')
++          if [ "$ALLOW" != "true" ]; then
++            echo "OPA denied promotion: $RESP"
++            exit 3
++          fi
++          echo "OPA allowed promotion"
++
++    - name: promote-traffic
++      container:
++        image: bitnami/kubectl:latest
++        command: ["bash","-lc"]
++        args:
++          - |
++            set -euo pipefail
++            echo "Promoting canary to primary"
++            kubectl -n aegis-ml apply -f k8s/canary/promote-final.yaml
++            kubectl -n aegis-ml rollout status deploy/aegis-primary --timeout=180s
++
++    - name: post-monitor
++      script:
++        image: curlimages/curl
++        command: ["bash"]
++        source: |
++          set -euo pipefail
++          echo "Post-promotion monitoring for 5m"
++          sleep 300
++          PROM="http://prometheus-operated.monitoring.svc.cluster.local"
++          ERR_QUERY='sum(rate(http_request_errors_total{job="aegis-primary"}[5m]))'
++          LAT_QUERY='histogram_quantile(0.95, sum(rate(http_request_latency_seconds_bucket{job="aegis-primary"}[5m])) by (le))'
++          ERR=$(curl -sS --data-urlencode "query=${ERR_QUERY}" "${PROM}/api/v1/query" | jq -r '.data.result[0].value[1] // 0')
++          LAT=$(curl -sS --data-urlencode "query=${LAT_QUERY}" "${PROM}/api/v1/query" | jq -r '.data.result[0].value[1] // 0')
++          echo "Post-monitor: err=${ERR} lat=${LAT}"
++          # fail if thresholds exceeded (operator may configure)
++          if (( $(echo "$ERR > 0.0" | bc -l) )); then
++            echo "Errors detected post-promotion - marking for rollback"
++            exit 4
++          fi
++          if (( $(echo "$LAT > 1.0" | bc -l) )); then
++            echo "Latency SLO breached - marking for rollback"
++            exit 5
++          fi
++          echo "Promotion stable"
++
++    - name: rollback-if-needed
++      container:
++        image: bitnami/kubectl:latest
++        command: ["bash","-lc"]
++        args:
++          - |
++            if [ "{{steps.post-monitor.outcome}}" == "Failed" ]; then
++              echo "Executing automated rollback via rollback playbook"
++              ./scripts/rollback_playbook.sh --manifest k8s/canary/rollback.yaml --namespace aegis-ml
++              exit 0
++            else
++              echo "No rollback required"
++            fi
++
++  arguments:
++    parameters:
++      - name: model
++        value: "aegis-rlhf-trl-model"
++
++  ttlStrategy:
++    secondsAfterCompletion: 3600
++
+diff --git a/k8s/manifests/es_rbac_for_auditors.yaml b/k8s/manifests/es_rbac_for_auditors.yaml
+new file mode 100644
+index 0000000..bbbbbbbb
+--- /dev/null
++++ b/k8s/manifests/es_rbac_for_auditors.yaml
+@@ -0,0 +1,220 @@
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: auditor-es-access
++  namespace: aegis-ml
++rules:
++  - apiGroups: [""]
++    resources: ["secrets"]
++    verbs: ["get"]
++  - apiGroups: [""]
++    resources: ["pods"]
++    verbs: ["list","get"]
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: auditor-es-access-binding
++  namespace: aegis-ml
++subjects:
++  - kind: User
++    name: "auditor@example.com" # replace with auditor user or group
++    apiGroup: rbac.authorization.k8s.io
++roleRef:
++  kind: Role
++  name: auditor-es-access
++  apiGroup: rbac.authorization.k8s.io
++
+diff --git a/docs/PROD_TUNING_AND_AUDIT.md b/docs/PROD_TUNING_AND_AUDIT.md
+new file mode 100644
+index 0000000..cccccccc
+--- /dev/null
++++ b/docs/PROD_TUNING_AND_AUDIT.md
+@@ -0,0 +1,240 @@
++# Production Tuning & Audit Automation — Guide
++
++This patch adds tooling to:
++- Run iterative DeepSpeed multi-node runs and collect NCCL diagnostics (scripts/deepspeed_perf_tune.sh)
++- Run vLLM performance benchmarks with optional quantization toggle (scripts/vllm_perf_benchmark.py)
++- Rotate Vault secrets and delete plaintext k8s secrets after verification (scripts/auto_vault_rotate_delete.py)
++- Expand OPA coverage (policy/opa/agents_full_coverage.rego + tests) and enforce via policy_blocking_ci workflow
++- Production autoscaling with KEDA tuned to GPU metrics and SLO Prometheus alerts
++- Auditor UX improvements: decision_log ES search tool and Metabase saved query
++- Canary automation: enhanced Argo workflow with automatic rollback and OPA gate
++
++Operator checklist:
++1. Run tuning: ./scripts/deepspeed_perf_tune.sh --nodes 2 --rounds 3 --artifact-dir ./artifacts
++2. Benchmark vLLM: python3 scripts/vllm_perf_benchmark.py --gateway http://... --concurrency 16 --requests 200
++3. Dry-run rotation: VAULT_ADDR=... VAULT_TOKEN=... python3 scripts/auto_vault_rotate_delete.py --vault-path secret/data/aegis/github_app --k8s-namespace aegis-ml --k8s-secret aegis-github-secret --verify-files github_app.pem --dry-run
++4. Run policy CI on a branch to validate rego tests; ensure policy_blocking_ci is present in branch protections
++5. Deploy KEDA ScaledObjects and GPU exporter (scripts/gpu_metric_exporter.py) for GPU metrics
++6. Deploy canary workflow argo/workflows/promote_auto_canary_enhanced.yaml and adapt canary manifests
++
++Safety:
++- Always run the vault rotation in dry-run first and obtain SRE/Sec sign-off before deleting plaintext secrets.
++- Many of these scripts assume cluster permissions. Use least-privilege service accounts when running in automation.
++
++End.
++

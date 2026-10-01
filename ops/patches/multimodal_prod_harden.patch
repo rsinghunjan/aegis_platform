@@ -1,0 +1,471 @@
+*** Begin Patch
+*** Add File:services/multimodal/ingest/resumable_service.py
++#!/usr/bin/env python3
++"""
++Resumable ingestion service (simple chunked uploads)
++- Endpoints:
++  - POST /resumable/init  -> {upload_id, upload_url}
++  - PUT  /resumable/{upload_id}/chunk?offset=<n>  -> upload chunk bytes
++  - POST /resumable/{upload_id}/finalize -> assemble, compute sha256, create derivatives, upload, register
++  - GET  /resumable/{upload_id}/status -> progress info
++
++Persistence:
++- Stores chunks under MM_INGEST_TMP/<upload_id>/chunks/
++- Final assembled file is processed by existing ingestion helpers (thumbnail, transcode)
++"""
++import os, uuid, hashlib, shutil, time, json
++from fastapi import FastAPI, UploadFile, File, HTTPException, Body
++from pydantic import BaseModel
++from typing import Optional
++from services.multimodal.storage.uploader import upload_to_storage
++from services.multimodal.metadata.register_dataset import register_file_entry
++from PIL import Image
++import subprocess
++
++app = FastAPI(title="Aegis Resumable Ingest Service")
++
++TMP = os.environ.get("MM_INGEST_TMP", "/tmp/mm_ingest")
++OUT_DIR = os.environ.get("MM_INGEST_OUT", "/workspace/ingest")
++STORE_PREFIX = os.environ.get("MM_STORE_PREFIX", "")
++os.makedirs(TMP, exist_ok=True)
++os.makedirs(OUT_DIR, exist_ok=True)
++
++class InitRequest(BaseModel):
++    filename: str
++    modality: str
++    dataset_id: str
++    total_size: Optional[int] = None
++
++@app.post("/resumable/init")
++def init_upload(req: InitRequest):
++    uid = uuid.uuid4().hex
++    upload_dir = os.path.join(TMP, uid)
++    os.makedirs(os.path.join(upload_dir, "chunks"), exist_ok=True)
++    meta = {
++        "id": uid,
++        "filename": req.filename,
++        "modality": req.modality,
++        "dataset_id": req.dataset_id,
++        "total_size": req.total_size,
++        "created_at": int(time.time()),
++        "chunks": []
++    }
++    with open(os.path.join(upload_dir, "meta.json"), "w") as f:
++        json.dump(meta, f)
++    return {"upload_id": uid, "upload_url": f"/resumable/{uid}/chunk"}
++
++@app.put("/resumable/{upload_id}/chunk")
++async def upload_chunk(upload_id: str, offset: int = 0, chunk: UploadFile = File(...)):
++    upload_dir = os.path.join(TMP, upload_id)
++    if not os.path.exists(upload_dir):
++        raise HTTPException(status_code=404, detail="upload id not found")
++    chunk_dir = os.path.join(upload_dir, "chunks")
++    os.makedirs(chunk_dir, exist_ok=True)
++    # store chunk file named by offset to allow idempotent uploads
++    chunk_path = os.path.join(chunk_dir, f"{offset:020d}.chunk")
++    data = await chunk.read()
++    with open(chunk_path, "wb") as f:
++        f.write(data)
++    # update meta
++    meta_path = os.path.join(upload_dir, "meta.json")
++    meta = json.load(open(meta_path))
++    if offset not in meta.get("chunks", []):
++        meta["chunks"].append(offset)
++    with open(meta_path, "w") as f:
++        json.dump(meta, f)
++    return {"status": "ok", "offset": offset, "bytes": len(data)}
++
++@app.post("/resumable/{upload_id}/finalize")
++def finalize(upload_id: str):
++    upload_dir = os.path.join(TMP, upload_id)
++    if not os.path.exists(upload_dir):
++        raise HTTPException(status_code=404, detail="upload id not found")
++    meta = json.load(open(os.path.join(upload_dir, "meta.json")))
++    chunks_dir = os.path.join(upload_dir, "chunks")
++    chunk_files = sorted(os.listdir(chunks_dir))
++    assembled_path = os.path.join(OUT_DIR, f"{upload_id}_{meta['filename']}")
++    with open(assembled_path, "wb") as w:
++        for cf in chunk_files:
++            with open(os.path.join(chunks_dir, cf), "rb") as r:
++                shutil.copyfileobj(r, w)
++    # compute sha256
++    h = hashlib.sha256()
++    with open(assembled_path, "rb") as f:
++        for b in iter(lambda: f.read(8192), b""):
++            h.update(b)
++    sha = h.hexdigest()
++    # create derivatives depending on modality
++    derivatives = {}
++    try:
++        if meta["modality"] == "image":
++            thumb = os.path.join(OUT_DIR, f"{sha}_thumb.png")
++            img = Image.open(assembled_path)
++            img.thumbnail((256,256))
++            img.save(thumb, format="PNG")
++            derivatives["thumbnail"] = thumb
++        elif meta["modality"] == "audio":
++            wav = os.path.join(OUT_DIR, f"{sha}.wav")
++            subprocess.check_call(["ffmpeg","-y","-i", assembled_path, "-ar","16000","-ac","1", wav])
++            derivatives["wav"] = wav
++        elif meta["modality"] == "video":
++            frames_prefix = os.path.join(OUT_DIR, f"{sha}_frame")
++            subprocess.check_call(["ffmpeg","-y","-i", assembled_path, "-r","1", "-vf","scale=224:224", f"{frames_prefix}_%04d.png"])
++            frames = sorted([os.path.join(OUT_DIR,p) for p in os.listdir(OUT_DIR) if p.startswith(os.path.basename(frames_prefix))])
++            derivatives["frames"] = frames
++    except Exception as e:
++        # derivative creation best-effort
++        print("derivative creation failed", e)
++    # upload original and derivatives
++    storage_uri = upload_to_storage(assembled_path, object_name=f"{meta['dataset_id']}/{sha}_{meta['filename']}")
++    uploaded_derivs = {}
++    for k,v in derivatives.items():
++        if isinstance(v, list):
++            uploaded_derivs[k] = [upload_to_storage(p, object_name=f"{meta['dataset_id']}/{os.path.basename(p)}") for p in v]
++        else:
++            uploaded_derivs[k] = upload_to_storage(v, object_name=f"{meta['dataset_id']}/{os.path.basename(v)}")
++    manifest_entry = {
++        "id": sha,
++        "dataset_id": meta["dataset_id"],
++        "original_name": meta["filename"],
++        "modality": meta["modality"],
++        "storage_uri": storage_uri,
++        "derivatives": uploaded_derivs,
++        "sha256": sha,
++        "ingested_at": int(time.time())
++    }
++    try:
++        register_file_entry(manifest_entry)
++    except Exception as e:
++        print("metadata registration failed", e)
++    # cleanup
++    try:
++        shutil.rmtree(upload_dir)
++    except Exception:
++        pass
++    return {"manifest": manifest_entry}
++
++@app.get("/resumable/{upload_id}/status")
++def status(upload_id: str):
++    upload_dir = os.path.join(TMP, upload_id)
++    if not os.path.exists(upload_dir):
++        raise HTTPException(status_code=404, detail="upload id not found")
++    meta = json.load(open(os.path.join(upload_dir, "meta.json")))
++    chunks = sorted(meta.get("chunks", []))
++    return {"upload_id": upload_id, "metadata": meta, "received_chunks": chunks}
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/autoscale/ingest_hpa.yaml
++apiVersion: autoscaling/v2
++kind: HorizontalPodAutoscaler
++metadata:
++  name: multimodal-ingest-hpa
++  namespace: inference
++spec:
++  scaleTargetRef:
++    apiVersion: apps/v1
++    kind: Deployment
++    name: multimodal-ingest
++  minReplicas: 2
++  maxReplicas: 10
++  metrics:
++    - type: Resource
++      resource:
++        name: cpu
++        target:
++          type: Utilization
++          averageUtilization: 60
++    - type: Resource
++      resource:
++        name: memory
++        target:
++          type: Utilization
++          averageUtilization: 70
++
+*** End Patch
+*** Begin Patch
+*** Add File:tekton/tasks/push_triton_model_task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: push-triton-model-task
++  namespace: ml-pipelines
++spec:
++  params:
++    - name: local-model-dir
++      type: string
++    - name: model-name
++      type: string
++    - name: store-prefix
++      type: string
++  steps:
++    - name: package
++      image: alpine:3.18
++      script: |
++        #!/usr/bin/env sh
++        set -euo pipefail
++        echo "Packaging model..."
++        /scripts/package_triton_model.sh $(inputs.params.local-model-dir) $(inputs.params.model-name) /workspace/out || true
++    - name: upload
++      image: bitnami/aws-cli:2.15
++      script: |
++        #!/usr/bin/env sh
++        set -euo pipefail
++        echo "Uploading packaged model to store..."
++        if echo "$(inputs.params.store-prefix)" | grep -q '^s3://'; then
++          aws s3 cp --recursive /tmp/triton_repo_*/ s3://$(echo $(inputs.params.store-prefix) | sed 's#s3://##')/$(inputs.params.model-name)/ || true
++        else
++          echo "Non S3 store prefix; please mount PV or implement uploader"
++        fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/push_triton_model.yml
++name: Push Triton Model to Model Repo
++on:
++  workflow_dispatch:
++
++jobs:
++  push_model:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.10'
++      - name: Package model and upload
++        env:
++          STORE_PREFIX: ${{ secrets.MODEL_STORE_PREFIX }} # e.g. s3://aegis-model-repo
++        run: |
++          ./scripts/package_triton_model.sh models/vision_sample vision_encoder "$STORE_PREFIX"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/triton/validate_and_bake_kernel.py
++#!/usr/bin/env python3
++"""
++Validate kernel autotuner result for vision workloads and bake into Triton configmap
++ - Expects ops/triton/backend/kernel_best_config_vision.json to exist
++ - Runs validate_kernel_results.py and then writes a configmap kernel-best-config-vision
++"""
++import os, subprocess, sys
++
++CONFIG_PATH = os.environ.get("KERNEL_CONFIG_PATH", "ops/triton/backend/kernel_best_config_vision.json")
++NAMESPACE = os.environ.get("TRITON_NAMESPACE", "inference")
++
++def main():
++    if not os.path.exists(CONFIG_PATH):
++        print("No kernel config found at", CONFIG_PATH); sys.exit(2)
++    # validate (assumes script exists)
++    subprocess.check_call(["python","services/triton/kernel_opt/validate_kernel_results.py", CONFIG_PATH])
++    # create configmap
++    subprocess.check_call(["kubectl","-n",NAMESPACE,"create","configmap","kernel-best-config-vision","--from-file="+CONFIG_PATH,"--dry-run=client","-o","yaml"], stdout=open("/tmp/cm.yaml","wb"))
++    subprocess.check_call(["kubectl","-n",NAMESPACE,"apply","-f","/tmp/cm.yaml"])
++    print("Applied kernel-best-config-vision configmap")
++    # optionally rollout triton server to pick up config (operator decision)
++    try:
++        subprocess.check_call(["kubectl","-n",NAMESPACE,"rollout","restart","deployment/triton-clip-backend"])
++    except Exception as e:
++        print("Could not restart triton deployment:", e)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:tekton/tasks/multimodal-eval-thresholds.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: multimodal-eval-thresholds
++  namespace: ml-pipelines
++spec:
++  params:
++    - name: predictions-jsonl
++      type: string
++    - name: thresholds-json
++      type: string
++  steps:
++    - name: eval
++      image: us.gcr.io/aegis/multimodal-eval:latest
++      script: |
++        #!/usr/bin/env bash
++        set -euo pipefail
++        python services/multimodal/validation/multimodal_metrics.py --predictions $(inputs.params.predictions-jsonl) --out /workspace/metrics.json
++        cat /workspace/metrics.json
++        # compare with thresholds
++        python - <<'PY'
++import json,sys
++metrics = json.load(open('/workspace/metrics.json'))
++thresholds = json.load(open('$(inputs.params.thresholds-json)'))
++fail=False
++msgs=[]
++for k,v in thresholds.items():
++    if k not in metrics: continue
++    mv = metrics[k]
++    for sub,thr in v.items():
++        if mv.get(sub) is None: continue
++        if mv.get(sub) < thr:
++            fail=True
++            msgs.append(f"{k}.{sub} below threshold {mv.get(sub)} < {thr}")
++if fail:
++    print('Thresholds failed:', msgs)
++    sys.exit(2)
++print('Metrics pass thresholds')
++PY
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/prometheus/multimodal_alerts.yml
++groups:
++- name: multimodal-alerts
++  rules:
++  - alert: MultimodalSSIMDegraded
++    expr: aegis_multimodal_image_ssim_mean < 0.85
++    for: 30m
++    labels:
++      severity: page
++    annotations:
++      summary: "Average SSIM for image validation dropped below 0.85"
++      description: "Investigate recent model/pipeline changes and adversarial drift"
++
++  - alert: MultimodalAudioSNRDegraded
++    expr: aegis_multimodal_audio_snr_mean < 10
++    for: 30m
++    labels:
++      severity: warning
++    annotations:
++      summary: "Average audio SNR dropped below 10 dB"
++      description: "Check preprocessing/transcoding and model changes"
++
++  - alert: MultimodalEmbeddingDriftHigh
++    expr: aegis_multimodal_embedding_drift > 0.18
++    for: 30m
++    labels:
++      severity: page
++    annotations:
++      summary: "Multimodal embedding drift above 0.18"
++      description: "Investigate data drift and recent model changes"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/multimodal/storage/s3_set_lifecycle.sh
++#!/usr/bin/env bash
++#
++# Helper to set lifecycle rules for an S3 bucket used to store multimodal datasets
++#
++if [ $# -lt 1 ]; then
++  echo "Usage: $0 <s3-bucket-name> [prefix]"
++  exit 2
++fi
++BUCKET=$1
++PREFIX=${2:-}
++
++cat > /tmp/lifecycle.json <<EOF
++{
++  "Rules": [
++    {
++      "ID": "MultimodalArchive",
++      "Prefix": "$PREFIX",
++      "Status": "Enabled",
++      "Transitions": [
++        {
++          "Days": 30,
++          "StorageClass": "STANDARD_IA"
++        },
++        {
++          "Days": 365,
++          "StorageClass": "GLACIER"
++        }
++      ],
++      "NoncurrentVersionExpiration": {
++        "NoncurrentDays": 3650
++      }
++    }
++  ]
++}
++EOF
++
++aws s3api put-bucket-lifecycle-configuration --bucket "$BUCKET" --lifecycle-configuration file:///tmp/lifecycle.json
++echo "Applied lifecycle rules to s3://$BUCKET (prefix=$PREFIX)"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/multimodal/thumbnail_transcode_daemon.py
++#!/usr/bin/env python3
++"""
++Daemon that ensures thumbnails/transcodes for objects in storage exist as first-class artifacts.
++ - Periodically scans metadata service for recent files without derivatives and creates them.
++ - Uploads derivative artifacts back to store and updates metadata via metadata service.
++"""
++import os, time, json
++from services.multimodal.metadata.register_dataset import register_file_entry
++from services.multimodal.storage.uploader import upload_to_storage
++from urllib.parse import urlparse
++from PIL import Image
++import requests, tempfile, shutil, subprocess
++
++METADATA_URL = os.environ.get("METADATA_URL", "http://metadata.svc")
++POLL_INTERVAL = int(os.environ.get("THUMB_DAEMON_INTERVAL_S", "300"))
++STORE_PREFIX = os.environ.get("MM_STORE_PREFIX", "")
++
++def fetch_recent_items():
++    try:
++        resp = requests.get(METADATA_URL.rstrip("/") + "/files/recent", timeout=10)
++        resp.raise_for_status()
++        return resp.json()
++    except Exception as e:
++        print("Failed to list recent metadata:", e)
++        return []
++
++def download_storage_uri(uri, local_path):
++    if uri.startswith("s3://"):
++        # require aws cli
++        subprocess.check_call(["aws","s3","cp",uri, local_path])
++    elif uri.startswith("file://"):
++        shutil.copy(uri[len("file://"):], local_path)
++    else:
++        # attempt HTTP GET
++        r = requests.get(uri, timeout=30)
++        r.raise_for_status()
++        with open(local_path, "wb") as f:
++            f.write(r.content)
++
++def ensure_derivs(item):
++    # only handle images and audio in daemon
++    modality = item.get("modality")
++    uri = item.get("storage_uri")
++    if not uri:
++        return
++    if modality == "image" and not item.get("derivatives", {}).get("thumbnail"):
++        tmp = tempfile.mktemp(suffix=".img")
++        try:
++            download_storage_uri(uri, tmp)
++            img = Image.open(tmp)
++            img.thumbnail((256,256))
++            tpath = tmp + "_thumb.png"
++            img.save(tpath, format="PNG")
++            up = upload_to_storage(tpath, object_name=f"{item['dataset_id']}/{item['id']}_thumb.png")
++            # update metadata - best effort
++            item.setdefault("derivatives",{})["thumbnail"] = up
++            requests.post(METADATA_URL.rstrip("/") + "/files/update", json={"id": item["id"], "derivatives": item["derivatives"]}, timeout=10)
++            print("Created thumbnail for", item["id"])
++        except Exception as e:
++            print("Thumbnail creation failed for", item["id"], e)
++        finally:
++            try: os.remove(tmp)
++            except: pass
++
++def main_loop():
++    while True:
++        items = fetch_recent_items()
++        for it in items:
++            ensure_derivs(it)
++        time.sleep(POLL_INTERVAL)
++
++if __name__=="__main__":
++    main_loop()
++
+*** End Patch
+*** End Patch

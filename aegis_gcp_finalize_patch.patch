@@ -1,0 +1,313 @@
+*** Begin Patch
+*** Add File: scripts/gcp_finalize_and_validate.sh
++#!/usr/bin/env bash
++#
++# Finalize GCP provisioning, bind Workload Identity, push images, run ops validation
++# and perform end-to-end checks for Aegis on GCP.
++#
++# Usage:
++#   PROJECT=my-proj GCS_BUCKET=my-bucket REGION=us-central1 ZONE=us-central1-b \
++#     REPO=aegis-repo IMAGE=tpu-trainer:latest ./scripts/gcp_finalize_and_validate.sh
++#
++# The script is best-effort and will try to run each step if the required tools and env vars are present.
++set -euo pipefail
++
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++timestamp() { date --utc +"%Y-%m-%dT%H:%M:%SZ"; }
++
++# Required env vars (some can be provided by terraform outputs later)
++PROJECT="${PROJECT:-}"
++GCS_BUCKET="${GCS_BUCKET:-}"
++REGION="${REGION:-us-central1}"
++ZONE="${ZONE:-us-central1-b}"
++REPO="${REPO:-aegis-repo}"
++IMAGE="${IMAGE:-tpu-trainer:latest}"
++K8S_NAMESPACE="${K8S_NAMESPACE:-aegis}"
++K8S_SA="${K8S_SA:-aegis-trainer}"
++REPORT="/tmp/gcp_finalize_report.json"
++
++require_cmd() {
++  if ! command -v "$1" >/dev/null 2>&1; then
++    echo "Missing required command: $1" >&2
++    return 1
++  fi
++  return 0
++}
++
++log() { echo "$(timestamp) - $*"; }
++
++status_init() {
++  cat >"$REPORT" <<EOF
++{
++  "started_at": "$(timestamp)",
++  "project": "${PROJECT}",
++  "gcs_bucket": "${GCS_BUCKET}",
++  "results": {}
++}
++EOF
++}
++
++status_update() {
++  # $1 = key, $2 = value (assumed JSON literal or string)
++  key="$1"
++  val="$2"
++  tmp=$(mktemp)
++  jq --arg k "$key" --arg v "$val" '.results[$k]=$v' "$REPORT" > "$tmp" && mv "$tmp" "$REPORT"
++}
++
++status_update_json() {
++  # $1 key, $2 raw JSON string value
++  key="$1"
++  val="$2"
++  tmp=$(mktemp)
++  # Read current, set key to parsed JSON value
++  jq --arg k "$key" --argjson v "$val" '.results[$k]=$v' "$REPORT" > "$tmp" && mv "$tmp" "$REPORT"
++}
++
++status_finish() {
++  tmp=$(mktemp)
++  jq '. + {"finished_at":"'"$(timestamp)"'"}' "$REPORT" > "$tmp" && mv "$tmp" "$REPORT"
++  log "Report written to $REPORT"
++}
++
++main() {
++  status_init
++
++  # STEP 1: Provision GCP infra via terraform helper
++  if [ -z "$PROJECT" ] || [ -z "$GCS_BUCKET" ]; then
++    log "PROJECT and GCS_BUCKET env vars are required for provisioning. Skipping terraform apply."
++    status_update "terraform" "skipped_missing_env"
++  else
++    if require_cmd terraform && [ -x "./infra/gcp/terraform_apply.sh" ]; then
++      log "Running infra/gcp/terraform_apply.sh..."
++      if PROJECT="$PROJECT" GCS_BUCKET="$GCS_BUCKET" REGION="$REGION" ZONE="$ZONE" ./infra/gcp/terraform_apply.sh; then
++        log "Terraform apply completed."
++        status_update "terraform" "applied"
++      else
++        log "Terraform apply failed."
++        status_update "terraform" "failed"
++      fi
++    else
++      log "Terraform or infra/gcp/terraform_apply.sh missing; attempting terraform in infra/gcp if present."
++      if [ -d infra/gcp ] && require_cmd terraform; then
++        (cd infra/gcp && terraform init -input=false && terraform apply -auto-approve -var "project=${PROJECT}" -var "gcs_bucket=${GCS_BUCKET}" -var "region=${REGION}" -var "zone=${ZONE}") && status_update "terraform" "applied" || status_update "terraform" "failed"
++      else
++        status_update "terraform" "skipped_no_tooling"
++      fi
++    fi
++
++    # Dump terraform outputs if available
++    if require_cmd terraform && [ -d infra/gcp ]; then
++      if terraform -chdir=infra/gcp output -json >/tmp/gcp_tf_outputs.json 2>/dev/null; then
++        TF_JSON=$(cat /tmp/gcp_tf_outputs.json)
++        status_update_json "terraform_outputs" "$TF_JSON"
++        # extract common outputs if present
++        GKE_CLUSTER=$(echo "$TF_JSON" | jq -r '.gke_cluster_name.value // empty' 2>/dev/null || true)
++        TRAINER_SA_EMAIL=$(echo "$TF_JSON" | jq -r '.trainer_sa_email.value // empty' 2>/dev/null || true)
++        ARTIFACT_REGISTRY=$(echo "$TF_JSON" | jq -r '.artifact_registry.value // empty' 2>/dev/null || true)
++        log "Terraform outputs: gke_cluster_name=${GKE_CLUSTER:-<none>} trainer_sa_email=${TRAINER_SA_EMAIL:-<none>} artifact_registry=${ARTIFACT_REGISTRY:-<none>}"
++      else
++        log "No terraform outputs found or terraform not initialized in infra/gcp."
++      fi
++    fi
++  fi
++
++  # STEP 2: Bind Workload Identity
++  WI_OK=false
++  if [ -z "${TRAINER_SA_EMAIL:-}" ]; then
++    TRAINER_SA_EMAIL="${GCP_SA_EMAIL:-}"
++  fi
++  if [ -n "$TRAINER_SA_EMAIL" ]; then
++    if [ -x "./scripts/gcp_wi_bind.sh" ] && require_cmd gcloud && require_cmd kubectl; then
++      log "Binding Workload Identity using scripts/gcp_wi_bind.sh..."
++      if PROJECT="$PROJECT" NAMESPACE="$K8S_NAMESPACE" K8S_SA="$K8S_SA" GCP_SA_EMAIL="$TRAINER_SA_EMAIL" ./scripts/gcp_wi_bind.sh; then
++        WI_OK=true
++        status_update "workload_identity" "bound"
++      else
++        status_update "workload_identity" "failed"
++      fi
++    else
++      log "scripts/gcp_wi_bind.sh not executable or gcloud/kubectl missing; skipping WI bind."
++      status_update "workload_identity" "skipped_no_tools"
++    fi
++  else
++    log "Trainer service account email not available; set GCP_SA_EMAIL or ensure terraform output trainer_sa_email exists."
++    status_update "workload_identity" "skipped_no_sa_email"
++  fi
++
++  # Optional verification: show IAM policy for the SA and look for workloadIdentityBindings
++  if [ "$WI_OK" = true ] && require_cmd gcloud; then
++    log "Fetching IAM policy for ${TRAINER_SA_EMAIL} to verify workloadIdentityBindings..."
++    if gcloud iam service-accounts get-iam-policy "$TRAINER_SA_EMAIL" --project "$PROJECT" >/tmp/gcp_sa_iam_policy.json 2>/dev/null; then
++      POL_OUT=$(cat /tmp/gcp_sa_iam_policy.json)
++      status_update_json "sa_iam_policy" "$POL_OUT"
++    else
++      log "Failed to fetch IAM policy for ${TRAINER_SA_EMAIL} (may require permissions)."
++    fi
++  fi
++
++  # STEP 3: Build & push image to Artifact Registry
++  if require_cmd docker && [ -x "./scripts/push_image_crosscloud.sh" ]; then
++    log "Pushing image ${IMAGE} to GCP Artifact Registry via scripts/push_image_crosscloud.sh..."
++    if CLOUD_PROVIDER=gcp PROJECT="$PROJECT" REPO="$REPO" REGION="$REGION" IMAGE="$IMAGE" DOCKERFILE="${DOCKERFILE:-tpu/Dockerfile.tpu_trainer}" ./scripts/push_image_crosscloud.sh >/tmp/gcp_image_push.out 2>&1; then
++      log "Image push completed."
++      status_update "image_push" "success"
++      status_update "image_push_log" "$(sed -n '1,200p' /tmp/gcp_image_push.out | sed 's/\"/\\\"/g' | tr '\n' ' ' )"
++    else
++      log "Image push failed. See /tmp/gcp_image_push.out"
++      status_update "image_push" "failed"
++      status_update "image_push_log" "$(sed -n '1,200p' /tmp/gcp_image_push.out | sed 's/\"/\\\"/g' | tr '\n' ' ' )"
++    fi
++  else
++    log "Docker or push helper missing; skipping image push."
++    status_update "image_push" "skipped_no_tools"
++  fi
++
++  # STEP 4: Run ops validation (blocking)
++  OPS_OK=false
++  if [ -x "./scripts/ops_run_operational_validation.sh" ]; then
++    log "Running ops validation script (this may take time)..."
++    if ./scripts/ops_run_operational_validation.sh --ci; then
++      log "Ops validation script completed (check /tmp/ops_signoff_report.json)"
++    else
++      log "Ops validation script finished with non-zero exit (check /tmp/ops_signoff_report.json)"
++    fi
++    if [ -f /tmp/ops_signoff_report.json ]; then
++      P0=$(jq -r '.p0_failures // 0' /tmp/ops_signoff_report.json || echo "0")
++      status_update_json "ops_signoff" "$(cat /tmp/ops_signoff_report.json | jq -c '.')"
++      if [ "$P0" -eq 0 ]; then
++        OPS_OK=true
++        status_update "ops_validation" "pass"
++      else
++        status_update "ops_validation" "fail_p0"
++      fi
++    else
++      status_update "ops_validation" "no_report"
++    fi
++  else
++    log "Ops validation script missing; skipping."
++    status_update "ops_validation" "skipped_no_script"
++  fi
++
++  # STEP 5: End-to-end checks
++  E2E_OK=true
++  e2e_details="{}"
++
++  # GKE connectivity
++  if [ -n "${GKE_CLUSTER:-}" ] && require_cmd gcloud && require_cmd kubectl; then
++    log "Fetching GKE credentials for cluster ${GKE_CLUSTER}..."
++    if gcloud container clusters get-credentials "$GKE_CLUSTER" --zone "$ZONE" --project "$PROJECT"; then
++      if kubectl get nodes -o wide >/tmp/gke_nodes.txt 2>/dev/null; then
++        status_update "gke_nodes" "$(sed -n '1,200p' /tmp/gke_nodes.txt | sed 's/\"/\\\"/g' | tr '\n' ' ' )"
++      fi
++    else
++      log "Failed to get GKE credentials for ${GKE_CLUSTER}"
++      E2E_OK=false
++    fi
++  else
++    log "GKE cluster name not available; skipping kubectl connectivity check."
++  fi
++
++  # Submit Argo workflow (if argo CLI present)
++  if require_cmd argo && [ -f "argo/workflows/tpu_ephemeral_vm.yaml" ]; then
++    log "Submitting Argo TPU ephemeral VM workflow to namespace ${K8S_NAMESPACE}..."
++    if argo submit argo/workflows/tpu_ephemeral_vm.yaml -p OBJECT_STORE_BUCKET="${GCS_BUCKET}" -n "$K8S_NAMESPACE" >/tmp/argo_submit.out 2>&1; then
++      status_update "argo_submit" "submitted"
++      status_update "argo_submit_log" "$(sed -n '1,200p' /tmp/argo_submit.out | sed 's/\"/\\\"/g' | tr '\n' ' ' )"
++    else
++      log "Argo submit failed (see /tmp/argo_submit.out)"
++      status_update "argo_submit" "failed"
++      E2E_OK=false
++    fi
++  else
++    log "argo CLI or tpu_ephemeral_vm.yaml missing; skipping argo submit."
++    status_update "argo_submit" "skipped_no_tool_or_manifest"
++  fi
++
++  # Check artifacts in GCS
++  if require_cmd gsutil; then
++    log "Listing artifacts in gs://${GCS_BUCKET}/model-archives/"
++    if gsutil ls "gs://${GCS_BUCKET}/model-archives/" >/tmp/gcs_listing.txt 2>/dev/null; then
++      status_update "gcs_model_archives" "$(sed -n '1,100p' /tmp/gcs_listing.txt | sed 's/\"/\\\"/g' | tr '\n' ' ' )"
++    else
++      log "No artifacts found or gsutil couldn't list path."
++      status_update "gcs_model_archives" "none_or_unreachable"
++      E2E_OK=false
++    fi
++  else
++    log "gsutil not found; skipping GCS checks."
++    status_update "gcs_model_archives" "skipped_no_gsutil"
++  fi
++
++  # Check for attestation files in GCS
++  if require_cmd gsutil; then
++    if gsutil ls "gs://${GCS_BUCKET}/model-archives/**.attestation.json" >/dev/null 2>&1; then
++      status_update "gcs_attestations" "present"
++    else
++      status_update "gcs_attestations" "not_found"
++    fi
++  fi
++
++  # Rekor check (optional)
++  if require_cmd rekor-cli; then
++    log "Attempting to discover rekor entries for recently uploaded artifacts (best-effort)..."
++    # Try to fetch list of objects and check for attestation files; this is a heuristic
++    if [ -f /tmp/gcs_listing.txt ]; then
++      FIRST_OBJ=$(head -n1 /tmp/gcs_listing.txt || true)
++      if [ -n "$FIRST_OBJ" ]; then
++        tmpobj=$(mktemp)
++        if gsutil cp "$FIRST_OBJ" "$tmpobj" >/dev/null 2>&1; then
++          DIGEST=$(sha256sum "$tmpobj" | awk '{print $1}')
++          if rekor-cli search --artifact "$DIGEST" >/tmp/rekor_search.txt 2>/dev/null; then
++            status_update "rekor_search" "entries_found"
++            status_update "rekor_search_log" "$(sed -n '1,200p' /tmp/rekor_search.txt | sed 's/\"/\\\"/g' | tr '\n' ' ' )"
++          else
++            status_update "rekor_search" "no_entries"
++          fi
++        fi
++      fi
++    fi
++  else
++    status_update "rekor_search" "skipped_no_cli"
++  fi
++
++  # Gatekeeper check (dry-run unsigned vs attested)
++  if require_cmd kubectl && [ -f "k8s/serving/unsigned-sample.yaml" ]; then
++    log "Testing Gatekeeper admission for unsigned sample (server dry-run)..."
++    if kubectl apply --server-dry-run=client -f k8s/serving/unsigned-sample.yaml -n "$K8S_NAMESPACE" >/tmp/gatekeeper_dryrun.out 2>&1; then
++      status_update "gatekeeper_unsigned" "allowed_dryrun_client"
++    else
++      status_update "gatekeeper_unsigned" "denied_dryrun_client_or_error"
++    fi
++  else
++    status_update "gatekeeper_unsigned" "skipped_no_manifest_or_kubectl"
++  fi
++
++  if require_cmd kubectl && [ -f "k8s/serving/attested-sample.yaml" ]; then
++    log "Testing Gatekeeper admission for attested sample (server dry-run)..."
++    if kubectl apply --server-dry-run=client -f k8s/serving/attested-sample.yaml -n "$K8S_NAMESPACE" >/tmp/gatekeeper_attested.out 2>&1; then
++      status_update "gatekeeper_attested" "allowed_dryrun_client"
++    else
++      status_update "gatekeeper_attested" "denied_dryrun_client_or_error"
++      E2E_OK=false
++    fi
++  else
++    status_update "gatekeeper_attested" "skipped_no_manifest_or_kubectl"
++  fi
++
++  # Final E2E result
++  if [ "$E2E_OK" = true ] && [ "$OPS_OK" = true ]; then
++    status_update "final_status" "operational"
++  elif [ "$E2E_OK" = true ]; then
++    status_update "final_status" "e2e_ok_ops_maybe_fail"
++  else
++    status_update "final_status" "not_operational"
++  fi
++
++  status_finish
++}
++
++main "$@"
++
+*** End Patch
+*** End Patch

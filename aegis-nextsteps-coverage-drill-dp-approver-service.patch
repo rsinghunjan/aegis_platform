@@ -1,0 +1,376 @@
+*** Begin Patch
+*** Add File:ops/automation/deployment_coverage_check.py
++#!/usr/bin/env python3
++"""
++Deployment & code coverage checker
++
++Checks:
++ - No direct Triton/vLLM client usage in repository (enforce gateway).
++ - Kubernetes cluster deployments reference gateway (env var or annotation).
++ - Warn if any deployments/services expose Triton/vLLM endpoints directly.
++
++Usage:
++  python3 ops/automation/deployment_coverage_check.py [--kube-context CONTEXT]
++
++This script is intended to be run by CI or an operator with kubectl access.
++"""
++import subprocess
++import argparse
++import sys
++import re
++import json
++
++def check_codebase():
++    print("Checking source for direct Triton/vLLM usage...")
++    found = []
++    patterns = [re.compile(r"\btriton\b", re.I), re.compile(r"v2/models", re.I), re.compile(r"tritonclient", re.I), re.compile(r"vllm", re.I)]
++    files = subprocess.check_output(["git", "ls-files", "*.py", "*.js", "*.ts", "*.go"], text=True).splitlines()
++    for f in files:
++        if f.startswith("ops/serving/gateway"):  # skip gateway sources
++            continue
++        try:
++            txt = open(f, "r", errors="ignore").read()
++        except Exception:
++            continue
++        for p in patterns:
++            if p.search(txt):
++                found.append((f, p.pattern))
++                break
++    if found:
++        print("Direct calls/patterns detected (file, pattern):")
++        for f,pat in found:
++            print(" -", f, pat)
++    else:
++        print("No direct Triton/vLLM patterns found in source (quick scan).")
++    return found
++
++def kubectl(ctx=None, args=None):
++    cmd = ["kubectl"]
++    if ctx:
++        cmd += ["--context", ctx]
++    cmd += args
++    return subprocess.check_output(cmd, text=True)
++
++def check_k8s(ctx=None, namespace=None):
++    print("Checking Kubernetes deployments/services for gateway coverage...")
++    problems = []
++    ns_args = ["--all-namespaces"] if not namespace else ["-n", namespace]
++    # List deployments
++    deps = json.loads(kubectl(ctx, ["get","deployments"] + ns_args + ["-o","json"]))
++    for item in deps.get("items", []):
++        name = item["metadata"]["name"]
++        ns = item["metadata"]["namespace"]
++        # Check env vars for TRITON_GATEWAY_URL or annotation indicating uses gateway
++        uses_gateway = False
++        spec = item.get("spec",{})
++        for c in spec.get("template",{}).get("spec",{}).get("containers",[]):
++            for env in c.get("env",[]):
++                if env.get("name") in ("TRITON_GATEWAY_URL","TRITON_GATEWAY") or env.get("value","").find("triton-gateway")!=-1:
++                    uses_gateway = True
++            # check image name for gateway proxy (heuristic)
++            img = c.get("image","")
++            if "gateway" in img or "triton-gateway" in img:
++                uses_gateway = True
++        # If deployment is model-serving-like (heuristic by name) and does not use gateway, warn
++        if re.search(r"(model|serving|inference|triton)", name, re.I) and not uses_gateway:
++            problems.append(f"Deployment {ns}/{name} looks like a serving deployment but no gateway env found.")
++    # Services exposing triton/vllm ports
++    svcs = json.loads(kubectl(ctx, ["get","services"] + ns_args + ["-o","json"]))
++    for s in svcs.get("items", []):
++        name = s["metadata"]["name"]
++        ns = s["metadata"]["namespace"]
++        for p in s.get("spec",{}).get("ports",[]):
++            port = p.get("port")
++            if port in (8000,8001,8002,8080,8081,8082):
++                # these ports commonly used by Triton/vLLM; report for operator review
++                problems.append(f"Service {ns}/{name} exposes port {port} (check that it is not direct Triton endpoint).")
++    if problems:
++        print("Kubernetes coverage issues found:")
++        for p in problems:
++            print(" -", p)
++    else:
++        print("Kubernetes coverage checks passed (no obvious direct serving endpoints detected).")
++    return problems
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--kube-context", help="kubectl context to use")
++    ap.add_argument("--namespace", help="namespace to limit checks")
++    args = ap.parse_args()
++    code_issues = check_codebase()
++    try:
++        k8s_issues = check_k8s(ctx=args.kube_context, namespace=args.namespace)
++    except subprocess.CalledProcessError as e:
++        print("kubectl failed - cluster checks skipped. Ensure kubectl works and you have access.", file=sys.stderr)
++        k8s_issues = ["kubectl-failed"]
++    report = {
++        "code_issues": [i[0] for i in code_issues],
++        "k8s_issues": k8s_issues
++    }
++    print("\nSummary report:")
++    print(json.dumps(report, indent=2))
++    if code_issues or k8s_issues:
++        sys.exit(2)
++    sys.exit(0)
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:ops/runbooks/incident_drill/run_incident_drill.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Automated incident drill runner:
++# 1) Runs the red-team full suite locally (or via GitHub Actions) to produce a simulated alert.
++# 2) If red-team detects an issue, calls the content-alert-handler to create remediation Argo workflow.
++# 3) Waits for the Argo workflow to finish, verifies model deployment scaled to 0, and checks evidence artifact uploaded.
++#
++# Requirements:
++# - kubectl and argo CLI configured for the cluster
++# - awscli configured (if S3 evidence upload is used)
++# - CONTENT_ALERT_HANDLER (URL), ARGO_NS, MODEL_DEPLOYMENT, S3_AUDIT_BUCKET environment variables
++
++CONTENT_ALERT_HANDLER=${CONTENT_ALERT_HANDLER:-http://content-alert-handler:7072/alert}
++ARGO_NS=${ARGO_NS:-aegis-ml}
++MODEL_DEPLOYMENT=${MODEL_DEPLOYMENT:-model-serving}
++S3_AUDIT_BUCKET=${S3_AUDIT_BUCKET:-}
++
++echo "Step 1: Run red-team full suite"
++set +e
++python3 ops/tests/redteam/prompt_injection_tests.py "${MODEL_ENDPOINT:-http://localhost:8080/generate}"
++RT_RC=$?
++python3 ops/tests/redteam/multi_step_agent_exfiltration.py "${AGENT_URL:-http://localhost:8081/run}"
++RT2_RC=$?
++set -e
++
++if [ $RT_RC -ne 0 ] || [ $RT2_RC -ne 0 ]; then
++  echo "Red-team detected issues; calling remediation handler..."
++  RESP=$(curl -s -X POST -H "Content-Type: application/json" -d "{\"alert\":\"drill_failure\",\"source\":\"incident_drill\",\"time\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" "$CONTENT_ALERT_HANDLER")
++  echo "Remediation handler response: $RESP"
++else
++  echo "Red-team passed; for drill, still invoking remediation handler in dry-run mode."
++  RESP=$(curl -s -X POST -H "Content-Type: application/json" -d "{\"alert\":\"drill_dryrun\",\"source\":\"incident_drill\",\"time\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" "$CONTENT_ALERT_HANDLER")
++  echo "Handler response (dry-run): $RESP"
++fi
++
++echo "Step 2: Identify created Argo workflow (sleep 5s then list recent workflows)"
++sleep 5
++argo list -n "$ARGO_NS" --sort-by=startTime | head -n 20
++WF_NAME=$(argo list -n "$ARGO_NS" --output json | jq -r '.[0].metadata.name')
++if [ -z "$WF_NAME" ] || [ "$WF_NAME" = "null" ]; then
++  echo "No workflow found in namespace $ARGO_NS. Exiting."
++  exit 2
++fi
++echo "Monitoring Argo workflow: $WF_NAME"
++argo watch -n "$ARGO_NS" "$WF_NAME" || true
++
++echo "Step 3: Verify model deployment scaled to 0 (or remediated)"
++REPLICAS=$(kubectl -n "$ARGO_NS" get deployment "$MODEL_DEPLOYMENT" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "n/a")
++echo "Model deployment replicas: $REPLICAS"
++
++if [ -n "$S3_AUDIT_BUCKET" ]; then
++  echo "Step 4: Check S3 for evidence artifacts"
++  aws s3 ls "${S3_AUDIT_BUCKET}/content_incident/" || echo "No evidence objects found or access denied"
++fi
++
++echo "Incident drill complete. Please review Argo workflow and evidence bundle for completeness."
++
+*** End File
+*** Add File:ops/infra/terraform/dp_prod/README.md
++Provisioning HA DP service (example)
++
++Important: This is an example Terraform layout for provisioning an HA Postgres instance (RDS) and a Secrets Manager entry for the DB password.
++You must adapt variable values and security controls to your cloud account and security policy (VPC/subnets/security-groups).
++
++Steps:
++ - Edit terraform.tfvars with your VPC and subnet values.
++ - terraform init
++ - terraform plan -var-file=terraform.tfvars
++ - Submit plan for CloudSec review
++ - terraform apply -var-file=terraform.tfvars (after approval)
++
++This module outputs RDS endpoint and secret arn which you should connect to ExternalSecret (see ops/fl/dp/k8s).
++
+*** End File
+*** Add File:ops/human_review/signing_service/Dockerfile
++FROM python:3.11-slim
++ENV DEBIAN_FRONTEND=noninteractive
++RUN apt-get update && apt-get install -y --no-install-recommends curl openssl ca-certificates && \
++    python3 -m pip install --upgrade pip
++RUN pip install flask python-dotenv
++WORKDIR /app
++COPY app.py /app/app.py
++COPY requirements.txt /app/requirements.txt
++RUN chmod +x /app/app.py
++EXPOSE 8086
++CMD ["python3","/app/app.py"]
++
+*** End File
+*** Add File:ops/human_review/signing_service/requirements.txt
++flask
++python-dotenv
++
+*** End File
+*** Add File:ops/human_review/signing_service/app.py
++#!/usr/bin/env python3
++"""
++Approver signing service (minimal, opinionated)
++
++ - Receives approval payloads (raw bytes) via POST /sign (content-type: application/octet-stream)
++ - Requires header X-Approver-Token for simple auth (in prod, integrate with SSO/OIDC)
++ - Signs the blob using cosign sign-blob with COSIGN_KMS_URI and returns hex-encoded signature
++
++Security notes:
++ - This service is a mediator. In production you should gate signing via an approval workflow,
++   short-lived grants, and strict audit logging. Do NOT expose KMS keys to approvers directly.
++ - The service calls cosign locally; cosign must be available in the container and COSIGN_KMS_URI set.
++"""
++from flask import Flask, request, jsonify
++import os, tempfile, subprocess, binascii, time, logging
++
++APP = Flask(__name__)
++logging.basicConfig(level=logging.INFO)
++
++# Simple approver token list (in prod, validate via OIDC or an access control service)
++ALLOWED_TOKENS = os.environ.get("ALLOWED_APPROVER_TOKENS", "")  # comma-separated tokens
++ALLOWED = [t.strip() for t in ALLOWED_TOKENS.split(",") if t.strip()]
++COSIGN_KEY = os.environ.get("COSIGN_KMS_URI", "")
++
++def verify_token(tok: str) -> bool:
++    if not ALLOWED:
++        # No config -> deny by default
++        return False
++    return tok in ALLOWED
++
++@APP.route("/sign", methods=["POST"])
++def sign_blob():
++    approver_token = request.headers.get("X-Approver-Token","")
++    if not verify_token(approver_token):
++        return jsonify({"ok":False, "error":"unauthorized"}), 401
++    data = request.get_data()
++    if not data:
++        return jsonify({"ok":False, "error":"empty payload"}), 400
++    # write blob to temp file
++    with tempfile.NamedTemporaryFile(delete=False) as bfh:
++        bfh.write(data)
++        bpath = bfh.name
++    sigpath = bpath + ".sig"
++    try:
++        if not COSIGN_KEY:
++            return jsonify({"ok":False, "error":"COSIGN_KMS_URI not configured"}), 500
++        # cosign sign-blob --key <KMS> --output-signature <sig> <blob>
++        cmd = ["cosign", "sign-blob", "--key", COSIGN_KEY, "--output-signature", sigpath, bpath]
++        subprocess.check_call(cmd)
++        with open(sigpath, "rb") as fh:
++            sig = fh.read()
++        hex_sig = binascii.hexlify(sig).decode()
++        # audit log (simple)
++        logging.info("signed blob by token=%s size=%d ts=%s", approver_token[:6] if approver_token else "nil", len(data), time.time())
++        return jsonify({"ok":True, "signature_hex": hex_sig})
++    except subprocess.CalledProcessError as e:
++        logging.exception("cosign failed")
++        return jsonify({"ok":False, "error":"signing_failed"}), 500
++    finally:
++        try:
++            os.unlink(bpath)
++            if os.path.exists(sigpath):
++                os.unlink(sigpath)
++        except Exception:
++            pass
++
++if __name__=="__main__":
++    APP.run(host="0.0.0.0", port=int(os.environ.get("PORT","8086")))
++
+*** End File
+*** Add File:ops/human_review/signing_service/k8s/signing_service_deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: approver-signing-service
++  namespace: aegis-system
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: approver-signing-service
++  template:
++    metadata:
++      labels:
++        app: approver-signing-service
++    spec:
++      containers:
++      - name: signing
++        image: <YOUR_REGISTRY>/aegis-approver-signing:latest
++        env:
++        - name: COSIGN_KMS_URI
++          valueFrom:
++            secretKeyRef:
++              name: cosign-kms-secret
++              key: kms_uri
++        - name: ALLOWED_APPROVER_TOKENS
++          valueFrom:
++            secretKeyRef:
++              name: approver-tokens
++              key: tokens
++        ports:
++        - containerPort: 8086
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: approver-signing
++  namespace: aegis-system
++spec:
++  ports:
++  - port: 8086
++    targetPort: 8086
++  selector:
++    app: approver-signing-service
++
+*** End File
+*** Add File:ops/automation/checklist_report_generation.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Run deployment coverage check and produce a simple report in /tmp/aegis_coverage_report.json
++OUT=/tmp/aegis_coverage_report.json
++python3 ops/automation/deployment_coverage_check.py --kube-context "${KUBE_CONTEXT:-}" --namespace "${KUBE_NAMESPACE:-}" > /tmp/coverage_raw.txt || true
++python3 - <<PY
++import json,sys
++raw = open("/tmp/coverage_raw.txt").read()
++report = {"generated_at": __import__("time").ctime(), "summary": raw[:4000]}
++open("$OUT","w").write(json.dumps(report,indent=2))
++print("Wrote coverage report to $OUT")
++PY
++echo "You can review $OUT and /tmp/coverage_raw.txt. Upload it to your audit bucket if desired."
++
+*** End File
+*** Add File:ops/docs/next_actions_handout.md
++# Next actions handout for Infra/OPs
++
++Runbook (high level)
++1) Build & publish the detector image:
++   - Set ARTIFACT_BASE and IMAGE_NAME secrets in CI.
++   - Trigger .github/workflows/build_and_verify_detectors.yml
++2) Deploy approver signing service:
++   - Build image for ops/human_review/signing_service and push to registry.
++   - Create k8s secrets cosign-kms-secret (kms_uri) and approver-tokens (tokens).
++   - Apply k8s manifest ops/human_review/signing_service/k8s/signing_service_deployment.yaml
++3) Provision HA DP:
++   - Edit ops/infra/terraform/dp_prod/terraform.tfvars with VPC/subnet values.
++   - Submit terraform plan for CloudSec review and apply.
++   - Wire external secret ops/fl/dp/k8s/dp_secret_external_secret.yaml to read DB URL & token.
++4) Run coverage check & generate report:
++   - ./ops/automation/checklist_report_generation.sh
++   - Share /tmp/aegis_coverage_report.json with CloudSec / Compliance
++5) Run incident drill:
++   - ./ops/runbooks/incident_drill/run_incident_drill.sh (ensure ARGO_NS, CONTENT_ALERT_HANDLER env vars set)
++
++Contact points
++- Infra: infra-team@example.com
++- Security: secops@example.com
++- ML Ops: mlops@example.com
++
+*** End File
+*** End Patch

@@ -1,0 +1,584 @@
+*** Begin Patch
+*** Add File:cloud/hsm/aws_cloudhsm.tf
++/*
++AWS CloudHSM provisioning module (example).
++Operator: populate terraform.tfvars with vpc_id, subnet_ids, deloyment_owner and run `terraform init && terraform apply`.
++Note: This is a template — adjust IAM and networking per your org security policies.
++*/
++provider "aws" {
++  region = var.aws_region
++}
++
++resource "aws_cloudhsm_v2_cluster" "aegis_hsm" {
++  subnet_ids       = var.hsm_subnet_ids
++  hsm_type         = "hsm1.medium"
++  source_backup_id = ""
++  tags = {
++    Name = "aegis-cloudhsm"
++    Owner = var.deployment_owner
++  }
++}
++
++resource "aws_cloudhsm_v2_hsm" "aegis_hsm_nodes" {
++  count      = length(var.hsm_subnet_ids)
++  cluster_id = aws_cloudhsm_v2_cluster.aegis_hsm.cluster_id
++  subnet_id  = var.hsm_subnet_ids[count.index]
++}
++
++output "cloudhsm_cluster_id" {
++  value = aws_cloudhsm_v2_cluster.aegis_hsm.cluster_id
++}
++
++variable "aws_region" { type = string }
++variable "hsm_subnet_ids" { type = list(string) }
++variable "deployment_owner" { type = string }
++
+*** End Patch
+*** Begin Patch
+*** Add File:quantum/hsm/vendor_integration/install_vendor_pkcs11.sh
++#!/usr/bin/env bash
++# Install vendor PKCS#11 module and configure HSM audit forwarding to S3/SIEM.
++# Usage: sudo ./install_vendor_pkcs11.sh --module /opt/vendor/lib/vendor_pkcs11.so --s3-audit-bucket my-hsm-audit-bucket --siem-endpoint https://siem.example.com/ingest
++set -euo pipefail
++
++PKCS11_MODULE=""
++S3_AUDIT_BUCKET=""
++SIEM_ENDPOINT=""
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --module) PKCS11_MODULE="$2"; shift 2;;
++    --s3-audit-bucket) S3_AUDIT_BUCKET="$2"; shift 2;;
++    --siem-endpoint) SIEM_ENDPOINT="$2"; shift 2;;
++    *) echo "Unknown $1"; exit 1;;
++  esac
++done
++
++: "${PKCS11_MODULE:?--module required}"
++
++echo "Installing PKCS#11 module to /usr/lib/ and making accessible..."
++mkdir -p /usr/lib/aegis-pkcs11
++cp "${PKCS11_MODULE}" /usr/lib/aegis-pkcs11/vendor_pkcs11.so
++chmod 644 /usr/lib/aegis-pkcs11/vendor_pkcs11.so
++
++echo "Registering module path in /etc/ld.so.conf.d/aegis-pkcs11.conf"
++echo "/usr/lib/aegis-pkcs11" > /etc/ld.so.conf.d/aegis-pkcs11.conf
++ldconfig
++
++# Configure rsyslog to forward HSM audit logs to local file and a forwarder (SIEM)
++AUDIT_DIR="/var/log/aegis/hsm"
++mkdir -p "${AUDIT_DIR}"
++chown root:root "${AUDIT_DIR}"
++chmod 750 "${AUDIT_DIR}"
++
++cat >/etc/rsyslog.d/30-aegis-hsm.conf <<EOF
++# Capture local HSM audit facility (assumes vendor logs to local facility local4)
++local4.*    ${AUDIT_DIR}/hsm-audit.log
++# Forward to remote SIEM if provided
++EOF
++
++systemctl restart rsyslog || true
++
++if [ -n "${S3_AUDIT_BUCKET}" ]; then
++  echo "Installing s3-sync uploader cron (pushes new audit files to s3://${S3_AUDIT_BUCKET}/hsm-audit/)"
++  cat >/usr/local/bin/aegis_hsm_s3sync.sh <<'SYNC'
++#!/usr/bin/env bash
++set -e
++AUDIT_DIR="/var/log/aegis/hsm"
++BUCKET="$1"
++aws s3 cp "${AUDIT_DIR}/" "s3://${BUCKET}/hsm-audit/" --recursive --exclude "*" --include "*.log" || true
++SYNC
++  chmod +x /usr/local/bin/aegis_hsm_s3sync.sh
++  (crontab -l 2>/dev/null || true; echo "*/5 * * * * /usr/local/bin/aegis_hsm_s3sync.sh ${S3_AUDIT_BUCKET} >/dev/null 2>&1") | crontab -
++fi
++
++if [ -n "${SIEM_ENDPOINT}" ]; then
++  echo "Installing simple SIEM forwarder (file -> HTTP)"
++  cat >/usr/local/bin/aegis_hsm_forward_to_siem.sh <<'FORWARD'
++#!/usr/bin/env bash
++set -euo pipefail
++AUDIT_DIR="/var/log/aegis/hsm"
++SIEM="$1"
++for f in $(ls -1 "${AUDIT_DIR}"/*.log 2>/dev/null || true); do
++  curl -sS -X POST "${SIEM}" --data-binary @"${f}" -H "Content-Type: application/json" || true
++done
++FORWARD
++  chmod +x /usr/local/bin/aegis_hsm_forward_to_siem.sh
++  (crontab -l 2>/dev/null || true; echo "*/5 * * * * /usr/local/bin/aegis_hsm_forward_to_siem.sh ${SIEM_ENDPOINT} >/dev/null 2>&1") | crontab -
++fi
++
++echo "PKCS#11 module installed and audit forwarding configured (if S3/SIEM supplied)."
++echo "Update Vault with PKCS#11 path and slot using quantum/vault/write_hsm_config_and_pubkey.sh"
++
+*** End Patch
+*** Begin Patch
+*** Add File:quantum/crypto/hsm_helper_vendor.py
++#!/usr/bin/env python3
++"""
++Vendor HSM helper utilities:
++ - import_key_from_pem: imports a public key PEM to vendor HSM representation (uses vendor CLI wrapper if needed)
++ - robust_sign: adds retries and vendor-quirk normalization when signing via HSMService
++"""
++import time, base64
++from quantum.crypto.hsm_service import HSMService
++
++def import_public_key_to_vault(vault_client, vault_path, pub_pem):
++    # vault_client: hvac.Client instance
++    vault_client.secrets.kv.v2.create_or_update_secret(path=vault_path, secret={"public_key": pub_pem})
++    return True
++
++def robust_sign(pkcs11_module, slot, pin, keylabel, data, attempts=3, backoff=3):
++    svc = HSMService(pkcs11_module=pkcs11_module, slot=slot)
++    for i in range(attempts):
++        try:
++            sig_b64 = svc.sign(pin, keylabel, data)
++            # Some vendors return raw sig; normalize to base64 string
++            if isinstance(sig_b64, bytes):
++                sig_b64 = base64.b64encode(sig_b64).decode("ascii")
++            return sig_b64
++        except Exception as e:
++            if i + 1 == attempts:
++                raise
++            time.sleep(backoff * (i + 1))
++
+*** End Patch
+*** Begin Patch
+*** Add File:providers/pilot/adapters_common.py
++"""
++Common helpers for QPU adapters: retries, metadata normalization and noise extraction.
++Adapters should call normalize_backend_metadata(resp) to unify vendor differences.
++"""
++import time, json
++
++def retry_on_exceptions(fn, attempts=3, backoff=2):
++    def wrapper(*a, **kw):
++        last = None
++        for i in range(attempts):
++            try:
++                return fn(*a, **kw)
++            except Exception as e:
++                last = e
++                time.sleep(backoff * (i + 1))
++        raise last
++    return wrapper
++
++def normalize_backend_metadata(meta):
++    """
++    Normalize vendor backend metadata dictionaries to a common set:
++    fields: name, calibration, noise_model, timestamp
++    """
++    out = {"name": None, "calibration": None, "noise_model": None, "timestamp": None}
++    if not meta:
++        return out
++    # common heuristics
++    out["name"] = meta.get("name") or meta.get("backend") or meta.get("deviceArn") or meta.get("id")
++    out["calibration"] = meta.get("calibration") or meta.get("calib") or meta.get("calibration_data")
++    out["noise_model"] = meta.get("noiseModel") or meta.get("noise") or meta.get("error_map")
++    out["timestamp"] = meta.get("timestamp") or meta.get("last_updated") or meta.get("created_at")
++    return out
++
+*** End Patch
+*** Begin Patch
+*** Add File:providers/pilot/braket_full.py
+*** End Patch
+*** Begin Patch
+*** Update File:providers/pilot/braket_full.py
+@@
+ class BraketFullAdapter(QuantumBackendAdapter):
+     def __init__(self, region=None, s3_bucket=None):
+         self.region = region or os.environ.get("AWS_REGION", "us-west-2")
+         self.client = boto3.client("braket", region_name=self.region)
+         self.s3 = boto3.client("s3", region_name=self.region)
+         self.s3_bucket = s3_bucket or os.environ.get("BRAKET_RESULTS_BUCKET")
+         self.jobs = {}
+ 
+     def submit_job(self, job_spec):
++        # Wrap submission in retry and normalize quirks
++        from providers.pilot.adapters_common import retry_on_exceptions
++        @retry_on_exceptions
++        def _submit():
++            job_id = str(uuid.uuid4())
++            device_arn = job_spec.get("device")
++            program = job_spec.get("program") or job_spec.get("circuit_qasm")
++            if not device_arn:
++                self.jobs[job_id] = {"status":"ERROR","error":"device not specified"}
++                return job_id
++            key = f"braket/programs/{job_id}.json"
++            self.s3.put_object(Bucket=self.s3_bucket, Key=key, Body=program.encode("utf-8"))
++            # Some older Braket SDK versions require different arg names; normalize
++            kwargs = {
++                "action": {"content": program},
++                "deviceArn": device_arn,
++                "shots": job_spec.get("shots", 100),
++                "outputS3Bucket": self.s3_bucket,
++                "outputS3KeyPrefix": f"braket/results/{job_id}"
++            }
++            resp = self.client.create_quantum_task(**kwargs)
++            self.jobs[job_id] = {"status":"SUBMITTED","task_arn": resp.get("quantumTaskArn")}
++            return job_id
++        return _submit()
+@@
+     def get_result(self, job_id):
+         info = self.jobs.get(job_id)
+         if not info:
+             return {"status":"UNKNOWN"}
+         if info.get("status") == "SUBMITTED":
+             arn = info.get("task_arn")
+             resp = self.client.get_quantum_task(quantumTaskArn=arn)
+             status = resp.get("status")
+             info["status"] = status
+             if status in ("COMPLETED","SUCCEEDED"):
+-                prefix = f"braket/results/{job_id}/"
+-                objs = self.s3.list_objects_v2(Bucket=self.s3_bucket, Prefix=prefix)
+-                results = []
+-                for o in objs.get("Contents", []):
+-                    key = o["Key"]
+-                    tmp = f"/tmp/{os.path.basename(key)}"
+-                    self.s3.download_file(self.s3_bucket, key, tmp)
+-                    try:
+-                        results.append(json.load(open(tmp)))
+-                    except:
+-                        results.append({"file": key})
+-                info["results"] = results
++                prefix = f"braket/results/{job_id}/"
++                objs = self.s3.list_objects_v2(Bucket=self.s3_bucket, Prefix=prefix)
++                results = []
++                for o in objs.get("Contents", []):
++                    key = o["Key"]
++                    tmp = f"/tmp/{os.path.basename(key)}"
++                    self.s3.download_file(self.s3_bucket, key, tmp)
++                    try:
++                        results.append(json.load(open(tmp)))
++                    except Exception:
++                        results.append({"file": key})
++                # normalize metadata
++                from providers.pilot.adapters_common import normalize_backend_metadata
++                info["results"] = results
++                info["backend_meta_normalized"] = normalize_backend_metadata(resp.get("deviceMetadata") or resp.get("deviceSpecs") or {})
+             return info
+         return info
+*** End Patch
+*** Begin Patch
+*** Add File:providers/pilot/ibm_full.py
+*** End Patch
+*** Begin Patch
+*** Update File:providers/pilot/ibm_full.py
+@@
+ class IBMFullAdapter:
+     def __init__(self):
+         token = os.environ.get("QISKIT_IBM_TOKEN")
+         if not token:
+             raise RuntimeError("QISKIT_IBM_TOKEN unset")
+         self.service = IBMQRuntimeService(channel="ibm_cloud", token=token)
+         self.jobs = {}
+ 
+     def submit_job(self, job_spec):
+-        job_id = str(uuid.uuid4())
+-        backend_name = job_spec.get("backend")
+-        qasm = job_spec.get("circuit_qasm")
+-        shots = job_spec.get("shots", 1024)
+-        try:
+-            with Session(service=self.service, backend=backend_name) as session:
+-                sampler = Sampler(session=session)
+-                result = sampler.run(qasm, shots=shots)
+-                counts = result.shots_counts()
+-                try:
+-                    backend_props = session.backend.properties()
+-                    backend_meta = backend_props.to_dict() if backend_props else None
+-                except Exception:
+-                    backend_meta = None
+-                self.jobs[job_id] = {"status":"DONE","counts":counts,"backend_meta": backend_meta}
+-            return job_id
+-        except Exception as e:
+-            self.jobs[job_id] = {"status":"ERROR","error": str(e)}
+-            return job_id
++        from providers.pilot.adapters_common import retry_on_exceptions, normalize_backend_metadata
++        @retry_on_exceptions
++        def _submit():
++            job_id = str(uuid.uuid4())
++            backend_name = job_spec.get("backend")
++            qasm = job_spec.get("circuit_qasm")
++            shots = job_spec.get("shots", 1024)
++            try:
++                with Session(service=self.service, backend=backend_name) as session:
++                    sampler = Sampler(session=session)
++                    result = sampler.run(qasm, shots=shots)
++                    counts = result.shots_counts()
++                    try:
++                        backend_props = session.backend.properties()
++                        backend_meta = backend_props.to_dict() if backend_props else {}
++                    except Exception:
++                        backend_meta = {}
++                    self.jobs[job_id] = {"status":"DONE","counts":counts,"backend_meta": normalize_backend_metadata(backend_meta)}
++                return job_id
++            except Exception as e:
++                self.jobs[job_id] = {"status":"ERROR","error": str(e)}
++                return job_id
++        return _submit()
+*** End Patch
+*** Begin Patch
+*** Add File:feature_store/deploy_feast.sh
++#!/usr/bin/env bash
++# Deploy a minimal Feast environment (local/process) for staging: Redis + Postgres + Feast SDK usage.
++# This script uses docker-compose for a quick staging environment.
++set -euo pipefail
++COMPOSE_FILE=$(dirname "$0")/docker-compose-feast.yml
++echo "Bringing up Redis and Postgres for Feast (docker-compose)..."
++docker-compose -f "${COMPOSE_FILE}" up -d
++echo "Feast staging environment started. Use feature_store/ingest/ingest_example.py to create sample data."
++
+*** End Patch
+*** Begin Patch
+*** Add File:feature_store/docker-compose-feast.yml
++version: '3.7'
++services:
++  redis:
++    image: redis:6.2
++    ports:
++      - "6379:6379"
++  postgres:
++    image: postgres:13
++    environment:
++      POSTGRES_PASSWORD: postgres
++      POSTGRES_USER: feast
++      POSTGRES_DB: feast
++    ports:
++      - "5432:5432"
++
+*** End Patch
+*** Begin Patch
+*** Add File:serving/seldon/deploy_seldon_example.yaml
++apiVersion: machinelearning.seldon.io/v1
++kind: SeldonDeployment
++metadata:
++  name: aegis-demo
++  namespace: aegis
++spec:
++  protocol: tensorflow
++  predictors:
++  - name: default
++    replicas: 1
++    graph:
++      name: model
++      implementation: SKLEARN_SERVER
++      modelUri: gs://aegis-models/aegis-demo
++    componentSpecs:
++    - spec:
++        containers:
++        - name: model
++          image: seldonio/sklearnserver:1.13.0
++          imagePullPolicy: IfNotPresent
++
+*** End Patch
+*** Begin Patch
+*** Add File:serving/bentoml/build_and_deploy.sh
++#!/usr/bin/env bash
++# Build a BentoML model image and deploy locally (example)
++set -euo pipefail
++MODEL_NAME=${1:-aegis-demo}
++TAG=${2:-latest}
++bentoml build -f bentoml_service.py
++bentoml containerize ${MODEL_NAME}:${TAG} -t aegis/${MODEL_NAME}:${TAG}
++echo "Built container aegis/${MODEL_NAME}:${TAG}; push to registry and deploy to cluster or run locally with Docker."
++
+*** End Patch
+*** Begin Patch
+*** Add File:serving/bentoml/bentoml_service.py
++import bentoml
++from bentoml.io import JSON
++
++@bentoml.env(infer_pip_requirements=True)
++@bentoml.artifacts([])
++class DummyService(bentoml.BentoService):
++    @bentoml.api(input=JSON, batch=False)
++    def predict(self, parsed_json):
++        return {"echo": parsed_json}
++
++if __name__ == "__main__":
++    svc = DummyService()
++    svc.save("aegis-demo")
++
+*** End Patch
+*** Begin Patch
+*** Add File:agent/celery/tasks.py
++from celery import Celery
++import subprocess, os, json
++
++CELERY_BROKER = os.environ.get("CELERY_BROKER_URL", "redis://redis:6379/0")
++app = Celery("aegis", broker=CELERY_BROKER, backend=os.environ.get("CELERY_RESULT_BACKEND"))
++
++@app.task(bind=True, max_retries=3, default_retry_delay=10)
++def run_braket_pilot(self, vault_path, program, s3_bucket):
++    try:
++        cmd = ["python3", "providers/pilot/orchestrator.py", "--provider", "braket", "--vault-path", vault_path, "--program", program, "--s3-bucket", s3_bucket]
++        subprocess.check_call(cmd)
++        return {"status": "submitted"}
++    except Exception as e:
++        raise self.retry(exc=e)
++
++@app.task(bind=True, max_retries=2, default_retry_delay=5)
++def verify_rekor(self, mlflow_url, threshold=5):
++    try:
++        cmd = ["python3", "quantum/rekor/check_mlflow_rekor.py", "--mlflow-url", mlflow_url, "--threshold", str(threshold)]
++        subprocess.check_call(cmd)
++        return {"status":"ok"}
++    except Exception as e:
++        raise self.retry(exc=e)
++
+*** End Patch
+*** Begin Patch
+*** Add File:agent/celery/README.md
++Celery agent orchestration
++-------------------------
++1. Deploy Redis (broker) and optionally a result backend (redis or rpc).
++2. Start Celery worker: CELERY_BROKER_URL=redis://redis:6379/0 celery -A agent.celery.tasks worker --loglevel=info
++3. Submit tasks from CLI or UI: from agent.celery.tasks import run_braket_pilot; run_braket_pilot.delay("secret/data/quantum/providers","/tmp/demo.qasm","aegis-staging-bucket")
++
+*** End Patch
+*** Begin Patch
+*** Add File:observability/cur/lambda_cur_processor.py
+*** End Patch
+*** Begin Patch
+*** Update File:observability/cur/lambda_cur_processor.py
+@@
+-import json, boto3, os, tempfile
+-import pandas as pd
++import json, boto3, os, tempfile, re
++import pandas as pd
+@@
+-        # For brevity assume CSV; convert to DataFrame and map to (job,cost)
+-        df = pd.read_csv(local_path) if local_path.endswith(".csv") else pd.read_parquet(local_path)
+-        # Placeholder: operator must adapt these columns to find job-id or tag
+-        if "resourceTags" in df.columns:
+-            # parse tags column to extract aegis:job-id (pseudo)
+-            df["job"] = df["resourceTags"].apply(lambda x: parse_job_from_tags(x))
+-        else:
+-            df["job"] = "unknown"
+-        df_summary = df.groupby("job")["cost"].sum().reset_index()
++        # Parse AWS CUR CSV/Parquet and map cost lines to Aegis job IDs using resource tags or line-item description.
++        df = pd.read_csv(local_path) if local_path.endswith(".csv") else pd.read_parquet(local_path)
++        # try to find aegis job id in columns or tags
++        job_col = None
++        for c in ["resourceTags", "lineItem/ProductCode", "resourceId", "resourceTags.user"]:
++            if c in df.columns:
++                job_col = c
++                break
++        if job_col:
++            df["job"] = df[job_col].apply(lambda v: extract_job_id_from_field(v))
++        else:
++            # fallback: try to parse job id from resource description
++            df["job"] = df.apply(lambda r: parse_job_from_description(str(r.get("lineItem/UsageType",""))), axis=1)
++        df_summary = df.groupby("job")["cost"].sum().reset_index()
+@@
+ def parse_job_from_tags(tag_field):
+     # operator-defined parsing
+     return "unknown"
++
++def extract_job_id_from_field(field):
++    if not isinstance(field, str):
++        try:
++            field = json.dumps(field)
++        except Exception:
++            field = str(field)
++    # heuristics: look for aegis-job-<id> or job:<id>
++    m = re.search(r"(aegis[-_]job[-_]?[:=]?([A-Za-z0-9-]+))", field)
++    if m:
++        return m.group(2)
++    m2 = re.search(r"job[:=]([A-Za-z0-9-]+)", field)
++    if m2:
++        return m2.group(1)
++    return "unknown"
++
++def parse_job_from_description(desc):
++    m = re.search(r"job[:=]([A-Za-z0-9-]+)", desc)
++    return m.group(1) if m else "unknown"
+*** End Patch
+*** Begin Patch
+*** Add File:sdk/cli/aegis_cli/extra_commands.py
++import click, subprocess
++
++@click.command()
++@click.option("--deploy-feast", is_flag=True, help="Deploy Feast staging environment (docker-compose)")
++def infra_setup(deploy_feast):
++    if deploy_feast:
++        subprocess.run(["bash","feature_store/deploy_feast.sh"])
++    click.echo("Infra helper commands executed.")
++
+*** End Patch
+*** Begin Patch
+*** Add File:ui/backend/routes.py
++from flask import Blueprint, jsonify, request
++import subprocess, json
++
++bp = Blueprint("aegis", __name__, url_prefix="/api")
++
++@bp.route("/submit-plan", methods=["POST"])
++def submit_plan():
++    data = request.json or {}
++    # enqueue agent plan as Celery task (if available)
++    try:
++        from agent.celery.tasks import run_braket_pilot
++        run_braket_pilot.delay(data.get("vault_path","secret/data/quantum/providers"), data.get("program","/tmp/demo.qasm"), data.get("s3_bucket","aegis-staging-bucket"))
++        return jsonify({"status":"submitted"}), 202
++    except Exception as e:
++        return jsonify({"error": str(e)}), 500
++
++@bp.route("/status", methods=["GET"])
++def status():
++    return jsonify({"ok": True})
++
+*** End Patch
+*** Begin Patch
+*** Add File:broker/scripts/install_cert_manager.sh
++#!/usr/bin/env bash
++set -euo pipefail
++echo "Installing cert-manager CRDs and controller (cluster-admin required)..."
++kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
++kubectl wait --for=condition=available --timeout=120s deployment/cert-manager -n cert-manager || true
++kubectl apply -f broker/k8s/cert-manager-issuer.yaml
++echo "cert-manager installed and issuer applied."
++
+*** End Patch
+*** Begin Patch
+*** Add File:broker/scripts/smoke_tests.sh
++#!/usr/bin/env bash
++set -euo pipefail
++NAMESPACE=${1:-aegis}
++echo "Checking broker pods..."
++kubectl get pods -n "${NAMESPACE}"
++echo "Health endpoint check (pod must expose /health on port 8080)"
++POD=$(kubectl get pods -n "${NAMESPACE}" -l app=aegis-quantum-broker -o jsonpath='{.items[0].metadata.name}')
++kubectl exec -n "${NAMESPACE}" "${POD}" -- curl -sS http://localhost:8080/health || { echo "health check failed"; exit 2; }
++echo "Smoke tests passed."
++
+*** End Patch
+*** Begin Patch
+*** Add File:compliance/auto_prepare_audit.sh
++#!/usr/bin/env bash
++set -euo pipefail
++OUTDIR=${1:-/tmp/aegis_auto_audit}
++mkdir -p "${OUTDIR}"
++echo "Collecting hybrid metadata and Rekor entries for MLflow runs..."
++python3 - <<PY
++import os, json, subprocess, tempfile
++out='${OUTDIR}'
++# Collect hybrid metadata files if present
++for root,dirs,files in os.walk('.'):
++    for f in files:
++        if f == 'hybrid-signature.json':
++            src=os.path.join(root,f)
++            dst=os.path.join(out, os.path.relpath(src,'.').replace('/','_') + '_' + f)
++            os.makedirs(os.path.dirname(dst), exist_ok=True)
++            subprocess.call(['cp', src, dst])
++# Export Rekor entries for artifacts found in MLflow runs (requires list of hashes)
++print('Collected hybrid metadata files into', out)
++PY
++echo "Signing evidence with cosign (if COSIGN_KEY env var present)..."
++if [ -n "${COSIGN_KEY:-}" ]; then
++  tar czf "${OUTDIR}.tar.gz" -C "${OUTDIR}" .
++  cosign sign-blob --key "${COSIGN_KEY}" --output-signature "${OUTDIR}/evidence.sig" "${OUTDIR}.tar.gz" || true
++fi
++echo "Audit bundle ready at ${OUTDIR}.tar.gz"
++
+*** End Patch
+*** End Patch

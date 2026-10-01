@@ -1,0 +1,581 @@
+*** Begin Patch
+*** Add File:ops/cluster/runtime_validator_enhanced.py
++#!/usr/bin/env python3
++"""
++Enhanced cluster runtime validator + node labeling helper.
++ - Checks node container runtime strings for runsc/kata or other configured runtimes.
++ - Optionally labels nodes with a `runtime.aegis/has-isolation=true|false` label.
++ - Emits a JSON report and can upload to S3.
++
++Usage:
++  python ops/cluster/runtime_validator_enhanced.py --kubeconfig /path/to/kubeconfig --s3 s3://bucket/path
++"""
++import argparse
++import json
++import os
++import sys
++from datetime import datetime
++
++try:
++    from kubernetes import client, config
++except Exception:
++    client = None
++
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++def load_kube(kubeconfig=None):
++    if client is None:
++        raise RuntimeError("kubernetes python client required: pip install kubernetes")
++    if kubeconfig:
++        config.load_kube_config(kubeconfig)
++    else:
++        try:
++            config.load_incluster_config()
++        except Exception:
++            config.load_kube_config()
++
++def check_and_label_nodes(label_nodes=False):
++    v1 = client.CoreV1Api()
++    nodes = v1.list_node().items
++    report = {"timestamp": datetime.utcnow().isoformat(), "nodes": []}
++    for n in nodes:
++        name = n.metadata.name
++        runtime = (n.status.node_info.container_runtime_version or "").lower()
++        labels = n.metadata.labels or {}
++        has_isolation = False
++        # heuristic checks
++        if "runsc" in runtime or "kata" in runtime or "firecracker" in runtime:
++            has_isolation = True
++        report["nodes"].append({"name": name, "runtime": runtime, "labels": labels, "has_isolation": has_isolation})
++        if label_nodes:
++            patch = {"metadata": {"labels": {"runtime.aegis/has-isolation": "true" if has_isolation else "false"}}}
++            try:
++                v1.patch_node(name, patch)
++            except Exception as e:
++                print(f"Failed to label node {name}: {e}")
++    return report
++
++def upload_report_s3(s3_uri, data_bytes):
++    if not boto3:
++        raise RuntimeError("boto3 required to upload to S3")
++    bucket = s3_uri.replace("s3://", "").split("/", 1)[0]
++    prefix = "/".join(s3_uri.replace("s3://", "").split("/", 1)[1:]).rstrip("/")
++    key = f"{prefix}/runtime-validator-report-{int(__import__('time').time())}.json"
++    s3 = boto3.client("s3")
++    s3.put_object(Bucket=bucket, Key=key, Body=data_bytes, ContentType="application/json")
++    return f"s3://{bucket}/{key}"
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--kubeconfig", default=None)
++    p.add_argument("--label-nodes", action="store_true")
++    p.add_argument("--s3", default="")
++    args = p.parse_args()
++    load_kube(args.kubeconfig)
++    report = check_and_label_nodes(label_nodes=args.label_nodes)
++    out = json.dumps(report, indent=2).encode("utf-8")
++    print(out.decode())
++    if args.s3:
++        uri = upload_report_s3(args.s3, out)
++        print("Uploaded report to:", uri)
++    # exit code non-zero if any node lacks isolation
++    lacking = [n for n in report["nodes"] if not n["has_isolation"]]
++    if lacking:
++        print("Nodes without recommended isolation:", [n["name"] for n in lacking])
++        sys.exit(2)
++    print("All nodes report isolation heuristics OK")
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:ops/webhook/generate_selfsigned_cert.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Generate a CA and a TLS cert for a webhook server and prints base64 CA bundle for ValidatingWebhookConfiguration.
++#
++OUT_DIR=${1:-/tmp/webhook-certs}
++mkdir -p "$OUT_DIR"
++cd "$OUT_DIR"
++
++echo "Generating CA..."
++openssl genrsa -out ca.key 2048
++openssl req -x509 -new -nodes -key ca.key -subj "/CN=aegis-webhook-ca" -days 3650 -out ca.crt
++
++echo "Generating server key..."
++openssl genrsa -out server.key 2048
++openssl req -new -key server.key -subj "/CN=aegis-admission-webhook.ml-serving.svc" -out server.csr
++
++cat > webhook.ext <<EOF
++authorityKeyIdentifier=keyid,issuer
++basicConstraints=CA:FALSE
++keyUsage = digitalSignature, keyEncipherment
++subjectAltName = DNS:aegis-admission-webhook.ml-serving.svc, DNS:aegis-admission-webhook
++EOF
++
++openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 365 -extfile webhook.ext
++
++echo "Created files in $OUT_DIR"
++echo "CA bundle (base64):"
++base64 -w0 ca.crt || true
++
++echo
++echo "Remember to create Kubernetes secret 'webhook-tls' in ml-serving with server.key/server.crt and to put CA bundle into ValidatingWebhookConfiguration"
++
+*** End File
+*** Add File:services/serving/diffusers/watermark/forensic_reporter.py
++#!/usr/bin/env python3
++"""
++Forensic reporter for watermarked artifacts.
++ - Runs detection across a set of transformations and records scores.
++ - Generates a signed evidence bundle (uses cosign CLI) for forensic submission.
++"""
++import os
++import io
++import json
++import tarfile
++import tempfile
++import subprocess
++from PIL import Image, ImageOps
++from services.serving.diffusers.watermark.vendor_adapter import embed, detect
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++COSIGN_KEY_REF = os.environ.get("COSIGN_KEY_REF", "")  # e.g., keyless or KMS ref
++
++def _variants(img: Image.Image):
++    v = {}
++    v["orig"] = img
++    v["resize_0.5"] = img.resize((img.width//2, img.height//2))
++    v["resize_2x"] = img.resize((img.width*2, img.height*2))
++    v["jpeg_80"] = img
++    buf = io.BytesIO(); img.save(buf, format="JPEG", quality=80)
++    v["jpeg_80"] = Image.open(io.BytesIO(buf.getvalue()))
++    v["rot_10"] = img.rotate(10).resize(img.size)
++    v["crop"] = img.crop((img.width//8, img.height//8, img.width*7//8, img.height*7//8)).resize(img.size)
++    v["flip_lr"] = ImageOps.mirror(img)
++    return v
++
++def analyze_and_bundle(image_bytes: bytes, payload: str, out_prefix: str = None):
++    im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
++    embedded = embed(image_bytes, payload, strength=0.02)
++    im_emb = Image.open(io.BytesIO(embedded)).convert("RGB")
++    results = {}
++    for name, var in _variants(im_emb).items():
++        buf = io.BytesIO(); var.save(buf, format="PNG"); vb = buf.getvalue()
++        ok = False
++        try:
++            ok = detect(vb, payload)
++        except Exception:
++            ok = False
++        results[name] = {"detected": bool(ok)}
++    # create evidence archive
++    tmpdir = tempfile.mkdtemp()
++    meta = {"payload": payload, "results": results}
++    meta_path = os.path.join(tmpdir, "forensic_metadata.json")
++    with open(meta_path, "w") as f:
++        json.dump(meta, f, indent=2)
++    img_path = os.path.join(tmpdir, "embedded.png")
++    with open(img_path, "wb") as f:
++        f.write(embedded)
++    archive = os.path.join(tmpdir, f"forensic_bundle_{int(__import__('time').time())}.tar.gz")
++    with tarfile.open(archive, "w:gz") as tar:
++        tar.add(meta_path, arcname="metadata.json")
++        tar.add(img_path, arcname="embedded.png")
++    # sign with cosign (if available)
++    signed = None
++    if COSIGN_KEY_REF:
++        try:
++            cmd = ["cosign", "sign", "--key", COSIGN_KEY_REF, archive]
++            subprocess.check_call(cmd)
++            signed = archive
++        except Exception as e:
++            print("cosign sign failed:", e)
++    # upload to S3 if configured
++    s3_uri = None
++    if EVIDENCE_BUCKET:
++        import boto3
++        s3 = boto3.client("s3")
++        bucket = EVIDENCE_BUCKET.replace("s3://","")
++        key = f"forensics/{out_prefix or 'unknown'}/{os.path.basename(archive)}"
++        s3.upload_file(archive, bucket, key)
++        s3_uri = f"s3://{bucket}/{key}"
++    return {"results": results, "archive_path": archive, "signed": bool(signed), "s3_uri": s3_uri}
++
+*** End File
+*** Add File:services/serving/diffusers/moderation_evaluator.py
++#!/usr/bin/env python3
++"""
++Evaluate moderation models on labeled datasets and push metrics to Prometheus pushgateway or S3.
++Also exposes a simple HTTP endpoint to run evaluation on-demand.
++"""
++import os
++import json
++from typing import Dict
++from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
++
++from services.serving.diffusers.moderation_multilingual import get_pipe_for_text
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++PUSHGATEWAY = os.environ.get("PROM_PUSHGATEWAY", "")
++
++def evaluate_jsonl(dataset_path: str, threshold: float = 0.6) -> Dict:
++    tp = fp = tn = fn = 0
++    per_model = {}
++    with open(dataset_path) as f:
++        for line in f:
++            j = json.loads(line)
++            text = j["text"]; label = int(j["label"])
++            pipe = get_pipe_for_text(text)
++            model = pipe.model.name_or_path if pipe else "fallback"
++            out = pipe(text, truncation=True) if pipe else [{"score": 0.0}]
++            score = float(out[0].get("score",0.0))
++            pred = 1 if score > threshold else 0
++            per_model.setdefault(model, {"tp":0,"fp":0,"tn":0,"fn":0})
++            if pred==1 and label==1:
++                tp+=1; per_model[model]["tp"]+=1
++            if pred==1 and label==0:
++                fp+=1; per_model[model]["fp"]+=1
++            if pred==0 and label==0:
++                tn+=1; per_model[model]["tn"]+=1
++            if pred==0 and label==1:
++                fn+=1; per_model[model]["fn"]+=1
++    total = {"tp":tp,"fp":fp,"tn":tn,"fn":fn,"per_model": per_model}
++    # push to pushgateway if configured
++    if PUSHGATEWAY:
++        registry = CollectorRegistry()
++        g = Gauge("aegis_moderation_eval_tp", "tp", registry=registry)
++        g.set(tp)
++        try:
++            push_to_gateway(PUSHGATEWAY, job='aegis_moderation_eval', registry=registry)
++        except Exception as e:
++            print("pushgateway push failed:", e)
++    # save to S3
++    if EVIDENCE_BUCKET:
++        import boto3, tempfile
++        s3 = boto3.client("s3")
++        bucket = EVIDENCE_BUCKET.replace("s3://","")
++        key = f"moderation/eval/results_{int(__import__('time').time())}.json"
++        tmp = tempfile.mktemp(suffix=".json")
++        json.dump(total, open(tmp,"w"))
++        s3.upload_file(tmp, bucket, key)
++    return total
++
+*** End File
+*** Add File:services/serving/diffusers/moderation_reassign.py
++#!/usr/bin/env python3
++"""
++Reassign or escalate stale moderation stream items.
++ - Claims items idle > threshold and pushes them to escalation queue / reviewed stream for human triage.
++ """
++import os
++import time
++import json
++try:
++    import redis
++except Exception:
++    redis = None
++
++STREAM = os.environ.get("MODERATION_STREAM", "diffusers:moderation:stream")
++ESCALATION_STREAM = os.environ.get("MODERATION_ESCALATION_STREAM", "diffusers:moderation:escalation")
++REDIS_URL = os.environ.get("REDIS_BROKER", "redis://redis:6379/0")
++STALE_SEC = int(os.environ.get("MODERATION_STALE_SEC", str(60*60)))
++
++def reassign_stale():
++    if redis is None:
++        raise RuntimeError("redis required")
++    r = redis.from_url(REDIS_URL)
++    # get pending entries
++    pending = r.xpending(STREAM, "-", "+", 100)
++    now = int(time.time() * 1000)
++    to_escalate = []
++    for p in pending:
++        # format varies; safe-guarding
++        try:
++            msg_id = p[0] if isinstance(p, (list, tuple)) else p.get("message_id", None)
++            idle = p[2] if isinstance(p, (list, tuple)) else p.get("idle", 0)
++        except Exception:
++            continue
++        if idle and int(idle) > (STALE_SEC * 1000):
++            to_escalate.append(msg_id)
++    for mid in to_escalate:
++        try:
++            entries = r.xrange(STREAM, min=mid, max=mid, count=1)
++            if not entries:
++                continue
++            payload = entries[0][1].get(b"payload").decode("utf-8")
++            r.xadd(ESCALATION_STREAM, {"payload": payload})
++            r.xdel(STREAM, mid)
++        except Exception as e:
++            print("escalation error", e)
++
++if __name__ == "__main__":
++    reassign_stale()
++
+*** End File
+*** Add File:ops/monitoring/autoscaler_tuner.py
++#!/usr/bin/env python3
++"""
++Autoscaler tuner:
++ - Queries Prometheus for queue length and GPU utilization
++ - Suggests KEDA threshold and replica limits
++ - Optionally patches a KEDA ScaledObject via the Kubernetes API (dry-run by default)
++"""
++import os
++import math
++import requests
++from urllib.parse import urljoin
++try:
++    from kubernetes import client, config
++except Exception:
++    client = None
++
++PROM_URL = os.environ.get("PROMETHEUS_URL", "http://prometheus.monitoring.svc:9090")
++SCALED_OBJECT_NAME = os.environ.get("KEDA_SCALEDOBJECT_NAME", "diffusers-queue-scaledobject")
++NAMESPACE = os.environ.get("KEDA_NAMESPACE", "ml-serving")
++
++def query(q):
++    r = requests.get(urljoin(PROM_URL, "/api/v1/query"), params={"query": q}, timeout=10)
++    r.raise_for_status()
++    return r.json()
++
++def suggest():
++    qres = query("sum(redis_list_length{list='diffusers:queue'})")
++    queue_len = float(qres["data"]["result"][0]["value"][1]) if qres["data"]["result"] else 0.0
++    gres = query("avg(dcgm_gpu_utilization)")
++    gpu_util = float(gres["data"]["result"][0]["value"][1]) if gres["data"]["result"] else 0.0
++    print("Observed queue length:", queue_len, "GPU util avg:", gpu_util)
++    # simple heuristic: threshold ~ max(5, queue_len*0.5), max replicas by gpu_util
++    threshold = max(5, math.ceil(queue_len * 0.5))
++    max_replicas = 1 if gpu_util > 80 else 8
++    print("Suggested KEDA threshold:", threshold, "suggested maxReplicas:", max_replicas)
++    return {"threshold": threshold, "max_replicas": max_replicas}
++
++def patch_keda(threshold, max_replicas, dry_run=True):
++    if client is None:
++        print("kubernetes client not available; skipping patch")
++        return
++    config.load_kube_config()
++    api = client.CustomObjectsApi()
++    body = {"spec": {"maxReplicaCount": int(max_replicas), "triggers": [{"type":"prometheus", "metadata": {"threshold": str(threshold)}}]}}
++    if dry_run:
++        print("Dry-run patch body:", body)
++        return
++    try:
++        api.patch_namespaced_custom_object(group="keda.sh", version="v1alpha1", namespace=NAMESPACE, plural="scaledobjects", name=SCALED_OBJECT_NAME, body=body)
++        print("Patched ScaledObject", SCALED_OBJECT_NAME)
++    except Exception as e:
++        print("Failed to patch ScaledObject:", e)
++
++if __name__ == "__main__":
++    s = suggest()
++    patch_keda(s["threshold"], s["max_replicas"], dry_run=True)
++
+*** End File
+*** Add File:services/gateway/quota_service.py
++#!/usr/bin/env python3
++"""
++HTTP quota service wrapping QuotaClientV2 for gateway integration.
++ - Exposes endpoints: /reserve, /release, /check
++ - Useful for decoupling quota logic from gateway process and for auditing.
++"""
++from flask import Flask, request, jsonify
++from services.serving.diffusers.quota_client_v2 import QuotaClientV2
++
++app = Flask("aegis-quota-service")
++qc = QuotaClientV2()
++
++@app.route("/reserve", methods=["POST"])
++def reserve():
++    j = request.get_json(force=True)
++    tenant = j.get("tenant")
++    amount = float(j.get("amount", 0.0))
++    idempotency_key = j.get("idempotency_key") or ""
++    try:
++        ok = qc.reserve(tenant, amount, idempotency_key)
++        return jsonify({"ok": bool(ok), "idempotency_key": idempotency_key})
++    except Exception as e:
++        return jsonify({"ok": False, "error": str(e)}), 500
++
++@app.route("/release", methods=["POST"])
++def release():
++    j = request.get_json(force=True)
++    tenant = j.get("tenant")
++    idempotency_key = j.get("idempotency_key")
++    try:
++        ok = qc.release(tenant, idempotency_key)
++        return jsonify({"ok": bool(ok)})
++    except Exception as e:
++        return jsonify({"ok": False, "error": str(e)}), 500
++
++@app.route("/healthz")
++def health():
++    return jsonify({"status":"ok"})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8082")))
++
+*** End File
+*** Add File:services/evidence/cosign_kms_signer.py
++#!/usr/bin/env python3
++"""
++Helper to sign local artifact or S3-hosted archive using cosign with KMS-backed key reference.
++ - Expects COSIGN_KEY to be a KMS reference supported by cosign (e.g. "gcpkms://...").
++ - Produces a signature file next to the artifact and can upload signature to S3.
++"""
++import os
++import subprocess
++import tempfile
++
++COSIGN_KEY = os.environ.get("COSIGN_KEY", "")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++
++def sign_local(artifact_path: str):
++    if not COSIGN_KEY:
++        raise RuntimeError("COSIGN_KEY not configured")
++    cmd = ["cosign", "sign", "--key", COSIGN_KEY, artifact_path]
++    subprocess.check_call(cmd)
++    sig_path = artifact_path + ".sig"
++    return sig_path
++
++def sign_and_upload(artifact_path: str, s3_uri: str = None):
++    sig = sign_local(artifact_path)
++    if s3_uri or EVIDENCE_BUCKET:
++        import boto3
++        bucket = (s3_uri or EVIDENCE_BUCKET).replace("s3://","").split("/",1)[0]
++        key = f"signatures/{os.path.basename(sig)}"
++        s3 = boto3.client("s3")
++        s3.upload_file(sig, bucket, key)
++        return f"s3://{bucket}/{key}"
++    return None
++
+*** End File
+*** Add File:ops/self_heal/self_heal_controller.py
++#!/usr/bin/env python3
++"""
++Simple self-healing controller:
++ - Polls Prometheus for configured alert expressions (cost runaway, moderation backlog, repro mismatch)
++ - If any alert condition persists beyond threshold, triggers a rollback action via Kubernetes (Deployment rollback)
++ - This is a PoC; integrate with your orchestration & GitOps flow for production.
++"""
++import os
++import time
++import requests
++from urllib.parse import urljoin
++try:
++    from kubernetes import client, config
++except Exception:
++    client = None
++
++PROM_URL = os.environ.get("PROMETHEUS_URL", "http://prometheus.monitoring.svc:9090")
++CHECK_INTERVAL = int(os.environ.get("SELFHEAL_INTERVAL", "30"))
++ALERT_DURATION = int(os.environ.get("SELFHEAL_ALERT_SEC", "600"))
++
++ALERTS = {
++    "CostRunawaySuspected": "sum(rate(nvidia_gpu_utilization[5m])) by (cluster) > 0.9 and sum(redis_list_length{list='diffusers:queue'}) > 50",
++    "ModerationPendingHigh": "aegis_moderation_pending > 100"
++}
++
++def query_prom(q):
++    r = requests.get(urljoin(PROM_URL, "/api/v1/query"), params={"query": q}, timeout=10)
++    r.raise_for_status()
++    return r.json()
++
++def check_alert(expr):
++    try:
++        res = query_prom(expr)
++        # return True if result value > 0
++        return bool(res.get("data", {}).get("result"))
++    except Exception:
++        return False
++
++def trigger_rollback(deployment_name, namespace="ml-serving"):
++    if client is None:
++        print("kubernetes client not available; cannot roll back")
++        return False
++    config.load_kube_config()
++    apps = client.AppsV1Api()
++    try:
++        # simple approach: scale down to zero then scale back (or use rollout undo via kubectl)
++        body = {"spec": {"replicas": 0}}
++        apps.patch_namespaced_deployment_scale(deployment_name, namespace, body)
++        print("Scaled deployment", deployment_name, "to 0 as mitigation")
++        return True
++    except Exception as e:
++        print("rollback error:", e)
++        return False
++
++def main():
++    while True:
++        for name, expr in ALERTS.items():
++            ok = check_alert(expr)
++            if ok:
++                print(f"Alert {name} firing: taking mitigation")
++                # mitigation mapping (example)
++                if name == "CostRunawaySuspected":
++                    trigger_rollback("aegis-diffusers", namespace="ml-serving")
++                if name == "ModerationPendingHigh":
++                    # scale reviewer deployment up (poC)
++                    if client:
++                        try:
++                            config.load_kube_config()
++                            apps = client.AppsV1Api()
++                            apps.patch_namespaced_deployment_scale("aegis-moderation-reviewer", "ml-serving", {"spec": {"replicas": 5}})
++                            print("Scaled moderators up to 5")
++                        except Exception as e:
++                            print("scaling reviewers error", e)
++        time.sleep(CHECK_INTERVAL)
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:.github/workflows/model_promotion_gate.yml
++name: Model promotion policy gate
++
++on:
++  workflow_dispatch:
++
++jobs:
++  policy-checks:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: 3.10
++      - name: Install deps
++        run: |
++          python -m pip install --upgrade pip
++          pip install boto3 requests pillow numpy || true
++      - name: Watermark gate
++        env:
++          WATERMARK_TEST_INPUT: ./tests/watermark_samples
++          WATERMARK_TEST_CSV: ./artifacts/wm_scale.csv
++        run: |
++          python services/serving/diffusers/watermark/scale_test.py
++          python - <<'PY'
++import csv,sys
++rows = list(csv.DictReader(open("artifacts/wm_scale.csv")))
++det_rate = sum(1 for r in rows if r["detected"]=="True")/max(1,len(rows))
++print("detection_rate", det_rate)
++if det_rate < 0.9:
++  print("Watermark gate failed")
++  sys.exit(1)
++PY
++      - name: Moderation gate (placeholder)
++        run: |
++          echo "Run moderation_evaluator against labeled dataset (manual step or secrets required)"
++      - name: Reproducibility gate (placeholder)
++        run: |
++          echo "Run reproducibility validator against a few sample runs (requires access to evidence bucket)"
++      - name: Approve promotion
++        run: |
++          echo "All gates passed (or are placeholders) — promote model artifact via your release process"
++
+*** End File
+*** End Patch

@@ -1,0 +1,434 @@
+*** Begin Patch
+*** Add File: .github/workflows/agentic_chaos_and_evidence.yml
++name: Agentic Chaos Campaign & Evidence Collection
++on:
++  workflow_dispatch:
++    inputs:
++      namespace:
++        description: "Kubernetes namespace to run chaos in"
++        required: false
++        default: "aegis"
++      duration:
++        description: "Duration of chaos campaign in seconds"
++        required: false
++        default: "300"
++
++jobs:
++  run-chaos-and-collect:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Install tools
++        run: |
++          sudo apt-get update
++          sudo apt-get install -y jq awscli
++          curl -LO "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"
++          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
++      - name: Trigger chaos job in cluster
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG_STAGING }}
++          NAMESPACE: ${{ github.event.inputs.namespace }}
++          DURATION: ${{ github.event.inputs.duration }}
++        run: |
++          # Ensure configmap and cronjob exist (manifests assumed to be in repo)
++          kubectl --kubeconfig="$KUBECONFIG" apply -f k8s/chaos/configmap.yaml -n "${NAMESPACE}" || true
++          kubectl --kubeconfig="$KUBECONFIG" apply -f k8s/chaos/chaos-cronjob.yaml -n "${NAMESPACE}" || true
++          # create an immediate job from the cronjob
++          JOB_NAME="agentic-chaos-run-$(date +%s)"
++          kubectl --kubeconfig="$KUBECONFIG" -n "${NAMESPACE}" create job --from=cronjob/agentic-chaos-campaign ${JOB_NAME}
++          echo "Launched job ${JOB_NAME}"
++          # wait up to DURATION+120s for completion
++          kubectl --kubeconfig="$KUBECONFIG" -n "${NAMESPACE}" wait --for=condition=complete job/${JOB_NAME} --timeout=$((DURATION+120))s || true
++          # copy any evidence artifact (the chaos runner uploads to S3 if COMPLIANCE_BUCKET configured)
++      - name: Run evidence collector (optional cluster-side)
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG_STAGING }}
++          COMPLIANCE_BUCKET: ${{ secrets.COMPLIANCE_BUCKET }}
++          PROM_URL: ${{ secrets.PROM_URL }}
++        run: |
++          # Try to run the repo's evidence collector from an operator host (requires kube access)
++          python3 scripts/evidence_collector.py || echo "evidence_collector.py failed locally; check cluster uploader"
++      - name: Parse evidence from S3 and summarize
++        env:
++          AWS_REGION: ${{ secrets.AWS_REGION }}
++          COMPLIANCE_BUCKET: ${{ secrets.COMPLIANCE_BUCKET }}
++        run: |
++          pip install boto3
++          python3 scripts/evidence_parser.py --s3-bucket "${{ secrets.COMPLIANCE_BUCKET }}" --prefix "chaos/" || true
++      - name: Upload summary artifact
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: chaos-evidence-summary
++          path: /tmp/chaos_summary.json
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/evidence_parser.py
++#!/usr/bin/env python3
++"""
++Evidence parser: fetches latest chaos evidence artifact (tgz) from S3 prefix and summarizes logs.
++Outputs /tmp/chaos_summary.json with a short summary including:
++ - stuck_tx_ids (if any)
++ - prepare/commit/abort counts
++ - fatal errors found
++Exit code:
++ - 0 if no stuck transactions found and no fatal errors
++ - 2 if anomalies detected
++"""
++import argparse, os, sys, tarfile, json, re, tempfile
++from collections import Counter
++
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++def find_latest_key(s3, bucket, prefix):
++    objs = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
++    contents = objs.get("Contents", [])
++    if not contents:
++        return None
++    latest = sorted(contents, key=lambda o: o["LastModified"], reverse=True)[0]
++    return latest["Key"]
++
++def analyze_logs(extract_dir):
++    summary = {"stuck_tx_ids": [], "prepare_total":0, "commit_total":0, "abort_total":0, "fatal_errors": []}
++    # scan known log files if present
++    patterns = {
++        "prepare": re.compile(r"\bprepare\b", re.IGNORECASE),
++        "commit": re.compile(r"\bcommit\b", re.IGNORECASE),
++        "abort": re.compile(r"\babort(ed|ion)?\b", re.IGNORECASE),
++        "stuck_tx": re.compile(r"stuck|stalled|stuck transaction", re.IGNORECASE),
++        "tx_id": re.compile(r"tx_id[:= ]([0-9a-fA-F-]+)")
++    }
++    counts = Counter()
++    tx_ids = set()
++    fatal_errors = []
++    for root, _, files in os.walk(extract_dir):
++        for fname in files:
++            if not fname.endswith(('.txt','.log','.json')): continue
++            path = os.path.join(root, fname)
++            try:
++                with open(path, 'r', errors='ignore') as fh:
++                    for line in fh:
++                        if patterns["stuck_tx"].search(line):
++                            # try to capture tx id
++                            m = patterns["tx_id"].search(line)
++                            if m:
++                                tx_ids.add(m.group(1))
++                        if patterns["prepare"].search(line):
++                            counts["prepare"] += 1
++                        if patterns["commit"].search(line):
++                            counts["commit"] += 1
++                        if patterns["abort"].search(line):
++                            counts["abort"] += 1
++                        if "FATAL" in line or "panic" in line.lower() or "exception" in line.lower():
++                            fatal_errors.append({"file": path, "line": line.strip()[:400]})
++            except Exception:
++                continue
++    summary["stuck_tx_ids"] = list(tx_ids)
++    summary["prepare_total"] = counts["prepare"]
++    summary["commit_total"] = counts["commit"]
++    summary["abort_total"] = counts["abort"]
++    summary["fatal_errors"] = fatal_errors
++    return summary
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--s3-bucket", required=False)
++    p.add_argument("--prefix", default="chaos/")
++    p.add_argument("--local-artifact", required=False)
++    args = p.parse_args()
++
++    artifact_path = None
++    if args.local_artifact and os.path.exists(args.local_artifact):
++        artifact_path = args.local_artifact
++    elif args.s3_bucket and boto3:
++        s3 = boto3.client("s3")
++        key = find_latest_key(s3, args.s3_bucket, args.prefix)
++        if not key:
++            print("No artifact found under s3://{}/{}".format(args.s3_bucket, args.prefix))
++        else:
++            tmp = "/tmp/chaos_latest.tgz"
++            print("Downloading s3://{}/{} -> {}".format(args.s3_bucket, key, tmp))
++            s3.download_file(args.s3_bucket, key, tmp)
++            artifact_path = tmp
++    else:
++        print("No S3 client available and no local artifact specified.")
++
++    if not artifact_path or not os.path.exists(artifact_path):
++        summary = {"error":"no_artifact_found"}
++        open("/tmp/chaos_summary.json","w").write(json.dumps(summary, indent=2))
++        print(json.dumps(summary, indent=2))
++        sys.exit(2)
++
++    extract_dir = tempfile.mkdtemp(prefix="chaos_evidence_")
++    try:
++        with tarfile.open(artifact_path, "r:gz") as tf:
++            tf.extractall(extract_dir)
++    except Exception as e:
++        summary = {"error":"artifact_extract_failed","detail":str(e)}
++        open("/tmp/chaos_summary.json","w").write(json.dumps(summary, indent=2))
++        print(json.dumps(summary, indent=2))
++        sys.exit(2)
++
++    summary = analyze_logs(extract_dir)
++    summary["artifact"] = artifact_path
++    open("/tmp/chaos_summary.json","w").write(json.dumps(summary, indent=2))
++    print(json.dumps(summary, indent=2))
++    # fail if stuck txs or fatal errors found
++    if summary["stuck_tx_ids"] or summary["fatal_errors"]:
++        sys.exit(2)
++    sys.exit(0)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/trigger_chaos.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Helper script to trigger chaos cronjob immediately in a cluster using provided KUBECONFIG.
++NAMESPACE=${1:-aegis}
++KUBECONFIG=${KUBECONFIG:-$KUBECONFIG}
++
++if [ -z "${KUBECONFIG}" ]; then
++  echo "Please set KUBECONFIG env pointing to staging kubeconfig"
++  exit 2
++fi
++
++kubectl --kubeconfig="$KUBECONFIG" apply -f k8s/chaos/configmap.yaml -n "${NAMESPACE}"
++kubectl --kubeconfig="$KUBECONFIG" apply -f k8s/chaos/chaos-cronjob.yaml -n "${NAMESPACE}"
++JOB_NAME="agentic-chaos-run-$(date +%s)"
++kubectl --kubeconfig="$KUBECONFIG" -n "${NAMESPACE}" create job --from=cronjob/agentic-chaos-campaign ${JOB_NAME}
++echo "Created job ${JOB_NAME} in namespace ${NAMESPACE}"
++echo "Wait for job completion and then run scripts/evidence_collector.py and scripts/evidence_parser.py"
++
+*** End Patch
+*** Begin Patch
+*** Add File: runbooks/chaos_preflight_checklist.md
++# Agentic Chaos Campaign — Preflight Checklist
++
++Before running the chaos campaign, ensure you have:
++- On-call operator(s) available and aware of the experiment window.
++- Access to staging kubeconfig (secret KUBECONFIG_STAGING).
++- COMPLIANCE_BUCKET and AWS credentials available to upload evidence.
++- Prometheus endpoint accessible for queries (PROM_URL).
++- Approved maintenance window and a rollback plan if unexpected production-like impact occurs.
++
++Steps
++1. Notify on-call and set pages to "test mode" for the scheduled window.
++2. Verify staging cluster health:
++   kubectl --kubeconfig $KUBECONFIG_STAGING get nodes
++   kubectl --kubeconfig $KUBECONFIG_STAGING get pods -n aegis
++3. Ensure evidence upload works:
++   python3 scripts/evidence_collector.py --dry-run
++4. Run the chaos campaign:
++   - Option A (GitHub Actions): Trigger workflow "Agentic Chaos Campaign & Evidence Collection" in Actions UI (inputs: namespace=aegis, duration=300)
++   - Option B (manual): Run scripts/trigger_chaos.sh after setting KUBECONFIG env.
++5. After completion, fetch summary:
++   - Check Actions artifact "chaos-evidence-summary" or run:
++     python3 scripts/evidence_parser.py --s3-bucket <COMPLIANCE_BUCKET> --prefix "chaos/"
++6. If stuck transactions or fatal errors found:
++   - Pause further experiments (do not run RLHF).
++   - Open an incident with logs and the evidence artifact.
++   - Triage with participant owners and apply timeout/backoff tuning.
++
+*** End Patch
+*** Begin Patch
+*** Add File: .github/workflows/rlhf_pilot_sequence.yml
++name: RLHF Pilot Sequence (preflight -> submit -> validate)
++on:
++  workflow_dispatch:
++    inputs:
++      mode:
++        required: true
++        default: "k8s"     # k8s or local
++      model_name:
++        required: false
++        default: "distilgpt2"
++      require_chaos_passed:
++        description: "Set to 'true' to assert chaos summary shows no anomalies"
++        required: false
++        default: "false"
++      chaos_summary_s3_key:
++        description: "Optional: s3 key to chaos summary to validate (automated check)"
++        required: false
++
++jobs:
++  preflight:
++    runs-on: ubuntu-latest
++    outputs:
++      preflight_ok: ${{ steps.check.outputs.ok }}
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup deps
++        run: python -m pip install --upgrade pip && pip install boto3 requests
++      - name: Pilot preflight checks
++        id: check
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG_STAGING }}
++          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
++          COMPLIANCE_BUCKET: ${{ secrets.COMPLIANCE_BUCKET }}
++        run: |
++          chmod +x scripts/pilot_preflight_check.sh
++          ./scripts/pilot_preflight_check.sh || (echo "::set-output name=ok::false"; exit 2)
++          echo "::set-output name=ok::true"
++
++  run-pilot:
++    needs: preflight
++    if: needs.preflight.outputs.preflight_ok == 'true'
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup env
++        run: |
++          python -m pip install --upgrade pip
++          pip install mlflow transformers datasets accelerate boto3
++      - name: Launch pilot (k8s or local)
++        env:
++          MODE: ${{ github.event.inputs.mode }}
++          MODEL_NAME: ${{ github.event.inputs.model_name }}
++          KUBECONFIG: ${{ secrets.KUBECONFIG_STAGING }}
++          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
++          COMPLIANCE_BUCKET: ${{ secrets.COMPLIANCE_BUCKET }}
++        run: |
++          if [ "${MODE}" = "k8s" ]; then
++            kubectl --kubeconfig="$KUBECONFIG" apply -f k8s/rlhf/mpi_job_pilot.yaml -n aegis-ml
++            kubectl --kubeconfig="$KUBECONFIG" wait --for=condition=complete mpijob/rlhf-mpi-pilot -n aegis-ml --timeout=2h || true
++            # fetch launcher logs
++            LAUNCHER=$(kubectl --kubeconfig="$KUBECONFIG" -n aegis-ml get pods -l mpi-job-name=rlhf-mpi-pilot,role=launcher -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
++            if [ -n "$LAUNCHER" ]; then
++              kubectl --kubeconfig="$KUBECONFIG" -n aegis-ml logs $LAUNCHER --tail=200 || true
++            fi
++          else
++            accelerate launch --num_processes 2 rl/pilot_train.py --model-name "${MODEL_NAME}" --output-dir "/tmp/rlhf_pilot" --epochs 1
++          fi
++      - name: Validate checkpoint and run adversarial gate
++        env:
++          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
++        run: |
++          CKPT=$(ls /tmp/rlhf_pilot/*.tar.gz 2>/dev/null || true)
++          if [ -n "$CKPT" ]; then
++            python rl/checkpoint_validate.py --ckpt "$CKPT" || (echo "checkpoint validation failed" && exit 2)
++            python scripts/adversarial_gate_runner.py || (echo "adversarial gate failed" && exit 2)
++          else
++            echo "No local checkpoint: checking MLflow for artifacts"
++            python - <<PY
++import mlflow,os
++mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI"))
++client = mlflow.tracking.MlflowClient()
++runs = client.search_runs(experiment_ids=None, filter_string="", max_results=10)
++print("Recent runs:", [r.info.run_id for r in runs])
++PY
++
++      - name: Upload pilot evidence
++        uses: actions/upload-artifact@v4
++        with:
++          name: rlhf-pilot-artifacts
++          path: /tmp/rlhf_pilot || true
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/pilot_preflight_check.sh
++#!/usr/bin/env bash
++set -euo pipefail
++echo "Running RLHF pilot preflight checks..."
++
++# 1) Kube access
++if [ -z "${KUBECONFIG:-}" ]; then
++  echo "KUBECONFIG not set. Please set KUBECONFIG env to your staging kubeconfig."
++  exit 2
++fi
++kubectl --kubeconfig="$KUBECONFIG" get nodes -o wide
++
++# 2) Check for GPU nodes (if running k8s mode)
++if kubectl --kubeconfig="$KUBECONFIG" get nodes -o jsonpath='{.items[*].status.allocatable}' | grep -q "nvidia.com/gpu"; then
++  echo "GPU nodes appear present"
++else
++  echo "No GPU nodes detected; ensure staging has GPU quota if running k8s pilot"
++fi
++
++# 3) MLflow connectivity
++if [ -n "${MLFLOW_TRACKING_URI:-}" ]; then
++  echo "Checking MLflow tracking URI: $MLFLOW_TRACKING_URI"
++  python - <<PY
++import os, mlflow
++try:
++    mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI"))
++    client = mlflow.tracking.MlflowClient()
++    print("MLflow available")
++except Exception as e:
++    print("MLflow check failed:", e)
++    raise
++PY
++else
++  echo "MLFLOW_TRACKING_URI not set; CI will still run local smoke"
++fi
++
++# 4) S3 write test
++if [ -n "${COMPLIANCE_BUCKET:-}" ]; then
++  echo "Testing S3 write to bucket ${COMPLIANCE_BUCKET}"
++  python - <<PY
++import boto3,os
++bucket=os.environ.get("COMPLIANCE_BUCKET")
++s3=boto3.client("s3")
++key="preflight/test_write_$(int(__import__('time').time())).txt"
++open('/tmp/preflight.txt','w').write('ok')
++s3.upload_file('/tmp/preflight.txt',bucket,key)
++print("S3 write ok:", key)
++PY
++else
++  echo "COMPLIANCE_BUCKET not set - artifact upload will be skipped"
++fi
++
++echo "Preflight checks passed"
++exit 0
++
+*** End Patch
+*** Begin Patch
+*** Add File: docs/sequence_run_instructions.md
++# Sequence: Run Agentic Chaos Campaign then RLHF Pilot
++
++This document describes the recommended sequence for validating Agentic and Generative readiness.
++
++Prereqs
++- KUBECONFIG for staging available as secret KUBECONFIG_STAGING (set in GitHub Actions or local env).
++- COMPLIANCE_BUCKET and AWS creds configured for artifacts upload.
++- PROM_URL set for Prometheus queries (optional but recommended).
++- MLflow tracking available for RLHF pilot (MLFLOW_TRACKING_URI).
++
++Step A — Run Agentic Chaos Campaign
++1. Option (GitHub Actions):
++   - Open the repo Actions and run workflow "Agentic Chaos Campaign & Evidence Collection".
++     Provide namespace (default: aegis) and duration (secs).
++2. Option (manual operator):
++   - On operator host:
++     export KUBECONFIG=/path/to/staging/kubeconfig
++     ./scripts/trigger_chaos.sh aegis
++3. After job finishes the workflow or operator should run:
++   python3 scripts/evidence_parser.py --s3-bucket <COMPLIANCE_BUCKET> --prefix "chaos/"
++   - Inspect /tmp/chaos_summary.json. If it contains stuck_tx_ids or fatal_errors, DO NOT RUN RLHF pilot.
++
++Step B — If chaos passed, run RLHF Pilot
++1. Run preflight:
++   export KUBECONFIG=...
++   export MLFLOW_TRACKING_URI=...
++   export COMPLIANCE_BUCKET=...
++   ./scripts/pilot_preflight_check.sh
++2. Use GitHub Actions:
++   - Run workflow "RLHF Pilot Sequence (preflight -> submit -> validate)" with mode=k8s and model_name as needed.
++3. After pilot completes:
++   - Verify MLflow run artifacts and checkpoint.
++   - Validate with checkpoint_validate and adversarial harness (workflow runs these).
++   - Store evidence in COMPLIANCE_BUCKET and link to inventory.
++
++Notes
++- Always run chaos campaign and resolve anomalies before heavy training runs.
++- Keep operator on-call during both experiments.
++
+*** End Patch
+*** End Patch

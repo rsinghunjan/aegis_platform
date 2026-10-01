@@ -1,0 +1,413 @@
+*** Begin Patch
+*** Add File: quantum/workflows/simulate_promote_qpu.py
++#!/usr/bin/env python3
++"""
++End-to-end simulator -> promote -> QPU workflow
++
++Steps:
++ 1) Run circuit on local simulator (Qiskit Aer) for validation.
++ 2) If pass, check BAA if regulated data is present (provider/legal/check_baa.py).
++ 3) Submit job to chosen provider adapter (Braket or Qiskit) and poll for completion.
++ 4) Record provider receipt and raw provenance into MLflow and attest receipt to Rekor (quantum/attestation/provider_receipt.py).
++
++Usage:
++  python simulate_promote_qpu.py --circuit qasm_file.qasm --provider braket --shots 256 --mlflow-run-id <runid>
++
++Requires: qiskit / amazon-braket-sdk when targeting providers, and environment credentials set.
++"""
++import argparse
++import time
++import json
++import os
++import logging
++
++LOG = logging.getLogger("aegis.e2e")
++logging.basicConfig(level=logging.INFO)
++
++try:
++    from qiskit import QuantumCircuit, Aer, execute
++except Exception:
++    QuantumCircuit = Aer = execute = None
++
++from quantum.attestation.provider_receipt import attest_and_store_receipt
++from quantum.attestation.rekor_mlflow import record_receipt_mlflow
++from provider.legal.check_baa import check_baa_for_provider
++
++# choose provider adapters (we keep import local to avoid hard deps when not used)
++def get_adapter(provider):
++    if provider.startswith("braket"):
++        from quantum.adapters.braket_adapter import BraketAdapter
++        return BraketAdapter()
++    elif provider.startswith("qiskit") or provider.startswith("ibm"):
++        from quantum.adapters.qiskit_adapter import QiskitAdapter
++        # non-simulator qiskit adapter expects IBMQ token in env
++        return QiskitAdapter(use_simulator=False)
++    else:
++        raise RuntimeError("unsupported provider: " + provider)
++
++
++def run_simulation_local(qasm_text, shots=1024):
++    if Aer is None:
++        raise RuntimeError("Qiskit Aer not available in this runtime")
++    qc = QuantumCircuit.from_qasm_str(qasm_text)
++    backend = Aer.get_backend("aer_simulator")
++    job = execute(qc, backend=backend, shots=shots)
++    res = job.result()
++    counts = res.get_counts()
++    # simple validation: non-empty counts and no obvious errors
++    passed = bool(counts)
++    return {"passed": passed, "counts": counts}
++
++
++def poll_provider(adapter, provider_job_id, poll_interval=5, timeout=3600):
++    start = time.time()
++    while True:
++        status = adapter.status(provider_job_id)
++        LOG.info("provider status: %s", status)
++        st = str(status.get("status", "")).lower()
++        if st in ("done", "completed", "successful"):
++            return adapter.result(provider_job_id)
++        if st in ("failed", "error", "cancelled"):
++            raise RuntimeError(f"provider job failed: {status}")
++        if time.time() - start > timeout:
++            raise RuntimeError("timeout waiting for provider job")
++        time.sleep(poll_interval)
++
++
++def parse_args():
++    p = argparse.ArgumentParser()
++    p.add_argument("--circuit", required=True, help="path to qasm file")
++    p.add_argument("--provider", required=True, choices=["braket", "qiskit_ibm"], help="target provider")
++    p.add_argument("--shots", type=int, default=256)
++    p.add_argument("--regulated", action="store_true", help="flag indicating regulated data (PHI/PII) used")
++    p.add_argument("--mlflow-run-id", default=None)
++    return p.parse_args()
++
++
++def main():
++    args = parse_args()
++    qasm = open(args.circuit).read()
++    LOG.info("Running local simulator for validation")
++    sim_res = run_simulation_local(qasm, shots=args.shots)
++    LOG.info("sim result: passed=%s counts_keys=%s", sim_res["passed"], list(sim_res["counts"].keys())[:5])
++    if not sim_res["passed"]:
++        raise SystemExit("local simulation failed — aborting promote")
++
++    # BAA check if regulated data will be sent to an external provider
++    if args.regulated:
++        LOG.info("Regulated data flag present — verifying BAA status for provider %s", args.provider)
++        if not check_baa_for_provider(args.provider):
++            raise SystemExit(f"BAA not in place for provider {args.provider}; cannot send regulated data")
++        LOG.info("BAA present — continuing")
++
++    LOG.info("Acquiring adapter for provider %s", args.provider)
++    adapter = get_adapter(args.provider)
++
++    LOG.info("Submitting to provider")
++    submit_meta = adapter.submit(qasm, shots=args.shots)
++    provider_job_id = submit_meta.get("provider_job_id") or submit_meta.get("id") or submit_meta.get("receipt", {}).get("id")
++    LOG.info("submitted provider_job_id=%s", provider_job_id)
++
++    # poll until done
++    res = poll_provider(adapter, provider_job_id)
++    LOG.info("provider raw result keys: %s", list(res.keys()))
++
++    # build job_meta for attestation
++    job_meta = {"provider": args.provider, "provider_job_id": provider_job_id, "submitted_at": time.time(), "submit_meta": submit_meta}
++
++    # store provenance & attestation
++    LOG.info("Recording provenance to MLflow and attesting to Rekor")
++    attested = attest_and_store_receipt(provider_job_id, job_meta)
++    LOG.info("Attestation completed")
++
++    if args.mlflow_run_id:
++        LOG.info("Recording receipt & results into MLflow run %s", args.mlflow_run_id)
++        record_receipt_mlflow(args.mlflow_run_id, job_meta, res)
++
++    LOG.info("End-to-end promote completed for provider_job_id=%s", provider_job_id)
++
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: quantum/attestation/rekor_mlflow.py
++#!/usr/bin/env python3
++"""
++Helpers to record provider receipts into MLflow and ensure Rekor attestation exists.
++"""
++import os
++import json
++import subprocess
++import logging
++from pathlib import Path
++
++LOG = logging.getLogger("aegis.rekor_mlflow")
++logging.basicConfig(level=logging.INFO)
++
++MLFLOW_URI = os.environ.get("MLFLOW_TRACKING_URI", "")
++USE_MLFLOW = bool(MLFLOW_URI)
++
++def record_receipt_mlflow(run_id: str, job_meta: dict, provider_result: dict):
++    try:
++        if USE_MLFLOW:
++            import mlflow
++            mlflow.set_tracking_uri(MLFLOW_URI)
++            with mlflow.start_run(run_id=run_id):
++                mlflow.log_param("provider", job_meta.get("provider"))
++                mlflow.log_param("provider_job_id", job_meta.get("provider_job_id"))
++                mlflow.log_dict(job_meta, "provider_meta.json")
++                # store result snapshot
++                Path("/tmp/aegis_qpu_result").mkdir(parents=True, exist_ok=True)
++                Path("/tmp/aegis_qpu_result/result.json").write_text(json.dumps(provider_result))
++                mlflow.log_artifact("/tmp/aegis_qpu_result", artifact_path="qpu_result")
++        else:
++            LOG.info("MLflow not configured; skipping MLflow recording")
++    except Exception as e:
++        LOG.exception("mlflow logging failed: %s", e)
++
++    # Ensure Rekor entry exists for attested manifest if cosign was used by attestation path
++    try:
++        # optional: check by searching rekor for job_meta digest
++        manifest_path = f"/tmp/qpu_receipt_{job_meta.get('provider_job_id')}.json"
++        Path(manifest_path).write_text(json.dumps(job_meta))
++        digest = subprocess.check_output(["sha256sum", manifest_path]).decode().split()[0]
++        # search Rekor
++        try:
++            out = subprocess.check_output(["rekor-cli", "search", "hash", digest], stderr=subprocess.DEVNULL, timeout=15)
++            LOG.info("Rekor entry lookup returned: %s", out.decode()[:200])
++        except subprocess.CalledProcessError:
++            LOG.warning("No Rekor entry found for %s — ensure attestation flow ran", manifest_path)
++    except Exception as e:
++        LOG.exception("Rekor verification failed: %s", e)
++
+*** End Patch
+*** Begin Patch
+*** Add File: quantum/scheduler/sla_enforcer.py
++#!/usr/bin/env python3
++"""
++SLA Enforcer & Scheduler pause toggle
++
++Monitors Prometheus metrics (queue latency and error rate) and toggles a 'scheduler_pause' flag
++in the DB (control table) or writes a local file control flag. The production scheduler should
++read this flag and pause promotions when present.
++"""
++import os
++import time
++import logging
++import requests
++from sqlalchemy import create_engine, Table, Column, String, MetaData
++
++LOG = logging.getLogger("aegis.sla")
++logging.basicConfig(level=logging.INFO)
++
++PROM_URL = os.environ.get("PROM_URL", "http://prometheus.monitoring.svc.cluster.local:9090")
++DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://aegis:aegis@postgres:5432/aegis")
++PAUSE_FLAG_FILE = os.environ.get("PAUSE_FLAG_FILE", "/tmp/quantum_scheduler_pause.flag")
++
++engine = create_engine(DATABASE_URL)
++
++def prom_query(q):
++    r = requests.get(f"{PROM_URL}/api/v1/query", params={"query": q}, timeout=10)
++    r.raise_for_status()
++    return r.json()
++
++def check_and_enforce(queue_latency_threshold=120.0, error_rate_threshold=0.2):
++    # p95 submission latency
++    try:
++        qlat = 'histogram_quantile(0.95, sum(rate(quantum_job_submit_duration_seconds_bucket[5m])) by (le))'
++        lat_res = prom_query(qlat)
++        lat_val = float(lat_res["data"]["result"][0]["value"][1]) if lat_res["data"]["result"] else 0.0
++    except Exception:
++        lat_val = 0.0
++    try:
++        qerr = '(increase(quantum_job_failures_total[10m]) / max(1, increase(quantum_job_submissions_total[10m])))'
++        err_res = prom_query(qerr)
++        err_val = float(err_res["data"]["result"][0]["value"][1]) if err_res["data"]["result"] else 0.0
++    except Exception:
++        err_val = 0.0
++
++    LOG.info("SLA metrics: p95_latency=%.2f err_rate=%.3f", lat_val, err_val)
++    if lat_val > queue_latency_threshold or err_val > error_rate_threshold:
++        LOG.warning("SLA breach detected; enabling scheduler pause")
++        open(PAUSE_FLAG_FILE, "w").write("paused\n")
++    else:
++        if os.path.exists(PAUSE_FLAG_FILE):
++            os.remove(PAUSE_FLAG_FILE)
++            LOG.info("SLA healthy; removed pause flag")
++
++def main():
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--interval", type=int, default=60)
++    p.add_argument("--latency", type=float, default=120.0)
++    p.add_argument("--err", type=float, default=0.2)
++    args = p.parse_args()
++    while True:
++        try:
++            check_and_enforce(queue_latency_threshold=args.latency, error_rate_threshold=args.err)
++        except Exception as e:
++            LOG.exception("SLA enforcer error: %s", e)
++        time.sleep(args.interval)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: quantum/billing/reconcile_invoices.py
++#!/usr/bin/env python3
++"""
++Reconcile recorded qpu_charges with provider billing data (AWS Cost Explorer example).
++This script fetches cost data for a date range and attempts to match entries by tags or amounts.
++It's a best-effort connector to aid chargeback reconciliation.
++"""
++import os
++import boto3
++import json
++import logging
++from datetime import date, timedelta
++from sqlalchemy import create_engine, text
++
++LOG = logging.getLogger("aegis.reconcile")
++logging.basicConfig(level=logging.INFO)
++
++DB_URL = os.environ.get("DATABASE_URL", "postgresql://aegis:aegis@postgres:5432/aegis")
++engine = create_engine(DB_URL)
++
++def fetch_aws_costs(start_date, end_date):
++    client = boto3.client("ce", region_name="us-east-1")
++    resp = client.get_cost_and_usage(
++        TimePeriod={"Start": start_date.isoformat(), "End": end_date.isoformat()},
++        Granularity="DAILY",
++        Metrics=["UnblendedCost"],
++        GroupBy=[{"Type":"DIMENSION","Key":"SERVICE"}]
++    )
++    return resp
++
++def list_unreconciled_charges():
++    with engine.connect() as conn:
++        res = conn.execute(text("SELECT id, owner, provider, shots, amount_usd, created_at FROM qpu_charges WHERE reconciled IS DISTINCT FROM true"))
++        return [dict(r) for r in res]
++
++def mark_reconciled(charge_id):
++    with engine.connect() as conn:
++        conn.execute(text("UPDATE qpu_charges SET reconciled = true WHERE id = :id"), {"id": charge_id})
++
++def reconcile_window(days=7):
++    end = date.today()
++    start = end - timedelta(days=days)
++    LOG.info("Fetching AWS costs from %s to %s", start, end)
++    costs = fetch_aws_costs(start, end)
++    LOG.info("Got cost response keys: %s", list(costs.keys()))
++    charges = list_unreconciled_charges()
++    LOG.info("Found %d unreconciled charges", len(charges))
++    # naive: print charges and leave manual reconciliation steps to billing owner
++    print(json.dumps({"charges": charges, "costs_sample": costs.get("ResultsByTime", [])[:2]}, indent=2))
++
++if __name__ == "__main__":
++    reconcile_window()
++
+*** End Patch
+*** Begin Patch
+*** Add File: quantum/policy/opa/require_baa.rego
++package aegis.quantum.baa
++
++default allow = false
++
++# Input expected: { "provider": "braket", "regulated": true }
++allow {
++    not input.regulated
++}
++
++allow {
++    input.regulated
++    # Check that provider has BAA entry via external data or local registry (`data.providers_baa`)
++    data.providers_baa[input.provider] == true
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File: provider/legal/check_baa.py
++#!/usr/bin/env python3
++"""
++Simple check against provider/legal/baas_tracker.csv to determine if BAA signed for a provider.
++"""
++import csv
++from pathlib import Path
++
++BAA_CSV = Path("provider/legal/baas_tracker.csv")
++
++def check_baa_for_provider(provider_name: str) -> bool:
++    if not BAA_CSV.exists():
++        return False
++    with BAA_CSV.open() as fh:
++        rdr = csv.DictReader(fh)
++        for r in rdr:
++            if r.get("provider") == provider_name:
++                return r.get("baa_signed", "").lower() == "true"
++    return False
++
++if __name__ == "__main__":
++    import sys
++    prov = sys.argv[1] if len(sys.argv)>1 else "braket"
++    ok = check_baa_for_provider(prov)
++    print(prov, "BAA signed:", ok)
++    exit(0 if ok else 2)
++
+*** End Patch
+*** Begin Patch
+*** Add File: ci/.github/workflows/qpu_e2e_run.yml
++name: QPU End-to-End E2E (simulate -> promote -> attest)
++on:
++  workflow_dispatch:
++
++jobs:
++  qpu-e2e:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: "3.9"
++      - name: Install deps
++        run: |
++          python -m pip install --upgrade pip
++          pip install qiskit amazon-braket-sdk mlflow requests
++      - name: Run E2E simulate->promote
++        env:
++          BRAKET_DEVICE_ARN: ${{ secrets.BRAKET_DEVICE_ARN }}
++          IBMQ_API_TOKEN: ${{ secrets.IBMQ_API_TOKEN }}
++          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
++        run: |
++          python quantum/workflows/simulate_promote_qpu.py --circuit tests/data/simple.qasm --provider braket --shots 64 --mlflow-run-id "${{ secrets.MLFLOW_RUN_ID }}"
++
+*** End Patch
+*** Begin Patch
+*** Add File: docs/quantum/e2e_runbook.md
++# Quantum E2E Runbook: simulate -> promote -> attest
++
++Purpose:
++- Validate end-to-end workflow from local simulation to QPU run with receipt attestation and MLflow provenance.
++
++Preconditions:
++- MLflow configured and MLFLOW_RUN_ID available.
++- Provider credentials configured in CI secrets or environment (e.g., BRAKET_DEVICE_ARN, IBMQ_API_TOKEN).
++- Rekor and cosign available in PATH for attestation tasks.
++- BAA must be signed if regulated data will be sent (provider/legal/baas_tracker.csv).
++
++Steps:
++1) Run local simulation using Qiskit Aer and validate results.
++2) If simulation succeeds and BAA (if required) is present, submit to provider adapter.
++3) Poll provider until job completes; collect counts and metadata.
++4) Record provenance in MLflow and run attestation flow (cosign + Rekor) to record provider receipt.
++5) Store artifacts and monitor Grafana/Prometheus dashboards for SLA metrics.
++
++Failure modes & mitigation:
++- Provider timeouts: retry with exponential backoff; if persistent, route to alternative provider or simulator.
++- SLA breach during promotions: SLA enforcer will create a scheduler pause flag; ops must investigate and either resume or reroute.
++
+*** End Patch
+*** End Patch

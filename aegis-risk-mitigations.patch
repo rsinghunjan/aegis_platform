@@ -1,0 +1,625 @@
+*** Begin Patch
+*** Add File:services/factuality/verifier.py
++#!/usr/bin/env python3
++"""
++Simple factuality verifier for Aegis:
++ - Splits a response into candidate claims (sentences)
++ - For each claim, queries RAG (vector DB retriever) for supporting documents
++ - Produces a support score per claim and an overall support ratio
++ - Used by post-filters to decide human escalation
++
++Config via env:
++ - RAG_URL: URL to RAG service (compose/retrieve endpoints)
++ - SUPPORT_SCORE_THRESHOLD: minimal similarity score (lower means less support). Default 0.5 (adjust per embedding metric)
++"""
++import os, requests, math
++from typing import List
++
++RAG_URL = os.environ.get("RAG_URL", "http://rag:8082")
++SUPPORT_THRESHOLD = float(os.environ.get("SUPPORT_SCORE_THRESHOLD", "0.5"))
++
++def split_into_claims(text: str) -> List[str]:
++    # Very small heuristic splitter — replace with NLP claim extraction for production
++    import re
++    sentences = [s.strip() for s in re.split(r'[.?!\n]+', text) if s.strip()]
++    return sentences
++
++def support_for_claim(claim: str, top_k: int = 3) -> float:
++    """
++    Ask RAG for nearest documents for the claim (we use claim text as "query" and rely on RAG to embed).
++    Expects RAG /retrieve to optionally accept `text` fallback when an embedding is not provided.
++    Returns best support score (lower is better for L2, higher for cosine depending on RAG index); here we expect
++    RAG to return meta.score where lower is better (e.g., L2). We convert to a normalized support in [0,1].
++    """
++    try:
++        r = requests.post(f"{RAG_URL}/retrieve", json={"text": claim, "top_k": top_k}, timeout=5)
++        r.raise_for_status()
++        hits = r.json().get("hits", [])
++        if not hits:
++            return 0.0
++        # Best hit score extraction using heuristics:
++        # If RAG returns "score" where higher is better (cosine), use directly; else invert L2 distances.
++        scores = []
++        for h in hits:
++            s = h.get("score", None)
++            if s is None:
++                # try embedding distance -> assume none
++                continue
++            scores.append(float(s))
++        if not scores:
++            return 0.0
++        best = max(scores)
++        # Heuristic normalize: if RAG returns cosine (0..1) best is already good
++        # If best appears negative or >1, we clamp - keep simple: scale between 0..1
++        normalized = min(1.0, max(0.0, best))
++        return normalized
++    except Exception:
++        return 0.0
++
++def verify_response(response_text: str, min_support_ratio: float = 0.6) -> dict:
++    claims = split_into_claims(response_text)
++    if not claims:
++        return {"claims": [], "support_ratio": 0.0, "verdict": "no_claims"}
++    supports = []
++    for c in claims:
++        s = support_for_claim(c)
++        supports.append({"claim": c, "support": s})
++    # A claim is supported if normalized support >= SUPPORT_THRESHOLD
++    supported = [s for s in supports if s["support"] >= SUPPORT_THRESHOLD]
++    ratio = len(supported) / len(supports)
++    verdict = "supported" if ratio >= min_support_ratio else "hallucination"
++    return {"claims": supports, "supported_count": len(supported), "total_claims": len(supports), "support_ratio": ratio, "verdict": verdict}
++
++if __name__ == "__main__":
++    import sys, json
++    txt = sys.stdin.read() if not sys.stdin.isatty() else " ".join(sys.argv[1:])
++    print(json.dumps(verify_response(txt), indent=2))
++
+*** End File
+*** Add File:services/postfilter/postfilter.py
++#!/usr/bin/env python3
++"""
++Post-filter service that:
++ - Runs factuality verification on model outputs
++ - Applies simple rule-based post-filters (banlist, short-response, numeric-checks)
++ - Escalates to human-in-loop if verdict indicates hallucination or if postfilters trigger
++
++Endpoints:
++ - POST /filter  { "model": "...", "response": "...", "query": "...", "metadata": {...} }
++
++Escalation:
++ - On escalation, calls services/escalation/escalate.py::escalate_for_review
++"""
++from flask import Flask, request, jsonify
++import os, json
++from services.factuality.verifier import verify_response
++from services.escalation.escalate import escalate_for_review
++
++app = Flask(__name__)
++HUMAN_ESCALATION_MIN_SUPPORT = float(os.environ.get("HUMAN_ESCALATION_MIN_SUPPORT","0.6"))
++MAX_RESPONSE_LENGTH = int(os.environ.get("MAX_RESPONSE_LENGTH","10000"))
++BANLIST = set([w.strip().lower() for w in os.environ.get("POSTFILTER_BANLIST","").split(",") if w.strip()])
++
++def run_postfilters(response: str) -> list:
++    violations = []
++    if len(response) > MAX_RESPONSE_LENGTH:
++        violations.append("length_exceeded")
++    if BANLIST:
++        rlow = response.lower()
++        for b in BANLIST:
++            if b and b in rlow:
++                violations.append(f"banlist_{b}")
++    # numeric-check heuristic: if response claims numeric value but it's not numeric -> flag? (simple)
++    return violations
++
++@app.route("/filter", methods=["POST"])
++def filter_route():
++    body = request.get_json()
++    resp = body.get("response","")
++    query = body.get("query","")
++    model = body.get("model","")
++    meta = body.get("metadata",{})
++    post_violations = run_postfilters(resp)
++    fact = verify_response(resp, min_support_ratio=HUMAN_ESCALATION_MIN_SUPPORT)
++    escalate = False
++    reasons = []
++    if post_violations:
++        escalate = True
++        reasons += post_violations
++    if fact.get("verdict") == "hallucination":
++        escalate = True
++        reasons.append("factuality_fail")
++    if escalate:
++        ticket = escalate_for_review(model=model, query=query, response=resp, evidence=fact, reasons=reasons, metadata=meta)
++        return jsonify({"ok": False, "escalated": True, "reasons": reasons, "ticket": ticket}), 200
++    return jsonify({"ok": True, "escalated": False, "support": fact}), 200
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("POSTFILTER_PORT","8092")))
++
+*** End File
+*** Add File:services/escalation/escalate.py
++#!/usr/bin/env python3
++"""
++Escalation helpers:
++ - Create a human review ticket (GitHub issue or PagerDuty webhook)
++ - Record escalation in remediation tracker
++"""
++import os, subprocess, json, time
++
++GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
++GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
++PAGERDUTY_WEBHOOK = os.environ.get("PAGERDUTY_WEBHOOK", "")
++REMEDIATION_TRACKER = os.environ.get("REMEDIATION_TRACKER_SCRIPT", "services/audit/remediation_tracker.py")
++
++def create_github_issue(title: str, body: str):
++    if not (GITHUB_REPO and GITHUB_TOKEN):
++        return {"error":"no_gh"}
++    url = f"https://api.github.com/repos/{GITHUB_REPO}/issues"
++    payload = {"title": title, "body": body, "labels": ["human-review", "escalation"]}
++    out = subprocess.check_output(["curl","-sS","-X","POST","-H",f"Authorization: token {GITHUB_TOKEN}","-H","Accept: application/vnd.github.v3+json","-d", json.dumps(payload), url], universal_newlines=True)
++    return json.loads(out)
++
++def notify_pagerduty(summary, details):
++    if not PAGERDUTY_WEBHOOK:
++        return {"error":"no_pd"}
++    subprocess.check_call(["curl","-sS","-X","POST","-H","Content-Type: application/json","-d", json.dumps({"summary": summary, "details": details}), PAGERDUTY_WEBHOOK])
++    return {"ok": True}
++
++def record_remediation(finding):
++    # finding is a list of dicts compatible with remediation_tracker.py
++    try:
++        subprocess.check_call(["python3", REMEDIATION_TRACKER, json.dumps(finding)])
++        return {"ok": True}
++    except Exception as e:
++        return {"error": str(e)}
++
++def escalate_for_review(model, query, response, evidence, reasons, metadata=None):
++    title = f"Human review: possible hallucination / policy issue - model={model}"
++    body = f"""Detected an automated escalation for model `{model}`.
++
++Query:
++{query}
++
++Response:
++{response}
++
++Reasons: {reasons}
++
++Support evidence summary:
++{json.dumps(evidence, indent=2)}
++
++Metadata:
++{json.dumps(metadata, indent=2)}
++"""
++    gh = create_github_issue(title, body)
++    notify = notify_pagerduty(title, {"issue": gh} if isinstance(gh, dict) else {"issue": str(gh)})
++    # create remediation tracker entry
++    finding = [{"id": f"escalation-{int(time.time())}", "severity":"high", "title": title, "description": body, "status":"open"}]
++    rec = record_remediation(finding)
++    return {"github": gh, "pagerduty": notify, "remediation": rec}
++
++if __name__=="__main__":
++    print("Escalation helper")
++
+*** End File
+*** Add File:services/agent/multi_sign_verify.py
++#!/usr/bin/env python3
++"""
++Verify a delegation/manifest meets an M-of-N signature requirement.
++ - Downloads manifest from evidence bucket (s3:// or gs://)
++ - Attempts cosign verify with each provided public key URI
++ - Requires `required` successful verifications to pass
++
++Usage:
++  multi_sign_verify.verify(manifest_uri, pubkey_uris, required=2)
++"""
++import os, subprocess, tempfile
++
++def fetch_uri(uri, dest):
++    if uri.startswith("s3://"):
++        subprocess.check_call(["aws","s3","cp", uri, dest])
++    elif uri.startswith("gs://"):
++        subprocess.check_call(["gsutil","cp", uri, dest])
++    elif uri.startswith("file://"):
++        src = uri[len("file://"):]
++        subprocess.check_call(["cp", src, dest])
++    else:
++        raise RuntimeError("Unsupported URI scheme")
++
++def verify(manifest_uri, pubkey_uris, required=2):
++    tmp = tempfile.mkdtemp()
++    manifest_local = os.path.join(tmp, "manifest.json")
++    fetch_uri(manifest_uri, manifest_local)
++    ok_count = 0
++    for pk in pubkey_uris:
++        try:
++            pk_local = os.path.join(tmp, os.path.basename(pk))
++            fetch_uri(pk, pk_local)
++            # try cosign verify with key
++            subprocess.check_call(["cosign", "verify", "--key", pk_local, manifest_local])
++            ok_count += 1
++        except subprocess.CalledProcessError:
++            continue
++    return {"ok_count": ok_count, "required": required, "passed": ok_count >= required}
++
++if __name__ == "__main__":
++    import sys, json
++    m = sys.argv[1]
++    pks = sys.argv[2].split(",")
++    req = int(sys.argv[3]) if len(sys.argv) > 3 else 2
++    print(json.dumps(verify(m, pks, req), indent=2))
++
+*** End File
+*** Add File:services/agent/orchestrator_secure.py
++#!/usr/bin/env python3
++"""
++Secure orchestrator wrapper:
++ - Wraps agent tool calls and enforces:
++   * policy checks (via policy engine)
++   * multi-sign delegation verification before legal/finance tools
++   * post-call attestation + optional postfilter factuality check (for responses)
++ - Replaces the non-secure orchestrator for sensitive flows
++"""
++from flask import Flask, request, jsonify
++import os, requests, json, time, subprocess
++from services.agent.multi_sign_verify import verify as verify_manifest
++from services.postfilter.postfilter import filter_route as postfilter_handler
++
++app = Flask(__name__)
++POLICY_ENGINE = os.environ.get("POLICY_ENGINE_URL","http://policy-engine:8085/evaluate")
++DELEGATION_MANIFEST_URI = os.environ.get("DELEGATION_MANIFEST_URI","")  # e.g., s3://bucket/delegations/manifest.json
++DELEGATION_PUBKEYS = os.environ.get("DELEGATION_PUBKEYS","")  # comma-separated pubkey URIs
++DELEGATION_REQUIRED = int(os.environ.get("DELEGATION_REQUIRED","2"))
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET","")
++POSTFILTER_URL = os.environ.get("POSTFILTER_URL","http://postfilter:8092/filter")
++SANDBOX_RUNNER = os.environ.get("SANDBOX_RUNNER","/ops/sandbox/run_sandbox.sh")
++
++def policy_check(action, actor="automation"):
++    try:
++        r = requests.post(POLICY_ENGINE, json={"action": action, "actor": actor}, timeout=5)
++        r.raise_for_status()
++        return r.json()
++    except Exception as e:
++        return {"allow": False, "error": str(e)}
++
++def run_sandbox_cmd(cmd):
++    out = subprocess.check_output([SANDBOX_RUNNER, json.dumps({"cmd": cmd})], universal_newlines=True)
++    return out
++
++@app.route("/run", methods=["POST"])
++def run_plan():
++    body = request.get_json()
++    plan = body.get("plan", [])
++    actor = body.get("actor","automation")
++    results = []
++    # If delegation required for certain actions (legal/finance), verify multi-sign manifest
++    delegation_ok = True
++    if DELEGATION_MANIFEST_URI and DELEGATION_PUBKEYS:
++        pubkeys = [p.strip() for p in DELEGATION_PUBKEYS.split(",") if p.strip()]
++        verification = verify_manifest(DELEGATION_MANIFEST_URI, pubkeys, DELEGATION_REQUIRED)
++        delegation_ok = verification.get("passed", False)
++        if not delegation_ok:
++            return jsonify({"error":"delegation_missing_or_invalid", "details": verification}), 403
++    for step in plan:
++        tool = step.get("tool")
++        args = step.get("args", {})
++        # Enforce policy per tool
++        if tool in ("exec",):
++            pol = policy_check("forensic_signoff", actor)
++            if not pol.get("allow", False):
++                return jsonify({"error":"policy_denied", "detail": pol}), 403
++        try:
++            if tool == "search":
++                r = requests.post(f"{os.environ.get('RAG_URL','http://rag:8082')}/retrieve", json=args, timeout=10)
++                res = r.json()
++            elif tool == "exec":
++                if not delegation_ok:
++                    return jsonify({"error":"delegation_not_verified"}), 403
++                res = run_sandbox_cmd(args.get("cmd"))
++            else:
++                res = {"error":"unknown_tool"}
++            # Post-call: if tool produced textual output, run postfilter
++            text = None
++            if isinstance(res, dict):
++                text = res.get("result") or res.get("output") or res.get("text")
++            elif isinstance(res, str):
++                text = res
++            if text:
++                # call postfilter service to evaluate factuality & escalate if needed
++                try:
++                    pf = requests.post(POSTFILTER_URL, json={"model":"agent-tool","response": text, "query": args.get("query",""), "metadata": {"tool": tool}}, timeout=10)
++                except Exception:
++                    pf = None
++            # Attest the step
++            ev = {"ts": int(time.time()), "actor": actor, "tool": tool, "args": args, "result_summary": str(res)[:1000]}
++            # write attestation local and optionally sign/upload (reuse earlier oncall_playbook_runner attestation)
++            tmp = f"/tmp/agent_ev_{int(time.time())}.json"
++            with open(tmp,"w") as fh: json.dump(ev, fh)
++            if os.environ.get("COSIGN_KEY_REF"):
++                subprocess.call(["cosign","sign","--key", os.environ.get("COSIGN_KEY_REF"), tmp])
++            if EVIDENCE_BUCKET and EVIDENCE_BUCKET.startswith("s3://"):
++                subprocess.call(["aws","s3","cp", tmp, f"{EVIDENCE_BUCKET}/agent/{os.path.basename(tmp)}"])
++            results.append({"tool": tool, "result": res})
++        except Exception as e:
++            return jsonify({"error":"tool_failed", "tool": tool, "detail": str(e)}), 500
++    return jsonify({"results": results})
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("AGENT_SECURE_PORT","8091")))
++
+*** End File
+*** Add File:services/llm/llm_proxy_secure.py
++#!/usr/bin/env python3
++"""
++Secure LLM proxy with Redis-backed token accounting and rate limiting.
++ - Uses Redis to maintain per-tenant token budgets and sliding-window rate limits.
++ - If Redis is not available falls back to in-memory (best effort).
++
++Environment:
++ - REDIS_URL: redis://host:6379/0
++ - LLM_UPSTREAM: upstream LLM endpoint
++ - QUOTA_PER_WINDOW: integer tokens per window
++ - WINDOW_SECS: window duration in seconds
++ - RATE_LIMIT_PER_SEC: requests/sec allowed per tenant
++"""
++from flask import Flask, request, jsonify
++import os, requests, time
++from prometheus_client import Counter, Histogram
++
++app = Flask(__name__)
++UPSTREAM = os.environ.get("LLM_UPSTREAM","http://localhost:8000")
++TOKEN_COUNTER = Counter("aegis_llm_tokens_total", "Tokens consumed", ["tenant"])
++REQ_LATENCY = Histogram("aegis_llm_request_latency_seconds", "LLM request latency")
++
++QUOTA = int(os.environ.get("QUOTA_PER_WINDOW", "100000"))
++WINDOW_SECS = int(os.environ.get("WINDOW_SECS", "3600"))
++RATE_LIMIT_PER_SEC = float(os.environ.get("RATE_LIMIT_PER_SEC", "5.0"))
++REDIS_URL = os.environ.get("REDIS_URL", "")
++
++use_redis = False
++if REDIS_URL:
++    try:
++        import redis
++        rconn = redis.from_url(REDIS_URL)
++        use_redis = True
++    except Exception:
++        use_redis = False
++
++# in-memory fallback
++quota_window = {}
++req_timestamps = {}
++
++def count_tokens(text):
++    return max(1, len(text.split()))
++
++def consume_tokens(tenant, tokens):
++    now = int(time.time())
++    if use_redis:
++        key = f"aegis:quota:{tenant}:{now // WINDOW_SECS}"
++        used = int(rconn.get(key) or 0)
++        if used + tokens > QUOTA:
++            return False
++        rconn.incrby(key, tokens)
++        rconn.expire(key, WINDOW_SECS * 2)
++        return True
++    else:
++        window = quota_window.get(tenant, {"start": now, "used": 0})
++        if now - window["start"] >= WINDOW_SECS:
++            window = {"start": now, "used": 0}
++        if window["used"] + tokens > QUOTA:
++            quota_window[tenant] = window
++            return False
++        window["used"] += tokens
++        quota_window[tenant] = window
++        return True
++
++def rate_limit_ok(tenant):
++    now = time.time()
++    if use_redis:
++        # naive per-second window
++        key = f"aegis:rate:{tenant}:{int(now)}"
++        v = int(rconn.incr(key))
++        if v == 1:
++            rconn.expire(key, 2)
++        return v <= RATE_LIMIT_PER_SEC
++    else:
++        ts = req_timestamps.get(tenant, [])
++        ts = [t for t in ts if now - t <= 1.0]
++        if len(ts) >= RATE_LIMIT_PER_SEC:
++            return False
++        ts.append(now)
++        req_timestamps[tenant] = ts
++        return True
++
++@app.route("/v1/generate", methods=["POST"])
++def generate():
++    t0 = time.time()
++    body = request.get_json(force=True)
++    tenant = body.get("tenant","default")
++    prompt = body.get("prompt","")
++    if not rate_limit_ok(tenant):
++        return jsonify({"error":"rate_limited"}), 429
++    tokens = count_tokens(prompt)
++    if not consume_tokens(tenant, tokens):
++        return jsonify({"error":"quota_exceeded"}), 429
++    TOKEN_COUNTER.labels(tenant=tenant).inc(tokens)
++    try:
++        r = requests.post(UPSTREAM.rstrip("/") + "/generate", json=body, timeout=60)
++    except Exception as e:
++        return jsonify({"error":"upstream_error", "detail": str(e)}), 502
++    REQ_LATENCY.observe(time.time() - t0)
++    return (r.content, r.status_code, r.headers.items())
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("LLM_PROXY_SECURE_PORT","8084")))
++
+*** End File
+*** Add File:tools/ci/estimate_token_cost.py
++#!/usr/bin/env python3
++"""
++Estimate token cost for prompt files under a given directory and fail CI if estimated cost exceeds budget.
++ - Uses crude token estimate: tokens ~= words / 0.75 (approx)
++ - Config via env:
++   - TOKEN_PRICE_PER_1K: cost per 1k tokens (float)
++   - BUDGET_DOLLARS: maximum allowed dollars for this change
++
++Usage:
++  python3 tools/ci/estimate_token_cost.py --dir prompts/
++"""
++import os, sys, argparse, glob, json
++
++def estimate_tokens(text: str) -> int:
++    words = len(text.split())
++    tokens = int(words / 0.75)
++    return tokens
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--dir", required=True)
++    args = p.parse_args()
++    files = glob.glob(os.path.join(args.dir, "**/*.txt"), recursive=True)
++    total_tokens = 0
++    for f in files:
++        with open(f) as fh:
++            total_tokens += estimate_tokens(fh.read())
++    price_per_1k = float(os.environ.get("TOKEN_PRICE_PER_1K","0.002"))  # example $0.002 / 1k tokens
++    budget = float(os.environ.get("BUDGET_DOLLARS","1.0"))
++    cost = (total_tokens / 1000.0) * price_per_1k
++    print(f"Found {len(files)} prompt files, estimated tokens={total_tokens}, estimated_cost=${cost:.4f}, budget=${budget}")
++    if cost > budget:
++        print("Token budget exceeded — failing CI")
++        sys.exit(2)
++    print("Within budget")
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:.github/workflows/token_budget_check.yml
++name: Token Budget Check
++on:
++  pull_request:
++    paths:
++      - "prompts/**"
++jobs:
++  budget:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Estimate token cost
++        env:
++          TOKEN_PRICE_PER_1K: ${{ secrets.TOKEN_PRICE_PER_1K }}
++          BUDGET_DOLLARS: ${{ secrets.PROMPT_BUDGET_DOLLARS }}
++        run: |
++          python3 tools/ci/estimate_token_cost.py --dir prompts || exit 2
++
+*** End File
+*** Add File:ops/autoscale/autoscale_guard.py
++#!/usr/bin/env python3
++"""
++Autoscale guard:
++ - Monitor Prometheus for rapid scale-out events or sustained low utilization and enforce a policy by notifying operators or toggling a "guard" ConfigMap.
++ - This is a safety helper; operators should adapt it to patch KEDA/HPA objects if needed.
++
++Config via env:
++ - PROM_URL
++ - GUARD_ALERT_WEBHOOK
++ - MAX_ALLOWED_REPLICAS (int)
++ - MAX_GPU_UTIL (float 0-1)
++"""
++import os, requests, time, json, subprocess
++
++PROM = os.environ.get("PROM_URL","http://prometheus.monitoring.svc:9090")
++ALERT_WEBHOOK = os.environ.get("GUARD_ALERT_WEBHOOK","")
++MAX_REPLICAS = int(os.environ.get("MAX_ALLOWED_REPLICAS","20"))
++MAX_GPU_UTIL = float(os.environ.get("MAX_GPU_UTIL","0.9"))
++
++def query_prom(q):
++    r = requests.get(PROM + "/api/v1/query", params={"query": q}, timeout=10)
++    r.raise_for_status()
++    return r.json()
++
++def send_alert(msg):
++    if ALERT_WEBHOOK:
++        requests.post(ALERT_WEBHOOK, json={"message": msg}, timeout=5)
++    else:
++        print("ALERT:", msg)
++
++def check_scale():
++    # example: get current triton replica count via K8s metric (placeholder) and GPU util
++    try:
++        # GPU util: average over 1m
++        gpu = query_prom('avg(nvidia_gpu_utilization_gpu)')[ "data"]["result"]
++        gpu_val = float(gpu[0]["value"][1]) if gpu else 0.0
++    except Exception:
++        gpu_val = 0.0
++    # Example check for replica count metric name aegis_triton_replicas_total (requires instrumenting)
++    try:
++        rep = query_prom('sum(kube_deployment_spec_replicas{deployment=~".*triton.*"})')
++        replicas = int(rep["data"]["result"][0]["value"][1]) if rep and rep["data"]["result"] else 0
++    except Exception:
++        replicas = 0
++    if replicas > MAX_REPLICAS or gpu_val/100.0 > MAX_GPU_UTIL:
++        send_alert(f"Autoscale guard triggered: replicas={replicas}, gpu_util={gpu_val}%")
++        # operator action: write ConfigMap to disable scaling (placeholder)
++        try:
++            subprocess.call(["kubectl","create","configmap","aegis-autoscale-guard","--from-literal=guard=1","-n","inference"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++        except Exception:
++            pass
++
++if __name__ == "__main__":
++    check_scale()
++
+*** End File
+*** Add File:services/legal/delegation_enforcer.py
++#!/usr/bin/env python3
++"""
++Local enforcement utility: assert that a delegation manifest for an action exists and is M-of-N signed
++before allowing automated legal/finance actions.
++ - Leverages services/agent/multi_sign_verify.py
++ - Example usage: called by orchestrators before running finance/legal tools
++"""
++import os
++from services.agent.multi_sign_verify import verify
++
++DELEGATION_MANIFEST_URI = os.environ.get("DELEGATION_MANIFEST_URI","")
++DELEGATION_PUBKEYS = os.environ.get("DELEGATION_PUBKEYS","")
++DELEGATION_REQUIRED = int(os.environ.get("DELEGATION_REQUIRED","2"))
++
++def enforce():
++    if not DELEGATION_MANIFEST_URI or not DELEGATION_PUBKEYS:
++        return {"passed": False, "reason": "delegation_config_missing"}
++    pubkeys = [p.strip() for p in DELEGATION_PUBKEYS.split(",") if p.strip()]
++    return verify(DELEGATION_MANIFEST_URI, pubkeys, DELEGATION_REQUIRED)
++
++if __name__=="__main__":
++    import json
++    print(json.dumps(enforce(), indent=2))
++
+*** End File
+*** Add File:services/requirements-extra.txt
++redis
++requests
++pymilvus
++cosign  # placeholder note: cosign is CLI installed, not a PyPI package
++
+*** End File
+*** Add File:docs/runbooks/human_escalation_runbook.md
++# Human Escalation Runbook (for hallucinations / legal/finance escalations)
++
++1. Triage
++ - Check GitHub issue created by escalate_for_review; verify evidence bundle in EVIDENCE_BUCKET.
++ - Validate factuality evidence (RAG hits). Use services/factuality/verifier.py to reproduce findings.
++2. Containment
++ - If the incident involves incorrect public-facing content, take immediate mitigation (disable agent, remove output, or toggle kill-switch).
++3. Remediation
++ - Correct prompt/template in prompt registry; re-evaluate using evaluation harness.
++ - If model requires retrain, run retrain_playbook with attestation and A/B canary.
++4. Legal & Finance
++ - For legal/finance escalations, ensure delegation manifest exists and is signed; consult legal on escalation.
++5. Postmortem
++ - Record root cause, remedial actions, and add test checks to postfilter or policy engine to prevent recurrence.
++
+*** End File
+*** End Patch

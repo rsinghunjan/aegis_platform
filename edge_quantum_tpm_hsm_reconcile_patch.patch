@@ -1,0 +1,616 @@
+*** Begin Patch
+*** Add File: device/tpm_client.py
++#!/usr/bin/env python3
++"""
++TPM/HSM client shim (emulator-first).
++
++Provides a pluggable interface for:
++ - generate_keypair_in_tpm() -> (pub_pem, attestation_blob)
++ - verify_attestation(blob) -> dict (emulator returns decoded payload)
++
++On real devices replace the emulator internals with tpm2-pytss or vendor SDK calls.
++"""
++import os
++import json
++import base64
++from typing import Tuple
++
++try:
++    from cryptography.hazmat.primitives.asymmetric import rsa
++    from cryptography.hazmat.primitives import serialization
++except Exception:
++    raise
++
++EMULATOR = os.environ.get("TPM_EMULATOR", "1") == "1"
++
++class TPMClient:
++    def __init__(self, device_id: str = None):
++        self.device_id = device_id or f"dev-{int(os.times()[4])}"
++
++    def generate_keypair_in_tpm(self) -> Tuple[str, str]:
++        """
++        Generate a keypair inside TPM/HSM if available; fallback to ephemeral software key for emulator.
++        Returns (public_key_pem, attestation_blob)
++        """
++        if not EMULATOR:
++            # TODO: implement real TPM calls using tpm2-pytss or vendor SDK
++            raise NotImplementedError("Real TPM support not implemented in this shim.")
++
++        # Emulator path: generate a software RSA key and produce an attestation blob
++        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++        pub = key.public_key().public_bytes(
++            encoding=serialization.Encoding.PEM,
++            format=serialization.PublicFormat.SubjectPublicKeyInfo
++        ).decode()
++        # Fake attestation: include device id, pub hash, and timestamp
++        payload = {"device_id": self.device_id, "pub_fingerprint": self._fingerprint(pub), "ts": int(__import__("time").time())}
++        att = base64.b64encode(json.dumps(payload).encode()).decode()
++        return pub, att
++
++    def verify_attestation(self, attestation_blob: str) -> dict:
++        """
++        Verify an attestation blob. Emulator decodes and returns payload.
++        Real implementation should verify TPM quote and PCRs.
++        """
++        if EMULATOR:
++            try:
++                payload = json.loads(base64.b64decode(attestation_blob).decode())
++                return {"ok": True, "payload": payload}
++            except Exception as e:
++                return {"ok": False, "error": str(e)}
++        else:
++            # TODO: real TPM quote verify
++            return {"ok": False, "error": "not_implemented"}
++
++    def _fingerprint(self, pub_pem: str) -> str:
++        import hashlib
++        return hashlib.sha256(pub_pem.encode()).hexdigest()
++
++if __name__ == "__main__":
++    c = TPMClient("device-emulator-123")
++    pub, att = c.generate_keypair_in_tpm()
++    print("PUB:", pub[:80])
++    print("ATTEST:", att[:80])
++
+*** End Patch
+*** Begin Patch
+*** Add File: device/enroll_device.py
++#!/usr/bin/env python3
++"""
++Device enrollment script (emulator-first).
++Generates key in TPM (or emulator), creates attestation, posts to operator signer,
++and stores the returned signed certificate locally for mTLS.
++"""
++import os, json, requests
++from device.tpm_client import TPMClient
++
++SIGNER_URL = os.environ.get("SIGNER_URL", "http://device-hsm-signer.operator.svc:8111/sign_device")
++OP_APPROVAL_HEADER = os.environ.get("OPERATOR_APPROVAL_HEADER", "1")
++OUT_DIR = os.environ.get("OUT_DIR", "/data")
++
++def enroll(device_id=None):
++    client = TPMClient(device_id=device_id)
++    pub, att = client.generate_keypair_in_tpm()
++    payload = {"device_id": client.device_id, "public_key": pub, "attestation": att}
++    headers = {"X-Operator-Approved": OP_APPROVAL_HEADER}
++    r = requests.post(SIGNER_URL, json=payload, headers=headers, timeout=10)
++    if not r.ok:
++        raise RuntimeError(f"Sign request failed: {r.status_code} {r.text}")
++    resp = r.json()
++    signed_cert = resp.get("signature") or resp.get("cert")
++    os.makedirs(OUT_DIR, exist_ok=True)
++    with open(os.path.join(OUT_DIR, f"{client.device_id}.pub.pem"), "w") as f:
++        f.write(pub)
++    with open(os.path.join(OUT_DIR, f"{client.device_id}.signed.pem"), "w") as f:
++        f.write(signed_cert)
++    print("Enrollment successful:", client.device_id)
++    return client.device_id
++
++if __name__ == "__main__":
++    import sys
++    device = enroll(sys.argv[1] if len(sys.argv) > 1 else None)
++    print("Device enrolled:", device)
++
+*** End Patch
+*** Begin Patch
+*** Add File: hsm/device_hsm_signer_v2.py
++#!/usr/bin/env python3
++"""
++Operator HSM signer service v2:
++ - verifies attestation blobs (emulator or real TPM)
++ - signs public key via HSM (or fallback openssl on operator host)
++ - records evidence to Rekor and uploads metadata to COMPLIANCE_BUCKET (S3)
++"""
++import os, json, tempfile, subprocess, base64
++from flask import Flask, request, jsonify
++import boto3
++
++HSM_SIGN_CMD = os.environ.get("HSM_SIGN_CMD", "/opt/hsm/hsm_sign_device.sh")
++REKOR_CLI = os.environ.get("REKOR_CLI", "rekor-cli")
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++APPROVAL_HEADER = os.environ.get("OPERATOR_APPROVAL_HEADER", "X-Operator-Approved")
++USE_EMULATOR_ATTEST = os.environ.get("TPM_EMULATOR", "1") == "1"
++
++app = Flask("device-hsm-signer-v2")
++s3 = boto3.client("s3") if COMPLIANCE_BUCKET else None
++
++def sign_with_hsm(pub_pem: str, device_id: str) -> str:
++    # Prefer HSM sign command if present; fallback to openssl local sign (insecure, operator only)
++    if os.path.exists(HSM_SIGN_CMD):
++        tmp = tempfile.NamedTemporaryFile(delete=False)
++        tmp.write(pub_pem.encode()); tmp.flush(); tmp.close()
++        try:
++            out = subprocess.check_output([HSM_SIGN_CMD, tmp.name, device_id], stderr=subprocess.STDOUT, timeout=30).decode().strip()
++            return out
++        finally:
++            try: os.unlink(tmp.name)
++            except: pass
++    # fallback: produce a fake signature using openssl if available
++    try:
++        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pem")
++        tmp.write(pub_pem.encode()); tmp.flush(); tmp.close()
++        out = subprocess.check_output(["openssl", "rsa", "-in", tmp.name, "-pubin", "-text"], stderr=subprocess.STDOUT, timeout=20).decode()
++        return "FAKE-SIGNATURE:" + out[:200]
++    except Exception as e:
++        raise RuntimeError("No HSM available and openssl fallback failed: " + str(e))
++
++def rekor_upload(local_path: str) -> str:
++    if not REKOR_CLI:
++        return "no_rekor"
++    try:
++        out = subprocess.check_output([REKOR_CLI, "upload", "--artifact", local_path], stderr=subprocess.STDOUT, timeout=20).decode().strip()
++        return out
++    except Exception as e:
++        return str(e)
++
++@app.post("/sign_device")
++def sign_device():
++    if not request.headers.get(APPROVAL_HEADER):
++        return jsonify({"error":"operator approval header required"}), 403
++    j = request.get_json() or {}
++    device_id = j.get("device_id")
++    pubkey = j.get("public_key")
++    attestation = j.get("attestation")
++    if not device_id or not pubkey or not attestation:
++        return jsonify({"error":"device_id, public_key and attestation required"}), 400
++    # Verify attestation (emulator or real)
++    if USE_EMULATOR_ATTEST:
++        try:
++            payload = json.loads(base64.b64decode(attestation).decode())
++            if payload.get("device_id") != device_id:
++                return jsonify({"error":"attestation_mismatch"}), 400
++        except Exception as e:
++            return jsonify({"error":"invalid_attestation","detail":str(e)}), 400
++    else:
++        # TODO: real TPM quote verification
++        return jsonify({"error":"real_tpm_not_implemented"}), 500
++    # Sign the public key
++    try:
++        signature = sign_with_hsm(pubkey, device_id)
++    except Exception as e:
++        return jsonify({"error":"hsm_sign_failed","detail":str(e)}), 500
++    # Record evidence
++    evidence = {"device_id": device_id, "signature": signature, "attestation": attestation, "ts": int(__import__("time").time())}
++    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
++    tmp.write(json.dumps(evidence).encode()); tmp.flush(); tmp.close()
++    rekor_out = rekor_upload(tmp.name)
++    s3_key = None
++    if s3 and COMPLIANCE_BUCKET:
++        s3_key = f"hsm/device_signatures/{device_id}_{int(__import__('time').time())}.json"
++        try:
++            s3.upload_file(tmp.name, COMPLIANCE_BUCKET, s3_key)
++        except Exception:
++            s3_key = None
++    try:
++        os.unlink(tmp.name)
++    except Exception:
++        pass
++    return jsonify({"ok": True, "signature": signature, "rekor": rekor_out, "s3_key": f"s3://{COMPLIANCE_BUCKET}/{s3_key}" if s3_key else None})
++
++@app.get("/health")
++def health():
++    return jsonify({"ok": True})
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8111")))
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/hsm/device-hsm-signer-operator.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: device-hsm-signer
++  namespace: operator
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: device-hsm-signer
++  template:
++    metadata:
++      labels:
++        app: device-hsm-signer
++    spec:
++      serviceAccountName: device-hsm-signer-sa
++      containers:
++        - name: signer
++          image: aegis/device-hsm-signer:latest
++          env:
++            - name: COMPLIANCE_BUCKET
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-secrets
++                  key: compliance-bucket
++            - name: TPM_EMULATOR
++              value: "1"
++          volumeMounts:
++            - name: hsm-socket
++              mountPath: /var/run/hsm
++      volumes:
++        - name: hsm-socket
++          hostPath:
++            path: /var/run/hsm
++            type: DirectoryOrCreate
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: device-hsm-signer
++  namespace: operator
++spec:
++  selector:
++    app: device-hsm-signer
++  ports:
++    - port: 8111
++      targetPort: 8111
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/hsm/networkpolicy-operator-only.yaml
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: allow-operator-to-hsm-signer
++  namespace: operator
++spec:
++  podSelector:
++    matchLabels:
++      app: device-hsm-signer
++  policyTypes:
++    - Ingress
++  ingress:
++    - from:
++        - namespaceSelector:
++            matchLabels:
++              role: operator
++      ports:
++        - protocol: TCP
++          port: 8111
++
+*** End Patch
+*** Begin Patch
+*** Add File: edge/fleet_load_simulator.py
++#!/usr/bin/env python3
++"""
++Simple fleet load simulator:
++ - simulates device enrollments and periodic check-ins
++ - used to validate enrollment, rotation, and OTA canary behavior at scale
++"""
++import argparse, requests, random, time, concurrent.futures
++
++def enroll_one(signer_url, idx):
++    try:
++        url = signer_url
++        payload = {"device_id": f"sim-{idx}", "public_key": "MOCKPUB", "attestation": "MOCKATTEST"}
++        headers = {"X-Operator-Approved": "1"}
++        r = requests.post(url, json=payload, headers=headers, timeout=5)
++        return r.ok
++    except Exception:
++        return False
++
++def checkin_one(ota_url, device_id):
++    try:
++        r = requests.post(ota_url, json={"device": device_id, "event": "checkin", "ts": int(time.time())}, timeout=3)
++        return r.ok
++    except Exception:
++        return False
++
++def run(total=1000, concurrency=100, signer_url=None, ota_url=None):
++    ok = 0
++    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
++        futures = [ex.submit(enroll_one, signer_url, i) for i in range(total)]
++        for f in concurrent.futures.as_completed(futures):
++            if f.result():
++                ok += 1
++    print(f"Enrolled {ok}/{total}")
++    # simulate periodic checkins for a subset
++    ids = [f"sim-{i}" for i in range(min(200, total))]
++    for _ in range(10):
++        with concurrent.futures.ThreadPoolExecutor(max_workers=50) as ex:
++            futures = [ex.submit(checkin_one, ota_url, d) for d in ids]
++            _ = [f.result() for f in concurrent.futures.as_completed(futures)]
++        time.sleep(2)
++
++if __name__=="__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--total", type=int, default=500)
++    p.add_argument("--concurrency", type=int, default=100)
++    p.add_argument("--signer_url", default="http://device-hsm-signer.operator.svc:8111/sign_device")
++    p.add_argument("--ota_url", default="http://ota.aegis.svc:8205/device")
++    args = p.parse_args()
++    run(total=args.total, concurrency=args.concurrency, signer_url=args.signer_url, ota_url=args.ota_url)
++
+*** End Patch
+*** Begin Patch
+*** Add File: .github/workflows/edge_canary_enroll.yml
++name: Edge Enrollment Smoke & Canary
++on:
++  workflow_dispatch:
++    inputs:
++      signer_url:
++        required: false
++        default: "http://device-hsm-signer.operator.svc:8111/sign_device"
++
++jobs:
++  enroll-smoke:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup python
++        run: python -m pip install --upgrade pip && pip install requests
++      - name: Run device enrollment emulator (operator network required)
++        env:
++          SIGNER_URL: ${{ github.event.inputs.signer_url }}
++        run: |
++          python device/enroll_device.py || (echo "Enrollment failed" && exit 2)
++
+*** End Patch
+*** Begin Patch
+*** Add File: runbooks/edge_tpm_enrollment_runbook.md
++# Edge TPM/HSM Enrollment Runbook (operator)
++
++Purpose
++- Describe operator steps to enable on-device TPM enrollment and validate evidence.
++
++Steps
++1. Deploy signer and NetworkPolicy:
++   kubectl apply -f k8s/hsm/device-hsm-signer-operator.yaml
++   kubectl apply -f k8s/hsm/networkpolicy-operator-only.yaml
++2. Verify signer is only reachable from operator namespace:
++   kubectl -n operator get svc device-hsm-signer
++   From non-operator namespace, attempt curl (should be blocked).
++3. Run enrollment emulator from operator host:
++   SIGNER_URL=http://device-hsm-signer.operator.svc:8111/sign_device python device/enroll_device.py
++4. Inspect evidence in COMPLIANCE_BUCKET (s3://<bucket>/hsm/device_signatures/)
++5. For rollout: run edge/fleet_load_simulator.py with parameters to simulate bulk enroll + checkin.
++
++Notes
++- Replace emulator TPM client with real tpm2-pytss implementation on device agent before production.
++- Ensure Rekor and S3 evidence are generated and immutable.
++
+*** End Patch
+*** Begin Patch
+*** Add File: quantum/receipts_ingest/reconcile_provider_receipts.py
++#!/usr/bin/env python3
++"""
++Reconcile provider receipts (S3 / local file) with local job records.
++ - Reads receipts from COMPLIANCE_BUCKET/payouts/provider/ or local dir
++ - Queries local job storage (Elasticsearch / job DB) for matching job ids and durations
++ - Produces /tmp/quantum_reconcile_report.json and uploads to COMPLIANCE_BUCKET
++"""
++import os, json, boto3, requests
++from datetime import datetime, timedelta
++
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++ES_HOST = os.environ.get("ES_HOST")
++LOCAL_JOB_API = os.environ.get("QUANTUM_JOB_API", "http://quantum-jobs.aegis.svc:8302")
++
++s3 = boto3.client("s3") if COMPLIANCE_BUCKET else None
++
++def list_provider_receipts(prefix="provider_receipts/"):
++    if not s3:
++        return []
++    objs = s3.list_objects_v2(Bucket=COMPLIANCE_BUCKET, Prefix=prefix)
++    return [o["Key"] for o in objs.get("Contents", [])]
++
++def download_and_parse(key):
++    tmp = f"/tmp/{os.path.basename(key)}"
++    s3.download_file(COMPLIANCE_BUCKET, key, tmp)
++    with open(tmp) as fh:
++        return json.load(fh)
++
++def fetch_local_jobs(start_ts, end_ts):
++    # Query job API for jobs within timeframe
++    r = requests.get(f"{LOCAL_JOB_API}/jobs?start={start_ts}&end={end_ts}", timeout=10)
++    r.raise_for_status()
++    return r.json()
++
++def reconcile(window_minutes=60):
++    now = datetime.utcnow()
++    start = now - timedelta(minutes=window_minutes)
++    receipts = list_provider_receipts()
++    report = {"ts": now.isoformat(), "checked": [], "anomalies": []}
++    for key in receipts:
++        rec = download_and_parse(key)
++        # expected rec structure: {"job_id": "...", "provider_id": "...", "qpu_time": seconds, "cost": 123.45}
++        job_id = rec.get("job_id")
++        if not job_id:
++            report["anomalies"].append({"key": key, "reason": "no_job_id"})
++            continue
++        try:
++            local = requests.get(f"{LOCAL_JOB_API}/jobs/{job_id}", timeout=5).json()
++        except Exception:
++            report["anomalies"].append({"job_id": job_id, "reason": "local_job_missing"})
++            continue
++        # compare qpu_time
++        provider_secs = rec.get("qpu_time", 0)
++        local_secs = local.get("qpu_time", 0)
++        if abs(provider_secs - local_secs) > max(1, 0.1 * max(provider_secs, local_secs)):
++            report["anomalies"].append({"job_id": job_id, "provider_secs": provider_secs, "local_secs": local_secs})
++        else:
++            report["checked"].append(job_id)
++    # write report
++    out = "/tmp/quantum_reconcile_report.json"
++    with open(out, "w") as fh:
++        json.dump(report, fh, indent=2)
++    if s3 and COMPLIANCE_BUCKET:
++        s3.upload_file(out, COMPLIANCE_BUCKET, f"quantum/reconcile/{int(datetime.utcnow().timestamp())}_report.json")
++    print("Wrote report to", out)
++    return report
++
++if __name__ == "__main__":
++    reconcile()
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/quantum/reconcile-cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: quantum-reconcile
++  namespace: aegis
++spec:
++  schedule: "0 * * * *"
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          containers:
++            - name: reconcile
++              image: aegis/quantum-tools:latest
++              command: ["python", "/opt/quantum/reconcile_provider_receipts.py"]
++              env:
++                - name: COMPLIANCE_BUCKET
++                  valueFrom:
++                    secretKeyRef:
++                      name: aegis-secrets
++                      key: compliance-bucket
++                - name: QUANTUM_JOB_API
++                  value: "http://quantum-jobs.aegis.svc:8302"
++          restartPolicy: OnFailure
++
+*** End Patch
+*** Begin Patch
+*** Add File: quantum/admission_webhook.py
++#!/usr/bin/env python3
++"""
++Simple admission-like webhook process that enforces per-tenant QPU quotas.
++This is a standalone validating service to be connected behind your API gateway or k8s validating webhook.
++It expects incoming JSON job submissions with "tenant" and "requested_time" (seconds).
++Quota store is Redis (per-tenant available seconds).
++"""
++import os, json
++from flask import Flask, request, jsonify
++import redis
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/1")
++DEFAULT_QUOTA = int(os.environ.get("QPU_DEFAULT_QUOTA_SECS", "3600"))
++
++app = Flask("quantum-admission")
++r = redis.from_url(REDIS_URL)
++
++def tenant_quota_key(tenant):
++    return f"qpu_quota:{tenant}"
++
++@app.post("/submit")
++def submit():
++    j = request.get_json() or {}
++    tenant = j.get("tenant") or "default"
++    req_secs = int(j.get("requested_time", 60))
++    key = tenant_quota_key(tenant)
++    # initialize quota if missing
++    if not r.exists(key):
++        r.set(key, DEFAULT_QUOTA)
++    avail = int(r.get(key) or 0)
++    if req_secs > avail:
++        return jsonify({"ok": False, "reason": "quota_exceeded", "available": avail}), 429
++    # consume tokens atomically (decrby)
++    r.decrby(key, req_secs)
++    return jsonify({"ok": True, "remaining": int(r.get(key) or 0)})
++
++@app.post("/quota/replenish")
++def replenish():
++    j = request.get_json() or {}
++    tenant = j.get("tenant")
++    amt = int(j.get("amount", 0))
++    if not tenant:
++        return jsonify({"ok": False, "error": "tenant required"}), 400
++    r.incrby(tenant_quota_key(tenant), amt)
++    return jsonify({"ok": True, "tenant": tenant, "new": int(r.get(tenant_quota_key(tenant) or 0))})
++
++@app.get("/health")
++def health():
++    return jsonify({"ok": True})
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8401")))
++
+*** End Patch
+*** Begin Patch
+*** Add File: .github/workflows/quantum_receipt_reconcile.yml
++name: Quantum Receipt Reconcile Smoke
++on:
++  workflow_dispatch:
++    inputs:
++      window_minutes:
++        required: false
++        default: "60"
++
++jobs:
++  reconcile:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup python deps
++        run: python -m pip install --upgrade pip && pip install boto3 requests
++      - name: Run reconcile script
++        env:
++          COMPLIANCE_BUCKET: ${{ secrets.COMPLIANCE_BUCKET }}
++          QUANTUM_JOB_API: ${{ secrets.QUANTUM_JOB_API }}
++        run: |
++          python quantum/receipts_ingest/reconcile_provider_receipts.py
++      - name: Upload artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: quantum-reconcile-report
++          path: /tmp/quantum_reconcile_report.json
++
+*** End Patch
+*** Begin Patch
+*** Add File: runbooks/quantum_reconciliation_runbook.md
++# Quantum Reconciliation Runbook
++
++Purpose
++- How to run, validate and act on reconciliation reports for QPU provider billing.
++
++Steps
++1. Ensure COMPLIANCE_BUCKET and QUANTUM_JOB_API are configured.
++2. Trigger reconciliation:
++   kubectl run -n aegis --rm -it reconcile --image=aegis/quantum-tools:latest -- python /opt/quantum/reconcile_provider_receipts.py
++3. Inspect /tmp/quantum_reconcile_report.json and uploaded S3 artifact under quantum/reconcile/
++4. If anomalies reported, open remediation issue and attach the reconciliation artifact; notify procurement for invoice disputes.
++
++Notes
++- Reconciliation should run hourly (CronJob provided). For critical mismatches, operator should pause new QPU allocations for affected tenant/provider pending root cause analysis.
++
+*** End Patch
+*** Begin Patch
+*** Add File: runbooks/edge_and_quantum_next_steps.md
++# Edge & Quantum Next Steps (operator checklist)
++
++Edge
++- Replace emulator TPM path in device/tpm_client.py with tpm2-pytss implementation on target devices.
++- Roll out device agent update to a small cohort and verify enrollment + Rekor evidence.
++- Run fleet_load_simulator in staging (k8s job) and deploy canary monitor to validate OTA.
++- Schedule device pen tests and harden firmware/update pipeline.
++
++Quantum
++- Perform operator-approved staging real-provider job following vault/scripts/store_real_provider_creds.sh.
++- Ensure provider receipts are landed in COMPLIANCE_BUCKET and run reconciliation.
++- Deploy admission_webhook in front of job submission to enforce per-tenant quotas.
++- Schedule legal/compliance signoffs before enabling production hardware for tenants.
++
+*** End Patch
+*** End Patch

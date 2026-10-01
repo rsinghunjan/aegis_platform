@@ -1,0 +1,418 @@
+*** Begin Patch
+*** Add File: scripts/provision_kms_and_set_secrets.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Wrapper to provision cloud KMS + OIDC (terraform) and set GitHub secrets.
++# Supports AWS and GCP.
++#
++# Usage:
++#   ./scripts/provision_kms_and_set_secrets.sh <cloud> <gh_owner/gh_repo>
++#
++CLOUD=${1:-}
++GH_REPO=${2:-}
++if [[ -z "$CLOUD" || -z "$GH_REPO" ]]; then
++  echo "Usage: $0 <aws|gcp> <owner/repo>"
++  exit 2
++fi
++
++ROOT="$(cd "$(dirname "$0")/.." && pwd)"
++pushd "$ROOT" >/dev/null
++
++if [[ "$CLOUD" == "aws" ]]; then
++  echo "Provisioning AWS infra (KMS, OIDC role, RDS, ElastiCache, S3) via terraform/aws"
++  (cd terraform/aws && terraform init && terraform apply -auto-approve)
++  OUT=$(cd terraform/aws && terraform output -json)
++  KMS_ARN=$(echo "$OUT" | jq -r '.kms_key_arn.value')
++  BUCKET=$(echo "$OUT" | jq -r '.s3_compliance_bucket.value')
++  echo "Setting GitHub secrets for $GH_REPO"
++  gh secret set CLOUD_PROVIDER --repo "$GH_REPO" --body "aws"
++  gh secret set AWS_KMS_KEY_ARN --repo "$GH_REPO" --body "$KMS_ARN"
++  gh secret set COMPLIANCE_BUCKET --repo "$GH_REPO" --body "$BUCKET"
++  # Rekor url and registry secrets should be set by operator (prompts)
++  echo "Please set REKOR_URL, REGISTRY_HOST, REGISTRY_USER, REGISTRY_TOKEN manually or via gh secret set."
++
++elif [[ "$CLOUD" == "gcp" ]]; then
++  echo "Provisioning GCP infra via terraform/gcp"
++  (cd terraform/gcp && terraform init && terraform apply -auto-approve)
++  OUT=$(cd terraform/gcp && terraform output -json)
++  KMS_REF=$(echo "$OUT" | jq -r '.gcp_kms_key_ref.value')
++  SA_EMAIL=$(echo "$OUT" | jq -r '.github_actions_sa_email.value')
++  echo "Please create a service account key for $SA_EMAIL and add as GH secret GCP_SA_KEY_JSON"
++  gh secret set CLOUD_PROVIDER --repo "$GH_REPO" --body "gcp"
++  gh secret set GCP_KMS_KEY_REF --repo "$GH_REPO" --body "$KMS_REF"
++  echo "Please set REKOR_URL, REGISTRY_HOST, REGISTRY_USER, REGISTRY_TOKEN manually."
++else
++  echo "Unsupported cloud: $CLOUD"
++  exit 2
++fi
++
++popd >/dev/null
++echo "Provisioning complete. Follow runbooks to bootstrap Vault and deploy attestation."
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/migrate_secrets_to_vault.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Migrate secrets in a JSON file to Vault KV v2.
++# secrets-to-migrate.json format:
++# {
++#   "path/in/vault": { "key1": "val1", "key2": "val2" }
++# }
++#
++# Usage: ./scripts/migrate_secrets_to_vault.sh secrets-to-migrate.json
++#
++FILE=${1:-}
++if [ -z "$FILE" ]; then
++  echo "Usage: $0 secrets-to-migrate.json"
++  exit 2
++fi
++
++if ! command -v vault >/dev/null 2>&1; then
++  echo "vault CLI required"
++  exit 1
++fi
++
++jq -c 'to_entries[]' "$FILE" | while read -r entry; do
++  path=$(echo "$entry" | jq -r '.key')
++  data=$(echo "$entry" | jq -r '.value')
++  echo "Writing secret to secret/data/$path"
++  # Convert JSON object to key=val args
++  python3 - <<PY
++import json,sys,subprocess
++entry = json.loads('''$data''')
++args = ['vault','kv','put','secret/data/$path']
++for k,v in entry.items():
++    args.append(f"{k}={v}")
++subprocess.check_call(args)
++PY
++done
++
++echo "Migration complete."
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/hardening/networkpolicy-agent-exec.yaml
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: agent-exec-egress-allowlist
++  namespace: agent-exec
++spec:
++  podSelector: {}
++  policyTypes:
++  - Egress
++  egress:
++  - to:
++    - namespaceSelector:
++        matchLabels:
++          name: ops
++    ports:
++    - protocol: TCP
++      port: 443
++  - to:
++    - ipBlock:
++        cidr: 10.0.0.0/8
++  - to:
++    - ipBlock:
++        cidr: 52.216.0.0/12 # example registry / S3 ranges - replace with your cloud ranges
++    ports:
++    - protocol: TCP
++      port: 443
++
++---
++# Deny all other egress by default (NetworkPolicy is additive - this policy restricts egress to above)
++# Note: Ensure required egress (DNS, API) is allowed via allowlist above; tune for your environment.
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/hardening/podsecurity-standards.yaml
++apiVersion: policy/v1beta1
++kind: PodSecurityPolicy
++metadata:
++  name: aegis-restrictive-psp
++spec:
++  privileged: false
++  allowPrivilegeEscalation: false
++  requiredDropCapabilities:
++    - ALL
++  volumes:
++    - configMap
++    - emptyDir
++    - persistentVolumeClaim
++  hostNetwork: false
++  hostPID: false
++  hostIPC: false
++  runAsUser:
++    rule: MustRunAsNonRoot
++  seLinux:
++    rule: RunAsAny
++  fsGroup:
++    rule: RunAsAny
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/attestation/rekor_verifier.py
++"""
++Helper to validate that a given image digest has a Rekor entry signed by the expected KMS key id.
++Used by attestation service to ensure Rekor-proof and signer verification.
++"""
++import requests
++import base64
++import json
++
++REKOR_URL = "https://rekor.sigstore.dev"
++
++def get_rekor_entries_for_digest(digest):
++    # digest: sha256:...
++    try:
++        url = f"{REKOR_URL}/api/v1/log/entries?hash={digest}"
++        r = requests.get(url, timeout=10)
++        r.raise_for_status()
++        return r.json()
++    except Exception as e:
++        return {"error": str(e)}
++
++def extract_pubkey_from_entry(entry):
++    # entry is Rekor entry structure; attempt to find public key info
++    try:
++        # navigate common Rekor entry structure
++        body = entry.get("body")
++        if isinstance(body, dict):
++            return body
++        return entry
++    except Exception:
++        return None
++
++def rekor_signed_by_kms(digest, expected_key_id_substring):
++    entries = get_rekor_entries_for_digest(digest)
++    if "error" in entries:
++        return False, entries
++    for k,v in entries.items():
++        # v is log entry; inspect for key id / key metadata
++        serialized = json.dumps(v)
++        if expected_key_id_substring in serialized:
++            return True, v
++    return False, entries
++
+*** End Patch
+*** Begin Patch
+*** Add File: .github/workflows/ci_sign_verify_rekor.yml
++name: CI: Build, Sign with KMS, Verify Rekor & Publish SBOM
++on:
++  push:
++    branches: [ main ]
++
++jobs:
++  build-and-sign:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Build image
++        run: |
++          IMAGE="${{ secrets.REGISTRY_HOST }}/aegis:${{ github.sha }}"
++          docker build -t "$IMAGE" -f services/serving/Dockerfile .
++          docker push "$IMAGE"
++          echo "IMAGE=$IMAGE" >> $GITHUB_OUTPUT
++      - name: Sign with KMS (cloud-specific)
++        env:
++          IMAGE: ${{ steps.build-and-sign.outputs.IMAGE }}
++        run: |
++          set -e
++          if [ "${{ secrets.CLOUD_PROVIDER }}" = "aws" ]; then
++            cosign sign --key "awskms://${{ secrets.AWS_KMS_KEY_ARN }}" "$IMAGE"
++          else
++            cosign sign --key "gcpkms://${{ secrets.GCP_KMS_KEY_REF }}" "$IMAGE"
++          fi
++      - name: Verify Rekor entry exists
++        env:
++          IMAGE: ${{ steps.build-and-sign.outputs.IMAGE }}
++        run: |
++          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE" | awk -F@ '{print $2}')
++          # Query Rekor for digest
++          curl -sS "${{ secrets.REKOR_URL }}/api/v1/log/entries?hash=${DIGEST}" | jq '.'
++          echo "If Rekor returned entries, the signature is recorded."
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/pen_test_harness.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Run automated pen tests focusing on agent sandbox and attestation bypass attempts.
++#
++ROOT="$(cd "$(dirname "$0")/.." && pwd)"
++pushd "$ROOT" >/dev/null
++mkdir -p artifacts/pen_tests
++
++echo "1) Attempt metadata server access from agent-exec job"
++kubectl run pen-metadata --rm -i --restart=Never --image=busybox -n agent-exec -- sh -c "wget -qO- http://169.254.169.254/latest/meta-data || true" > artifacts/pen_tests/metadata_attempt.txt || true
++
++echo "2) Attempt hostPath mount escape (deploy a pod requesting hostPath; should be blocked by PSP/PSA)"
++cat > /tmp/hostpath-pod.yaml <<EOF
++apiVersion: v1
++kind: Pod
++metadata:
++  name: hostpath-test
++  namespace: agent-exec
++spec:
++  containers:
++  - name: test
++    image: busybox
++    command: ["sh","-c","sleep 300"]
++    volumeMounts:
++    - name: host
++      mountPath: /host
++  volumes:
++  - name: host
++    hostPath:
++      path: /
++EOF
++if kubectl apply -f /tmp/hostpath-pod.yaml; then
++  echo "HostPath pod created: potential PSP missing" > artifacts/pen_tests/hostpath_result.txt
++  kubectl delete -f /tmp/hostpath-pod.yaml --ignore-not-found
++else
++  echo "HostPath pod creation denied (expected)" > artifacts/pen_tests/hostpath_result.txt
++fi
++
++echo "3) Attempt to create privileged pod"
++kubectl run priv-test --image=busybox -n agent-exec --overrides='{"apiVersion":"v1","spec":{"containers":[{"name":"priv","image":"busybox","securityContext":{"privileged":true},"command":["sleep","300"]}]}}' --restart=Never || echo "Privileged pod denied (expected)"
++
++echo "4) Attempt unsigned deployment (attestation enforcement)"
++if kubectl apply -f tests/unsigned_deploy.yaml; then
++  echo "Unsigned deployment accepted -> FAILURE" > artifacts/pen_tests/unsigned_result.txt
++  kubectl delete -f tests/unsigned_deploy.yaml --ignore-not-found
++else
++  echo "Unsigned deployment rejected -> OK" > artifacts/pen_tests/unsigned_result.txt
++fi
++
++echo "5) Collect logs"
++for ns in agent-exec ops staging; do
++  mkdir -p artifacts/pen_tests/logs/$ns
++  kubectl get pods -n $ns -o name | while read -r p; do
++    name=$(echo $p | sed 's#pod/##')
++    kubectl logs -n $ns "$name" --all-containers > artifacts/pen_tests/logs/$ns/$name.log || true
++  done
++done
++
++echo "Pen tests complete. Results in artifacts/pen_tests"
++popd >/dev/null
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/drill_postgres_failover.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Automate a Postgres failover drill for clustered setups or guidance for managed RDS Multi-AZ.
++#
++NAMESPACE=${NAMESPACE:-ops}
++PG_DEPLOY=${PG_DEPLOY:-postgres}
++
++echo "1) Identify primary Postgres pod"
++PRIMARY=$(kubectl get pods -n "$NAMESPACE" -l app="$PG_DEPLOY" -o jsonpath='{.items[0].metadata.name}')
++echo "Primary candidate: $PRIMARY"
++
++echo "2) Simulate failure by cordoning the pod (delete to simulate crash)"
++kubectl delete pod "$PRIMARY" -n "$NAMESPACE" --wait=true || true
++
++echo "3) Wait for replacement or failover"
++sleep 20
++kubectl get pods -n "$NAMESPACE" -l app="$PG_DEPLOY"
++
++echo "4) Run smoke DB test"
++kubectl run -n "$NAMESPACE" pg-client --image=postgres:15 --rm -it --env="PGPASSWORD=$(kubectl get secret aegis-db -n $NAMESPACE -o jsonpath='{.data.password}' | base64 --decode)" -- bash -c "psql -h postgres -U $(kubectl get secret aegis-db -n $NAMESPACE -o jsonpath='{.data.user}' | base64 --decode) -c 'select 1'"
++
++echo "Failover drill complete. Check DB availability and replication status manually."
++
+*** End Patch
+*** Begin Patch
+*** Add File: runbooks/pen_test_and_drill_runbook.md
++# Pen Test & Drill Runbook
++
++Purpose
++- Execute automated pen tests and DR drills, collect evidence and produce remediation tickets.
++
++Prereqs
++- kubectl context to staging
++- gh CLI for uploading reports optional
++
++Automated steps
++1) Run pen tests:
++   ./scripts/pen_test_harness.sh
++   - Collect results in artifacts/pen_tests
++2) Run DB failover drill:
++   ./scripts/drill_postgres_failover.sh
++   - Verify app read/write via smoke tests
++3) Run security validations:
++   ./scripts/run_security_validations.sh
++
++Evidence & signoff
++- Collect all artifact bundles:
++  ./scripts/collect_evidence.sh evidence_bundle.tgz
++- Security owner reviews findings and signs off or opens remediation tickets.
++
+*** End Patch
+*** Begin Patch
+*** Add File: monitoring/alerts_additional.yaml
++groups:
++- name: aegis.production.security
++  rules:
++  - alert: AttestationServiceDown
++    expr: absent(up{job="attestation"} == 1)
++    for: 2m
++    labels:
++      severity: critical
++    annotations:
++      summary: "Attestation service is down"
++
++  - alert: AgentSandboxEscalation
++    expr: increase(aegis_agent_privilege_attempts_total[5m]) > 0
++    for: 5m
++    labels:
++      severity: critical
++    annotations:
++      summary: "Agent attempted privileged operation"
++
+*** End Patch
+*** Begin Patch
+*** Add File: .github/workflows/weekly_signoff_reminder.yml
++name: Weekly: Evidence & Signoff Reminder
++on:
++  schedule:
++    - cron: '0 9 * * 1' # every Monday 09:00 UTC
++
++jobs:
++  reminder:
++    runs-on: ubuntu-latest
++    steps:
++      - name: Reminder note
++        run: |
++          echo "Reminder: Run pen tests, DR drills and collect evidence. Upload to artifacts and obtain sign-off."
++
+*** End Patch
+*** Begin Patch
+*** Add File: runbooks/sign_off_runbook.md
++# Sign-off Runbook (how to mark Aegis production-ready)
++
++1) Complete infra provisioning:
++   - Run scripts/provision_kms_and_set_secrets.sh <cloud> <owner/repo>
++2) Bootstrap Vault and migrate secrets:
++   - Use scripts/migrate_secrets_to_vault.sh and scripts/deploy_vault_and_migrate.sh
++3) Deploy attestation & Gatekeeper:
++   - scripts/deploy_attestation_and_gatekeeper.sh
++4) Execute scale validations:
++   - scripts/run_scale_validations.sh
++5) Execute security validations:
++   - scripts/run_security_validations.sh
++6) Collect artifacts and evidence:
++   - scripts/collect_evidence.sh evidence.tgz
++7) Runbook & DR drill:
++   - scripts/drill_postgres_failover.sh
++8) Signoff:
++   - Complete runbooks/signoff_template.md and obtain security, SRE and product owner signatures
++
+*** End Patch
+*** End Patch

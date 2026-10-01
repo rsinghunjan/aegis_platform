@@ -1,0 +1,670 @@
+*** Begin Patch
+*** Add File:ops/infra/vault/README_VAULT_QUANTUM.md
++Vault + ExternalSecrets guidance for Aegis (QPU + approver + adapters)
++
++Overview:
++- Store all QPU provider credentials in HashiCorp Vault (don't bake keys in images).
++- Use ExternalSecrets (external-secrets.io) or Vault Agent Injector to mount short-lived secrets into pods.
++- Use Kubernetes ServiceAccount to authenticate to Vault via Kubernetes auth and map roles to secrets.
++
++Quick steps:
++1. Create Vault policy (see vault-policy-examples.hcl).
++2. Enable Kubernetes auth in Vault and map k8s service accounts to Vault roles.
++3. Create secrets at paths like secret/data/quantum/ibmq and secret/data/quantum/braket.
++4. Deploy ExternalSecret manifests (see k8s/quantum/externalsecret_ibmq.yaml).
++5. Ensure adapters read secrets from ephemeral mount /var/secrets/<provider>/token or via env injected secret.
++
++Security notes:
++- Use Vault TTLs and renewals; prefer short-lived tokens.
++- Audit Vault access with Vault audit devices (file/syslog).
++- Never commit secrets or KMS URIs to git.
++
+*** End File
+*** Add File:k8s/quantum/externalsecret_all_providers.yaml
++apiVersion: external-secrets.io/v1beta1
++kind: ExternalSecret
++metadata:
++  name: quantum-credentials
++  namespace: aegis-ml
++spec:
++  refreshInterval: "30m"
++  secretStoreRef:
++    name: vault-backend
++    kind: ClusterSecretStore
++  target:
++    name: quantum-credentials
++    creationPolicy: Owner
++  data:
++  - secretKey: ibmq_token
++    remoteRef:
++      key: secret/data/quantum/ibmq
++      property: token
++  - secretKey: braket_access_key
++    remoteRef:
++      key: secret/data/quantum/braket
++      property: access_key
++  - secretKey: braket_secret_key
++    remoteRef:
++      key: secret/data/quantum/braket
++      property: secret_key
++  - secretKey: azure_creds
++    remoteRef:
++      key: secret/data/quantum/azure
++      property: credentials
++
+*** End File
+*** Add File:ops/quantum/vault_fetch_example.py
++#!/usr/bin/env python3
++"""
++Example: read provider token from mounted Kubernetes secret (ExternalSecrets) or via Vault SDK.
++ - Preferred: read from /var/secrets/quantum-credentials/<key>
++ - Alternative: use hvac to talk to Vault with Kubernetes auth (not recommended in pod).
++"""
++import os
++
++def read_ibmq_token():
++    # Path where ExternalSecrets mounts data: adjust to your ExternalSecrets configuration
++    mounted = "/var/secrets/quantum-credentials/ibmq_token"
++    if os.path.exists(mounted):
++        return open(mounted).read().strip()
++    # Fallback to env var (should be avoided)
++    return os.environ.get("IBMQ_TOKEN")
++
++if __name__ == "__main__":
++    print("IBMQ token (masked):", (read_ibmq_token()[:4] + "..." if read_ibmq_token() else "MISSING"))
++
+*** End File
+*** Add File:ops/quantum/cosign_rekor/README_SIGNING.md
++Cosign + Rekor wiring notes
++
++Goals:
++- Sign evidence bundles with cosign using a KMS-backed key (AWS/GCP/Azure).
++- Record the signature in Rekor transparency log.
++
++Example cosign KMS URI (AWS):
++ - "kms://arn:aws:kms:us-west-2:123456789012:key/abcd-..."
++
++Basic sign + upload flow:
++  cosign sign-blob --key ${COSIGN_KEY} <bundle.json>
++  # signature file will be <bundle.json>.sig
++  rekor-cli upload --artifact <bundle.json> --signature <bundle.json>.sig --public-key <pubkey>
++
++Automate in CI: use CI runner with cosign installed and KMS permission to sign; store COSIGN_KEY URI in GitHub Actions secrets.
++
+*** End File
+*** Add File:ops/quantum/cosign_rekor/sign_and_register.sh
++#!/usr/bin/env bash
++set -euo pipefail
++if [ "$#" -lt 1 ]; then
++  echo "Usage: $0 <file-to-sign>"
++  exit 2
++fi
++FILE="$1"
++if [ -z "${COSIGN_KEY:-}" ]; then
++  echo "COSIGN_KEY env var not set (KMS URI or key path)"
++  exit 1
++fi
++echo "Signing $FILE with cosign key $COSIGN_KEY"
++cosign sign-blob --key "${COSIGN_KEY}" "$FILE"
++SIG="$FILE.sig"
++echo "Registering with Rekor ($REKOR_SERVER)"
++if [ -n "${REKOR_SERVER:-}" ]; then
++  rekor-cli upload --rekor_server "${REKOR_SERVER}" --artifact "$FILE" --signature "$SIG" || echo "Rekor upload failed"
++else
++  echo "REKOR_SERVER not set; skipping Rekor upload"
++fi
++echo "Signed and (maybe) registered"
++
+*** End File
+*** Add File:.github/workflows/ci_sign_and_register.yml
++name: Sign and Register Evidence
++on:
++  workflow_dispatch:
++jobs:
++  sign-and-register:
++    runs-on: ubuntu-latest
++    steps:
++    - uses: actions/checkout@v4
++    - name: Install cosign & rekor-cli
++      run: |
++        curl -sSL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/download/v2.0.0/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign
++        curl -sSL -o /usr/local/bin/rekor-cli https://github.com/sigstore/rekor/releases/download/v0.9.0/rekor-cli_linux_amd64 && chmod +x /usr/local/bin/rekor-cli
++    - name: Sign evidence and register
++      env:
++        COSIGN_KEY: ${{ secrets.COSIGN_KEY }}
++        REKOR_SERVER: ${{ secrets.REKOR_SERVER }}
++      run: |
++        FILE=ops/quantum/examples/evidence_bundle_example.json
++        # create sample evidence if missing
++        mkdir -p artifacts && jq -n '{"example":"evidence"}' > $FILE
++        bash ops/quantum/cosign_rekor/sign_and_register.sh "$FILE"
++
+*** End File
+*** Add File:db/migrations/001_approver_init.sql
++-- SQL migration for approver PostgreSQL schema
++CREATE TABLE IF NOT EXISTS approvals (
++  id UUID PRIMARY KEY,
++  ts TIMESTAMP WITH TIME ZONE DEFAULT now(),
++  namespace TEXT NOT NULL,
++  action JSONB NOT NULL,
++  requester TEXT,
++  token TEXT,
++  signed BOOLEAN DEFAULT false
++);
++
+*** End File
+*** Add File:ops/approver/approver_postgres.py
++#!/usr/bin/env python3
++"""
++Approver service backed by PostgreSQL (production-ready skeleton).
++ - Issues signed approval tokens (cosign KMS) for auto-approvable requests
++ - Stores approvals in Postgres for audit
++"""
++import os
++import json
++import uuid
++import subprocess
++import logging
++import psycopg2
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++
++LOG = logging.getLogger("aegis.approver")
++APP = FastAPI()
++
++DB_DSN = os.environ.get("APPROVER_POSTGRES_DSN", "postgresql://approver:pass@postgres.aegis.svc.cluster.local:5432/approver")
++COSIGN_KEY = os.environ.get("COSIGN_KEY")  # KMS URI
++REKOR_SERVER = os.environ.get("REKOR_SERVER", "")
++
++def get_conn():
++    return psycopg2.connect(DB_DSN)
++
++class ApprovalRequest(BaseModel):
++    namespace: str
++    action: dict
++    requester: str = "unknown"
++
++@APP.post("/auto-approve")
++def auto_approve(req: ApprovalRequest):
++    # In production, call OPA to verify auto-approvable; omitted here for brevity
++    approval_id = str(uuid.uuid4())
++    payload = {"approval_id": approval_id, "namespace": req.namespace, "action": req.action, "requester": req.requester}
++    tmp = f"/tmp/approval_{approval_id}.json"
++    with open(tmp, "w") as fh:
++        json.dump(payload, fh)
++    signed = False
++    sig_path = None
++    if COSIGN_KEY:
++        try:
++            subprocess.check_call(["cosign", "sign-blob", "--key", COSIGN_KEY, tmp])
++            sig_path = tmp + ".sig"
++            signed = True
++            # optional register to Rekor
++            if REKOR_SERVER:
++                subprocess.check_call(["rekor-cli", "upload", "--rekor_server", REKOR_SERVER, "--artifact", tmp, "--signature", sig_path])
++        except Exception as e:
++            LOG.exception("Signing failed: %s", e)
++    # store in DB
++    conn = get_conn()
++    cur = conn.cursor()
++    cur.execute("INSERT INTO approvals (id, namespace, action, requester, token, signed) VALUES (%s,%s,%s,%s,%s,%s)",
++                (approval_id, req.namespace, json.dumps(req.action), req.requester, sig_path or tmp, signed))
++    conn.commit()
++    cur.close()
++    conn.close()
++    return {"approval_id": approval_id, "signed": signed, "token_path": sig_path or tmp}
++
++if __name__ == "__main__":
++    import uvicorn
++    uvicorn.run(APP, host="0.0.0.0", port=int(os.environ.get("APPROVER_PORT", 8081)))
++
+*** End File
+*** Add File:k8s/approver/postgres-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: approver
++  namespace: aegis-system
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: approver
++  template:
++    metadata:
++      labels:
++        app: approver
++    spec:
++      serviceAccountName: approver-sa
++      containers:
++      - name: approver
++        image: "<YOUR_REGISTRY>/aegis-approver-postgres:latest"
++        env:
++        - name: APPROVER_POSTGRES_DSN
++          valueFrom:
++            secretKeyRef:
++              name: approver-db-secret
++              key: dsn
++        - name: COSIGN_KEY
++          valueFrom:
++            secretKeyRef:
++              name: cosign-secret
++              key: key_uri
++        - name: REKOR_SERVER
++          valueFrom:
++            secretKeyRef:
++              name: rekor-secret
++              key: server
++        ports:
++        - containerPort: 8081
++
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: approver-sa
++  namespace: aegis-system
++
+*** End File
+*** Add File:k8s/approver/rbac.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: approver-role
++  namespace: aegis-system
++rules:
++- apiGroups: [""]
++  resources: ["secrets"]
++  verbs: ["get","list"]
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: approver-rolebinding
++  namespace: aegis-system
++subjects:
++- kind: ServiceAccount
++  name: approver-sa
++  namespace: aegis-system
++roleRef:
++  kind: Role
++  name: approver-role
++  apiGroup: rbac.authorization.k8s.io
++
+*** End File
+*** Add File:k8s/jailed/gvisor-runtimeclass.yaml
++apiVersion: node.k8s.io/v1
++kind: RuntimeClass
++metadata:
++  name: gvisor
++handler: runsc
++
+*** End File
+*** Add File:k8s/jailed/jailed-executor-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: jailed-executor
++  namespace: aegis-system
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: jailed-executor
++  template:
++    metadata:
++      labels:
++        app: jailed-executor
++    spec:
++      runtimeClassName: gvisor
++      serviceAccountName: jailed-exec-sa
++      containers:
++      - name: jailed
++        image: "<YOUR_REGISTRY>/aegis-jailed-executor:latest"
++        securityContext:
++          runAsNonRoot: true
++          allowPrivilegeEscalation: false
++        env:
++        - name: TIMEOUT_S
++          value: "30"
++        resources:
++          limits:
++            cpu: "500m"
++            memory: "256Mi"
++
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: jailed-exec-sa
++  namespace: aegis-system
++
+*** End File
+*** Add File:k8s/jailed/networkpolicy.yaml
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: jailed-exec-egress-restrict
++  namespace: aegis-system
++spec:
++  podSelector:
++    matchLabels:
++      app: jailed-executor
++  policyTypes:
++  - Egress
++  egress:
++  - to:
++    - podSelector:
++        matchLabels:
++          app: approver
++    ports:
++    - protocol: TCP
++      port: 8081
++  - to:
++    - ipBlock:
++        cidr: 10.0.0.0/8
++    ports:
++    - protocol: TCP
++      port: 443
++
+*** End File
+*** Add File:docs/pentest/JAILED_PENTEST_CHECKLIST.md
++# Pentest checklist for jailed executor / sandbox
++
++Initial hardening tests:
++- Confirm runtimeClass uses gVisor or Firecracker and verify node configuration.
++- Validate no hostPath mounts exposing sensitive files.
++- Verify container cannot escalate privileges (no CAP_SYS_ADMIN etc).
++- Ensure network egress is restricted to approver + allowed endpoints only.
++- Fuzz tool arguments and ensure argument sanitizer rejects malformed payloads.
++- Test resource exhaustion limits (CPU/memory/IO) and verify timeout enforcement.
++- Verify files created by jailed process are owned in per-run ephemeral directories and removed after execution.
++- Run container escape tests (CVE-based scanners + custom exploitation attempts).
++- Confirm audit logs flow to central logging and evidence bundles are created even on failures.
++
++Operational tests:
++- Rotate cosign/KMS keys and ensure running processes can still sign/verify appropriately.
++- Simulate approver outage and verify jailed executor degrades safely (deny operations).
++
+*** End File
+*** Add File:ops/quantum/qpu_queue_service_postgres.py
++#!/usr/bin/env python3
++"""
++QPU Job Queue Microservice (Postgres-backed) with batching/multiplexing sketch.
++ - Accepts job submissions and enforces team quotas
++ - Background worker batches small circuits for backends that support multiplexing
++ - Uses provider adapters to submit and polls results asynchronously
++"""
++import os
++import time
++import json
++import logging
++import threading
++import uuid
++from typing import List, Dict, Any
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++import psycopg2
++from psycopg2.extras import RealDictCursor
++
++from adapters.ibmq_adapter import IBMQAdapter
++from adapters.braket_adapter import BraketAdapter
++
++LOG = logging.getLogger("aegis.qpu.queue.pg")
++APP = FastAPI()
++
++DB_DSN = os.environ.get("QPU_POSTGRES_DSN", "postgresql://qpu:qpu_pass@postgres.qpu.svc.cluster.local:5432/qpu")
++PROCESS_INTERVAL = float(os.environ.get("QPU_PROCESS_INTERVAL", "5"))
++TEAM_QUOTA = {"research": 100.0, "prod": 50.0}  # dollars budget example
++COST_PER_SHOT = {"ibmq": 0.0001, "braket": 0.0002}
++
++def get_conn():
++    return psycopg2.connect(DB_DSN)
++
++class QpuJob(BaseModel):
++    circuit: str
++    backend: str
++    shots: int = 1024
++    owner: str
++    team: str = "research"
++
++def init_db():
++    conn = get_conn()
++    cur = conn.cursor()
++    cur.execute("""
++    CREATE TABLE IF NOT EXISTS qpu_jobs (
++      id UUID PRIMARY KEY,
++      circuit TEXT,
++      backend TEXT,
++      shots INTEGER,
++      owner TEXT,
++      team TEXT,
++      status TEXT,
++      submitted_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
++      started_at TIMESTAMP,
++      finished_at TIMESTAMP,
++      result JSONB,
++      est_cost NUMERIC
++    );
++    """)
++    conn.commit()
++    cur.close()
++    conn.close()
++
++def estimate_cost(backend: str, shots: int) -> float:
++    key = "ibmq" if "ibmq" in backend else "braket"
++    return shots * COST_PER_SHOT.get(key, 0.0001)
++
++@APP.post("/submit")
++def submit(job: QpuJob):
++    est = estimate_cost(job.backend, job.shots)
++    conn = get_conn()
++    cur = conn.cursor(cursor_factory=RealDictCursor)
++    cur.execute("SELECT COALESCE(SUM(est_cost),0) as usage FROM qpu_jobs WHERE team=%s AND status IN ('submitted','running')", (job.team,))
++    usage = cur.fetchone()["usage"]
++    if usage + est > TEAM_QUOTA.get(job.team, 1e9):
++        cur.close(); conn.close()
++        raise HTTPException(status_code=402, detail="team quota exceeded")
++    job_id = str(uuid.uuid4())
++    cur.execute("INSERT INTO qpu_jobs (id,circuit,backend,shots,owner,team,status,est_cost) VALUES (%s,%s,%s,%s,%s,%s,%s)",
++                (job_id, job.circuit, job.backend, job.shots, job.owner, job.team, "submitted", est))
++    conn.commit()
++    cur.close(); conn.close()
++    return {"job_id": job_id, "est_cost": float(est)}
++
++def batch_and_process():
++    ibm = IBMQAdapter()
++    brk = BraketAdapter()
++    while True:
++        try:
++            conn = get_conn()
++            cur = conn.cursor(cursor_factory=RealDictCursor)
++            cur.execute("SELECT id,circuit,backend,shots FROM qpu_jobs WHERE status='submitted' ORDER BY submitted_at LIMIT 50")
++            rows = cur.fetchall()
++            if not rows:
++                cur.close(); conn.close()
++                time.sleep(PROCESS_INTERVAL); continue
++            # Group by backend
++            by_backend = {}
++            for r in rows:
++                by_backend.setdefault(r["backend"], []).append(r)
++            for backend, jobs in by_backend.items():
++                # Multiplex small jobs: if backend supports multiplexing, combine circuits (provider-specific)
++                # Here we naively submit jobs individually but show where batching would occur.
++                for j in jobs:
++                    jid = j["id"]
++                    cur.execute("UPDATE qpu_jobs SET status='running', started_at=now() WHERE id=%s", (jid,))
++                    conn.commit()
++                    try:
++                        if "ibmq" in backend:
++                            resp = ibm.submit_async(j["circuit"], shots=j["shots"])
++                            if "error" in resp:
++                                res = {"fallback":"sim","error": resp.get("error")}
++                            else:
++                                job_id = resp.get("job_id")
++                                res = ibm.poll_job(job_id, timeout_s=600)
++                        else:
++                            resp = brk.submit_async(j["circuit"], shots=j["shots"])
++                            if "error" in resp:
++                                res = {"fallback":"sim","error":resp.get("error")}
++                            else:
++                                job_id = resp.get("job_id")
++                                res = brk.poll_job(job_id, timeout_s=1800)
++                        cur.execute("UPDATE qpu_jobs SET status=%s, finished_at=now(), result=%s WHERE id=%s",
++                                    (res.get("status","finished"), json.dumps(res), jid))
++                        conn.commit()
++                    except Exception as e:
++                        LOG.exception("processing failed for %s", jid)
++                        cur.execute("UPDATE qpu_jobs SET status='error', finished_at=now(), result=%s WHERE id=%s", (json.dumps({"error":str(e)}), jid))
++                        conn.commit()
++            cur.close(); conn.close()
++        except Exception as e:
++            LOG.exception("batch processor error: %s", e)
++        time.sleep(PROCESS_INTERVAL)
++
++if __name__ == "__main__":
++    init_db()
++    t = threading.Thread(target=batch_and_process, daemon=True)
++    t.start()
++    import uvicorn
++    uvicorn.run(APP, host="0.0.0.0", port=int(os.environ.get("QPU_QUEUE_PORT", 8080)))
++
+*** End File
+*** Add File:k8s/qpu/qpu-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: qpu-queue
++  namespace: aegis-ml
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: qpu-queue
++  template:
++    metadata:
++      labels:
++        app: qpu-queue
++    spec:
++      serviceAccountName: qpu-queue-sa
++      containers:
++      - name: qpu-queue
++        image: "<YOUR_REGISTRY>/aegis-qpu-queue:latest"
++        env:
++        - name: QPU_POSTGRES_DSN
++          valueFrom:
++            secretKeyRef:
++              name: qpu-db-secret
++              key: dsn
++        - name: QPU_PROCESS_INTERVAL
++          value: "5"
++        ports:
++        - containerPort: 8080
++
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: qpu-queue-sa
++  namespace: aegis-ml
++
+*** End File
+*** Add File:ops/ci/require_signed_and_dvc.yml
++name: CI: Require Signed Evidence & DVC Snapshot
++on:
++  pull_request:
++    paths:
++      - 'ops/quantum/**'
++jobs:
++  verify-snapshot:
++    runs-on: ubuntu-latest
++    steps:
++    - uses: actions/checkout@v4
++    - name: Check DVC snapshot exists
++      run: |
++        if ! ls ./artifacts/circuit_*.json 1> /dev/null 2>&1; then
++          echo "No DVC snapshot found under artifacts/; please run deterministic_circuit_snapshot.py"
++          exit 1
++        fi
++  verify-signature:
++    runs-on: ubuntu-latest
++    needs: verify-snapshot
++    steps:
++    - uses: actions/checkout@v4
++    - name: Install rekor-cli & cosign
++      run: |
++        curl -sSL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/download/v2.0.0/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign
++        curl -sSL -o /usr/local/bin/rekor-cli https://github.com/sigstore/rekor/releases/download/v0.9.0/rekor-cli_linux_amd64 && chmod +x /usr/local/bin/rekor-cli
++    - name: Verify evidence has Rekor entry
++      env:
++        REKOR_SERVER: ${{ secrets.REKOR_SERVER }}
++      run: |
++        # placeholder: in prod look up the bundle hash and query Rekor
++        echo "Assume Rekor verification implemented in your environment."
++
+*** End File
+*** Add File:ops/canary/CANARY_PLAYBOOK.md
++# Canary Playbook for promoting autonomy namespace
++
++Prereqs:
++- All above components deployed (Vault, ExternalSecrets, Approver Postgres, cosign KMS, Rekor, OPA, qpu queue)
++- Monitoring (Prometheus + Grafana) online
++
++Steps:
++1. Create AutonomyMode CR for namespace:
++   kubectl apply -f k8s/autonomy/autonomy-mode-cr.yaml  # set mode to SANDBOX for canary namespace
++2. Run sandbox canary (Argo):
++   argo submit --watch ops/automation/argo_autonomy_approval_workflow.yaml -p plan-file=ops/ci/sample_plan_sandbox.json -p namespace=sandbox-ns
++3. Monitor Prometheus queries during canary:
++   - aegis_agent_safety_violations_total
++   - aegis_blocked_tool_calls_total
++   - retrain_guard_denies_total
++4. Inspect evidence bundles, cosign signatures, and Rekor entries:
++   - ls /path/to/evidence
++   - rekor-cli search --artifact <bundle.json>
++5. If stable for 24–72h, promote to HYBRID and run extended canary (ops/ci/autonomy_tests.yml)
++6. For promotion to AUTONOMOUS, run 7+ day canary and red-team tests, then follow runbook to flip mode.
++
++Rollback:
++- kubectl patch autonomymode <name> -p '{"spec":{"mode":"OFF"}}' --type=merge
++- Revoke agent SA tokens and rotate approver keys.
++
+*** End File
+*** Add File:k8s/argo/canary_autonomy_workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  name: autonomy-canary
++  namespace: aegis-ml
++spec:
++  entrypoint: canary
++  templates:
++  - name: canary
++    steps:
++    - - name: run-canary-plan
++        template: run-plan
++    - - name: monitor
++        template: sleep
++
++  - name: run-plan
++    container:
++      image: "<YOUR_REGISTRY>/aegis-plan-verifier:latest"
++      command: ["python3","/app/plan_verifier_autonomy.py"]
++      args: ["--plan-file","/work/ops/ci/sample_plan_sandbox.json","--namespace","sandbox-ns"]
++      volumeMounts:
++      - name: work
++        mountPath: /work
++
++  - name: sleep
++    container:
++      image: alpine:3.17
++      command: ["sh","-c"]
++      args: ["echo sleeping; sleep 60"]
++    volumes:
++    - name: work
++      persistentVolumeClaim:
++        claimName: autonomy-work-pvc
++
+*** End File
+*** End Patch

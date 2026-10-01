@@ -1,0 +1,695 @@
+*** Begin Patch
+*** Add File: kserve/modelserver_inference.yaml
++apiVersion: "serving.kserve.io/v1beta1"
++kind: "InferenceService"
++metadata:
++  name: "aegis-modelserver"
++  namespace: "aegis"
++spec:
++  predictor:
++    minReplicas: 1
++    maxReplicas: 5
++    serviceAccountName: "model-server-sa"
++    sklearn:
++      storageUri: "s3://REPLACE_EVIDENCE_BUCKET/models/{{MODEL_NAME}}/v{{MODEL_VERSION}}"
++      resources:
++        requests:
++          cpu: "500m"
++          memory: "1Gi"
++        limits:
++          cpu: "2000m"
++          memory: "4Gi"
++    logger:
++      mode: "all"         # request/response logging for MCPx
++      url: "http://mcpx-logger.aegis.svc.cluster.local:8080/log"
++
++  transformer:         # optional pre/post processing container
++    containers:
++      - image: ghcr.io/yourorg/aegis-transformer:latest
++        name: transformer
++        resources:
++          requests:
++            cpu: "100m"
++            memory: "128Mi"
++
++  explainer:
++    alibi:
++      image: olivere/alibi-explainer:latest
++      resources:
++        requests:
++          cpu: "200m"
++          memory: "512Mi"
++
++# Notes:
++# - Replace MODEL_NAME/MODEL_VERSION via templating in your CI.
++# - KServe will autoscale predictor based on traffic (Knative/KPA config required).
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/knative/config-autoscaler.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: config-autoscaler
++  namespace: knative-serving
++data:
++  # conservative values for p95 latency SLOs
++  targetUtilization: "0.6"
++  panicThresholdPercentage: "200"
++  stableWindow: "60s"
++  panicWindow: "6s"
++
++# Apply to tune Knative Pod Autoscaler (KPA). Adjust per-cluster capacity.
+*** End Patch
+*** Begin Patch
+*** Add File: services/mcpx_logger.py
++#!/usr/bin/env python3
++"""
++Minimal MCPx logger: accepts POSTs with request/response payload and writes
++MCPx context to S3 and logs to stdout for Prometheus scraping.
++Intended to run as a small Kubernetes Deployment fronting production inference.
++"""
++from http.server import BaseHTTPRequestHandler, HTTPServer
++import json, os, boto3, time, uuid
++
++S3_BUCKET = os.environ.get("EVIDENCE_BUCKET", "aegis-evidence-bucket")
++AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
++PORT = int(os.environ.get("PORT", "8080"))
++
++s3 = boto3.client("s3", region_name=AWS_REGION)
++
++class Handler(BaseHTTPRequestHandler):
++    def do_POST(self):
++        length = int(self.headers.get('content-length', 0))
++        body = self.rfile.read(length)
++        try:
++            payload = json.loads(body)
++        except Exception:
++            payload = {"raw": body.decode('utf-8', errors='ignore')}
++        key = f"aegis/mcpx/{int(time.time())}-{uuid.uuid4().hex}.json"
++        s3.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(payload).encode('utf-8'))
++        print(f"mcpx_logged s3://{S3_BUCKET}/{key}")
++        self.send_response(200)
++        self.end_headers()
++        self.wfile.write(b"ok")
++
++def run():
++    server = HTTPServer(('', PORT), Handler)
++    print(f"Starting MCPx logger on port {PORT}")
++    server.serve_forever()
++
++if __name__ == "__main__":
++    run()
++
+*** End Patch
+*** Begin Patch
+*** Add File: canary/canary_rollout.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Simple canary rollout controller script for KServe + Istio VirtualService.
++# Usage: canary_rollout.sh <service> <namespace> <canary-weight> <stable-weight>
++#
++SERVICE=${1:-aegis-modelserver}
++NAMESPACE=${2:-aegis}
++CANARY_WEIGHT=${3:-10}
++STABLE_WEIGHT=${4:-90}
++
++# This expects a VirtualService with two subsets: stable and canary
++VS_NAME="${SERVICE}-vs"
++PATCH=$(cat <<EOF
++spec:
++  http:
++  - route:
++    - destination:
++        host: ${SERVICE}.${NAMESPACE}.svc.cluster.local
++        subset: canary
++      weight: ${CANARY_WEIGHT}
++    - destination:
++        host: ${SERVICE}.${NAMESPACE}.svc.cluster.local
++        subset: stable
++      weight: ${STABLE_WEIGHT}
++EOF
++)
++
++kubectl -n ${NAMESPACE} patch virtualservice ${VS_NAME} --type='merge' -p "${PATCH}"
++echo "Patched ${VS_NAME} to canary ${CANARY_WEIGHT}% / stable ${STABLE_WEIGHT}%"
++
+*** End Patch
+*** Begin Patch
+*** Add File: gatekeeper/constraint_require_signed_model.yaml
++apiVersion: constraints.gatekeeper.sh/v1beta1
++kind: K8sAllowedRepos
++metadata:
++  name: require-signed-models
++spec:
++  enforcementAction: dryrun
++  match:
++    kinds:
++      - apiGroups: ["serving.kserve.io"]
++        kinds: ["InferenceService"]
++  parameters:
++    # require presence of annotation 'aegis.cosign' that points to signature in Rekor
++    requiredAnnotations:
++      - "aegis.sig.rekor_entry"
++
++# Operators: start as dryrun, then flip enforcementAction to deny during controlled cutover.
+*** End Patch
+*** Begin Patch
+*** Add File: explainability/shap_explain.py
++#!/usr/bin/env python3
++"""
++Run SHAP explainability for a model stored in MLflow and log results as artifacts.
++Generates a simple model_card.md with feature importance summary.
++"""
++import os, json
++import mlflow, shap, pickle
++import pandas as pd
++from mlflow.tracking import MlflowClient
++
++MLFLOW_URI = os.environ.get("MLFLOW_TRACKING_URI")
++RUN_ID = os.environ.get("MODEL_RUN_ID")
++OUT_DIR = "/tmp/explain"
++os.makedirs(OUT_DIR, exist_ok=True)
++
++mlflow.set_tracking_uri(MLFLOW_URI)
++client = MlflowClient()
++
++def load_model(run_id):
++    local = f"/tmp/model_{run_id}.pkl"
++    try:
++        mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path="model/model.pkl", dst_path="/tmp")
++        with open(local,"rb") as f:
++            return pickle.load(f)
++    except Exception as e:
++        raise SystemExit("Failed to load model: " + str(e))
++
++def sample_data():
++    # Placeholder: operators must replace with production sample readers from lakeFS/S3
++    import numpy as np
++    import pandas as pd
++    X = pd.DataFrame(np.random.randn(200,10), columns=[f"f{i}" for i in range(10)])
++    return X
++
++def run_shap(model, X):
++    explainer = shap.Explainer(model.predict, X)
++    shap_values = explainer(X)
++    summary = shap.plots._waterfall.waterfall_legacy(explainer.expected_value, shap_values[0].values, X.iloc[0].to_dict(), show=False) if False else None
++    # Export shap feature importance (mean absolute)
++    import numpy as np
++    mean_abs = np.abs(shap_values.values).mean(axis=0)
++    feats = list(X.columns)
++    fi = sorted(zip(feats, mean_abs), key=lambda x: x[1], reverse=True)
++    return fi
++
++def write_model_card(run_id, fi):
++    md = f"# Model Card for run {run_id}\n\n"
++    md += "## Top feature importances (SHAP mean-abs)\n\n"
++    for name, val in fi[:20]:
++        md += f"- **{name}**: {val:.4f}\n"
++    path = os.path.join(OUT_DIR, "model_card.md")
++    with open(path,"w") as f:
++        f.write(md)
++    return path
++
++def main():
++    model = load_model(RUN_ID)
++    X = sample_data()
++    fi = run_shap(model, X)
++    card = write_model_card(RUN_ID, fi)
++    with mlflow.start_run() as run:
++        mlflow.log_artifact(card, artifact_path="explainability")
++    print("Wrote model_card to", card)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: ci/explainability_workflow.yml
++name: Explainability CI (SHAP + model_card)
++
++on:
++  workflow_dispatch:
++
++jobs:
++  explain:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.10'
++      - name: Install deps
++        run: pip install mlflow shap pandas scikit-learn
++      - name: Run SHAP explainability
++        env:
++          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
++          MODEL_RUN_ID: ${{ inputs.model_run_id || '' }}
++        run: |
++          python explainability/shap_explain.py
++      - name: Upload model_card artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: model-card
++          path: /tmp/explain/model_card.md
++
+*** End Patch
+*** Begin Patch
+*** Add File: monitoring/drift_detector.py
++#!/usr/bin/env python3
++"""
++Simple drift detector that reads prediction logs from Kafka, computes KS test
++versus baseline feature distributions and exports Prometheus metrics.
++Intended to run as a Deployment with access to Kafka and Prometheus pushgateway.
++"""
++import os, json, time
++from kafka import KafkaConsumer
++import numpy as np
++from scipy.stats import ks_2samp
++from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
++
++KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "kafka:9092")
++PUSHGATEWAY = os.environ.get("PUSHGATEWAY", "pushgateway.monitoring.svc.cluster.local:9091")
++TOPIC = os.environ.get("PRED_TOPIC", "predictions")
++BASELINE_PATH = os.environ.get("BASELINE_PATH", "/opt/baseline/baseline.json")
++
++consumer = KafkaConsumer(TOPIC, bootstrap_servers=[KAFKA_BROKER], auto_offset_reset='latest')
++
++def load_baseline():
++    try:
++        with open(BASELINE_PATH) as f:
++            return json.load(f)
++    except Exception:
++        # fallback: empty baseline
++        return {}
++
++def compute_drift(feature_vals, baseline_vals):
++    try:
++        stat, p = ks_2samp(feature_vals, baseline_vals)
++        return stat, p
++    except Exception:
++        return 0.0, 1.0
++
++def main():
++    baseline = load_baseline()
++    registry = CollectorRegistry()
++    g_stat = Gauge('aegis_feature_drift_ks', 'KS statistic for feature drift', ['feature'], registry=registry)
++    while True:
++        batch = []
++        for msg in consumer.poll(timeout_ms=1000, max_records=500).values():
++            for rec in msg:
++                try:
++                    batch.append(json.loads(rec.value))
++                except Exception:
++                    pass
++        if not batch:
++            time.sleep(5)
++            continue
++        # aggregate features
++        feats = {}
++        for row in batch:
++            for k,v in row.get('features', {}).items():
++                feats.setdefault(k, []).append(float(v))
++        for f,vals in feats.items():
++            baseline_vals = baseline.get(f, vals)
++            stat,p = compute_drift(vals, baseline_vals)
++            g_stat.labels(feature=f).set(stat)
++        push_to_gateway(PUSHGATEWAY, job='aegis-drift-detector', registry=registry)
++        time.sleep(30)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: monitoring/prometheus_drift_rules.yaml
++groups:
++- name: aegis-drift.rules
++  rules:
++  - alert: FeatureDriftHigh
++    expr: aegis_feature_drift_ks > 0.2
++    for: 10m
++    labels:
++      severity: warning
++    annotations:
++      summary: "High KS drift detected for feature {{ $labels.feature }}"
++      description: "KS statistic > 0.2 for >10m; investigate recent runs and MC/production input."
++
+*** End Patch
+*** Begin Patch
+*** Add File: uncertainty/conformal.py
++#!/usr/bin/env python3
++"""
++Simple Inductive Conformal wrapper for point regression (split conformal).
++Usage: fit on calibration set to produce intervals for new predictions.
++"""
++import numpy as np
++
++class SplitConformal:
++    def __init__(self, alpha=0.1):
++        self.alpha = alpha
++        self.quantile = None
++
++    def fit(self, model, X_cal, y_cal):
++        preds = model.predict(X_cal)
++        residuals = np.abs(y_cal - preds)
++        self.quantile = np.quantile(residuals, 1 - self.alpha)
++
++    def predict_interval(self, model, X):
++        preds = model.predict(X)
++        lower = preds - self.quantile
++        upper = preds + self.quantile
++        return preds, lower, upper
++
+*** End Patch
+*** Begin Patch
+*** Add File: testing/adversarial_test.py
++#!/usr/bin/env python3
++"""
++Small adversarial perturbation harness (FGSM-like) for classifier models.
++This is a light-weight CI check to ensure model robustness to small perturbations.
++"""
++import numpy as np
++import pickle
++import sys
++
++EPS = float(sys.argv[1]) if len(sys.argv)>1 else 0.01
++
++def perturb(X, eps=0.01):
++    noise = eps * np.sign(np.random.randn(*X.shape))
++    return X + noise
++
++def run_test(model_path="/tmp/model.pkl"):
++    with open(model_path,"rb") as f:
++        model = pickle.load(f)
++    # generate synthetic test set
++    X = np.random.randn(100, 10)
++    y = (np.random.rand(100)>0.5).astype(int)
++    base_acc = model.score(X,y)
++    Xp = perturb(X, EPS)
++    adv_acc = model.score(Xp,y)
++    print("base_acc", base_acc, "adv_acc", adv_acc)
++    # fail CI if accuracy drop > 15%
++    if base_acc - adv_acc > 0.15:
++        raise SystemExit(2)
++
++if __name__ == "__main__":
++    run_test()
++
+*** End Patch
+*** Begin Patch
+*** Add File: fairness/fairness_audit.py
++#!/usr/bin/env python3
++"""
++Compute a simple disparate impact metric for binary outcomes across a sensitive attribute.
++Logs a JSON report and pushes to MLflow.
++"""
++import pandas as pd, json, os
++import mlflow
++MLFLOW = os.environ.get("MLFLOW_TRACKING_URI")
++mlflow.set_tracking_uri(MLFLOW)
++
++def disparate_impact(df, sensitive_col, label_col):
++    groups = df.groupby(sensitive_col)
++    rates = groups[label_col].mean()
++    # ratio of min/max
++    ratio = rates.min() / max(rates.max(), 1e-9)
++    return ratio, rates.to_dict()
++
++def main(path="data/predictions.csv", sensitive="gender", label="y_pred"):
++    df = pd.read_csv(path)
++    ratio, rates = disparate_impact(df, sensitive, label)
++    report = {"disparate_impact_ratio": float(ratio), "rates": rates}
++    with open("/tmp/fairness_report.json","w") as f:
++        json.dump(report, f, indent=2)
++    if MLFLOW:
++        with mlflow.start_run() as run:
++            mlflow.log_artifact("/tmp/fairness_report.json", artifact_path="fairness")
++    print("Fairness report:", report)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: timeseries/backtest.py
++#!/usr/bin/env python3
++"""
++Simple backtest harness for time-series forecasting models.
++Produces MAE, RMSE, MASE and writes results to MLflow.
++"""
++import numpy as np, pandas as pd, mlflow
++from sklearn.metrics import mean_absolute_error, mean_squared_error
++
++MLFLOW = os.environ.get("MLFLOW_TRACKING_URI")
++mlflow.set_tracking_uri(MLFLOW)
++
++def mase(y_true, y_pred, y_train):
++    n = len(y_train)
++    d = np.mean(np.abs(np.diff(y_train)))
++    errors = np.abs(y_true - y_pred)
++    return np.mean(errors) / d if d>0 else np.nan
++
++def run_backtest(series, model_fn, horizon=12, n_splits=3):
++    results = []
++    L = len(series)
++    for i in range(n_splits):
++        train_end = L - horizon*(i+1)
++        train = series[:train_end]
++        test = series[train_end:train_end+horizon]
++        model = model_fn(train)
++        preds = model.predict(horizon)
++        mae = mean_absolute_error(test, preds)
++        rmse = mean_squared_error(test, preds, squared=False)
++        mase_val = mase(test, preds, train)
++        results.append({"mae":mae,"rmse":rmse,"mase":mase_val})
++    return results
++
++def main():
++    # placeholder series: operator should replace with real time series read
++    s = pd.Series(np.sin(np.linspace(0,50,200)) + np.random.normal(0,0.1,200))
++    # trivial model function
++    class NaiveModel:
++        def __init__(self, train): self.last = float(train.iloc[-1])
++        def predict(self, h): return [self.last]*h
++    def model_fn(train): return NaiveModel(train)
++    res = run_backtest(s, model_fn)
++    with mlflow.start_run() as run:
++        for i,r in enumerate(res):
++            mlflow.log_metrics(r, step=i)
++    print("Backtest results:", res)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: anomaly/isolation_detector.py
++#!/usr/bin/env python3
++"""
++IsolationForest anomaly detector that reads recent feature logs from S3 or Kafka
++and writes alerts to SNS/Slack and Prometheus.
++"""
++import os, json
++import boto3
++import numpy as np
++import pandas as pd
++from sklearn.ensemble import IsolationForest
++from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
++
++S3_BUCKET = os.environ.get("EVIDENCE_BUCKET")
++S3_PREFIX = os.environ.get("ANOMALY_PREFIX", "aegis/features/recent/")
++PUSHGATEWAY = os.environ.get("PUSHGATEWAY")
++
++s3 = boto3.client("s3")
++
++def read_recent(limit=10):
++    objs = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=S3_PREFIX, MaxKeys=limit).get("Contents", [])
++    frames = []
++    for o in objs:
++        key = o["Key"]
++        tmp = "/tmp/"+key.replace("/","_")
++        s3.download_file(S3_BUCKET, key, tmp)
++        try:
++            frames.append(pd.read_parquet(tmp))
++        except Exception:
++            try:
++                frames.append(pd.read_csv(tmp))
++            except Exception:
++                pass
++    if frames:
++        return pd.concat(frames, ignore_index=True)
++    return pd.DataFrame()
++
++def main():
++    df = read_recent()
++    if df.empty:
++        print("No recent feature data")
++        return
++    X = df.select_dtypes(include=[float,int]).fillna(0).values
++    iso = IsolationForest(contamination=0.01)
++    preds = iso.fit_predict(X)
++    anomalies = df[preds == -1]
++    if not anomalies.empty:
++        print("Detected anomalies:", len(anomalies))
++        registry = CollectorRegistry()
++        g = Gauge('aegis_anomalies_count', 'Number anomalies detected', registry=registry)
++        g.set(len(anomalies))
++        if PUSHGATEWAY:
++            push_to_gateway(PUSHGATEWAY, job='aegis-anomaly-detector', registry=registry)
++        # write audit
++        s3.put_object(Bucket=S3_BUCKET, Key=f"aegis/anomalies/{int(time.time())}.json", Body=anomalies.to_json().encode('utf-8'))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: retrain/cronworkflow_retrain.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: CronWorkflow
++metadata:
++  name: aegis-auto-retrain
++  namespace: aegis
++spec:
++  schedule: "0 */6 * * *"  # every 6 hours - adjust
++  concurrencyPolicy: "Allow"
++  workflowSpec:
++    entrypoint: retrain-flow
++    templates:
++    - name: retrain-flow
++      steps:
++      - - name: check-metrics
++          template: check-metrics
++      - - name: trigger-retrain
++          template: retrain-if-needed
++
++    - name: check-metrics
++      container:
++        image: ghcr.io/yourorg/aegis-tools:latest
++        command: ["python","/app/pipelines/check_retrain_metrics.py"]
++
++    - name: retrain-if-needed
++      when: "{{steps.check-metrics.outputs.result}} == 'retrain'"
++      container:
++        image: ghcr.io/yourorg/aegis-train:latest
++        command: ["python","/app/pipelines/retrain_trigger.py"]
++
++# check_retrain_metrics.py should set output 'retrain' when metrics degrade (operator to implement).
+*** End Patch
+*** Begin Patch
+*** Add File: labelstudio/labelstudio_deploy.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: labelstudio
++  namespace: aegis
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: labelstudio
++  template:
++    metadata:
++      labels:
++        app: labelstudio
++    spec:
++      containers:
++        - name: labelstudio
++          image: heartexlabs/label-studio:latest
++          ports:
++            - containerPort: 8080
++          env:
++            - name: LABEL_STUDIO_API_KEY
++              valueFrom:
++                secretKeyRef:
++                  name: labelstudio-secret
++                  key: api_key
++          volumeMounts:
++            - name: data
++              mountPath: /label-studio/data
++      volumes:
++        - name: data
++          emptyDir: {}
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: labelstudio
++  namespace: aegis
++spec:
++  selector:
++    app: labelstudio
++  ports:
++    - protocol: TCP
++      port: 80
++      targetPort: 8080
++
+*** End Patch
+*** Begin Patch
+*** Add File: cost/cost_estimator.py
++#!/usr/bin/env python3
++"""
++Simple per-run cost estimator based on recorded resource usage (CPU, GPU, hours).
++Logs estimate to MLflow and writes chargeback entry to S3.
++"""
++import os, json, time
++import mlflow, boto3
++
++MLFLOW = os.environ.get("MLFLOW_TRACKING_URI")
++BUCKET = os.environ.get("EVIDENCE_BUCKET")
++mlflow.set_tracking_uri(MLFLOW)
++s3 = boto3.client("s3")
++
++PRICE_PER_CPU_HOUR = float(os.environ.get("PRICE_PER_CPU_HOUR", "0.04"))
++PRICE_PER_GPU_HOUR = float(os.environ.get("PRICE_PER_GPU_HOUR", "2.0"))
++
++def estimate(run_meta):
++    cpu_hours = run_meta.get("cpu_hours", 0.0)
++    gpu_hours = run_meta.get("gpu_hours", 0.0)
++    return cpu_hours*PRICE_PER_CPU_HOUR + gpu_hours*PRICE_PER_GPU_HOUR
++
++def main(run_meta_path="/tmp/run_meta.json"):
++    if not os.path.exists(run_meta_path):
++        print("No run meta file", run_meta_path); return
++    with open(run_meta_path) as f:
++        meta = json.load(f)
++    cost = estimate(meta)
++    rec = {"run_id": meta.get("run_id"), "cost_estimate": cost, "timestamp": int(time.time())}
++    s3.put_object(Bucket=BUCKET, Key=f"aegis/costs/{rec['run_id']}.json", Body=json.dumps(rec).encode('utf-8'))
++    if MLFLOW and meta.get("run_id"):
++        with mlflow.start_run() as run:
++            mlflow.log_metric("cost_estimate", cost)
++    print("Estimated cost:", cost)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: README_SERVING_EXPLAINABILITY.md
++# Production Serving & Explainability, Monitoring, Retrain, Labeling and Costing
++
++This patch adds:
++- KServe InferenceService template with explainer and logger.
++- MCPx logger service to record request/response contexts to S3.
++- Canary rollout helper using Istio VirtualService patching.
++- Gatekeeper constraint skeleton for signed models (start dryrun).
++- SHAP explainability script and CI workflow to produce model_card.md.
++- Drift detector (Kafka consumer) and Prometheus rules for drift alerts.
++- Conformal uncertainty wrapper and adversarial/fairness/time-series/anomaly helper scripts.
++- Argo CronWorkflow skeleton for automated retrain triggers.
++- Label Studio deployment manifest.
++- Per-run cost estimator and associated S3 chargeback write.
++
++Operator notes:
++- Replace all REPLACE_* placeholders (S3 buckets, model names, run ids) before use.
++- Provide Kafka, Pushgateway & MLflow endpoints and wire credentials via ExternalSecrets.
++- Tune autoscaling, KServe resources, Knative config-autoscaler and Pod/Node sizing to match traffic/SLOs.
++- Add proper authentication and TLS for mcpx-logger and model servers in production.
++- Add CI policies to run explainability/adversarial/fairness jobs on model promotion PRs.
++
+*** End Patch
+*** End Patch

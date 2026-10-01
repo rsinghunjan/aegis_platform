@@ -1,0 +1,494 @@
+*** Begin Patch
+*** Add File:services/edge/local_milvus_compose.yml
++version: '3.7'
++services:
++  minio:
++    image: minio/minio:RELEASE.2023-07-24T00-00-00Z
++    environment:
++      MINIO_ACCESS_KEY: minio
++      MINIO_SECRET_KEY: minio123
++    command: server /data
++    ports:
++      - "9000:9000"
++    volumes:
++      - ./data/minio:/data
++
++  milvus:
++    image: milvusdb/milvus:2.2.12
++    environment:
++      TZ: UTC
++    ports:
++      - "19530:19530"
++      - "19121:19121"
++    volumes:
++      - ./data/milvus:/var/lib/milvus
++
++# Local edge stack: local Milvus and minimal object store for temporary evidence caching.
++# Edge processes should write evidence vector files to ./sync_queue/ for sync agent to pick up.
++
+*** End File
+*** Add File:services/edge/milvus_sync.py
++#!/usr/bin/env python3
++"""
++Edge -> Central Milvus sync agent.
++
++Assumptions:
++- Edge ingestion writes evidence JSON files to /data/sync_queue/*.json
++  each file contains: { "id": "<uuid>", "text": "...", "embedding": [..], "meta": {...} }
++- This agent attempts to push them to CENTRAL_MILVUS (env) and on success moves to /data/sync_ok/
++- Simple backoff and idempotent insert (if exists, skip).
++"""
++import os
++import json
++import time
++import shutil
++import logging
++from pymilvus import connections, Collection, utility
++
++LOG = logging.getLogger("aegis.edge.milvus_sync")
++logging.basicConfig(level=logging.INFO)
++
++LOCAL_QUEUE = os.environ.get("EDGE_SYNC_QUEUE", "/data/sync_queue")
++PROCESSED_DIR = os.environ.get("EDGE_SYNC_OK", "/data/sync_ok")
++CENTRAL_HOST = os.environ.get("CENTRAL_MILVUS_HOST", "milvus.milvus")
++CENTRAL_PORT = os.environ.get("CENTRAL_MILVUS_PORT", "19530")
++CENTRAL_COLLECTION = os.environ.get("CENTRAL_COLLECTION", "aegis_docs")
++
++os.makedirs(LOCAL_QUEUE, exist_ok=True)
++os.makedirs(PROCESSED_DIR, exist_ok=True)
++
++def connect_central():
++    try:
++        connections.connect(host=CENTRAL_HOST, port=str(CENTRAL_PORT))
++        if not utility.has_collection(CENTRAL_COLLECTION):
++            LOG.error("Central collection %s not found", CENTRAL_COLLECTION)
++            return None
++        return Collection(CENTRAL_COLLECTION)
++    except Exception as e:
++        LOG.warning("connect central failed: %s", e)
++        return None
++
++def process_file(path, collection):
++    try:
++        with open(path, "r") as f:
++            doc = json.load(f)
++        doc_id = doc.get("id")
++        embed = doc.get("embedding")
++        text = doc.get("text","")
++        meta = doc.get("meta",{})
++        # idempotency: check if id exists using filter (best-effort)
++        try:
++            res = collection.query(expr=f'id == "{doc_id}"', output_fields=["id"]) if collection.has_field("id") else []
++            if res:
++                LOG.info("doc %s already in central, skipping", doc_id)
++                return True
++        except Exception:
++            # ignore query errors, attempt insert
++            pass
++        # Insert - assumes schema [id (str), embedding (float vector), text (str), meta (json)]
++        collection.insert([{"id": doc_id, "embedding": embed, "text": text, "meta": meta}])
++        LOG.info("synced %s", doc_id)
++        return True
++    except Exception as e:
++        LOG.error("process_file error %s: %s", path, e)
++        return False
++
++def main():
++    while True:
++        collection = connect_central()
++        files = sorted([os.path.join(LOCAL_QUEUE,f) for f in os.listdir(LOCAL_QUEUE) if f.endswith(".json")])
++        if not files:
++            time.sleep(5)
++            continue
++        if not collection:
++            LOG.info("central unavailable, will retry in 10s")
++            time.sleep(10)
++            continue
++        for p in files:
++            ok = process_file(p, collection)
++            if ok:
++                shutil.move(p, os.path.join(PROCESSED_DIR, os.path.basename(p)))
++            else:
++                LOG.info("will retry %s later", p)
++        time.sleep(2)
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:services/a2a/fetchtoken_service.py
++#!/usr/bin/env python3
++"""
++Pre-provisioned fetch-token service for emergency A2A approvals in offline/edge conditions.
++
++- Admin can create a set of signed tokens (fetchtokens) with metadata and expiry.
++- Tokens are HMAC-signed using a secret stored in env or secret manager.
++- Edge services may present a token to the approver/retrieval-guard for expedited emergency approval.
++- Use sparingly & audit every redemption via MCP.
++"""
++import os
++import hmac
++import hashlib
++import json
++import time
++import uuid
++import logging
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++
++LOG = logging.getLogger("aegis.a2a.fetchtoken")
++logging.basicConfig(level=logging.INFO)
++app = FastAPI(title="Aegis FetchToken Service")
++
++SECRET = os.environ.get("FETCHTOKEN_SECRET", "change-me")  # store in KMS/secret manager
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++
++class TokenSpec(BaseModel):
++    purpose: str
++    expires_at: int  # epoch seconds
++    scope: str = "originals:*"  # e.g., originals:artifact-id
++
++def sign(payload: str) -> str:
++    sig = hmac.new(SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
++    return sig
++
++@app.post("/admin/create")
++def create_token(spec: TokenSpec):
++    tid = str(uuid.uuid4())
++    payload = json.dumps({"tid": tid, "purpose": spec.purpose, "expires_at": spec.expires_at, "scope": spec.scope})
++    sig = sign(payload)
++    token = {"token": payload, "sig": sig}
++    # write to MCP (audit)
++    try:
++        import requests
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/a2a/fetchtokens", json={"tid": tid, "scope": spec.scope, "expires_at": spec.expires_at}, timeout=5.0)
++    except Exception as e:
++        LOG.warning("failed to write fetchtoken audit: %s", e)
++    return token
++
++@app.post("/verify")
++def verify_token(token: dict):
++    try:
++        payload = token.get("token")
++        sig = token.get("sig")
++        if not payload or not sig:
++            raise HTTPException(status_code=400, detail="malformed token")
++        expected = sign(payload)
++        if not hmac.compare_digest(expected, sig):
++            raise HTTPException(status_code=403, detail="invalid signature")
++        obj = json.loads(payload)
++        if int(time.time()) > int(obj.get("expires_at",0)):
++            raise HTTPException(status_code=403, detail="expired token")
++        return {"ok": True, "scope": obj.get("scope")}
++    except HTTPException:
++        raise
++    except Exception as e:
++        LOG.error("verify error: %s", e)
++        raise HTTPException(status_code=500, detail="verify error")
++
+*** End File
+*** Add File:services/hil/staged_autonomy_controller.py
++#!/usr/bin/env python3
++"""
++Staged autonomy controller:
++- Receives proposed actions with verifier scores and invariants.
++- Decision flow:
++  - If score >= AUTO_THRESHOLD and invariants_ok => execute auto action (sandboxed) and create signed receipt.
++  - Else if score >= RECOMMEND_THRESHOLD => create a 'recommendation' (UI or operator) and optionally prefill A2A request.
++  - Else => create A2A approval request for human decision.
++- All actions log to MCP and require evidence_id for chaining.
++"""
++import os
++import logging
++import requests
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++
++LOG = logging.getLogger("aegis.hil.staged")
++logging.basicConfig(level=logging.INFO)
++app = FastAPI(title="Aegis Staged Autonomy Controller")
++
++AUTO_THRESHOLD = float(os.environ.get("AUTO_THRESHOLD", "0.75"))
++RECOMMEND_THRESHOLD = float(os.environ.get("RECOMMEND_THRESHOLD", "0.50"))
++SANDBOX_API = os.environ.get("SANDBOX_API", "http://sandbox:8000/run")
++A2A_API = os.environ.get("A2A_API", "http://approver:8080/request")
++RECEIPT_API = os.environ.get("RECEIPT_API", "http://receipt-signer:8080/sign")
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++
++class ActionReq(BaseModel):
++    action_id: str
++    action_type: str
++    params: dict
++    verifier_score: float
++    invariants_ok: bool
++    evidence_id: str = None
++    requestor: str = "system"
++
++def post_mcp(event):
++    try:
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/actions/events", json=event, timeout=3.0)
++    except Exception as e:
++        LOG.warning("mcp write failed: %s", e)
++
++def sign_receipt(event):
++    try:
++        r = requests.post(RECEIPT_API, json=event, timeout=5.0)
++        if r.ok:
++            return r.json()
++    except Exception as e:
++        LOG.warning("receipt signing failed: %s", e)
++    return None
++
++@app.post("/decide")
++def decide(req: ActionReq):
++    event = {"action_id": req.action_id, "type": req.action_type, "params": req.params, "score": req.verifier_score, "evidence_id": req.evidence_id, "ts": int(__import__("time").time())}
++    post_mcp({"phase":"decision_received","event":event})
++
++    # Auto execution
++    if req.verifier_score >= AUTO_THRESHOLD and req.invariants_ok:
++        # execute in sandbox
++        try:
++            r = requests.post(SANDBOX_API, json={"image":"alpine:3.18","cmd":req.params.get("cmd",[]),"requestor":req.requestor}, timeout=10.0)
++            res = r.json() if r.ok else {"error":"sandbox_exec_failed"}
++            receipt = sign_receipt({"event": event, "result": res, "type":"auto_execute"})
++            post_mcp({"phase":"auto_executed","event":event, "result":res, "receipt": receipt})
++            return {"decision":"auto_executed","result":res,"receipt":receipt}
++        except Exception as e:
++            LOG.error("auto exec failed: %s", e)
++            raise HTTPException(status_code=500, detail="auto execution failed")
++    # Recommend (human-in-the-loop assisted)
++    if req.verifier_score >= RECOMMEND_THRESHOLD:
++        # create recommendation record and optionally prefill A2A request
++        try:
++            prefill = {"model_id":"verifier-ensemble","artifact_uri":req.evidence_id,"approver":"oncall","decision":"requested","comment":"recommendation auto-prefill"}
++            r = requests.post(A2A_API, json=prefill, timeout=5.0)
++            a2a_id = r.json().get("id") if r.ok else None
++        except Exception:
++            a2a_id = None
++        post_mcp({"phase":"recommendation","event":event,"a2a_prefill":a2a_id})
++        return {"decision":"recommendation","a2a_prefill":a2a_id}
++    # Low confidence -> require A2A approval
++    try:
++        req_body = {"model_id":"verifier-ensemble","artifact_uri":req.evidence_id,"approver":"oncall","decision":"requested","comment":"low-confidence auto A2A"}
++        r = requests.post(A2A_API, json=req_body, timeout=5.0)
++        if r.ok:
++            a2a_id = r.json().get("id")
++        else:
++            a2a_id = None
++    except Exception as e:
++        LOG.warning("a2a create failed: %s", e)
++        a2a_id = None
++    post_mcp({"phase":"a2a_requested","event":event,"a2a_id":a2a_id})
++    return {"decision":"a2a_requested","a2a_id":a2a_id}
++
+*** End File
+*** Add File:k8s/policy/region_data_partition_constraint.yaml
++apiVersion: templates.gatekeeper.sh/v1beta1
++kind: ConstraintTemplate
++metadata:
++  name: k8srequireddatapartition
++spec:
++  crd:
++    spec:
++      names:
++        kind: K8sRequiredDataPartition
++  targets:
++    - target: admission.k8s.gatekeeper.sh
++      rego: |
++        package k8srequireddatapartition
++
++        violation[{"msg": msg}] {
++          input.review.object.metadata.annotations == null
++          msg := "missing data.region annotation"
++        }
++
++        violation[{"msg": msg}] {
++          ann := input.review.object.metadata.annotations
++          not ann["data.region"]
++          msg := "data.region annotation required (e.g. data.region=eu-west-1)"
++        }
++
++        # optional: deny writes that attempt to copy data.region outside allowed set (operator-managed list)
++        violation[{"msg": msg}] {
++          ann := input.review.object.metadata.annotations
++          ann["data.region"] == "restricted"
++          msg := "writes to region 'restricted' are not allowed"
++        }
++
+*** End File
+*** Add File:services/compliance/takedown_api.py
++#!/usr/bin/env python3
++"""
++Quick takedown API for privacy / legal removal requests.
++
++- POST /request { artifact_id, reason, requester }
++  -> creates takedown ticket, writes to MCP and places job file in /data/takedown_queue
++- Admin can call /process to run immediate deletion (operator-driven)
++"""
++import os
++import json
++import uuid
++import time
++import logging
++from fastapi import FastAPI, HTTPException, Body
++
++LOG = logging.getLogger("aegis.compliance.takedown")
++logging.basicConfig(level=logging.INFO)
++app = FastAPI(title="Aegis Takedown API")
++
++QUEUE_DIR = os.environ.get("TAKEDOWN_QUEUE", "/data/takedown_queue")
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++os.makedirs(QUEUE_DIR, exist_ok=True)
++
++@app.post("/request")
++def request_takedown(payload: dict = Body(...)):
++    artifact = payload.get("artifact_id")
++    reason = payload.get("reason","unspecified")
++    requester = payload.get("requester","unknown")
++    tid = str(uuid.uuid4())
++    ticket = {"ticket_id": tid, "artifact_id": artifact, "reason": reason, "requester": requester, "ts": int(time.time())}
++    # write to MCP for audit
++    try:
++        import requests
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/compliance/takedowns", json=ticket, timeout=3.0)
++    except Exception as e:
++        LOG.warning("mcp write failed: %s", e)
++    # enqueue
++    with open(os.path.join(QUEUE_DIR, f"{tid}.json"), "w") as f:
++        json.dump(ticket, f)
++    return {"ticket_id": tid, "status": "queued"}
++
++@app.post("/process")
++def process_one():
++    files = [f for f in os.listdir(QUEUE_DIR) if f.endswith(".json")]
++    if not files:
++        return {"processed": 0}
++    fpath = os.path.join(QUEUE_DIR, files[0])
++    with open(fpath) as f:
++        t = json.load(f)
++    # operator responsible for deletion; here we just mark as processed and log
++    processed_marker = os.path.join(QUEUE_DIR, f"{t['ticket_id']}.processed")
++    with open(processed_marker,"w") as fm:
++        fm.write(json.dumps({"ticket": t, "processed_at": int(time.time())}))
++    os.remove(fpath)
++    try:
++        import requests
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/compliance/takedowns/processed", json={"ticket": t}, timeout=3.0)
++    except Exception:
++        pass
++    return {"processed": 1, "ticket": t}
++
+*** End File
+*** Add File:services/retriever/curation_job.py
++#!/usr/bin/env python3
++"""
++Retrieval curation job:
++- Periodically checks doc age/freshness and flags stale docs for re-ingestion.
++- If percentage stale > threshold, pushes a reindex/retrain ticket to MCP.
++"""
++import os
++import time
++import logging
++from pymilvus import connections, Collection, utility
++import requests
++from datetime import datetime, timedelta
++
++LOG = logging.getLogger("aegis.retriver.curation")
++logging.basicConfig(level=logging.INFO)
++
++MILVUS_HOST = os.environ.get("MILVUS_HOST","milvus.milvus")
++MILVUS_PORT = os.environ.get("MILVUS_PORT","19530")
++COLLECTION_NAME = os.environ.get("MILVUS_COLLECTION","aegis_docs")
++STALE_DAYS = int(os.environ.get("STALE_DAYS","90"))
++STALE_PCT_THRESHOLD = float(os.environ.get("STALE_PCT_THRESHOLD","0.2"))
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API","http://mcp:8082")
++
++def main():
++    connections.connect(host=MILVUS_HOST, port=str(MILVUS_PORT))
++    if not utility.has_collection(COLLECTION_NAME):
++        LOG.error("collection %s missing", COLLECTION_NAME)
++        return
++    col = Collection(COLLECTION_NAME)
++    # best-effort: use 'meta' field with timestamp if present; otherwise cannot compute
++    total = 0
++    stale = 0
++    try:
++        for ent in col.query(expr="id != ''", output_fields=["meta"], timeout=60):
++            total += 1
++            meta = ent.get("meta") or {}
++            ts = meta.get("created_ts")
++            if ts:
++                created = datetime.utcfromtimestamp(int(ts))
++                if datetime.utcnow() - created > timedelta(days=STALE_DAYS):
++                    stale += 1
++        pct = stale / max(1, total)
++        LOG.info("curation: total=%d stale=%d pct=%.3f", total, stale, pct)
++        if pct >= STALE_PCT_THRESHOLD:
++            # push reindex/retrain ticket to MCP
++            payload = {"event": "retriever_curation_alert", "total": total, "stale": stale, "pct": pct, "ts": int(time.time())}
++            try:
++                requests.post(f"{AEGIS_MCP.rstrip('/')}/ops/retriever_curation", json=payload, timeout=5.0)
++            except Exception as e:
++                LOG.warning("mcp push failed: %s", e)
++    except Exception as e:
++        LOG.error("curation job failed: %s", e)
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:.github/workflows/preempt_rt_cold_validation.yml
++name: PREEMPT_RT Cold Validation
++on:
++  workflow_dispatch:
++jobs:
++  rt-cold-check:
++    runs-on: self-hosted
++    steps:
++      - name: Run cyclictest (requires rt-tests & cold-chamber infra)
++        run: |
++          if command -v cyclictest >/dev/null 2>&1; then
++            echo "Starting cyclictest"
++            sudo apt-get update && sudo apt-get install -y rt-tests
++            # run cyclictest for deterministic period; in lab, ensure ambient cold conditions present
++            cyclictest -m -p 80 -n -i 100 -l 10000 > cyclictest.out || true
++            grep "max" cyclictest.out || true
++            cat cyclictest.out
++          else
++            echo "cyclictest not available on runner"
++          fi
++      - name: Upload cyclictest results
++        uses: actions/upload-artifact@v4
++        with:
++          name: cyclictest-results
++          path: cyclictest.out
++
+*** End File
+*** Add File:README_EDGE_OFFLINE.md
++# Aegis — Edge / Offline & Safety Patterns
++
++This patch implements:
++- Edge-first local Milvus cache and a sync agent for delayed sync to central Milvus.
++- Pre-provisioned fetch-tokens for emergency A2A approvals (fetchtoken service).
++- Staged autonomy controller that enforces observe → recommend → auto flows and ties to A2A when required.
++- Gatekeeper data region constraint to enforce regional partitioning metadata.
++- Quick takedown API for urgent privacy/legal deletion requests.
++- Retriever curation job for freshness checks + MCP alerts.
++- PREEMPT_RT cold validation workflow template.
++
++Deployment hints:
++- Edge: deploy `local_milvus_compose.yml` on the edge box. Edge ingestion must write evidence files to /data/sync_queue as JSON for the sync agent.
++- Sync: run `services/edge/milvus_sync.py` on the edge; configure CENTRAL_MILVUS_HOST and collection name.
++- Fetchtokens: create a small number of tokens via `POST /admin/create` with short expiry (store token JSON encrypted offline). Redeem/verify via /verify on approver side.
++- Staged autonomy: wire verifier to call `/decide` on `staged_autonomy_controller` instead of directly invoking sandbox actions.
++- PREEMPT_RT validation: provision self-hosted runners with PREEMPT_RT images and run the `preempt_rt_cold_validation` workflow for lab validation (cold chamber if available).
++- Privacy & GDPR: ensure ingestion pipelines call Presidio adapter and that originals are encrypted with KMS. Use takedown API to quickly queue deletion requests and run operator process to clear artifacts.
++
++Operational checks:
++- Periodic sync success rate and queue depth monitored (edge).
++- Fetchtoken list rotation and audit in MCP.
++- curation job alert thresholds tuned (STALE_DAYS, STALE_PCT_THRESHOLD).
++- Ensure HIL evidence signing + FMEA link exists before enabling auto-actuation in production.
++
+*** End File
+*** End Patch

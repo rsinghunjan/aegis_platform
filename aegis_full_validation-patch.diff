@@ -1,0 +1,286 @@
+diff --git a/scripts/run_full_validation.sh b/scripts/run_full_validation.sh
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/scripts/run_full_validation.sh
+@@ -0,0 +1,223 @@
++#!/usr/bin/env bash
++#
++# Run the full validation sequence:
++#  - run the deepspeed+vLLM stress pipeline (scripts/deepspeed_vllm_stress_pipeline.sh)
++#  - collect artifacts and run KEDA threshold suggester (scripts/keda_threshold_suggester.py)
++#  - produce JSON report and optionally upload to S3 and open a PR containing the report
++# 
++# Requires:
++#  - KUBECONFIG or KUBECONFIG_STAGING in CI environment (cluster access)
++#  - aws CLI + S3 credentials if uploading artifacts
++#  - gh CLI or GITHUB_TOKEN if creating PRs (report branch)
++# 
++# Usage (local):
++#   KUBECONFIG=~/.kube/staging ./scripts/run_full_validation.sh --nodes 4 --rounds 3 --simulate-preemption true --artifact-dir ./artifacts --s3-bucket my-bucket --report-pr
++
++set -euo pipefail
++
++# Defaults
++NODES="${NODES:-4}"
++ROUNDS="${ROUNDS:-2}"
++TRAIN_SECONDS="${TRAIN_SECONDS:-300}"
++GATEWAY="${GATEWAY:-http://aegis-inference-gateway.aegis-ml.svc.cluster.local/generate}"
++ARTIFACT_DIR="${ARTIFACT_DIR:-./artifacts}"
++S3_BUCKET="${S3_BUCKET:-}"
++S3_PREFIX="${S3_PREFIX:-aegis/validation}"
++SIMULATE_PREEMPTION="${SIMULATE_PREEMPTION:-true}"
++KUBECONFIG_PATH="${KUBECONFIG_PATH:-${KUBECONFIG:-}}"
++OPEN_PR="${OPEN_PR:-false}"
++GITHUB_REPO="${GITHUB_REPO:-}"   # owner/repo
++REPORT_BRANCH="${REPORT_BRANCH:-validation/report-$(date +%s)}"
++REPORT_FILE="${REPORT_FILE:-validation_report_$(date +%Y%m%d%H%M%S).json}"
++
++# CLI args
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --nodes) NODES="$2"; shift 2;;
++    --rounds) ROUNDS="$2"; shift 2;;
++    --train-seconds) TRAIN_SECONDS="$2"; shift 2;;
++    --gateway) GATEWAY="$2"; shift 2;;
++    --artifact-dir) ARTIFACT_DIR="$2"; shift 2;;
++    --s3-bucket) S3_BUCKET="$2"; shift 2;;
++    --s3-prefix) S3_PREFIX="$2"; shift 2;;
++    --simulate-preemption) SIMULATE_PREEMPTION="$2"; shift 2;;
++    --kubeconfig) KUBECONFIG_PATH="$2"; shift 2;;
++    --open-pr) OPEN_PR="true"; shift;;
++    --github-repo) GITHUB_REPO="$2"; shift 2;;
++    --report-branch) REPORT_BRANCH="$2"; shift 2;;
++    *) echo "Unknown arg $1"; exit 1;;
++  esac
++done
++
++mkdir -p "${ARTIFACT_DIR}"
++
++echo "[validate] env summary:"
++echo "  NODES=$NODES ROUNDS=$ROUNDS TRAIN_SECONDS=$TRAIN_SECONDS"
++echo "  GATEWAY=$GATEWAY ARTIFACT_DIR=$ARTIFACT_DIR S3_BUCKET=$S3_BUCKET S3_PREFIX=$S3_PREFIX"
++echo "  SIMULATE_PREEMPTION=$SIMULATE_PREEMPTION"
++echo "  KUBECONFIG_PATH=${KUBECONFIG_PATH:-<not-set>}"
++echo "  OPEN_PR=$OPEN_PR GITHUB_REPO=$GITHUB_REPO"
++
++# Ensure KUBECONFIG if required
++if [[ -z "${KUBECONFIG_PATH:-}" ]]; then
++  echo "[validate] WARNING: KUBECONFIG not set. You must provide cluster access to run the stress pipeline."
++  echo "Exiting."
++  exit 2
++fi
++export KUBECONFIG="${KUBECONFIG_PATH}"
++
++# Run the main stress pipeline script (assumes script is executable)
++echo "[validate] Running deepspeed+vLLM stress pipeline..."
++./scripts/deepspeed_vllm_stress_pipeline.sh \
++  --nodes "${NODES}" \
++  --rounds "${ROUNDS}" \
++  --train-seconds "${TRAIN_SECONDS}" \
++  --gateway "${GATEWAY}" \
++  --artifact-dir "${ARTIFACT_DIR}" \
++  --s3-bucket "${S3_BUCKET}" \
++  --s3-prefix "${S3_PREFIX}" \
++  --simulate-preemption "${SIMULATE_PREEMPTION}"
++
++# Find vLLM CSVs and run KEDA threshold suggester
++CSV_FILES=( $(ls "${ARTIFACT_DIR}"/*/vllm_round_*.csv 2>/dev/null || true) )
++SUGGESTIONS=()
++if [[ ${#CSV_FILES[@]} -gt 0 ]]; then
++  echo "[validate] Running KEDA threshold suggester on CSVs:"
++  for csv in "${CSV_FILES[@]}"; do
++    echo "  - $csv"
++    thr=$(python3 scripts/keda_threshold_suggester.py --csv "$csv" --slo-p95 1.0 2>/dev/null || true)
++    SUGGESTIONS+=("{\"csv\":\"$csv\",\"suggestion\":\"$thr\"}")
++  done
++else
++  echo "[validate] No vLLM CSVs found under ${ARTIFACT_DIR}"
++fi
++
++# Bundle artifacts
++BUNDLE_NAME="validation_artifacts_$(date +%Y%m%d%H%M%S).tar.gz"
++tar -czf "${BUNDLE_NAME}" -C "${ARTIFACT_DIR}" .
++
++# Optionally upload to S3
++S3_UPLOAD_RESULT=null
++if [[ -n "${S3_BUCKET}" && -x "$(command -v aws)" ]]; then
++  S3_KEY="${S3_PREFIX%/}/${BUNDLE_NAME}"
++  echo "[validate] Uploading $BUNDLE_NAME to s3://${S3_BUCKET}/${S3_KEY}"
++  if aws s3 cp "${BUNDLE_NAME}" "s3://${S3_BUCKET}/${S3_KEY}"; then
++    S3_UPLOAD_RESULT="s3://${S3_BUCKET}/${S3_KEY}"
++  else
++    S3_UPLOAD_RESULT="upload-failed"
++  fi
++else
++  echo "[validate] Skipping S3 upload (S3_BUCKET not set or aws cli not available)"
++fi
++
++# Produce JSON report
++NOW=$(date --iso-8601=seconds)
++
++echo "[validate] Writing report to ${REPORT_FILE}"
++python3 - <<PYTHON
++import sys,glob,csv,json,os
++now=sys.argv[1]; nodes=int(sys.argv[2]); rounds=int(sys.argv[3]); train_seconds=int(sys.argv[4])
++bundle=sys.argv[5]; s3upload=sys.argv[6]; artdir=sys.argv[7]
++csvs=[]
++for c in glob.glob(os.path.join(artdir,"*","vllm_round_*.csv")):
++    total=0; success=0
++    try:
++        with open(c) as fh:
++            r=csv.DictReader(fh)
++            for row in r:
++                total+=1
++                ok=row.get("ok","")
++                if ok and ok.lower()=="true":
++                    success+=1
++    except Exception:
++        pass
++    csvs.append({"csv":c,"total":total,"success":success})
++report={"timestamp":now,"nodes":nodes,"rounds":rounds,"train_seconds":train_seconds,"artifact_bundle":bundle,"s3_upload":s3upload,"vllm_csv_summary":csvs}
++print(json.dumps(report,indent=2))
++with open("${REPORT_FILE}","w") as fh:
++    json.dump(report,fh,indent=2)
++PYTHON "${NOW}" "${NODES}" "${ROUNDS}" "${TRAIN_SECONDS}" "${BUNDLE_NAME}" "${S3_UPLOAD_RESULT}" "${ARTIFACT_DIR}"
++
++echo "[validate] Report written: ${REPORT_FILE}"
++
++# Optionally create a PR with the report
++if [[ "${OPEN_PR}" == "true" && -n "${GITHUB_REPO}" && -x "$(command -v gh)" ]]; then
++  echo "[validate] Creating PR with report (branch ${REPORT_BRANCH})"
++  git checkout -b "${REPORT_BRANCH}"
++  git add "${REPORT_FILE}"
++  git commit -m "Validation report: ${REPORT_FILE}"
++  git push --set-upstream origin "${REPORT_BRANCH}"
++  gh pr create --title "Validation report ${REPORT_FILE}" --body "Automated validation report. S3 upload: ${S3_UPLOAD_RESULT}" || echo "gh pr create failed"
++  git checkout -
++else
++  echo "[validate] PR creation skipped (OPEN_PR=${OPEN_PR}, GITHUB_REPO=${GITHUB_REPO})"
++fi
++
++echo "[validate] Done."
++exit 0
++
+diff --git a/.github/workflows/run_full_validation.yml b/.github/workflows/run_full_validation.yml
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/.github/workflows/run_full_validation.yml
+@@ -0,0 +1,58 @@
++name: Run Full Validation (dispatch)
++
++on:
++  workflow_dispatch:
++    inputs:
++      nodes:
++        description: 'DeepSpeed nodes'
++        required: false
++        default: '4'
++      rounds:
++        description: 'Rounds'
++        required: false
++        default: '2'
++      simulate_preemption:
++        description: 'simulate_preemption (true/false)'
++        required: false
++        default: 'true'
++      open_pr:
++        description: 'open PR with report (true/false)'
++        required: false
++        default: 'false'
++
++jobs:
++  run-validation:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: Ensure Python & tools
++        run: |
++          python -V
++          pip --version || true
++
++      - name: Run full validation (requires KUBECONFIG_STAGING in secrets)
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG_STAGING || '' }}
++          S3_BUCKET: ${{ secrets.ARTIFACT_S3_BUCKET || '' }}
++          GITHUB_REPO: ${{ secrets.GITHUB_REPO || '' }}
++        run: |
++          if [ -z "$KUBECONFIG" ]; then
++            echo "KUBECONFIG not present; this workflow must run on a self-hosted runner with cluster access. Exiting."
++            exit 0
++          fi
++          chmod +x scripts/run_full_validation.sh
++          ./scripts/run_full_validation.sh --nodes "${{ github.event.inputs.nodes }}" --rounds "${{ github.event.inputs.rounds }}" --simulate-preemption "${{ github.event.inputs.simulate_preemption }}" --artifact-dir ./artifacts --s3-bucket "$S3_BUCKET" --open-pr "${{ github.event.inputs.open_pr }}" --github-repo "${{ secrets.GITHUB_REPO || '' }}"
++
++      - name: Upload artifacts
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: full-validation-artifacts
++          path: artifacts || .
++
+diff --git a/docs/VALIDATION_RUNBOOK.md b/docs/VALIDATION_RUNBOOK.md
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/docs/VALIDATION_RUNBOOK.md
+@@ -0,0 +1,200 @@
++````markdown
++# Full Validation Runbook (DeepSpeed + vLLM)
++
++This runbook explains how to run the full production-scale validation sequence in staging using the supplied harness.
++
++Prereqs
++- A staging Kubernetes cluster with GPU nodes and RDMA/NIC configured.
++- KUBECONFIG file with permissions to scale StatefulSets and exec into pods.
++- AWS credentials (optional) for artifact upload.
++- gh CLI or GITHUB_TOKEN (optional) to open a PR with the report.
++
++Files added
++- scripts/run_full_validation.sh — main orchestrator
++- .github/workflows/run_full_validation.yml — dispatchable workflow (requires KUBECONFIG_STAGING secret or self-hosted runner)
++- Uses existing scripts:
++  - scripts/deepspeed_vllm_stress_pipeline.sh
++  - scripts/vllm_perf_benchmark.py
++  - scripts/keda_threshold_suggester.py
++
++Quick start (local)
++1. Set KUBECONFIG and (optional) AWS/GitHub env vars:
++   export KUBECONFIG=~/.kube/staging
++   export AWS_PROFILE=staging
++   export GITHUB_REPO=yourorg/yourrepo
++
++2. Run:
++   KUBECONFIG=~/.kube/staging ./scripts/run_full_validation.sh --nodes 4 --rounds 2 --simulate-preemption true --artifact-dir ./artifacts --s3-bucket my-bucket --open-pr
++
++3. Inspect artifacts:
++   - artifacts/round_* contain per-pod logs and nvidia-smi/dmesg
++   - vllm CSVs under artifacts/*/vllm_round_*.csv
++   - validation report JSON in the repo root (validation_report_*.json)
++
++Interpretation
++- The report summarizes:
++  - snapshot of runs (nodes, rounds, train seconds)
++  - artifact bundle path
++  - vLLM CSV summaries (count, successes)
++- Use scripts/keda_threshold_suggester.py on the CSVs to get a suggested GPU utilization threshold for KEDA.
++
++Recommended sequence
++1. Run 3–5 rounds with simulate_preemption=true.
++2. Review artifacts for NCCL/IB errors (dmesg, NCCL logs).
++3. If errors found, iterate on `k8s/manifests/deepspeed-tuning-configmap.yaml` (NCCL env) or kernel/NIC settings and re-run.
++4. Use keda suggester output to tune `k8s/manifests/keda_tuned_scaledobject.yaml`.
++5. After stable runs, run vault rotation & policy enforcement flows.
++
++Safety & operator notes
++- Always run in a limited staging tenancy with budget caps.
++- Ensure SRE & Security are informed before deleting secrets or running destructive preemption simulations.
++- Collect multiple artifact bundles from different runs to compare behavior across cluster topology variations.
++
++If you want, I can:
++- Create a follow-up PR that wires automatic report parsing and posts a summary to Slack/Teams after the workflow completes.
++- Add an automated analyzer that scans logs for NCCL-specific error patterns and surfaces them in the JSON report.
++
++```

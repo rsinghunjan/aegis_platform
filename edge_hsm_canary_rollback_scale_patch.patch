@@ -1,0 +1,433 @@
+*** Begin Patch
+*** Add File: hsm/device_hsm_signer.py
++#!/usr/bin/env python3
++"""
++Operator HSM-backed device public-key signer.
++ - Runs on operator hosts only (nodeSelector/operator)
++ - Signs device public keys using a host HSM via a provided signing script or PKCS#11 library
++ - Records signing evidence to Rekor and uploads metadata to COMPLIANCE_BUCKET
++ - Requires operator approval header X-Operator-Approved (simple guard). CI should NOT reach this service.
++
++Environment:
++ - HSM_SIGN_CMD: path to host script that performs the signing and returns signature text
++ - REKOR_CLI: path to rekor-cli binary for uploading artifact evidence (optional)
++ - COMPLIANCE_BUCKET: S3 bucket for evidence
++ - OPERATOR_APPROVAL_HEADER: header required (default "X-Operator-Approved")
++
++Operator must deploy this in an operator-only namespace and apply NetworkPolicies to block CI egress to it.
++"""
++import os, json, tempfile, subprocess, time
++from flask import Flask, request, jsonify
++import boto3
++
++HSM_SIGN_CMD = os.environ.get("HSM_SIGN_CMD", "/opt/hsm/hsm_sign_device.sh")
++REKOR_CLI = os.environ.get("REKOR_CLI", "rekor-cli")
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++APPROVAL_HEADER = os.environ.get("OPERATOR_APPROVAL_HEADER", "X-Operator-Approved")
++
++app = Flask("device-hsm-signer")
++s3 = boto3.client("s3") if COMPLIANCE_BUCKET else None
++
++def sign_with_hsm(pubkey_pem: str, device_id: str) -> str:
++    """
++    Call out to operator-provided HSM signing command.
++    The command should accept device_id and public key path and print signature or Rekor entry.
++    """
++    tmp = tempfile.NamedTemporaryFile(delete=False)
++    tmp.write(pubkey_pem.encode()); tmp.flush(); tmp.close()
++    try:
++        out = subprocess.check_output([HSM_SIGN_CMD, tmp.name, device_id], stderr=subprocess.STDOUT, timeout=30).decode().strip()
++        return out
++    finally:
++        try:
++            os.unlink(tmp.name)
++        except Exception:
++            pass
++
++def rekor_upload_artifact(local_path: str) -> str:
++    try:
++        out = subprocess.check_output([REKOR_CLI, "upload", "--artifact", local_path], stderr=subprocess.STDOUT, timeout=20).decode().strip()
++        return out
++    except Exception as e:
++        return str(e)
++
++@app.post("/sign_device")
++def sign_device():
++    # require operator header
++    if not request.headers.get(APPROVAL_HEADER):
++        return jsonify({"error": "operator approval header required"}), 403
++    j = request.get_json() or {}
++    device_id = j.get("device_id")
++    pubkey = j.get("public_key")
++    if not device_id or not pubkey:
++        return jsonify({"error": "device_id and public_key required"}), 400
++    try:
++        signature = sign_with_hsm(pubkey, device_id)
++    except subprocess.CalledProcessError as e:
++        return jsonify({"error": "hsm_sign_failed", "detail": e.output.decode() if hasattr(e, "output") else str(e)}), 500
++    except Exception as e:
++        return jsonify({"error": "hsm_sign_error", "detail": str(e)}), 500
++    # persist evidence locally then upload to S3 + Rekor
++    evidence = {"device_id": device_id, "signature": signature, "ts": int(time.time())}
++    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
++    tmp.write(json.dumps(evidence).encode()); tmp.flush(); tmp.close()
++    rekor_out = rekor_upload_artifact(tmp.name)
++    s3_key = None
++    if s3:
++        s3_key = f"hsm/device_signatures/{device_id}_{int(time.time())}.json"
++        s3.upload_file(tmp.name, COMPLIANCE_BUCKET, s3_key)
++    try:
++        os.unlink(tmp.name)
++    except Exception:
++        pass
++    return jsonify({"ok": True, "signature": signature, "rekor": rekor_out, "s3_key": f"s3://{COMPLIANCE_BUCKET}/{s3_key}" if s3_key else None})
++
++@app.get("/health")
++def health():
++    return {"ok": True}
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8111")))
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/hsm/device-hsm-signer-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: device-hsm-signer
++  namespace: operator
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: device-hsm-signer
++  template:
++    metadata:
++      labels:
++        app: device-hsm-signer
++    spec:
++      nodeSelector:
++        operator: "true"
++      serviceAccountName: device-hsm-signer-sa
++      containers:
++        - name: device-hsm-signer
++          image: aegis/device-hsm-signer:latest
++          env:
++            - name: HSM_SIGN_CMD
++              value: "/opt/hsm/hsm_sign_device.sh"
++            - name: REKOR_CLI
++              value: "rekor-cli"
++            - name: COMPLIANCE_BUCKET
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-secrets
++                  key: compliance-bucket
++          volumeMounts:
++            - name: hsm-socket
++              mountPath: /var/run/hsm
++            - name: bin-scripts
++              mountPath: /opt/hsm
++      volumes:
++        - name: hsm-socket
++          hostPath:
++            path: /var/run/hsm
++            type: DirectoryOrCreate
++        - name: bin-scripts
++          hostPath:
++            path: /opt/hsm
++            type: DirectoryOrCreate
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: device-hsm-signer
++  namespace: operator
++spec:
++  selector:
++    app: device-hsm-signer
++  ports:
++    - port: 8111
++      targetPort: 8111
++
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: device-hsm-signer-sa
++  namespace: operator
++
+*** End Patch
+*** Begin Patch
+*** Add File: ota/canary_monitor.py
++#!/usr/bin/env python3
++"""
++Canary Monitor:
++ - Watches fleet rollout state in Redis (rollout:{artifact}:{version})
++ - Monitors telemetry Redis list for 'install_failed' events from cohort devices
++ - If failure rate exceeds threshold within window, triggers OTA rollback via OTA API
++ - Uploads evidence to compliance bucket using edge/compliance_evidence_collector.upload_evidence
++"""
++import os, time, json, requests
++import redis
++from edge.compliance_evidence_collector import upload_evidence
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/7")
++FLEET_NAMESPACE = os.environ.get("FLEET_NAMESPACE", "aegis")
++OTA_API = os.environ.get("OTA_API", "http://ota.aegis.svc:8205")
++ROLLBACK_THRESHOLD = float(os.environ.get("CANARY_FAIL_RATE", "0.05"))  # fraction
++WINDOW_SECS = int(os.environ.get("CANARY_WINDOW_SECS", "600"))
++POLL_INTERVAL = int(os.environ.get("CANARY_POLL_SEC", "15"))
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++
++redis_client = redis.from_url(REDIS_URL)
++
++def get_rollout(artifact, version):
++    key = f"rollout:{artifact}:{version}"
++    data = redis_client.get(key)
++    if not data:
++        return None
++    return json.loads(data)
++
++def recent_telemetry_events(window_secs=WINDOW_SECS):
++    # telemetry events stored as Redis list 'telemetry:events' (most recent at left)
++    events = []
++    items = redis_client.lrange("telemetry:events", 0, 1000) or []
++    cutoff = time.time() - window_secs
++    for b in items:
++        try:
++            ev = json.loads(b.decode() if isinstance(b, bytes) else b)
++            if ev.get("ts", time.time()) >= cutoff:
++                events.append(ev)
++        except Exception:
++            continue
++    return events
++
++def count_failures_for_cohort(cohort, events):
++    failures = 0
++    total = 0
++    for ev in events:
++        device = ev.get("device")
++        if device in cohort:
++            total += 1
++            if ev.get("event") in ("install_failed","verify_failed"):
++                failures += 1
++    return failures, total
++
++def trigger_rollback(artifact, version, reason, evidence=None):
++    try:
++        requests.post(f"{OTA_API}/rollback", json={"name": artifact, "version": version}, timeout=10)
++    except Exception:
++        pass
++    # upload evidence if present
++    if evidence:
++        try:
++            k = upload_evidence(f"rollback_{artifact}_{version}", evidence, {"reason": reason})
++            print("Uploaded rollback evidence:", k)
++        except Exception as e:
++            print("Failed to upload evidence", e)
++
++def monitor_loop(artifact, version):
++    print("Starting canary monitor for", artifact, version)
++    while True:
++        rollout = get_rollout(artifact, version)
++        if rollout:
++            cohort = rollout.get("cohort", []) or []
++            events = recent_telemetry_events()
++            failures, total = count_failures_for_cohort(cohort, events)
++            rate = (failures / total) if total else 0.0
++            print(f"[{time.ctime()}] cohort_size={len(cohort)} total_events={total} failures={failures} rate={rate:.3f}")
++            if total >= 5 and rate >= ROLLBACK_THRESHOLD:
++                print("Failure threshold exceeded; triggering rollback")
++                evidence = json.dumps({"artifact": artifact, "version": version, "failures": failures, "total": total, "events_sample": events[:20]})
++                trigger_rollback(artifact, version, f"failure_rate {rate}", evidence)
++                return
++        else:
++            print("No rollout info found for", artifact, version)
++        time.sleep(POLL_INTERVAL)
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--artifact", required=True)
++    p.add_argument("--version", required=True)
++    args = p.parse_args()
++    monitor_loop(args.artifact, args.version)
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/ota/canary-monitor-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: canary-monitor
++  namespace: aegis
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: canary-monitor
++  template:
++    metadata:
++      labels:
++        app: canary-monitor
++    spec:
++      containers:
++        - name: canary-monitor
++          image: aegis/canary-monitor:latest
++          command: ["python", "/opt/ota/canary_monitor.py", "--artifact", "example-model", "--version", "canary"]
++          env:
++            - name: REDIS_URL
++              value: "redis://redis:6379/7"
++            - name: OTA_API
++              value: "http://ota.aegis.svc:8205"
++            - name: COMPLIANCE_BUCKET
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-secrets
++                  key: compliance-bucket
++
+*** End Patch
+*** Begin Patch
+*** Add File: tests/induce_canary_failures.sh
++#!/usr/bin/env bash
++#
++# Induce failures for devices in the current canary cohort.
++# Requires:
++#  FLEET_API - URL to fleet manager (e.g., http://fleet.aegis.svc:8220)
++#  OTA_ARTIFACT and OTA_VERSION - artifact/version for rollout
++#  TELEMETRY_URL - telemetry collector report endpoint (e.g., http://telemetry.aegis.svc:8215/report)
++set -euo pipefail
++FLEET_API="${FLEET_API:-http://fleet.aegis.svc:8220}"
++ART="${OTA_ARTIFACT:-example-model}"
++VER="${OTA_VERSION:-canary}"
++TELEMETRY_URL="${TELEMETRY_URL:-http://telemetry.aegis.svc:8215/report}"
++FAIL_REPS=${FAIL_REPS:-10}
++
++echo "Querying rollout cohort for $ART:$VER"
++COHORT=$(curl -s "${FLEET_API}/rollout_status/${ART}/${VER}" | jq -r ".[\"rollout:${ART}:${VER}\"]?.cohort // empty")
++if [ -z "$COHORT" ] || [ "$COHORT" = "null" ]; then
++  echo "No cohort found via fleet manager; attempting to fetch rollout key from Redis (not available in CI)"
++  exit 1
++fi
++echo "Cohort JSON: $COHORT"
++DEVICES=$(echo "$COHORT" | jq -r '.[]')
++echo "Will induce failures on devices: $DEVICES"
++
++for d in $DEVICES; do
++  echo "Inducing failures on device $d"
++  for i in $(seq 1 $FAIL_REPS); do
++    curl -s -X POST "${TELEMETRY_URL}" -H "Content-Type: application/json" -d "{\"device\":\"$d\",\"event\":\"install_failed\",\"ts\":$(date +%s)}" >/dev/null || true
++  done
++done
++echo "Induced failures for cohort devices"
++
+*** End Patch
+*** Begin Patch
+*** Add File: .github/workflows/edge_canary_rollback.yml
++name: Edge Canary Rollback Simulation
++on:
++  workflow_dispatch:
++    inputs:
++      artifact:
++        required: true
++      version:
++        required: true
++
++jobs:
++  run-simulation:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Start OTA canary rollout
++        env:
++          FLEET_API: ${{ secrets.FLEET_API }}
++          ARTIFACT: ${{ github.event.inputs.artifact }}
++          VERSION: ${{ github.event.inputs.version }}
++        run: |
++          curl -s -X POST "${FLEET_API}/rollout" -H "Content-Type: application/json" -d "{\"artifact\":\"${ARTIFACT}\",\"version\":\"${VERSION}\",\"policy\":{\"cohort_size\":5}}"
++      - name: Run fleet load simulator (generate device traffic)
++        env:
++          TELEMETRY_URL: ${{ secrets.TELEMETRY_URL }}
++        run: |
++          python -m pip install --upgrade pip
++          pip install aiohttp
++          python edge/fleet_load_simulator.py --total 200 --concurrency 50
++      - name: Induce failures to trigger rollback
++        env:
++          FLEET_API: ${{ secrets.FLEET_API }}
++          OTA_ARTIFACT: ${{ github.event.inputs.artifact }}
++          OTA_VERSION: ${{ github.event.inputs.version }}
++          TELEMETRY_URL: ${{ secrets.TELEMETRY_URL }}
++        run: |
++          chmod +x tests/induce_canary_failures.sh
++          ./tests/induce_canary_failures.sh
++      - name: Wait and confirm rollback
++        env:
++          FLEET_API: ${{ secrets.FLEET_API }}
++          ARTIFACT: ${{ github.event.inputs.artifact }}
++          VERSION: ${{ github.event.inputs.version }}
++        run: |
++          echo "Waiting up to 120s for rollback to be triggered by canary monitor..."
++          for i in $(seq 1 24); do
++            STATUS=$(curl -s "${FLEET_API}/rollout_status/${ARTIFACT}/${VERSION}" | jq -r '.[].state // empty' || true)
++            echo "Rollout state: $STATUS"
++            if [ "$STATUS" = "rolled_back" ] || [ "$STATUS" = "rolled back" ] || [ "$STATUS" = "rolling_back" ]; then
++              echo "Rollback detected."
++              exit 0
++            fi
++            sleep 5
++          done
++          echo "Rollback not detected in time; failing."
++          exit 2
++
+*** End Patch
+*** Begin Patch
+*** Add File: edge/run_fleet_load_simulator_k8s_job.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: fleet-load-simulator
++  namespace: aegis
++spec:
++  parallelism: 5
++  completions: 5
++  template:
++    spec:
++      containers:
++        - name: simulator
++          image: python:3.10-slim
++          command:
++            - /bin/sh
++            - -c
++            - |
++              pip install aiohttp && python /workspace/edge/fleet_load_simulator.py --total 500 --concurrency 50
++          env:
++            - name: OTA_CHECKIN
++              value: "http://ota.aegis.svc:8205/device"
++            - name: TELEMETRY_URL
++              value: "http://telemetry.aegis.svc:8215/report"
++          volumeMounts:
++            - name: workspace
++              mountPath: /workspace
++      restartPolicy: Never
++      volumes:
++        - name: workspace
++          configMap:
++            name: edge-simulator-scripts
++  backoffLimit: 0
++
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: edge-simulator-scripts
++  namespace: aegis
++data:
++  edge/fleet_load_simulator.py: |
++    # Placeholder: ensure your cluster mounts the repo or build an image with the simulator baked in.
++    echo "Place fleet_load_simulator.py into this configmap or use a prebuilt image with the simulator."
++
+*** End Patch
+*** End Patch

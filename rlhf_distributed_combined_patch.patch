@@ -1,0 +1,286 @@
+*** Begin Patch
+*** Add File: k8s/rlhf/accelerate_distributed_job.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: rlhf-accelerate-distributed
++  namespace: aegis-ml
++spec:
++  template:
++    spec:
++      # This job runs the accelerate "launcher" that will coordinate processes.
++      # For true multi-node runs you must supply appropriate network settings (main_process_ip)
++      # and ensure nodes can reach each other on the chosen port.
++      containers:
++        - name: accelerate-launcher
++          image: aegis/rlhf:latest
++          command:
++            - "/bin/sh"
++            - "-c"
++            - |
++              set -euo pipefail
++              # Generate accelerate config and run launch; env vars control parallelism
++              /opt/rl/accelerate_launcher.sh
++          env:
++            - name: NUM_MACHINES
++              value: "1"                    # operator override for multi-node
++            - name: NUM_PROCESSES
++              value: "2"                    # processes per machine (e.g. GPUs per node)
++            - name: MAIN_PROCESS_IP
++              value: ""                     # set for multi-node (launcher host)
++            - name: MAIN_PROCESS_PORT
++              value: "29500"
++            - name: MODEL_NAME
++              value: "distilgpt2"
++            - name: OUTPUT_DIR
++              value: "/tmp/rlhf_out"
++            - name: MLFLOW_TRACKING_URI
++              valueFrom:
++                secretKeyRef:
++                  name: mlflow-secrets
++                  key: tracking-uri
++            - name: ARTIFACT_S3_BUCKET
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-secrets
++                  key: artifact-bucket
++          resources:
++            requests:
++              cpu: "4"
++              memory: "16Gi"
++            limits:
++              cpu: "8"
++              memory: "48Gi"
++      restartPolicy: Never
++  backoffLimit: 1
++
++---
++# Notes:
++# - For multi-node: set NUM_MACHINES>1 and ensure MAIN_PROCESS_IP points to the launcher's node ip (or use headless service).
++# - Use a proper scheduler (MPIJob, KubeRay, or a job controller) for large multi-node experiments in production.
++
+*** End Patch
+*** Begin Patch
+*** Add File: rl/accelerate_launcher.sh
++#!/usr/bin/env bash
++set -euo pipefail
++
++# Build an accelerate config dynamically and launch the distributed training script.
++# Environment:
++#  - NUM_MACHINES, NUM_PROCESSES, MAIN_PROCESS_IP, MAIN_PROCESS_PORT, MODEL_NAME, OUTPUT_DIR
++NUM_MACHINES=${NUM_MACHINES:-1}
++NUM_PROCESSES=${NUM_PROCESSES:-1}
++MAIN_PROCESS_IP=${MAIN_PROCESS_IP:-}
++MAIN_PROCESS_PORT=${MAIN_PROCESS_PORT:-29500}
++MODEL_NAME=${MODEL_NAME:-"distilgpt2"}
++OUTPUT_DIR=${OUTPUT_DIR:-"/tmp/rlhf_out"}
++
++ACCEL_CONF=/tmp/accelerate_config.yaml
++
++cat > ${ACCEL_CONF} <<YAML
++compute_environment: LOCAL_MACHINE
++distributed_type: MULTI_GPU
++downcast_bfloat16: "no"
++mixed_precision: "fp16"
++machine_rank: 0
++main_process_ip: "${MAIN_PROCESS_IP}"
++main_process_port: ${MAIN_PROCESS_PORT}
++num_machines: ${NUM_MACHINES}
++num_processes: ${NUM_PROCESSES}
++use_cpu: false
++YAML
++
++echo "Generated accelerate config:"
++cat ${ACCEL_CONF}
++
++echo "Launching accelerate with config ${ACCEL_CONF}..."
++# Use accelerate to launch the training script; the training script uses Trainer and will pick up distributed envs
++accelerate launch --config_file ${ACCEL_CONF} rl/distributed_train.py --model-name "${MODEL_NAME}" --output-dir "${OUTPUT_DIR}" --epochs 1 --per-device-batch-size 2
++
++echo "Accelerate launch finished."
++
+*** End Patch
+*** Begin Patch
+*** Add File: rl/distributed_train.py
++#!/usr/bin/env python3
++"""
++Distributed training entrypoint (works under `accelerate launch`).
++ - Uses HuggingFace Trainer for simple RLHF-style supervised pretraining step that can be used as a
++   starting point for more complex RLHF loops (PPO/trl).
++ - Logs parameters and artifacts to MLflow and uploads final model/checkpoint via checkpoint_manager.
++
++CLI args:
++ --model-name, --output-dir, --epochs, --per-device-batch-size, --save-steps
++"""
++import os, argparse, json, tempfile
++from datasets import Dataset
++from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling
++import mlflow
++from rl.checkpoint_validate import sha256
++
++# optional checkpoint upload helper (exists in repo as rl/checkpoint_manager.py)
++try:
++    from rl.checkpoint_manager import upload_checkpoint
++except Exception:
++    def upload_checkpoint(path, s3_path, metadata=None):
++        # fallback: just return metadata
++        return {"s3_path": s3_path, "local": path, "meta": metadata}
++
++def make_toy_dataset():
++    texts = ["Q: What is 2+2? A: 4", "Q: Capital of France? A: Paris", "Q: Who wrote Hamlet? A: Shakespeare"]
++    return Dataset.from_list([{"text": t} for t in texts])
++
++def tokenize_function(examples, tokenizer, max_length=128):
++    return tokenizer(examples["text"], truncation=True, padding="max_length", max_length=max_length)
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--model-name", default=os.environ.get("MODEL_NAME","distilgpt2"))
++    p.add_argument("--output-dir", default=os.environ.get("OUTPUT_DIR","/tmp/rlhf_out"))
++    p.add_argument("--epochs", type=int, default=1)
++    p.add_argument("--per-device-batch-size", type=int, default=2)
++    p.add_argument("--save-steps", type=int, default=50)
++    args = p.parse_args()
++
++    mlflow_uri = os.environ.get("MLFLOW_TRACKING_URI")
++    if mlflow_uri:
++        mlflow.set_tracking_uri(mlflow_uri)
++
++    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
++    model = AutoModelForCausalLM.from_pretrained(args.model_name)
++
++    ds = make_toy_dataset()
++    ds = ds.map(lambda x: tokenize_function(x, tokenizer), batched=True)
++    ds.set_format(type="torch", columns=["input_ids","attention_mask"])
++
++    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
++
++    training_args = TrainingArguments(
++        output_dir=args.output_dir,
++        per_device_train_batch_size=args.per_device_batch_size,
++        num_train_epochs=args.epochs,
++        logging_steps=10,
++        save_steps=args.save_steps,
++        save_total_limit=3,
++        fp16=True,
++    )
++
++    trainer = Trainer(model=model, args=training_args, train_dataset=ds, data_collator=data_collator)
++
++    with mlflow.start_run():
++        mlflow.log_param("model_name", args.model_name)
++        mlflow.log_param("epochs", args.epochs)
++        mlflow.log_param("per_device_batch_size", args.per_device_batch_size)
++        trainer.train()
++        trainer.save_model(args.output_dir)
++        # create a lightweight checkpoint artifact (tar)
++        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tar.gz")
++        import tarfile
++        with tarfile.open(tmp.name, "w:gz") as tf:
++            tf.add(args.output_dir, arcname="model")
++        checksum = sha256(tmp.name)
++        mlflow.log_param("checkpoint_sha256", checksum)
++        mlflow.log_artifact(tmp.name, artifact_path="checkpoints")
++        # upload checkpoint to artifact storage via upload_checkpoint helper
++        s3_rec = upload_checkpoint(tmp.name, f"rlhf/checkpoints/{os.path.basename(tmp.name)}", metadata={"model": args.model_name})
++        print("Uploaded checkpoint:", s3_rec)
++    print("Distributed training script finished.")
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: ci/rlhf_distributed_smoke.yml
++name: RLHF Distributed Smoke Test (CI)
++on:
++  workflow_dispatch:
++    inputs:
++      model_name:
++        required: false
++        default: "distilgpt2"
++
++jobs:
++  smoke:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python & deps
++        run: |
++          python -m pip install --upgrade pip
++          pip install torch transformers datasets accelerate mlflow boto3 trl
++      - name: Run small distributed accelerate launch (2 processes)
++        env:
++          MODEL_NAME: ${{ github.event.inputs.model_name }}
++          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
++        run: |
++          # run accelerate locally with 2 processes to emulate a tiny distributed run
++          python -m pip install --upgrade accelerate
++          accelerate launch --num_processes 2 rl/distributed_train.py --model-name "${MODEL_NAME}" --output-dir "/tmp/rlhf_smoke" --epochs 1 --per-device-batch-size 1 --save-steps 10
++      - name: Validate checkpoint
++        env:
++          CHECKPOINT: /tmp/rlhf_smoke/checkpoint-final.tar.gz
++          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
++        run: |
++          # locate produced checkpoint tar in /tmp/rlhf_smoke (trainer saves model directory)
++          CKPT=$(ls /tmp/rlhf_smoke/*.tar.gz || true)
++          if [ -z "$CKPT" ]; then
++            echo "No tarball found in /tmp/rlhf_smoke; listing dir:"
++            ls -al /tmp/rlhf_smoke || true
++            exit 2
++          fi
++          echo "Found checkpoint: $CKPT"
++          python rl/checkpoint_validate.py --ckpt "$CKPT"
++      - name: Run adversarial harness (optional)
++        if: success()
++        env:
++          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
++          ADV_MANIFEST: tests/adversarial_prompts.jsonl
++        run: |
++          # adversarial_harness should be tolerant of no real endpoint; this step is optional in CI smoke
++          python safety/adversarial_harness.py || echo "Adversarial harness failed or not configured"
++
+*** End Patch
+*** Begin Patch
+*** Add File: runbooks/rlhf_distributed_runbook.md
++# RLHF Distributed Staging Runbook
++
++Purpose
++- Run a distributed Accelerate-based RLHF experiment in staging that produces validated checkpoints, MLflow logs and an uploadable artifact suitable for adversarial evaluation and canary promotion.
++
++Prerequisites
++- K8s staging cluster (if running via k8s Job) with GPUs and network configured for multi-node launches.
++- MLflow tracking server and artifact store configured (MLFLOW_TRACKING_URI env or secret).
++- Accelerator & training image built (aegis/rlhf:latest) with proper CUDA/torch if using GPUs.
++- Secrets: mlflow-secrets (tracking uri), aegis-secrets (artifact bucket credentials).
++
++Local / CI Smoke Run
++1. Trigger GitHub Action `RLHF Distributed Smoke Test (CI)` or run locally:
++   accelerate launch --num_processes 2 rl/distributed_train.py --model-name distilgpt2 --output-dir /tmp/rlhf_smoke --epochs 1
++2. After run, validate checkpoint:
++   python rl/checkpoint_validate.py --ckpt /tmp/rlhf_smoke/<checkpoint>.tar.gz
++3. Run adversarial harness (optional in CI):
++   python safety/adversarial_harness.py
++
++Staging multi-node run (k8s Job)
++1. Configure env vars in k8s/rlhf/accelerate_distributed_job.yaml:
++   - NUM_MACHINES: number of nodes
++   - NUM_PROCESSES: gpus per node (or processes per machine)
++   - MAIN_PROCESS_IP: for NUM_MACHINES>1 ensure launcher node ip is set
++   - MLFLOW_TRACKING_URI, ARTIFACT_S3_BUCKET in secrets
++2. Apply job:
++   kubectl apply -f k8s/rlhf/accelerate_distributed_job.yaml -n aegis-ml
++3. Wait for completion:
++   kubectl logs job/rlhf-accelerate-distributed -n aegis-ml --follow
++4. After completion, retrieve artifacts from MLflow or configured artifact store (checkpoint tar saved by the training script)
++
++Resuming from checkpoint
++- Place checkpoint tar into accessible S3 path and pass its location into the training script (future extension).
++- For now, to resume implement Trainer.resume_from_checkpoint pointing to the model dir and rerun accelerate launch with same config.
++
++Production notes
++- For large runs use a job orchestration method designed for multi-node HPC (MPIJob / Kubeflow / Ray).
++- Ensure MLflow run ids and artifact URIs are recorded in the model registry and observed by adversarial gating flows.
++
+*** End Patch
+*** End Patch

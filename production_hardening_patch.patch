@@ -1,0 +1,370 @@
+*** Begin Patch
+*** Add File: k8s/pv_pvc_broker.yaml
++apiVersion: v1
++kind: PersistentVolumeClaim
++metadata:
++  name: broker-data-pvc
++  namespace: aegis
++spec:
++  accessModes:
++    - ReadWriteOnce
++  resources:
++    requests:
++      storage: 10Gi
++  storageClassName: standard
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/provider-broker-prod-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: provider-broker-prod
++  namespace: aegis
++spec:
++  replicas: 3
++  selector:
++    matchLabels:
++      app: provider-broker-prod
++  template:
++    metadata:
++      labels:
++        app: provider-broker-prod
++        tier: broker
++    spec:
++      serviceAccountName: provider-broker-sa
++      containers:
++        - name: broker
++          image: aegis/provider-broker-prod:latest
++          env:
++            - name: DATABASE_URL
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-db-secret
++                  key: database_url
++            - name: MODEL_BUCKET
++              value: "aegis-models"
++            - name: AWS_ACCESS_KEY_ID
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-s3-credentials
++                  key: access_key
++            - name: AWS_SECRET_ACCESS_KEY
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-s3-credentials
++                  key: secret_key
++          ports:
++            - containerPort: 8080
++          volumeMounts:
++            - name: broker-data
++              mountPath: /data
++          readinessProbe:
++            httpGet:
++              path: /state
++              port: 8080
++            initialDelaySeconds: 5
++            periodSeconds: 15
++      volumes:
++        - name: broker-data
++          persistentVolumeClaim:
++            claimName: broker-data-pvc
++
+*** End Patch
+*** Begin Patch
+*** Add File: vault/k8s/vault-agent-demo.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: vault-agent
++  namespace: aegis
++
++---
++apiVersion: v1
++kind: Pod
++metadata:
++  name: vault-agent-demo
++  namespace: aegis
++  annotations:
++    vault.hashicorp.com/agent-inject: "true"
++    vault.hashicorp.com/role: "aegis-role"
++    vault.hashicorp.com/agent-inject-token: "true"
++    vault.hashicorp.com/secret-volume-path: "/etc/vault/secrets"
++spec:
++  serviceAccountName: vault-agent
++  containers:
++    - name: app
++      image: alpine:3.18
++      command: ["sh", "-c", "sleep 3600"]
++      volumeMounts:
++        - name: vault-secrets
++          mountPath: /etc/vault/secrets
++  volumes:
++    - name: vault-secrets
++      emptyDir: {}
++
+*** End Patch
+*** Begin Patch
+*** Add File: zero_trust/ansible/cosign_hsm_sign_playbook.yml
++- name: Sign artifacts with Cosign PKCS11 on HSM admin host
++  hosts: hsm_admin
++  become: yes
++  vars:
++    cosign_path: "/usr/local/bin/cosign"
++    artifacts_dir: "/opt/aegis/artifacts_to_sign"
++    pkcs11_module: "{{ lookup('env','PKCS11_MODULE') | default('/usr/lib/your_pkcs11.so') }}"
++    pkcs11_pin: "{{ lookup('env','PKCS11_PIN') | default('1234') }}"
++    pkcs11_key_label: "{{ lookup('env','PKCS11_KEY_LABEL') | default('cosign-key') }}"
++  tasks:
++    - name: Ensure cosign installed
++      stat:
++        path: "{{ cosign_path }}"
++      register: cosign_bin
++
++    - name: Install cosign if missing (fetch latest release)
++      get_url:
++        url: "https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64"
++        dest: "{{ cosign_path }}"
++        mode: '0755'
++      when: not cosign_bin.stat.exists
++
++    - name: Find artifacts to sign
++      find:
++        paths: "{{ artifacts_dir }}"
++        patterns: "*.tar.gz,*.zip,*.pt,*.onnx,*.json"
++      register: artifacts
++      ignore_errors: yes
++
++    - name: Sign each artifact with PKCS11 key on HSM
++      shell: |
++        export COSIGN_PKCS11_MODULE="{{ pkcs11_module }}"
++        export COSIGN_PKCS11_PIN="{{ pkcs11_pin }}"
++        # Sign artifact; cosign will write signature and Rekor entry
++        "{{ cosign_path }}" sign-blob --key "pkcs11:object={{ pkcs11_key_label }}" "{{ item.path }}"
++      loop: "{{ artifacts.files | default([]) }}"
++      register: sign_results
++      failed_when: sign_results is failed
++
++    - name: Upload sign results summary for audit
++      copy:
++        content: "{{ sign_results }}"
++        dest: "/tmp/cosign_signing_results_{{ ansible_date_time.iso8601 }}.json"
++
+*** End Patch
+*** Begin Patch
+*** Add File: provider/broker_prod.py
++#!/usr/bin/env python3
++"""
++Production broker service that uses Postgres-backed state and durable model artifacts.
++Wraps provider/broker_state_postgres persistence layer and exposes select/ingest endpoints.
++Includes Prometheus metrics for cost-savings and safety signals.
++"""
++import os
++import json
++from flask import Flask, request, jsonify
++from prometheus_client import Counter, Gauge, start_http_server
++from provider.broker_state_postgres import persist_telemetry, save_model_artifact, list_models
++
++app = Flask("provider-broker-prod")
++INGESTED = Counter("aegis_broker_ingested_total", "Telemetry ingested", ["provider"])
++SELECTIONS = Counter("aegis_broker_selections_total", "Selections made", ["selected", "mode"])
++COST_SAVED = Gauge("aegis_broker_cost_saved_usd", "Estimated cost saved by broker decisions (USD)")
++FIDELITY_UPLIFT = Gauge("aegis_broker_fidelity_uplift", "Observed fidelity uplift (fraction)")
++
++@app.route("/ingest", methods=["POST"])
++def ingest():
++    rec = request.json or {}
++    job_id = rec.get("job_id")
++    persist_telemetry(job_id or "unknown", rec)
++    INGESTED.labels(provider=rec.get("provider","unknown")).inc()
++    return jsonify({"ok": True})
++
++@app.route("/select", methods=["POST"])
++def select():
++    payload = request.json or {}
++    candidates = payload.get("candidates", [])
++    mode = payload.get("mode", "prod")
++    # simple heuristic for prod: prefer lowest cost while respecting mode
++    best = None; best_val = float("inf")
++    for c in candidates:
++        meta = c.get("meta", {})
++        val = meta.get("cost_per_job", 1.0) + 0.0001 * meta.get("latency_ms",100)
++        if val < best_val:
++            best_val = val; best = c.get("name")
++    SELECTIONS.labels(selected=best or "none", mode=mode).inc()
++    return jsonify({"selected": best, "mode": mode})
++
++@app.route("/models", methods=["GET"])
++def models():
++    return jsonify({"models": list_models()})
++
++def start_metrics_server(port=9187):
++    start_http_server(port)
++    print("Prometheus metrics exposed on port", port)
++
++if __name__ == "__main__":
++    start_metrics_server(int(os.environ.get("METRICS_PORT", "9187")))
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
++
+*** End Patch
+*** Begin Patch
+*** Add File: provider/learner/evaluate_ab_results.py
++#!/usr/bin/env python3
++"""
++Evaluate A/B experiment results for learned broker or mitigation experiments.
++ - Accepts two lists of numeric observations (A baseline, B experiment)
++ - Computes effect size, t-test (Welch), confidence interval and writes JSON verdict
++ - Returns pass/fail based on configurable thresholds
++"""
++import argparse, json
++import math
++from statistics import mean, pvariance
++from math import sqrt
++import scipy.stats as stats
++
++def welch_ttest(a, b):
++    ma = mean(a); mb = mean(b)
++    va = pvariance(a); vb = pvariance(b)
++    na = len(a); nb = len(b)
++    se = math.sqrt((va/na) + (vb/nb))
++    t = (mb - ma) / se if se > 0 else 0.0
++    # degrees of freedom (Welch–Satterthwaite)
++    df = ((va/na + vb/nb)**2) / ((va*va)/(na*na*(na-1)) + (vb*vb)/(nb*nb*(nb-1))) if na>1 and nb>1 else 1
++    p = 1.0
++    try:
++        p = stats.t.sf(abs(t), df)*2
++    except Exception:
++        p = 1.0
++    return {"t": t, "p_value": p, "ma": ma, "mb": mb, "effect": (mb-ma)}
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--a", required=True, help="JSON array for baseline (A)")
++    p.add_argument("--b", required=True, help="JSON array for experiment (B)")
++    p.add_argument("--alpha", type=float, default=0.05)
++    p.add_argument("--min_effect", type=float, default=0.01)
++    p.add_argument("--out", default="/tmp/ab_result.json")
++    args = p.parse_args()
++    A = json.loads(args.a)
++    B = json.loads(args.b)
++    res = welch_ttest(A,B)
++    verdict = {"passed": False, "reason": ""}
++    if res["p_value"] < args.alpha and abs(res["effect"]) >= args.min_effect:
++        verdict["passed"] = True
++        verdict["reason"] = f"Significant effect: {res['effect']} (p={res['p_value']})"
++    else:
++        verdict["passed"] = False
++        verdict["reason"] = f"No significant effect (effect={res['effect']}, p={res['p_value']})"
++    out = {"result": res, "verdict": verdict}
++    with open(args.out, "w") as fh:
++        json.dump(out, fh, indent=2)
++    print("Wrote evaluation to", args.out)
++    if not verdict["passed"]:
++        raise SystemExit(2)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: metrics/grafana/broker_ab_dashboard.json
++{
++  "dashboard": {
++    "title": "Broker A/B & Impact",
++    "panels": [
++      {
++        "type": "graph",
++        "title": "Cost Saved by Broker (USD)",
++        "targets": [
++          { "expr": "aegis_broker_cost_saved_usd", "legendFormat": "cost_saved" }
++        ]
++      },
++      {
++        "type": "graph",
++        "title": "Fidelity Uplift (fraction)",
++        "targets": [
++          { "expr": "aegis_broker_fidelity_uplift", "legendFormat": "uplift" }
++        ]
++      },
++      {
++        "type": "stat",
++        "title": "A/B Last Verdict",
++        "targets": [
++          { "expr": "last_over_time(aegis_broker_ab_verdict[1d])", "legendFormat": "ab_verdict" }
++        ]
++      }
++    ]
++  }
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File: docs/DR_BCP.md
++# Disaster Recovery & Business Continuity Plan (Aegis) — Summary Runbook
++
+## Objectives
+- RTO: restore core control plane (k8s control plane + broker + mlflow) within 2 hours.
+- RPO: 1 hour for critical telemetry and ledger; up to 24 hours for experimental artifacts.
+
+## Key Components & Backups
+- Postgres (broker + mlflow): WAL streaming to replica; daily logical backups to S3.
+- Object store (S3/MinIO): replication & lifecycle; hourly snapshot export.
+- Vault: ensure disaster recovery configuration using integrated storage backend (Raft) and unseal keys stored offline.
+- HSM: key escrow & emergency rotation runbook — maintain second HSM in separate region as hot-standby.
+
+## Recovery Steps (high level)
+1. Bring up infra in new region: provisioning scripts (Terraform).
+2. Restore Postgres from latest WAL/backup.
+3. Restore MinIO/S3 artifacts from snapshot.
+4. Re-deploy MLflow server (ensure backend store points to restored Postgres + S3).
+5. Re-deploy provider broker and confirm /state healthy and model artifacts accessible.
+6. Run smoke tests (nightly verification script) to validate generative, agent, quantum flows.
+7. Notify stakeholders and update incident ticket.
+
+## Exercises
+- Quarterly DR test: run full restore in staging environment and generate sign-off evidence.
+- Document RTO/RPO results and iterate.
+
+*** End Patch
+*** Begin Patch
+*** Add File: .github/workflows/pen_test_schedule.yml
++name: Penetration Testing Schedule (reminder / ticket)
++on:
++  schedule:
++    - cron: "0 8 1 */3 *" # run on first day of every quarter at 08:00 UTC
++  workflow_dispatch:
++
++jobs:
++  create-issue:
++    runs-on: ubuntu-latest
++    steps:
++      - name: Create GitHub issue to schedule pen-test
++        uses: peter-evans/create-issue@v4
++        with:
++          token: ${{ secrets.GITHUB_TOKEN }}
++          title: "Quarterly penetration test — schedule and scope"
++          body: |
++            This is an automated reminder to schedule the quarterly penetration test for Aegis.
++            - Prepare scope: control plane, brokers, provider adapters, MLflow, image registry
++            - Ensure evidence collection path is ready (signoff/audit_package)
++            - Provide contact and window availability
++          labels: security, pen-test
++
+*** End Patch
+*** Begin Patch
+*** Add File: signoff/collect_evidence.sh
++#!/usr/bin/env bash
++set -euo pipefail
++OUT_DIR=${1:-/tmp/aegis_audit_evidence}
++mkdir -p "$OUT_DIR"
++echo "Collecting evidence to $OUT_DIR"
++# Example artifacts to collect - adapt to your environment
++cp /tmp/attestation_batch_report.json "$OUT_DIR/" 2>/dev/null || true
++cp /tmp/attestation_batch_report.json "$OUT_DIR/" 2>/dev/null || true
++aws s3 cp s3://aegis-logs/cloudhsm_audit.json "$OUT_DIR/cloudhsm_audit.json" 2>/dev/null || true
++cp signoff/aegis_signoff.md "$OUT_DIR/" 2>/dev/null || true
++tar -czf "/tmp/aegis_audit_package_$(date -u +%Y%m%dT%H%M%SZ).tgz" -C "$OUT_DIR" .
++echo "Wrote /tmp/aegis_audit_package_*.tgz"
++
+*** End Patch
+*** End Patch

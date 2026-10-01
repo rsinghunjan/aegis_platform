@@ -1,0 +1,415 @@
+*** Begin Patch
+*** Add File:services/attestation_verifier/pcr_policy_templates.json
++{
++  "device_profiles": {
++    "edge_controller_v1": {
++      "description": "Controller unit (edge) baseline PCR policy",
++      "required_pcrs": {
++        "0": "e3b0c44298fc1c149afbf4c8996fb924", 
++        "7": "00000000000000000000000000000000"
++      }
++    },
++    "robot_arm_v2": {
++      "description": "Robot arm runtime policy (example)",
++      "required_pcrs": {
++        "0": "e3b0c44298fc1c149afbf4c8996fb924",
++        "7": "cafebabecafebabecafebabecafebabe"
++      }
++    }
++  },
++  "notes": "Replace these example PCR hex values with measured PCR digests from your security team using tpm2 tools."
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:scripts/finalize_pcr_and_sign.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Finalize PCR policy, sign with KMS/HSM (example AWS KMS) and push to k8s secret for attestation verifier.
++#
++POLICY_TEMPLATE=${1:-services/attestation_verifier/pcr_policy_templates.json}
++PROFILE=${2:-edge_controller_v1}
++KMS_KEY_ARN=${KMS_KEY_ARN:-""}   # set ENV or export before running
++S3_UPLOAD_BUCKET=${S3_UPLOAD_BUCKET:-""}
++K8S_SECRET_NAME=${K8S_SECRET_NAME:-attestation-signed-policy}
++K8S_NS=${K8S_NS:-attestation}
++
++if [ -z "$KMS_KEY_ARN" ]; then
++  echo "Set KMS_KEY_ARN environment variable to your KMS key ARN (e.g. arn:aws:kms:...)" >&2
++  exit 2
++fi
++
++tmp=$(mktemp -d)
++policy_file="$tmp/policy.json"
++signed_file="$tmp/signed_policy.json"
++
++jq --arg p "$PROFILE" '.device_profiles[$p]' "$POLICY_TEMPLATE" > "$policy_file"
++echo "Selected policy profile: $PROFILE -> $policy_file"
++
++echo "Signing policy via AWS KMS..."
++python3 services/attestation_verifier/policy_kms_sign_aws.py sign --policy "$policy_file" --key-id "$KMS_KEY_ARN" --out "$signed_file"
++
++echo "Uploading signed policy to S3 (optional)..."
++if [ -n "$S3_UPLOAD_BUCKET" ]; then
++  aws s3 cp "$signed_file" "s3://${S3_UPLOAD_BUCKET}/attestation/signed_policy_${PROFILE}.json"
++fi
++
++echo "Creating k8s secret with signed policy"
++kubectl -n "$K8S_NS" create secret generic "$K8S_SECRET_NAME" --from-file=signed_policy.json="$signed_file" --dry-run=client -o yaml | kubectl apply -f -
++
++echo "Open GitHub issue requesting Security signoff (requires gh CLI)"
++ISS_TITLE="Security: PCR policy signed for profile ${PROFILE} - request signoff"
++ISS_BODY="Signed PCR policy for ${PROFILE} uploaded and installed to cluster namespace ${K8S_NS} as secret ${K8S_SECRET_NAME}.\n\nPlease review and sign off. Signed policy S3 (if uploaded): s3://${S3_UPLOAD_BUCKET}/attestation/signed_policy_${PROFILE}.json\n\nKMS Key: ${KMS_KEY_ARN}"
++if command -v gh >/dev/null 2>&1; then
++  gh issue create --title "$ISS_TITLE" --body "$ISS_BODY" --label security --assignee @me || true
++else
++  echo "Install gh CLI to auto-create PR/issue. Policy is ready in k8s secret."
++fi
++
++echo "Done. Security team: verify attached policy and run hardware attestation tests (hardware_attest_test.py) on representative devices."
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/cosign_kms_and_admission.yml
++name: Build, Sign with KMS Cosign and Validate Admission
++on:
++  workflow_dispatch:
++
++jobs:
++  build-and-sign:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Build image
++        run: |
++          IMAGE="${{ secrets.DOCKER_REGISTRY }}/aegis/gen-model:${GITHUB_SHA::8}"
++          docker build -t "$IMAGE" services/gen_model
++          docker push "$IMAGE"
++          echo "IMAGE=$IMAGE" >> $GITHUB_OUTPUT
++      - name: Cosign sign with AWS KMS
++        env:
++          COSIGN_EXPERIMENTAL: "1"
++        run: |
++          IMAGE="${{ steps.build-and-sign.outputs.IMAGE }}"
++          echo "Signing $IMAGE via AWS KMS"
++          cosign sign --key "kms://${{ secrets.COSIGN_AWS_KMS_KEY_ARN }}" "$IMAGE"
++          echo "SIGNED_IMAGE=$IMAGE" >> $GITHUB_OUTPUT
++
++  admission-test:
++    runs-on: ubuntu-latest
++    needs: build-and-sign
++    steps:
++      - name: Configure kubectl
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG }}
++        run: echo "kubeconfig set"
++      - name: Ensure Kyverno installed
++        run: |
++          kubectl -n kyverno get deployment kyverno >/dev/null 2>&1 || kubectl apply -f https://raw.githubusercontent.com/kyverno/kyverno/main/config/release/install.yaml
++          sleep 10
++      - name: Apply require-signed-images policy
++        run: |
++          kubectl apply -f security/kyverno/require-signed-images-namespace.yaml
++      - name: Try to create unsigned pod (should be denied)
++        run: |
++          cat > unsigned-pod.yaml <<'EOF'
++          apiVersion: v1
++          kind: Pod
++          metadata:
++            name: unsigned-test
++            namespace: inference
++          spec:
++            containers:
++            - name: app
++              image: "${{ secrets.DOCKER_REGISTRY }}/aegis/gen-model:unsigned"
++          EOF
++          if kubectl apply -f unsigned-pod.yaml 2>/tmp/err; then
++            echo "ERROR: unsigned pod admitted"; kubectl get pod -n inference unsigned-test || true; exit 1
++          else
++            echo "Unsigned pod correctly denied"
++          fi
++      - name: Deploy signed pod (should be allowed)
++        run: |
++          IMAGE="${{ steps.build-and-sign.outputs.IMAGE }}"
++          cat > signed-pod.yaml <<'EOF'
++          apiVersion: v1
++          kind: Pod
++          metadata:
++            name: signed-test
++            namespace: inference
++          spec:
++            containers:
++            - name: app
++              image: "${IMAGE}"
++          EOF
++          kubectl apply -f signed-pod.yaml
++          kubectl -n inference wait --for=condition=Ready pod/signed-test --timeout=60s || true
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/safety/apply_thresholds_and_deploy.sh
++#!/usr/bin/env bash
++set -euo pipefail
++THRESH_FILE=${1:-/tmp/thresholds.json}
++if [ ! -f "$THRESH_FILE" ]; then
++  echo "Threshold file not found: $THRESH_FILE" >&2
++  exit 2
++fi
++kubectl -n safety create configmap safety-thresholds --from-file=thresholds.json="$THRESH_FILE" --dry-run=client -o yaml | kubectl apply -f -
++echo "Thresholds deployed as configmap/safety-thresholds in namespace 'safety'"
++kubectl -n safety rollout restart deployment safety-detectors || true
++echo "safety-detectors restarted to pick up thresholds"
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/safety_calibrate_deploy.yml
++name: Calibrate Safety Thresholds and Deploy
++on:
++  workflow_dispatch:
++
++jobs:
++  calibrate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Install deps
++        run: |
++          python -m pip install --upgrade pip
++          pip install detoxify
++      - name: Run calibration (operator must supply SAFETY_CALIB_DATA secret content)
++        env:
++          SAFETY_CALIB_DATA: ${{ secrets.SAFETY_CALIB_DATA }}
++        run: |
++          if [ -n "${SAFETY_CALIB_DATA}" ]; then
++            echo "${SAFETY_CALIB_DATA}" > calib.jsonl
++            python ops/safety/calibrate_thresholds.py --in calib.jsonl --out thresholds.json
++            gh release create safety-thresholds-${GITHUB_SHA::8} --notes-file thresholds.json || true
++          else
++            echo "No SAFETY_CALIB_DATA provided; skipping calibration"
++          fi
++
++  deploy-thresholds:
++    needs: calibrate
++    runs-on: ubuntu-latest
++    steps:
++      - name: Download thresholds.json if present
++        run: |
++          gh release download safety-thresholds-* --pattern thresholds.json || true
++      - name: Deploy to cluster
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG }}
++        run: |
++          if [ -f thresholds.json ]; then
++            ./ops/safety/apply_thresholds_and_deploy.sh thresholds.json
++          else
++            echo "No thresholds artifact found; skip deploy"
++          fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/evidence_store/setup_s3_object_lock.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Create an S3 bucket with Object Lock enabled (requires special AWS configuration: bucket must be created with ObjectLock enabled).
++# This script demonstrates the steps; operators must ensure AWS account & region support Object Lock and that the bucket is created with ObjectLock enabled.
++#
++BUCKET=$1
++REGION=${2:-us-west-2}
++if [ -z "$BUCKET" ]; then
++  echo "Usage: $0 <bucket-name> [region]" >&2
++  exit 2
++fi
++
++aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" --create-bucket-configuration LocationConstraint="$REGION"
++aws s3api put-bucket-versioning --bucket "$BUCKET" --versioning-configuration Status=Enabled
++echo "NOTE: To enable Object Lock, the bucket must be created with ObjectLockEnabledForBucket=true via S3 control or the AWS console. Use the console or S3Control APIs for creation with Object Lock."
++echo "Bucket $BUCKET created (versioning enabled). Configure Object Lock via console if required."
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/quant/perf_benchmark.py
++#!/usr/bin/env python3
++"""
++Inference performance benchmark for a model using HuggingFace transformers.
++Measures throughput and latency for generate() over a small set of prompts.
++"""
++import time, argparse
++import torch
++from transformers import AutoModelForCausalLM, AutoTokenizer
++
++def bench(model_name_or_path, prompts, batch_size=1, device='cuda'):
++    model = AutoModelForCausalLM.from_pretrained(model_name_or_path).to(device)
++    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
++    model.eval()
++    inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
++    # warmup
++    for _ in range(3):
++        _ = model.generate(**inputs, max_length=32)
++    # timed runs
++    iters = 10
++    t0 = time.time()
++    for _ in range(iters):
++        _ = model.generate(**inputs, max_length=32)
++    t1 = time.time()
++    total = t1 - t0
++    print(f"Ran {iters} iterations in {total:.2f}s; avg {total/iters:.3f}s per batch")
++
++if __name__=="__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--model", default="distilgpt2")
++    p.add_argument("--prompts", default="Hello world")
++    p.add_argument("--batch", type=int, default=1)
++    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
++    args = p.parse_args()
++    prompts = [args.prompts] * args.batch
++    bench(args.model, prompts, batch_size=args.batch, device=args.device)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/training/checkpoint_resume_test.py
++#!/usr/bin/env python3
++"""
++Simple checkpoint resume test:
++ - Simulates training that periodically writes checkpoint files
++ - Simulates a failure and restarts training resuming from last checkpoint
++ - Verifies that checkpoint files are present and that resume logic loads previous state
++"""
++import os, time, json, argparse
++
++CKPT_DIR = "./tmp_ckpts"
++
++def create_checkpoint(step):
++    os.makedirs(CKPT_DIR, exist_ok=True)
++    path = os.path.join(CKPT_DIR, f"ckpt_{step}.json")
++    open(path,"w").write(json.dumps({"step": step, "ts": time.time()}))
++    print("Wrote", path)
++
++def latest_checkpoint():
++    if not os.path.exists(CKPT_DIR):
++        return None
++    files = sorted([f for f in os.listdir(CKPT_DIR) if f.startswith("ckpt_")])
++    if not files:
++        return None
++    return os.path.join(CKPT_DIR, files[-1])
++
++def run_training(steps=5, fail_at=3):
++    print("Starting synthetic training")
++    for s in range(1, steps+1):
++        create_checkpoint(s)
++        time.sleep(1)
++        if s == fail_at:
++            print("Simulate crash")
++            return
++
++def resume_training(total_steps=8):
++    ck = latest_checkpoint()
++    if ck:
++        print("Resuming from", ck)
++        state = json.load(open(ck))
++        start = state["step"] + 1
++    else:
++        start = 1
++    for s in range(start, total_steps+1):
++        create_checkpoint(s)
++        time.sleep(1)
++    print("Resume complete")
++
++if __name__=="__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--run-steps", type=int, default=5)
++    p.add_argument("--fail-at", type=int, default=3)
++    p.add_argument("--resume-to", type=int, default=8)
++    args = p.parse_args()
++    run_training(steps=args.run_steps, fail_at=args.fail_at)
++    print("Now resume")
++    resume_training(total_steps=args.resume_to)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/sim/attach_proofs_and_request_sme_wrapper.py
++#!/usr/bin/env python3
++"""
++Wrapper: run sim stress, produce a formal proof stub (Z3), upload artifacts, and create SME issue.
++Uses ops/sim/stress_runner.py and ops/formal/z3_proofs/lyapunov_check.py
++"""
++import subprocess, json, os, sys
++
++def run_sim_and_prove(runs=200, concurrency=8):
++    print("Running sim stress")
++    subprocess.check_call(["python","ops/sim/stress_runner.py","--runs",str(runs),"--concurrency",str(concurrency),"--out","sim_report.json"])
++    print("Run Z3 proof stub")
++    subprocess.check_call(["python","ops/formal/z3_proofs/lyapunov_check.py"])
++    # attach via earlier helper
++    subprocess.check_call(["python","ops/sim/attach_proofs_and_request_sme.py","sim_report.json","lyapunov_proof.json"])
++
++if __name__=="__main__":
++    run_sim_and_prove()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/monitoring/test_auto_fallback.sh
++#!/usr/bin/env bash
++set -euo pipefail
++# This script simulates a drift event and waits for the auto-fallback controller to act.
++DRIFT_SCORE=${1:-1.0}
++EVIDENCE_PATH=${EVIDENCE_PATH:-/tmp/last_drift.json}
++TARGET_DEP=${TARGET_DEPLOYMENT:-monitoring/gen-deployment}
++FALLBACK_IMAGE=${FALLBACK_IMAGE:-"ghcr.io/example/aegis-gen:baseline"}
++
++echo "{\"ts\": $(date +%s), \"drift_score\": ${DRIFT_SCORE}}" > "${EVIDENCE_PATH}"
++echo "Wrote drift score ${DRIFT_SCORE} to ${EVIDENCE_PATH}"
++echo "Waiting up to 120s for auto-fallback controller to patch deployment ${TARGET_DEP}"
++for i in $(seq 1 24); do
++  sleep 5
++  ns=${TARGET_DEP%%/*}
++  name=${TARGET_DEP#*/}
++  current=$(kubectl -n "${ns}" get deploy "${name}" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
++  echo "Current image: $current"
++  if [[ "$current" == *"${FALLBACK_IMAGE}"* ]]; then
++    echo "Fallback image applied"
++    exit 0
++  fi
++done
++echo "Auto-fallback not observed within timeout"
++exit 2
++
+*** End Patch
+*** Begin Patch
+*** Add File:terraform/secrets_manager_reference.tf
++/*
++Example: Reference AWS Secrets Manager secret in Terraform for DATABASE_URL instead of plaintext tfvars.
++*/
++data "aws_secretsmanager_secret_version" "database_url" {
++  secret_id = var.database_url_secret_arn
++}
++
++variable "database_url_secret_arn" {
++  type = string
++}
++
++output "database_url_value" {
++  value = data.aws_secretsmanager_secret_version.database_url.secret_string
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/ci/scan_and_block_if_plaintext.yml
++name: Scan repository for plaintext secrets and fail
++on:
++  workflow_dispatch:
++
++jobs:
++  scan:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run plaintext scanner
++        run: |
++          set -e
++          ./ops/terraform/scan_and_fail_if_plaintext.sh
++
+*** End Patch
+*** End Patch

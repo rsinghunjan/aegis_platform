@@ -1,0 +1,54 @@
+  7
+  8
+  9
+ 10
+ 11
+ 12
+ 13
+ 14
+ 15
+ 16
+ 17
+ 18
+ 19
+ 20
+ 21
+ 22
+ 23
+ 24
+ 25
+ 26
+ 27
+ 28
+ 29
+ 30
+#!/usr/bin/env python3
+"""
+Helper to obtain cosign public key either from mounted ExternalSecret path or Vault.
+
+get_cosign_pubkey_path() returns a filesystem path to a pubkey file (or None).
+"""
+from __future__ import annotations
+import os
+from pathlib import Path
+import tempfile
+import requests
+
+def get_cosign_pubkey_path(vault_kv_v2_path: str = None, mounted_path: str = "/etc/cosign/cosign_pub.pem"):
+    # prefer mounted ExternalSecret
+    if os.path.exists(mounted_path):
+        return mounted_path
+    # fallback to Vault KV v2 path e.g. "secret/data/aegis/cosign"
+    if vault_kv_v2_path and os.environ.get("VAULT_ADDR") and os.environ.get("VAULT_TOKEN"):
+        vault_addr = os.environ["VAULT_ADDR"].rstrip("/")
+        token = os.environ["VAULT_TOKEN"]
+        url = f"{vault_addr}/v1/{vault_kv_v2_path}"
+        r = requests.get(url, headers={"X-Vault-Token": token}, timeout=10)
+        r.raise_for_status()
+        data = r.json().get("data", {}).get("data") or {}
+        pub = data.get("public_key")
+        if pub:
+            tmp = Path(tempfile.mkdtemp()) / "cosign_pub.pem"
+            tmp.write_text(pub, encoding="utf-8")
+            return str(tmp)
+    return None

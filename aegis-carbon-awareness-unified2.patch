@@ -1,0 +1,481 @@
+*** Begin Patch
+*** Add File:services/training/train_with_carbon.py
++#!/usr/bin/env python3
++"""
++Training script instrumented with CodeCarbon to estimate emissions.
++Logs emissions to MLflow, MCP, and pushes a Prometheus metric to a pushgateway.
++
++Usage:
++ - Run this as the training job in Argo / locally.
++ - Configure MLFLOW_TRACKING_URI, MCP endpoint, and PROM_PUSHGATEWAY in env.
++"""
++import os
++import time
++import tempfile
++import joblib
++import requests
++from sklearn.linear_model import LogisticRegression
++from sklearn.datasets import load_iris
++from sklearn.model_selection import train_test_split
++from sklearn.metrics import accuracy_score
++
++try:
++    from codecarbon import EmissionsTracker
++except Exception:
++    EmissionsTracker = None
++
++import mlflow
++
++MLFLOW_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow:5000")
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++PUSHGATEWAY = os.environ.get("PROM_PUSHGATEWAY", "")
++PROJECT_NAME = os.environ.get("PROJECT_NAME", "aegis-train")
++
++mlflow.set_tracking_uri(MLFLOW_URI)
++
++
++def push_emissions_metric(run_id, emissions_kg):
++    if not PUSHGATEWAY:
++        return
++    try:
++        from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
++        registry = CollectorRegistry()
++        g = Gauge('aegis_training_emissions_kg', 'Estimated kg CO2e for training run', registry=registry)
++        g.set(emissions_kg)
++        push_to_gateway(PUSHGATEWAY, job=f"train-{run_id}", registry=registry)
++    except Exception:
++        pass
++
++
++def notify_mcp(event):
++    try:
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/monitoring/emissions", json=event, timeout=3.0)
++    except Exception:
++        pass
++
++
++def train_and_log():
++    X, y = load_iris(return_X_y=True)
++    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
++    clf = LogisticRegression(max_iter=1000)
++
++    # Start MLflow run
++    with mlflow.start_run(run_name=f"{PROJECT_NAME}-{int(time.time())}") as run:
++        run_id = run.info.run_id
++        mlflow.log_param("model", "logistic_regression")
++        # Start emissions tracker if available
++        emissions_kg = None
++        tracker = None
++        if EmissionsTracker is not None:
++            try:
++                tracker = EmissionsTracker(project_name=PROJECT_NAME, output_dir="/tmp/codecarbon")
++                tracker.start()
++            except Exception:
++                tracker = None
++
++        # Train
++        start = time.time()
++        clf.fit(X_train, y_train)
++        duration = time.time() - start
++        preds = clf.predict(X_test)
++        acc = float(accuracy_score(y_test, preds))
++
++        # Stop tracker and collect emissions
++        if tracker is not None:
++            try:
++                emissions_kg = tracker.stop()
++            except Exception:
++                try:
++                    emissions_kg = float(getattr(tracker, "_last_emissions", 0.0))
++                except Exception:
++                    emissions_kg = None
++
++        # Save model artifact
++        with tempfile.TemporaryDirectory() as td:
++            model_path = f"{td}/model.joblib"
++            joblib.dump(clf, model_path)
++            mlflow.log_artifact(model_path, artifact_path="model")
++
++        # Log metrics
++        mlflow.log_metric("accuracy", acc)
++        mlflow.log_metric("train_duration_seconds", duration)
++        if emissions_kg is not None:
++            mlflow.log_metric("emissions_kgco2e", float(emissions_kg))
++            push_emissions_metric(run_id, float(emissions_kg))
++            notify_mcp({"run_id": run_id, "emissions_kg": float(emissions_kg), "duration_s": duration, "project": PROJECT_NAME})
++
++        print("Run:", run_id, "accuracy:", acc, "emissions_kg:", emissions_kg)
++        return run_id, acc, emissions_kg
++
++
++if __name__ == "__main__":
++    train_and_log()
++
+*** End File
+*** Add File:services/inference/inference_emissions_wrapper.py
++#!/usr/bin/env python3
++"""
++A small wrapper to measure/estimate emissions for batch inference using CodeCarbon.
++Intended to be called around heavy batch inference jobs to record per-batch emissions.
++It logs emissions to MCP and pushes a Prometheus metric to a pushgateway.
++"""
++import os
++import time
++import requests
++
++try:
++    from codecarbon import EmissionsTracker
++except Exception:
++    EmissionsTracker = None
++
++PUSHGATEWAY = os.environ.get("PROM_PUSHGATEWAY", "")
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++
++
++def push_emissions_metric(job_name, emissions_kg):
++    if not PUSHGATEWAY:
++        return
++    try:
++        from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
++        registry = CollectorRegistry()
++        g = Gauge('aegis_inference_emissions_kg', 'Estimated kg CO2e for inference batch', registry=registry)
++        g.set(emissions_kg)
++        push_to_gateway(PUSHGATEWAY, job=job_name, registry=registry)
++    except Exception:
++        pass
++
++
++def run_with_emissions(job_name, func, *args, **kwargs):
++    tracker = None
++    if EmissionsTracker is not None:
++        try:
++            tracker = EmissionsTracker(project_name="aegis-inference", output_dir="/tmp/codecarbon")
++            tracker.start()
++        except Exception:
++            tracker = None
++    start = time.time()
++    result = func(*args, **kwargs)
++    duration = time.time() - start
++    emissions = None
++    if tracker is not None:
++        try:
++            emissions = tracker.stop()
++        except Exception:
++            try:
++                emissions = float(getattr(tracker, "_last_emissions", 0.0))
++            except Exception:
++                emissions = None
++    if emissions is not None:
++        push_emissions_metric(job_name, float(emissions))
++        try:
++            requests.post(f"{AEGIS_MCP.rstrip('/')}/monitoring/emissions", json={"job": job_name, "emissions_kg": float(emissions), "duration_s": duration}, timeout=3.0)
++        except Exception:
++            pass
++    return result
++
+*** End File
+*** Add File:services/carbon/carbon_scheduler.py
++#!/usr/bin/env python3
++"""
++Carbon-aware scheduler:
++- Polls a configurable carbon-intensity API (or uses a stub) and when intensity is below a configured threshold
++  it submits queued Argo Workflow YAMLs (found in CARBON_QUEUE_DIR) using `kubectl apply -f`.
++- This is intentionally simple and runs as a small controller on the cluster.
++
++Config (env):
++ - CARBON_API_URL: optional JSON API returning {"carbon_intensity": <gCO2eq/kWh>} or leave empty to use stubbed values.
++ - CARBON_THRESHOLD: gCO2eq/kWh threshold below which jobs are allowed (default 200).
++ - CARBON_QUEUE_DIR: directory with workflow yaml files to submit (default /data/carbon_queue)
++ - SUBMITTED_DIR: directory to move submitted files (default /data/carbon_submitted)
++ - POLL_SECONDS: how often to poll (default 300)
++"""
++import os
++import time
++import shutil
++import subprocess
++import requests
++
++CARBON_API_URL = os.environ.get("CARBON_API_URL", "")
++CARBON_THRESHOLD = float(os.environ.get("CARBON_THRESHOLD", "200.0"))
++CARBON_QUEUE_DIR = os.environ.get("CARBON_QUEUE_DIR", "/data/carbon_queue")
++SUBMITTED_DIR = os.environ.get("SUBMITTED_DIR", "/data/carbon_submitted")
++POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "300"))
++
++os.makedirs(CARBON_QUEUE_DIR, exist_ok=True)
++os.makedirs(SUBMITTED_DIR, exist_ok=True)
++
++
++def get_carbon_intensity():
++    if not CARBON_API_URL:
++        # stub: return a simple diurnal pattern to allow local testing (lower at night)
++        h = time.gmtime().tm_hour
++        return 50.0 if (h >= 0 and h <= 6) else 250.0
++    try:
++        r = requests.get(CARBON_API_URL, timeout=5.0)
++        r.raise_for_status()
++        j = r.json()
++        return float(j.get("carbon_intensity", j.get("value", 999.0)))
++    except Exception:
++        return 999.0
++
++
++def submit_workflow(path):
++    try:
++        subprocess.check_call(["kubectl", "apply", "-f", path])
++        return True
++    except subprocess.CalledProcessError:
++        return False
++
++
++def main():
++    while True:
++        intensity = get_carbon_intensity()
++        # log locally
++        print("current carbon intensity (gCO2eq/kWh):", intensity)
++        if intensity <= CARBON_THRESHOLD:
++            # submit all queued workflows
++            for f in sorted(os.listdir(CARBON_QUEUE_DIR)):
++                if not f.endswith((".yaml", ".yml")):
++                    continue
++                path = os.path.join(CARBON_QUEUE_DIR, f)
++                print("Attempting to submit", path)
++                ok = submit_workflow(path)
++                if ok:
++                    dst = os.path.join(SUBMITTED_DIR, f"{int(time.time())}-{f}")
++                    shutil.move(path, dst)
++                    print("Submitted and moved to", dst)
++                else:
++                    print("Submission failed for", path)
++        else:
++            print("Carbon intensity above threshold, delaying submissions.")
++        time.sleep(POLL_SECONDS)
++
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:services/promotion/check_and_promote_carbon.py
++#!/usr/bin/env python3
++"""
++Promotion guard that includes carbon checks.
++ - Checks latest staging model accuracy and emissions_kgco2e metric (if present).
++ - Uses a policy: (accuracy_gain / emissions_kg) >= MIN_GAIN_PER_KG  OR emissions_kg <= MAX_EMISSIONS_PER_PROMOTION
++ - If policy fails, opens an A2A approval request and includes carbon metadata in the request.
++"""
++import os
++import sys
++import requests
++from services.mlflow.mlflow_client import get_latest_model_metrics
++
++MODEL_NAME = os.environ.get("MODEL_NAME", "aegis-model")
++REQUIRED_ACCURACY = float(os.environ.get("REQUIRED_ACCURACY", "0.80"))
++MIN_GAIN_PER_KG = float(os.environ.get("MIN_GAIN_PER_KG", "0.01"))  # accuracy fraction per kgCO2e
++MAX_EMISSIONS_PER_PROMOTION = float(os.environ.get("MAX_EMISSIONS_PER_PROMOTION", "100.0"))  # kgCO2e
++A2A_API = os.environ.get("A2A_API", "http://approver:8080")
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++PRODUCTION_MODEL = os.environ.get("PRODUCTION_MODEL", "")
++
++
++def get_production_accuracy():
++    if not PRODUCTION_MODEL:
++        return 0.0
++    metrics = get_latest_model_metrics(PRODUCTION_MODEL, stage="Production")
++    if not metrics:
++        return 0.0
++    return float(metrics.get("accuracy", 0.0))
++
++
++def check_and_promote():
++    metrics = get_latest_model_metrics(MODEL_NAME, stage="Staging")
++    if not metrics:
++        print("no staging model found")
++        return 1
++    acc = float(metrics.get("accuracy", 0.0))
++    emissions = float(metrics.get("emissions_kgco2e", 0.0))
++    print("staging accuracy", acc, "emissions_kg", emissions)
++    prod_acc = get_production_accuracy()
++    acc_gain = max(0.0, acc - prod_acc)
++
++    # Decision logic
++    if acc >= REQUIRED_ACCURACY:
++        meets_carbon_policy = False
++        if emissions <= MAX_EMISSIONS_PER_PROMOTION:
++            meets_carbon_policy = True
++        elif emissions > 0 and (acc_gain / emissions) >= MIN_GAIN_PER_KG:
++            meets_carbon_policy = True
++
++        if meets_carbon_policy:
++            # proceed to request promotion (still via A2A for audit)
++            body = {"action_id": "promote-" + MODEL_NAME, "artifact_uri": f"mlflow://{MODEL_NAME}", "approver": "mlops", "decision": "requested", "comment": "auto-promotion request (carbon policy passed)"}
++            try:
++                r = requests.post(f"{A2A_API.rstrip('/')}/request", json=body, timeout=5.0)
++                if r.ok:
++                    print("A2A request opened", r.json().get("id"))
++                    requests.post(f"{AEGIS_MCP.rstrip('/')}/promotion/events", json={"model": MODEL_NAME, "accuracy": acc, "emissions_kg": emissions, "a2a": r.json().get("id")}, timeout=3.0)
++                    return 0
++            except Exception as e:
++                print("failed to open A2A", e)
++                return 1
++        else:
++            # Open A2A but include carbon advisory for human approver
++            body = {"action_id": "promote-" + MODEL_NAME, "artifact_uri": f"mlflow://{MODEL_NAME}", "approver": "mlops", "decision": "requested", "comment": "promotion blocked by carbon policy - approval required", "carbon": {"emissions_kg": emissions, "acc_gain": acc_gain}}
++            try:
++                r = requests.post(f"{A2A_API.rstrip('/')}/request", json=body, timeout=5.0)
++                if r.ok:
++                    print("A2A carbon advisory opened", r.json().get("id"))
++                    requests.post(f"{AEGIS_MCP.rstrip('/')}/promotion/events", json={"model": MODEL_NAME, "accuracy": acc, "emissions_kg": emissions, "a2a": r.json().get("id"), "carbon_policy": "requires_human"}, timeout=3.0)
++                    return 0
++            except Exception as e:
++                print("failed to open A2A", e)
++                return 1
++    else:
++        print("does not meet required accuracy")
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/promotion/events", json={"model": MODEL_NAME, "accuracy": acc, "promote": False}, timeout=3.0)
++        return 2
++
++
++if __name__ == "__main__":
++    sys.exit(check_and_promote())
++
+*** End File
+*** Add File:k8s/argo/training-workflow-carbon.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: model-training-
++  namespace: aegis-pipelines
++  annotations:
++    aegis.carbon-aware: "true"
++    aegis.carbon-window: "night"  # hint for external carbon scheduler
++spec:
++  entrypoint: train-pipeline
++  templates:
++    - name: train-pipeline
++      steps:
++        - - name: checkout
++            template: git-clone
++        - - name: snapshot-data
++            template: snapshot-data
++        - - name: train
++            template: train
++        - - name: register
++            template: register
++
++    - name: git-clone
++      container:
++        image: alpine/git:latest
++        command: [sh, -c]
++        args: ["git clone --depth 1 ${GIT_REPO} repo && ls repo"]
++      inputs:
++        parameters:
++          - name: GIT_REPO
++
++    - name: snapshot-data
++      container:
++        image: python:3.10-slim
++        command: [sh, -c]
++        args:
++          - pip install boto3 && python services/dvc/snapshot.py && echo "snapshot complete"
++
++    - name: train
++      container:
++        image: aegis/trainer:latest
++        env:
++          - name: MLFLOW_TRACKING_URI
++            value: "http://mlflow:5000"
++        command: [python, services/training/train_with_carbon.py]
++
++    - name: register
++      container:
++        image: aegis/registry-helper:latest
++        command: [sh, -c]
++        args: ["python services/mlflow/register_helper.py"]
++
+*** End File
+*** Add File:k8s/monitoring/prometheusrule-carbon.yaml
++apiVersion: monitoring.coreos.com/v1
++kind: PrometheusRule
++metadata:
++  name: aegis-carbon-alerts
++  namespace: monitoring
++spec:
++  groups:
++  - name: aegis.carbon.rules
++    rules:
++    - alert: TrainingEmissionsHigh
++      expr: increase(aegis_training_emissions_kg[7d]) > 500
++      for: 0m
++      labels:
++        severity: warning
++      annotations:
++        summary: "High cumulative training emissions"
++        description: "Total training emissions in the last 7 days exceeded 500 kg CO2e"
++
++    - alert: PromotionEmissionsExceeded
++      expr: aegis_promotion_last_emissions_kg > 200
++      for: 0m
++      labels:
++        severity: warning
++      annotations:
++        summary: "Promotion candidate emissions high"
++        description: "Latest promotion candidate reported emissions > 200 kg CO2e; check carbon policy"
++
+*** End File
+*** Add File:grafana/carbon_dashboard.json
++{
++  "dashboard": {
++    "title": "Aegis Carbon & Efficiency",
++    "panels": [
++      {
++        "type": "graph",
++        "title": "Training Emissions (kg) - last 30d",
++        "targets": [
++          { "expr": "sum(increase(aegis_training_emissions_kg[30d]))", "legendFormat": "Training emissions 30d" }
++        ]
++      },
++      {
++        "type": "graph",
++        "title": "Inference Emissions (kg) rate",
++        "targets": [
++          { "expr": "sum(rate(aegis_inference_emissions_kg[5m]))", "legendFormat": "inference kg/s" }
++        ]
++      },
++      {
++        "type": "singlestat",
++        "title": "Last Promotion Emissions (kg)",
++        "targets": [ { "expr": "aegis_promotion_last_emissions_kg" } ]
++      }
++    ]
++  }
++}
++
+*** End File
+*** Add File:docs/README_CARBON.md
++````markdown
++# Aegis Carbon Awareness — Overview & Usage
++
++This patch implements initial carbon-awareness features:
++
++- Instrument training and inference with CodeCarbon to estimate emissions (services/training/train_with_carbon.py, services/inference/inference_emissions_wrapper.py). Emissions are logged to MLflow, MCP and pushed to Prometheus pushgateway.
++- Carbon-aware scheduler that submits queued Argo training workflows when carbon intensity is below a configurable threshold (services/carbon/carbon_scheduler.py). Scheduler reads YAML workflows from CARBON_QUEUE_DIR and submits them via kubectl.
++- Promotion guard extended to consider emissions (services/promotion/check_and_promote_carbon.py). Promotion can be blocked or require A2A if emissions exceed configured budgets or if accuracy gain per kgCO2e is too low.
++- Argo training workflow annotated with carbon hints (k8s/argo/training-workflow-carbon.yaml).
++- Prometheus alerting rules and Grafana dashboard examples for carbon and efficiency monitoring (k8s/monitoring/prometheusrule-carbon.yaml, grafana/carbon_dashboard.json).
++
++Operator notes
++- Install CodeCarbon in your trainer/inference environments (pip install codecarbon).
++- Configure env vars: MLFLOW_TRACKING_URI, PROM_PUSHGATEWAY, AEGIS_MCP, CARBON_API_URL (optional), CARBON_THRESHOLD, CARBON_QUEUE_DIR.
++- Queue Argo workflow YAMLs in CARBON_QUEUE_DIR to have the carbon_scheduler submit them when carbon intensity is low.
++- Tune MIN_GAIN_PER_KG and MAX_EMISSIONS_PER_PROMOTION in check_and_promote_carbon.py to reflect organizational carbon policy.
++- Use cloud provider carbon APIs or ElectricityMap as CARBON_API_URL for real signals. The scheduler has a stub mode for local testing.
++- Add Prometheus metrics exporters and scrape pushgateway metrics; import the Grafana dashboard.
++
++Limitations & next steps
++- CodeCarbon provides estimates; for exact measurements integrate rack/PDUs or cloud provider carbon APIs.
++- Consider integrating a Kubernetes scheduler plugin for carbon-aware node selection for fine-grained placement.
++- Integrate spot/renewable instance selection via cluster autoscaler hooks and Argo nodeSelectors/affinity.
++````
++
+*** End File
+*** End Patch

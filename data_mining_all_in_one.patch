@@ -1,0 +1,277 @@
+*** Begin Patch
+*** Add File: argo/spark_fp_growth_cron.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: CronWorkflow
++metadata:
++  name: aegis-fp-growth-cron
++  namespace: aegis
++spec:
++  schedule: "0 2 * * *" # run daily at 02:00
++  concurrencyPolicy: "Forbid"
++  successfulJobsHistoryLimit: 3
++  failedJobsHistoryLimit: 1
++  timezone: "UTC"
++  workflowSpec:
++    entrypoint: fp-growth
++    arguments:
++      parameters:
++        - name: input-path
++          value: "s3://REPLACE_EVIDENCE_BUCKET/datasets/transactions_parquet/"
++        - name: items-col
++          value: "items_array"
++        - name: output-prefix
++          value: "s3://REPLACE_EVIDENCE_BUCKET/mining/fp_growth/{{workflow.uid}}"
++        - name: min-support
++          value: "0.01"
++        - name: min-confidence
++          value: "0.5"
++        - name: image-registry
++          value: "ghcr.io/yourorg"
++    templates:
++      - name: fp-growth
++        inputs:
++          parameters:
++            - name: input-path
++            - name: items-col
++            - name: output-prefix
++            - name: min-support
++            - name: min-confidence
++            - name: image-registry
++        container:
++          image: "{{inputs.parameters.image-registry}}/aegis-spark:latest"
++          command: ["/bin/bash","-lc"]
++          args:
++            - |
++              set -euo pipefail
++              echo "Running FP-Growth Spark job"
++              spark-submit --master k8s://https://kubernetes.default.svc \
++                --deploy-mode cluster \
++                --name fp-growth-job \
++                --conf spark.kubernetes.namespace=aegis \
++                --conf spark.kubernetes.authenticate.driver.serviceAccountName=spark \
++                /opt/spark/jobs/fp_growth_job.py \
++                --input "{{inputs.parameters.input-path}}" \
++                --items-col "{{inputs.parameters.items-col}}" \
++                --min-support "{{inputs.parameters.min-support}}" \
++                --min-confidence "{{inputs.parameters.min-confidence}}" \
++                --output "{{inputs.parameters.output-prefix}}"
++          resources:
++            limits:
++              cpu: "2000m"
++              memory: "8Gi"
++            requests:
++              cpu: "1000m"
++              memory: "4Gi"
+*** End Patch
+*** Begin Patch
+*** Add File: spark/fp_growth_job.py
++#!/usr/bin/env python3
++"""
++PySpark FP-Growth job
++- Reads transactions (Parquet or CSV) with a column of arrays of items
++- Runs MLlib FPGrowth to compute frequent itemsets and association rules
++- Writes outputs to S3 (parquet/json), logs artifacts to MLflow, archives & signs with cosign (KMS)
++"""
++import argparse, os, tempfile, tarfile, subprocess, json
++from pyspark.sql import SparkSession
++from pyspark.ml.fpm import FPGrowth
++import boto3
++import mlflow
++
++def parse_args():
++    p = argparse.ArgumentParser()
++    p.add_argument("--input", required=True)
++    p.add_argument("--items-col", default="items")
++    p.add_argument("--min-support", type=float, default=0.01)
++    p.add_argument("--min-confidence", type=float, default=0.5)
++    p.add_argument("--output", required=True)
++    p.add_argument("--mlflow-tracking-uri", default=os.environ.get("MLFLOW_TRACKING_URI"))
++    p.add_argument("--cosign-kms-arn", default=os.environ.get("COSIGN_KMS_ARN"))
++    return p.parse_args()
++
++def tar_and_upload(path, s3_prefix, cosign_kms=None):
++    archive = tempfile.mktemp(suffix=".tgz")
++    with tarfile.open(archive, "w:gz") as tar:
++        tar.add(path, arcname=os.path.basename(path))
++    # upload
++    parts = s3_prefix[5:].split("/",1)
++    bucket, prefix = parts[0], parts[1] if len(parts)>1 else ""
++    s3 = boto3.client("s3")
++    key = f"{prefix.rstrip('/')}/{os.path.basename(archive)}"
++    s3.upload_file(archive, bucket, key)
++    s3uri = f"s3://{bucket}/{key}"
++    sig = None
++    if cosign_kms:
++        try:
++            subprocess.check_call(["cosign","sign","--key",cosign_kms, archive])
++            sig = archive + ".sig"
++            s3.upload_file(sig, bucket, f"{prefix.rstrip('/')}/{os.path.basename(sig)}")
++        except Exception as e:
++            print("cosign sign failed:", e)
++    return s3uri, sig
++
++def main():
++    args = parse_args()
++    if args.mlflow_tracking_uri:
++        mlflow.set_tracking_uri(args.mlflow_tracking_uri)
++    spark = SparkSession.builder.appName("fp_growth_job").getOrCreate()
++    # read input
++    if args.input.endswith(".parquet"):
++        df = spark.read.parquet(args.input)
++    else:
++        df = spark.read.option("header", True).csv(args.input)
++    # assume items column is array; if string, try to split on comma
++    from pyspark.sql.functions import col, split, when
++    if dict(df.dtypes).get(args.items_col, "") == "string":
++        df = df.withColumn(args.items_col, split(col(args.items_col), ","))
++    fp = FPGrowth(itemsCol=args.items_col, minSupport=args.min_support, minConfidence=args.min_confidence)
++    model = fp.fit(df)
++    freq = model.freqItemsets
++    rules = model.associationRules
++    tmpdir = tempfile.mkdtemp()
++    out_freq = os.path.join(tmpdir, "freqItemsets.parquet")
++    out_rules = os.path.join(tmpdir, "assocRules.parquet")
++    freq.write.parquet(out_freq)
++    rules.write.parquet(out_rules)
++    # archive & upload
++    s3_prefix = args.output.rstrip("/")
++    s3uri, sig = tar_and_upload(tmpdir, s3_prefix, args.cosign_kms_arn)
++    # log to mlflow
++    with mlflow.start_run() as r:
++        mlflow.log_param("input", args.input)
++        mlflow.log_param("items_col", args.items_col)
++        mlflow.log_param("min_support", args.min_support)
++        mlflow.log_param("min_confidence", args.min_confidence)
++        mlflow.log_artifact(out_freq, artifact_path="fp_growth/freq")
++        mlflow.log_artifact(out_rules, artifact_path="fp_growth/rules")
++        mlflow.set_tag("output_s3", s3uri)
++        if sig:
++            mlflow.set_tag("signature", sig)
++    print("FP-Growth job complete. Results archived to:", s3uri)
++
++if __name__ == "__main__":
++    main()
+*** End Patch
+*** Begin Patch
+*** Add File: argo/graph_mining_workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: graph-mining-
++  namespace: aegis
++spec:
++  entrypoint: graph-mining
++  arguments:
++    parameters:
++      - name: vertices-path
++        value: "s3://REPLACE_EVIDENCE_BUCKET/graph/vertices.parquet"
++      - name: edges-path
++        value: "s3://REPLACE_EVIDENCE_BUCKET/graph/edges.parquet"
++      - name: output-prefix
++        value: "s3://REPLACE_EVIDENCE_BUCKET/mining/graph/{{workflow.uid}}"
++      - name: image-registry
++        value: "ghcr.io/yourorg"
++  templates:
++    - name: graph-mining
++      container:
++        image: "{{inputs.parameters.image-registry}}/aegis-spark:latest"
++        command: ["/bin/bash","-lc"]
++        args:
++          - |
++            spark-submit --master k8s://https://kubernetes.default.svc \
++              --deploy-mode cluster \
++              --name graph-mining-job \
++              --conf spark.kubernetes.namespace=aegis \
++              /opt/spark/jobs/graph_mining_job.py \
++              --vertices "{{workflow.parameters.vertices-path}}" \
++              --edges "{{workflow.parameters.edges-path}}" \
++              --output "{{workflow.parameters.output-prefix}}"
++        resources:
++          limits:
++            cpu: "2000m"
++            memory: "8Gi"
++          requests:
++            cpu: "1000m"
++            memory: "4Gi"
+*** End Patch
+*** Begin Patch
+*** Add File: graph/graph_mining_job.py
++#!/usr/bin/env python3
++"""
++Graph mining PySpark job using GraphFrames
++- Computes connected components and PageRank
++- Writes results to S3 (parquet), logs to MLflow, archives & signs
++"""
++import argparse, os, tempfile, tarfile, subprocess
++from pyspark.sql import SparkSession
++import boto3, mlflow
++
++def parse():
++    p = argparse.ArgumentParser()
++    p.add_argument("--vertices", required=True)
++    p.add_argument("--edges", required=True)
++    p.add_argument("--output", required=True)
++    p.add_argument("--mlflow-tracking-uri", default=os.environ.get("MLFLOW_TRACKING_URI"))
++    p.add_argument("--cosign-kms-arn", default=os.environ.get("COSIGN_KMS_ARN"))
++    return p.parse_args()
++
++def tar_and_upload(path, s3_prefix, cosign_kms=None):
++    archive = tempfile.mktemp(suffix=".tgz")
++    with tarfile.open(archive, "w:gz") as tar:
++        tar.add(path, arcname=os.path.basename(path))
++    parts = s3_prefix[5:].split("/",1)
++    bucket, prefix = parts[0], parts[1] if len(parts)>1 else ""
++    s3 = boto3.client("s3")
++    key = f"{prefix.rstrip('/')}/{os.path.basename(archive)}"
++    s3.upload_file(archive, bucket, key)
++    s3uri = f"s3://{bucket}/{key}"
++    if cosign_kms:
++        try:
++            subprocess.check_call(["cosign","sign","--key",cosign_kms, archive])
++            s3.upload_file(archive + ".sig", bucket, f"{prefix.rstrip('/')}/{os.path.basename(archive)}.sig")
++        except Exception as e:
++            print("cosign sign failed:", e)
++    return s3uri
++
++def main():
++    args = parse()
++    if args.mlflow_tracking_uri:
++        mlflow.set_tracking_uri(args.mlflow_tracking_uri)
++    spark = SparkSession.builder.appName("graph_mining").getOrCreate()
++    # GraphFrames requires package; assume spark image has GraphFrames installed
++    v = spark.read.parquet(args.vertices)
++    e = spark.read.parquet(args.edges)
++    from graphframes import GraphFrame
++    g = GraphFrame(v, e)
++    cc = g.connectedComponents()
++    pr = g.pageRank(resetProbability=0.15, maxIter=10)
++    tmpdir = tempfile.mkdtemp()
++    cc_out = os.path.join(tmpdir, "connected_components.parquet")
++    pr_out = os.path.join(tmpdir, "pagerank.parquet")
++    cc.write.parquet(cc_out)
++    pr.write.parquet(pr_out)
++    s3uri = tar_and_upload(tmpdir, args.output, args.cosign_kms_arn)
++    with mlflow.start_run() as r:
++        mlflow.log_param("vertices", args.vertices)
++        mlflow.log_param("edges", args.edges)
++        mlflow.log_artifact(cc_out, artifact_path="graph/cc")
++        mlflow.log_artifact(pr_out, artifact_path="graph/pr")
++        mlflow.set_tag("output_s3", s3uri)
++    print("Graph mining complete. Results at:", s3uri)
++
++if __name__ == "__main__":
++    main()
+*** End Patch
+*** Begin Patch
+*** Add File: flink/pyflink_window.py
++#!/usr/bin/env python3
++"""
++PyFlink streaming job: read events from Kafka topic 'events', compute co-occurrence pairs per event,
++count pairs in sliding windows and emit alerts when frequency crosses threshold.
++- Requires pyflink and Kafka client available in runtime image.
++- Configuration via env vars: KAFKA_BOOTSTRAP, INPUT_TOPIC, OUTPUT_TOPIC, ALERT_THRESHOLD, WINDOW_SIZE_SEC, SLIDE_SIZE_SEC
++"""
++import os
++from pyflink.datastream import StreamExecutionEnvironment, TimeCharacteristic
++from pyflink.datastream.window import SlidingEvent
+

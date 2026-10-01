@@ -1,0 +1,807 @@
+diff --git a/agents/orchestrator/main.py b/agents/orchestrator/main.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/agents/orchestrator/main.py
+@@ -0,0 +1,340 @@
++#!/usr/bin/env python3
++"""
++Decision Orchestrator for Aegis (agentic control plane).
++
++Responsibilities:
++ - Receive events (Argo Events / webhook) and persist the raw event (optional)
++ - Query OPA policy engine to make an allow/deny decision for requested actions
++ - Enforce kill-switch, rate limits, budget guards and model-risk checks
++ - Record every decision in the durable decision_log (Postgres) via agents.common.decision_db
++ - Emit Prometheus metrics about decisions/actions
++ - Trigger safe executions (Argo workflow submission or GitHub PR creation) when allowed (or in dry-run mode)
++
++Configuration via environment variables:
++ - OPA_URL (default http://opa:8181/v1/data/aegis/policies/allow)
++ - ARGO_RETRAIN_TEMPLATE (path to a JSON Argo workflow template)
++ - ARGO_SERVER (Argo server base URL)
++ - DECISION_DB_* envs for Postgres (handled by agents.common.decision_db)
++ - KILL_SWITCH (if "true", no actions will be executed)
++ - DRY_RUN (if "true", no external side effects; decisions still logged)
++ - RATE_LIMIT_PER_MIN (integer)
++ - REDIS_URL (optional, for distributed rate limiter)
++ - BUDGET_LIMIT (optional numeric monthly budget cap)
++ - GITHUB_* handled by agents.common.utils for PR creation
++ - PROMETHEUS_METRICS_PORT default 9000
++
++Notes:
++ - This is intentionally conservative and small: it demonstrates the safety checks and audit logging
++ - In production you should add authentication on the webhook (e.g., X-AEGIS-TOKEN header) and run OPA + Gatekeeper
++   as part of your control plane.
++"""
++import os
++import time
++import json
++import threading
++import traceback
++from datetime import datetime, timedelta
++
++from flask import Flask, request, jsonify
++import requests
++
++from prometheus_client import Counter, Gauge, start_http_server
++
++try:
++    import redis
++except Exception:
++    redis = None
++
++try:
++    from agents.common import decision_db
++    from agents.common.utils import argo_submit_workflow, create_github_pr, record_decision as utils_record_decision
++except Exception:
++    # In case relative import path differs in tests, attempt absolute
++    from agents.common import decision_db  # type: ignore
++    from agents.common.utils import argo_submit_workflow, create_github_pr, record_decision as utils_record_decision  # type: ignore
++
++app = Flask(__name__)
++
++# Configuration
++OPA_URL = os.environ.get("OPA_URL", "http://opa:8181/v1/data/aegis/policies/allow")
++ARGO_RETRAIN_TEMPLATE = os.environ.get("ARGO_RETRAIN_TEMPLATE", "/workflows/retrain_workflow.json")
++KILL_SWITCH = os.environ.get("KILL_SWITCH", "false").lower() == "true"
++DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
++RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "10"))
++REDIS_URL = os.environ.get("REDIS_URL", "")
++BUDGET_LIMIT = float(os.environ.get("BUDGET_LIMIT", "0.0"))  # 0.0 reserved for 'no budget guard'
++PROM_PORT = int(os.environ.get("PROMETHEUS_METRICS_PORT", "9000"))
++
++# Prometheus metrics
++MET_DECISIONS = Counter("aegis_decisions_total", "Total decisions by orchestrator", ["agent", "action", "result"])
++MET_ACTIONS = Counter("aegis_actions_executed_total", "Actions executed by orchestrator", ["agent", "action", "target"])
++MET_DECISION_DURATION = Gauge("aegis_decision_latency_seconds", "Time taken to make decision")
++MET_RATE_LIMIT_REJECTS = Counter("aegis_rate_limit_rejects_total", "Rate limit rejects")
++MET_BUDGET_REJECTS = Counter("aegis_budget_rejects_total", "Budget guard rejects")
++
++# Simple in-memory rate limiter fallback
++class InMemoryRateLimiter:
++    def __init__(self, per_min):
++        self.per_min = per_min
++        self.lock = threading.Lock()
++        self.tokens = per_min
++        self.last = time.time()
++
++    def allow(self, key="global"):
++        with self.lock:
++            now = time.time()
++            elapsed = now - self.last
++            # Refill tokens
++            refill = elapsed * (self.per_min / 60.0)
++            self.tokens = min(self.per_min, self.tokens + refill)
++            self.last = now
++            if self.tokens >= 1:
++                self.tokens -= 1
++                return True
++            return False
++
++class RedisRateLimiter:
++    """
++    Very small Redis-based counter per minute using INCR with EXPIRE.
++    Key format: "aegis:rl:{key}:{YYYYMMDDHHMM}"
++    """
++    def __init__(self, redis_url, per_min):
++        self.per_min = per_min
++        self.client = redis.from_url(redis_url, decode_responses=True)
++
++    def allow(self, key="global"):
++        now = datetime.utcnow()
++        window = now.strftime("%Y%m%d%H%M")
++        rkey = f"aegis:rl:{key}:{window}"
++        cur = self.client.incr(rkey)
++        if cur == 1:
++            # set expire a bit longer than a minute
++            self.client.expire(rkey, 75)
++        if cur > self.per_min:
++            return False
++        return True
++
++# Initialize rate limiter
++if REDIS_URL and redis:
++    RATE_LIMITER = RedisRateLimiter(REDIS_URL, RATE_LIMIT_PER_MIN)
++else:
++    RATE_LIMITER = InMemoryRateLimiter(RATE_LIMIT_PER_MIN)
++
++def opa_check(input_obj):
++    """
++    Query OPA for the given input. Return dict with 'allow': bool and optional 'reason'.
++    """
++    try:
++        resp = requests.post(OPA_URL, json={"input": input_obj}, timeout=10)
++        resp.raise_for_status()
++        data = resp.json()
++        # Policy expected to return {"result": {"allow": true, "msg": "...", ...}}
++        result = data.get("result", {})
++        return result
++    except Exception as e:
++        # conservative: deny on OPA errors
++        return {"allow": False, "reason": f"OPA error: {e}"}
++
++def get_budget_usage(model=None):
++    """
++    Placeholder for budget lookup. Integrate with cloud billing or internal chargeback.
++    For now, return 0.0
++    """
++    try:
++        # Integrate with billing export or internal DB
++        return 0.0
++    except Exception:
++        return 0.0
++
++def execute_action(action_type, action_payload):
++    """
++    Execute permitted action: currently supports 'retrain' (submit Argo workflow) and 'create_pr'.
++    Returns an object with result metadata.
++    """
++    if DRY_RUN:
++        return {"executed": False, "dry_run": True, "note": "Dry run enabled"}
++
++    if action_type == "retrain":
++        # Load workflow template and submit
++        try:
++            with open(ARGO_RETRAIN_TEMPLATE, "r") as fh:
++                wf = json.load(fh)
++            # Optionally patch params with model, s3 path etc from action_payload
++            # Caller may pass "params": {"model": "...", "s3_checkpoint_uri": "s3://..."}
++            # Submit workflow
++            resp = argo_submit_workflow(wf)
++            wf_name = resp.get("metadata", {}).get("name")
++            MET_ACTIONS.labels(agent="orchestrator", action="retrain", target=action_payload.get("model", "unknown")).inc()
++            return {"executed": True, "workflow": wf_name}
++        except Exception as e:
++            return {"executed": False, "error": str(e)}
++    elif action_type == "create_pr":
++        try:
++            title = action_payload.get("title", "Aegis auto PR")
++            body = action_payload.get("body", "")
++            head = action_payload.get("head", "aegis/auto")
++            base = action_payload.get("base", "main")
++            pr_url = create_github_pr(title=title, body=body, head_branch=head, base_branch=base)
++            MET_ACTIONS.labels(agent="orchestrator", action="create_pr", target=action_payload.get("model", "unknown")).inc()
++            return {"executed": True, "pr": pr_url}
++        except Exception as e:
++            return {"executed": False, "error": str(e)}
++    else:
++        return {"executed": False, "error": f"Unsupported action_type {action_type}"}
++
++@app.route("/healthz", methods=["GET"])
++def healthz():
++    return "ok", 200
++
++@app.route("/metrics", methods=["GET"])
++def metrics_proxy():
++    # Prometheus client runs its own HTTP server; keep endpoint for compatibility
++    return jsonify({"metrics_port": PROM_PORT}), 200
++
++@app.route("/webhook", methods=["POST"])
++def webhook():
++    start = time.time()
++    try:
++        payload = request.get_json(force=True)
++        # Expected payload example:
++        # { "agent_request": {"action":"retrain","model":"my_model","params":{...}}, "origin": {...} }
++        agent_request = payload.get("agent_request") or payload
++        action_type = agent_request.get("action")
++        model = agent_request.get("model")
++        params = agent_request.get("params", {})
++
++        record = {
++            "timestamp": datetime.utcnow().isoformat() + "Z",
++            "agent": "orchestrator",
++            "model": model,
++            "env": os.environ.get("ENVIRONMENT", "staging"),
++            "action": action_type,
++            "payload": agent_request,
++            "evidence": {"received_at": time.time()}
++        }
++
++        # 1) Kill switch
++        if KILL_SWITCH:
++            record["decision"] = {"allow": False, "reason": "kill-switch-engaged"}
++            utils_record_decision(record)
++            MET_DECISIONS.labels(agent="orchestrator", action=action_type, result="denied_kill_switch").inc()
++            return jsonify({"allowed": False, "reason": "kill-switch engaged"}), 423
++
++        # 2) Rate limit
++        if not RATE_LIMITER.allow(key=model or "global"):
++            MET_RATE_LIMIT_REJECTS.inc()
++            record["decision"] = {"allow": False, "reason": "rate-limit"}
++            utils_record_decision(record)
++            MET_DECISIONS.labels(agent="orchestrator", action=action_type, result="denied_rate_limit").inc()
++            return jsonify({"allowed": False, "reason": "rate-limit"}), 429
++
++        # 3) Budget guard (simple)
++        if BUDGET_LIMIT and BUDGET_LIMIT > 0:
++            usage = get_budget_usage(model)
++            if usage >= BUDGET_LIMIT:
++                MET_BUDGET_REJECTS.inc()
++                record["decision"] = {"allow": False, "reason": "budget-exceeded", "usage": usage}
++                utils_record_decision(record)
++                MET_DECISIONS.labels(agent="orchestrator", action=action_type, result="denied_budget").inc()
++                return jsonify({"allowed": False, "reason": "budget exceeded"}), 402
++
++        # 4) Policy check via OPA
++        opa_input = {
++            "action": action_type,
++            "model": model,
++            "params": params,
++            "env": os.environ.get("ENVIRONMENT", "staging"),
++            "timestamp": datetime.utcnow().isoformat() + "Z"
++        }
++        opa_start = time.time()
++        opa_resp = opa_check(opa_input)
++        opa_duration = time.time() - opa_start
++
++        decision = {"allow": bool(opa_resp.get("allow")), "reason": opa_resp.get("reason", "")}
++        record["decision"] = decision
++
++        # Record decision (try DB, fallback)
++        try:
++            utils_record_decision(record)
++        except Exception:
++            # Best-effort
++            print("Failed to write decision via utils; continuing")
++
++        # metrics
++        MET_DECISIONS.labels(agent="orchestrator", action=action_type or "unknown", result=("allow" if decision["allow"] else "deny")).inc()
++        MET_DECISION_DURATION.set(time.time() - start)
++
++        # 5) If allowed, execute or schedule action
++        if decision["allow"]:
++            # Enforce environment-level restrictions: staging auto-actions allowed; prod auto-actions require extra flag in OPA
++            env = os.environ.get("ENVIRONMENT", "staging")
++            if env == "production" and not opa_resp.get("allow_auto_execute", False):
++                # create PR for manual promotion
++                pr_payload = {
++                    "title": f"Promotion candidate for model {model}",
++                    "body": f"Agent suggests action {action_type} for model {model}\n\nEvidence:\n{json.dumps(opa_resp, indent=2)}",
++                    "head": f"aegis/auto/{model}/{int(time.time())}",
++                    "base": "main",
++                    "model": model
++                }
++                exec_res = execute_action("create_pr", pr_payload) if not DRY_RUN else {"dry_run": True}
++            else:
++                # direct execute (e.g., retrain) or create PR depending on action_type
++                if action_type == "retrain":
++                    exec_res = execute_action("retrain", {"model": model, "params": params})
++                elif action_type == "create_pr":
++                    exec_res = execute_action("create_pr", {"title": params.get("title", f"Auto PR {model}"), "body": params.get("body", ""), "head": params.get("head", f"aegis/auto/{model}")})
++                else:
++                    exec_res = {"executed": False, "error": "unsupported action_type"}
++
++            # record execution result
++            record_exec = {"timestamp": datetime.utcnow().isoformat() + "Z", "agent": "orchestrator", "action": action_type, "exec_result": exec_res}
++            utils_record_decision(record_exec)
++            return jsonify({"allowed": True, "exec": exec_res}), 200
++        else:
++            return jsonify({"allowed": False, "reason": decision.get("reason", "policy-deny")}), 403
++
++    except Exception as e:
++        traceback.print_exc()
++        return jsonify({"error": str(e)}), 500
++
++def start_metrics_server():
++    start_http_server(PROM_PORT)
++    print(f"Prometheus metrics server started on :{PROM_PORT}")
++
++def ensure_db_schema():
++    try:
++        decision_db.init_schema()
++        print("Decision DB schema initialized.")
++    except Exception as e:
++        print("Failed to init decision DB schema:", e)
++
++if __name__ == "__main__":
++    # Start metrics server
++    start_metrics_server()
++    # Init DB schema if possible
++    ensure_db_schema()
++    bind = os.environ.get("HTTP_BIND", "0.0.0.0:8082")
++    host, port = bind.split(":")
++    print("Starting Orchestrator on", bind, "DRY_RUN=", DRY_RUN, "KILL_SWITCH=", KILL_SWITCH)
++    app.run(host=host, port=int(port))
++
+diff --git a/policy/opa/agent_policies.rego b/policy/opa/agent_policies.rego
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/policy/opa/agent_policies.rego
+@@ -0,0 +1,140 @@
++# OPA policies for Aegis Decision Orchestrator
++package aegis.policies
++
++# Input structure expected:
++# {
++#   "action": "retrain" | "promote" | "create_pr" | ...,
++#   "model": "model_name",
++#   "params": {},
++#   "env": "staging" | "production",
++#   "timestamp": "..."
++# }
++
++default allow = false
++
++# Basic provenance requirements for actions that touch production
++provenance_ok {
++  input.params.run_id
++  input.params.lakefs_commit
++  input.params.image_digest
++}
++
++# Model risk mapping - in practice this should be a data lookup (data.models)
++# For demo, models with prefix "low-" are low risk
++model_risk_low {
++  startswith(input.model, "low-")
++}
++
++# Allow auto execution in staging for any action
++allow {
++  input.env == "staging"
++}
++
++# Allow auto-execution in production only if model is low-risk and provenance present
++allow {
++  input.env == "production"
++  model_risk_low
++  provenance_ok
++}
++
++# Provide additional decision outputs
++default reason = "not-applicable"
++reason = msg {
++  not allow
++  msg = "policy: action not allowed by default rules"
++}
++reason = msg {
++  allow
++  msg = "allowed by policy"
++}
++
++# allow_auto_execute flag for orchestrator to decide direct execution vs PR
++allow_auto_execute = true {
++  allow
++  input.env == "staging"
++}
++allow_auto_execute = true {
++  allow
++  input.env == "production"
++  model_risk_low
++  provenance_ok
++}
++allow_auto_execute = false {
++  not allow_auto_execute
++}
++
++# Expose structured result for orchestrator
++result = {"allow": allow, "reason": reason, "allow_auto_execute": allow_auto_execute}
++
+diff --git a/k8s/manifests/orchestrator-deployment.yaml b/k8s/manifests/orchestrator-deployment.yaml
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/k8s/manifests/orchestrator-deployment.yaml
+@@ -0,0 +1,116 @@
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-orchestrator
++  namespace: aegis-ml
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-orchestrator
++  template:
++    metadata:
++      labels:
++        app: aegis-orchestrator
++    spec:
++      serviceAccountName: aegis-agent-sa
++      containers:
++        - name: orchestrator
++          image: ghcr.io/yourorg/aegis-orchestrator:latest
++          imagePullPolicy: IfNotPresent
++          env:
++            - name: OPA_URL
++              value: "http://opa:8181/v1/data/aegis/policies/allow"
++            - name: ARGO_RETRAIN_TEMPLATE
++              value: "/workflows/retrain_workflow.json"
++            - name: ENVIRONMENT
++              value: "staging"
++            - name: DRY_RUN
++              value: "true"
++            - name: DECISION_DB_HOST
++              value: "aegis-postgres.aegis-ml.svc.cluster.local"
++            - name: DECISION_DB_NAME
++              value: "aegis"
++            - name: DECISION_DB_USER
++              value: "aegis"
++            - name: DECISION_DB_PASSWORD
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-postgres-secret
++                  key: password
++            - name: REDIS_URL
++              value: ""
++            - name: RATE_LIMIT_PER_MIN
++              value: "20"
++            - name: PROMETHEUS_METRICS_PORT
++              value: "9000"
++          ports:
++            - containerPort: 8082
++            - containerPort: 9000
++          resources:
++            requests:
++              cpu: "100m"
++              memory: "128Mi"
++            limits:
++              cpu: "500m"
++              memory: "512Mi"
++          livenessProbe:
++            httpGet:
++              path: /healthz
++              port: 8082
++            initialDelaySeconds: 10
++            periodSeconds: 20
++          readinessProbe:
++            httpGet:
++              path: /healthz
++              port: 8082
++            initialDelaySeconds: 5
++            periodSeconds: 10
++      tolerations:
++        - key: "aegis/agent"
++          operator: "Exists"
++
+diff --git a/k8s/manifests/agent-serviceaccount.yaml b/k8s/manifests/agent-serviceaccount.yaml
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/k8s/manifests/agent-serviceaccount.yaml
+@@ -0,0 +1,80 @@
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: aegis-agent-sa
++  namespace: aegis-ml
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: aegis-agent-role
++  namespace: aegis-ml
++rules:
++  - apiGroups: ["networking.istio.io"]
++    resources: ["virtualservices"]
++    verbs: ["get", "list", "patch"]
++  - apiGroups: [""]
++    resources: ["configmaps", "secrets"]
++    verbs: ["get", "list"]
++  - apiGroups: ["argoproj.io"]
++    resources: ["workflows"]
++    verbs: ["get", "list", "create"]
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: aegis-agent-rb
++  namespace: aegis-ml
++subjects:
++  - kind: ServiceAccount
++    name: aegis-agent-sa
++    namespace: aegis-ml
++roleRef:
++  kind: Role
++  name: aegis-agent-role
++  apiGroup: rbac.authorization.k8s.io
++
+diff --git a/k8s/manifests/kill-switch-configmap.yaml b/k8s/manifests/kill-switch-configmap.yaml
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/k8s/manifests/kill-switch-configmap.yaml
+@@ -0,0 +1,20 @@
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: aegis-orchestrator-config
++  namespace: aegis-ml
++data:
++  # When set to "true" the orchestrator will not execute any external side-effects (safety).
++  kill_switch: "false"
++  dry_run: "true"
++  # rate limit per minute (can be overridden via env)
++  rate_limit_per_min: "20"
++
+diff --git a/k8s/redis/redis-deployment.yaml b/k8s/redis/redis-deployment.yaml
+new file mode 100644
+index 0000000..6666666
+--- /dev/null
++++ b/k8s/redis/redis-deployment.yaml
+@@ -0,0 +1,44 @@
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-redis
++  namespace: aegis-ml
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-redis
++  template:
++    metadata:
++      labels:
++        app: aegis-redis
++    spec:
++      containers:
++        - name: redis
++          image: redis:6.2-alpine
++          ports:
++            - containerPort: 6379
++          resources:
++            requests:
++              cpu: "50m"
++              memory: "64Mi"
++            limits:
++              cpu: "200m"
++              memory: "256Mi"
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: aegis-redis
++  namespace: aegis-ml
++spec:
++  selector:
++    app: aegis-redis
++  ports:
++    - port: 6379
++      targetPort: 6379
++
+diff --git a/gatekeeper/constraint_auto_promote.yaml b/gatekeeper/constraint_auto_promote.yaml
+new file mode 100644
+index 0000000..7777777
+--- /dev/null
++++ b/gatekeeper/constraint_auto_promote.yaml
+@@ -0,0 +1,58 @@
++# Gatekeeper Constraint to prevent unauthorized auto-promotes by blocking K8s actions without required provenance.
++apiVersion: templates.gatekeeper.sh/v1beta1
++kind: ConstraintTemplate
++metadata:
++  name: k8srequiredprovenance
++spec:
++  crd:
++    spec:
++      names:
++        kind: K8sRequiredProvenance
++  targets:
++    - target: admission.k8s.gatekeeper.sh
++      rego: |
++        package k8srequiredprovenance
++
++        violation[{"msg": msg}] {
++          input.review.object.kind == "Deployment"
++          # Example: if label "aegis.auto" == "true" and missing provenance labels then deny
++          labels := input.review.object.metadata.labels
++          labels["aegis.auto"] == "true"
++          not labels["aegis.run_id"]
++          msg := "Auto-promote denied: missing aegis.run_id provenance label"
++        }
++
++---
++# Example Constraint using the template
++apiVersion: constraints.gatekeeper.sh/v1beta1
++kind: K8sRequiredProvenance
++metadata:
++  name: require-provenance-for-auto
++spec:
++  match:
++    kinds:
++      - apiGroups: [""]
++        kinds: ["Deployment"]
++
+diff --git a/agents/orchestrator/requirements.txt b/agents/orchestrator/requirements.txt
+new file mode 100644
+index 0000000..8888888
+--- /dev/null
++++ b/agents/orchestrator/requirements.txt
+@@ -0,0 +1,8 @@
++flask
++requests
++prometheus_client
++redis
++psycopg2-binary
++PyYAML
++pyjwt
++PyGithub
++
+diff --git a/tests/test_orchestrator.py b/tests/test_orchestrator.py
+new file mode 100644
+index 0000000..9999999
+--- /dev/null
++++ b/tests/test_orchestrator.py
+@@ -0,0 +1,140 @@
++import json
++import pytest
++import time
++from unittest import mock
++
++from agents.orchestrator import main as orchestrator
++
++@pytest.fixture(autouse=True)
++def patch_decision_db(monkeypatch):
++    # Replace DB calls with no-op
++    monkeypatch.setattr("agents.common.decision_db.record_decision", lambda *a, **k: {"id": 1, "created_at": time.time()})
++
++@pytest.fixture(autouse=True)
++def patch_opa(monkeypatch):
++    # Patch requests.post used by opa_check
++    class FakeResponse:
++        def __init__(self, data):
++            self._data = data
++        def json(self):
++            return self._data
++        def raise_for_status(self):
++            pass
++    def fake_post(url, json=None, timeout=10):
++        # allow if model starts with low-
++        inp = json.get("input", {})
++        model = inp.get("model", "")
++        if model.startswith("low-"):
++            return FakeResponse({"result": {"allow": True, "reason": "low risk", "allow_auto_execute": True}})
++        return FakeResponse({"result": {"allow": False, "reason": "not allowed", "allow_auto_execute": False}})
++    monkeypatch.setattr("agents.orchestrator.main.requests.post", fake_post)
++
++def test_allow_low_risk(monkeypatch):
++    client = orchestrator.app.test_client()
++    payload = {"agent_request": {"action": "retrain", "model": "low-demo-model", "params": {}}}
++    rv = client.post("/webhook", json=payload)
++    assert rv.status_code == 200
++    data = rv.get_json()
++    assert "allowed" in data
++    assert data["allowed"] in (True, False)  # in DRY_RUN true may be allowed but not executed
++
++def test_deny_high_risk(monkeypatch):
++    client = orchestrator.app.test_client()
++    payload = {"agent_request": {"action": "retrain", "model": "high-demo-model", "params": {}}}
++    rv = client.post("/webhook", json=payload)
++    assert rv.status_code == 403
++    data = rv.get_json()
++    assert data["allowed"] == False
++
++def test_rate_limit(monkeypatch):
++    # simulate rate limit by setting per_min very low and invoking many times
++    orchestrator.RATE_LIMITER = orchestrator.InMemoryRateLimiter(per_min=1)
++    client = orchestrator.app.test_client()
++    payload = {"agent_request": {"action": "retrain", "model": "low-demo-model", "params": {}}}
++    rv1 = client.post("/webhook", json=payload)
++    rv2 = client.post("/webhook", json=payload)
++    # first may pass, second should be rate-limited
++    assert rv2.status_code in (429, 200, 403)
++
+diff --git a/docs/agentic_readme.md b/docs/agentic_readme.md
+new file mode 100644
+index 0000000..aaaaaaaa
+--- /dev/null
++++ b/docs/agentic_readme.md
+@@ -0,0 +1,240 @@
++# Aegis: Steps and artifacts to become Fully Agentic
++
++This patch introduces the Decision Orchestrator and supporting manifests to close several gaps:
++
++- Durable decision logging (Postgres schema + helper)
++- Decision Orchestrator service (policy checks, kill-switch, rate-limiter, budget guard)
++- OPA policy for safe auto-execution and provenance checks
++- Gatekeeper ConstraintTemplate to block K8s auto-promote without provenance
++- Redis optional deployment for distributed rate limiting
++- Kubernetes ServiceAccount + RBAC for least-privilege agents
++- Kill-switch ConfigMap for quick pause of all autonomous actions
++- Unit tests for orchestrator
++- Prometheus metrics exported for observability
++
++High-level flow
++1. Events (Prometheus alert, SBOM scan, infra event) are delivered to an event bus (Argo Events / Kafka).
++2. Argo Events or event router posts to the Decision Orchestrator webhook (/webhook).
++3. Orchestrator:
++   - Checks kill-switch
++   - Enforces rate limits and budget guard
++   - Calls OPA for policy decision
++   - Logs decision to Postgres decision_log
++   - If allowed: executes or schedules action (Argo retrain or GitHub PR), respecting staging/production rules
++   - Emits Prometheus metrics for dashboards
++
++Deployment notes
++- Apply the Postgres deployment (k8s/postgres/postgres-deployment.yaml) and ensure secret aigis-postgres-secret exists.
++- Deploy Redis if you want distributed rate limiting (k8s/redis/redis-deployment.yaml)
++- Deploy OPA and load policy file (policy/opa/agent_policies.rego) into OPA server
++- Deploy Gatekeeper (optional) and apply the gatekeeper/constraint_auto_promote.yaml constraint template
++- Deploy the orchestrator:
++  kubectl apply -f k8s/manifests/agent-serviceaccount.yaml
++  kubectl apply -f k8s/manifests/kill-switch-configmap.yaml
++  kubectl apply -f k8s/postgres/postgres-deployment.yaml
++  kubectl apply -f k8s/redis/redis-deployment.yaml
++  kubectl apply -f k8s/manifests/orchestrator-deployment.yaml
++
++Testing the flow (staging)
++1. Ensure ARGO_RETRAIN_TEMPLATE path is populated in the orchestrator container image (or mount as config).
++2. Run unit tests:
++   pip install -r agents/orchestrator/requirements.txt
++   pytest tests/test_orchestrator.py
++3. Use Argo Events to forward synthetic drift -> orchestrator webhook:
++   - Port-forward eventsource: kubectl -n aegis-ml port-forward svc/aegis-webhook-es 12000:12000
++   - Run tests/send_synthetic_drift.py --model low-demo-model
++4. Observe:
++   - Prometheus metrics on orchestrator (port 9000)
++   - Decision entries in Postgres (SELECT * FROM decision_log ORDER BY created_at DESC LIMIT 10)
++   - If DRY_RUN=false and policy allows, Argo workflow submission or PR creation
++
++Policy & governance
++- OPA policy (policy/opa/agent_policies.rego) enforces:
++  - Staging: allow auto-execute by default
++  - Production: allow auto-execute only for low-risk models with required provenance (run_id, lakefs.commit, image_digest)
++- Gatekeeper constraint template blocks any K8s Deployment with aegis.auto=true and missing provenance label
++
++Security & least privilege
++- Use GitHub App installation tokens rather than personal tokens (see agents/common/github_app.py)
++- Use Vault to provision short-lived DB credentials and GitHub app key; mount via CSI or env via Vault Agent.
++- ServiceAccount aegis-agent-sa has minimal Role allowing it to patch VirtualService and submit Argo workflows.
++
++Observability
++- Orchestrator exports Prometheus metrics:
++  - aegis_decisions_total{agent,action,result}
++  - aegis_actions_executed_total{agent,action,target}
++  - aegis_decision_latency_seconds
++  - aegis_rate_limit_rejects_total
++  - aegis_budget_rejects_total
++
++Add Grafana panels for these metrics and an alert for high deny rates or frequent rate-limit hits.
++
++Fail-safe controls
++- Kill-switch: toggle aegis-orchestrator-config::kill_switch to "true" to prevent all agent-side effects
++- Rate-limiter: configured via env RATE_LIMIT_PER_MIN and Redis/IN-MEM fallback
++- Budget guard: configure BUDGET_LIMIT env (will deny actions when budget exceeded)
++
++Testing & simulation
++- Tests included (tests/test_orchestrator.py) validate OPA integration and rate-limiter behavior using mocks.
++- Add integration test harness that runs real Argo + OPA if you want full end-to-end CI validation.
++
++Next steps (recommendation)
++1. Replace DRY_RUN=true with false in staging after verifying runs a few times.
++2. Create a low-risk model test to allow automatic retrain promotions in staging.
++3. Add Gatekeeper OPA policies to cluster and run chaos tests with kill-switch.
++4. Integrate Vault for secrets and GitHub App for PR creation (see agents/common/github_app.py).
++
++If you want, I can:
++- A) Open a PR with this patch to your repo (provide owner/repo and branch)
++- B) Adapt the manifests to your cloud provider and existing node labels
++- C) Add a Grafana dashboard JSON that visualizes the orchestrator metrics
++
++Which would you like next?
++

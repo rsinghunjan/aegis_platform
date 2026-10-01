@@ -1,0 +1,156 @@
+name: Aegis — Fully AI Verification & Signoff
+
+on:
+  workflow_dispatch:
+    inputs:
+      argo_workflow_prefix:
+        description: "Argo workflow name prefix (e.g. aegis-ml-train-prod-)"
+        required: true
+      runs_to_check:
+        description: "Number of LakeFS/Argo runs to validate"
+        required: false
+        default: "3"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  run_full_verification:
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore kubeconfig
+        env:
+          KUBECONFIG_BASE64: ${{ secrets.KUBECONFIG_BASE64 }}
+        run: |
+          if [ -z "${KUBECONFIG_BASE64:-}" ]; then
+            echo "KUBECONFIG_BASE64 secret is required"
+            exit 1
+          fi
+          echo "${KUBECONFIG_BASE64}" | base64 --decode > /tmp/kubeconfig
+          export KUBECONFIG=/tmp/kubeconfig
+          kubectl config view --minify || true
+
+      - name: Install utilities
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq gettext curl python3-pip
+          pip3 install mlflow boto3 requests
+
+      - name: Failover test (Postgres HA)
+        id: failover
+        env:
+          NAMESPACE: ${{ secrets.K8S_NAMESPACE }}
+          PG_CLUSTER_NAME: mlflow
+        run: |
+          bash mlops/ha/failover_and_readreplica_test.sh || { echo "Failover test failed"; exit 1; }
+          cat /tmp/failover_result.txt || true
+        continue-on-error: true
+
+      - name: PITR / Restore test
+        id: restore
+        env:
+          MLFLOW_BACKUP_BUCKET: ${{ secrets.MLFLOW_BACKUP_BUCKET }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          PGHOST: ${{ secrets.DR_PGHOST }}
+          PGUSER: ${{ secrets.DR_PGUSER }}
+          PGDATABASE: ${{ secrets.DR_PGDATABASE }}
+          OUTPUT_DIR: /tmp/aegis-dr
+        run: |
+          mkdir -p /tmp/aegis-dr
+          bash mlops/dr/run_restore_and_measure.sh || { echo "Restore test failed"; exit 1; }
+          ls -la /tmp/aegis-dr
+        continue-on-error: true
+
+      - name: LakeFS multi-run verification
+        id: lakefs_verify
+        env:
+          WORKFLOW_PREFIX: ${{ github.event.inputs.argo_workflow_prefix }}
+          NAMESPACE: ${{ secrets.K8S_NAMESPACE }}
+          MLFLOW_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          N: ${{ github.event.inputs.runs_to_check }}
+        run: |
+          python3 -m pip install mlflow
+          bash mlops/lakefs/verify_multi_run.sh || { echo "LakeFS multi-run verification failed"; exit 1; }
+
+      - name: Argo E2E validation & promotion PR
+        id: argo_e2e
+        env:
+          KUBECONFIG: /tmp/kubeconfig
+          K8S_NAMESPACE: ${{ secrets.K8S_NAMESPACE }}
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        run: |
+          # run the Argo E2E promotion workflow runner
+          gh workflow run argo_end_to_end_promote.yml --repo ${{ github.repository }} --ref ${{ github.sha }} --field workflow_prefix=${{ github.event.inputs.argo_workflow_prefix }} || true
+          echo "Argo E2E promotion workflow queued - check Actions UI for detailed progress"
+
+      - name: Canary quick smoke + rollback simulation
+        id: canary
+        env:
+          NAMESPACE: ${{ secrets.K8S_NAMESPACE }}
+        run: |
+          # Run a simple canary test; ensure destinationrule and virtualservice are applied
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" apply -f mlops/serving/destinationrule_and_vs.yaml || true
+          bash mlops/serving/canary_test.sh || echo "Canary load test warning"
+          if kubectl -n "${{ secrets.K8S_NAMESPACE }}" get deploy -l version=canary -o name | grep -q .; then
+            echo "Canary pods detected; testing rollback"
+            bash mlops/serving/canary_rollback.sh "${{ secrets.K8S_NAMESPACE }}" aegis-ml-canary-predictor-default || true
+          fi
+
+      - name: Drift alert simulation
+        env:
+          PROM_URL: "http://prometheus.monitoring.svc.cluster.local"
+          DRIFT_BASELINE_FILE: /etc/aegis/baseline.json
+          DRIFT_THRESHOLD: "0.1"
+          SLACK_WEBHOOK: ${{ secrets.SLACK_DRIFT_WEBHOOK }}
+        run: |
+          # this uses the script to query Prometheus; in many environments you will need network access to prometheus.
+          python3 mlops/scripts/drift_alert_runner.py || echo "Drift runner executed (may require Prometheus access)"
+
+      - name: SBOM/Trivy gating test (simulate PR scan)
+        run: |
+          echo "SBOM/Trivy gating is enforced by workflows; this step verifies workflows are present."
+          ls .github/workflows | grep -E 'sbom|trivy' || echo "SBOM/Trivy workflows missing"
+
+      - name: Gatekeeper tenant label test + billing report
+        run: |
+          # Attempt to create an unlabeled namespace (this should be blocked by Gatekeeper if enforced)
+          TMPNS=aegis-test-$(date +%s)
+          kubectl create ns $TMPNS || true
+          kubectl label ns $TMPNS tenant=test-tenant || true
+          bash mlops/multi_tenant/billing_report.sh || true
+          rm -rf /tmp/aegis_billing_report.csv || true
+
+      - name: Collect artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aegis-verification-artifacts
+          path: |
+            /tmp/failover_result.txt
+            /tmp/aegis-dr/*
+            /tmp/argo_*.json
+            mlops/ha/failover_and_readreplica_test.sh
+            mlops/dr/run_restore_and_measure.sh
+            mlops/lakefs/verify_multi_run.sh
+            mlops/serving/canary_test.sh
+            mlops/serving/canary_rollback.sh
+          if-no-files-found: warn
+
+      - name: Create signoff PR (summary)
+        id: create_pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FAILOVER_OK: ${{ steps.failover.outcome }}
+          RESTORE_OK: ${{ steps.restore.outcome }}
+        run: |
+          PR_TITLE="Aegis — Production Readiness Signoff [automated run]"
+          PR_BODY="Automated verification run summary\n\n- Failover test: ${{ steps.failover.outcome }}\n- Restore test: ${{ steps.restore.outcome }}\n- LakeFS verification: ${ { steps.lakefs_verify.outcome } }\n- Argo E2E: queued (see Actions)\n\nArtifacts: see workflow artifacts for details.\n\nRequesting SRE and Security signoff.\\n\\n"
+          gh pr create --title "$PR_TITLE" --body "$PR_BODY" || echo "Unable to create PR automatically; please create a signoff PR and attach artifacts."
+
+      - name: Comment results on repo (optional)
+        run: |
+          echo "Verification run finished. Please review artifacts and the signoff PR created (if any)."

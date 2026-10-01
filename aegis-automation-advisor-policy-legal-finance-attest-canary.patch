@@ -1,0 +1,620 @@
+*** Begin Patch
+*** Add File:services/advisor/agent.py
++#!/usr/bin/env python3
++"""
++Advisor agent: given a small YAML service spec, generate IaC (Terraform) and CI (GitHub Actions)
++templates, run unit tests, and create a branch with the generated artifacts for operator review.
++
++This is intended to automate repeated consultant tasks: generate opinionated templates, run
++the acceptance harness, and surface a ready-to-review PR branch. It does NOT auto-merge.
++"""
++import os
++import sys
++import yaml
++import subprocess
++from jinja2 import Environment, FileSystemLoader, StrictUndefined
++from pathlib import Path
++import tempfile
++
++TEMPLATE_DIR = Path(__file__).parent / "templates"
++
++def load_spec(path):
++    with open(path) as f:
++        return yaml.safe_load(f)
++
++def render_templates(spec, out_dir):
++    env = Environment(loader=FileSystemLoader(str(TEMPLATE_DIR)), undefined=StrictUndefined)
++    rendered = []
++    for t in ["terraform.tf.j2", "ci.yml.j2", "k8s_deployment.yaml.j2"]:
++        tpl = env.get_template(t)
++        text = tpl.render(spec=spec)
++        out_path = Path(out_dir) / t.replace(".j2","")
++        out_path.write_text(text)
++        rendered.append(out_path)
++    return rendered
++
++def run_unit_tests(out_dir):
++    # Unit test placeholder: ensure generated files parse as YAML where applicable
++    errors = []
++    tf = Path(out_dir) / "terraform.tf"
++    ci = Path(out_dir) / "ci.yml"
++    k8s = Path(out_dir) / "k8s_deployment.yaml"
++    for p in [ci, k8s]:
++        try:
++            import yaml
++            yaml.safe_load(p.read_text())
++        except Exception as e:
++            errors.append((p, str(e)))
++    return errors
++
++def create_branch_with_files(out_dir, repo_dir=".", branch_prefix="advisor"):
++    timestamp = __import__("time").strftime("%Y%m%d%H%M%S", __import__("time").gmtime())
++    branch = f"{branch_prefix}/{timestamp}"
++    subprocess.check_call(["git","checkout","-b",branch], cwd=repo_dir)
++    for p in Path(out_dir).iterdir():
++        dest = Path(repo_dir) / "generated" / p.name
++        dest.parent.mkdir(parents=True, exist_ok=True)
++        dest.write_text(p.read_text())
++        subprocess.check_call(["git","add", str(dest)], cwd=repo_dir)
++    subprocess.check_call(["git","commit","-m",f"Advisor: add generated templates {timestamp}"], cwd=repo_dir)
++    print("Created branch", branch, "with generated artifacts. Push branch and open a PR for review.")
++    return branch
++
++def main():
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--spec", required=True, help="service spec YAML")
++    p.add_argument("--out", default=None, help="output dir (temp if omitted)")
++    p.add_argument("--repo", default=".", help="git repo to create branch in")
++    args = p.parse_args()
++    spec = load_spec(args.spec)
++    out = args.out or tempfile.mkdtemp(prefix="advisor-")
++    print("Rendering templates to", out)
++    render_templates(spec, out)
++    errs = run_unit_tests(out)
++    if errs:
++        print("Unit test errors:", errs)
++        sys.exit(2)
++    branch = create_branch_with_files(out, repo_dir=args.repo)
++    print("Done. Next: push and open PR:", f"git push origin {branch}")
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:services/advisor/templates/terraform.tf.j2
++terraform {
++  required_version = ">= 1.0"
++}
++
++provider "aws" {
++  region = "{{ spec.cloud.region | default('us-west-2') }}"
++}
++
++resource "aws_instance" "worker" {
++  ami           = "{{ spec.image.ami }}"
++  instance_type = "{{ spec.instance_type | default('g4dn.xlarge') }}"
++  tags = {
++    Name = "{{ spec.name }}-worker"
++  }
++}
++
+*** End File
+*** Add File:services/advisor/templates/ci.yml.j2
++name: Build & Sign {{ spec.name }}
++
++on: [push]
++
++jobs:
++  build:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Build image
++        run: |
++          docker build -t {{ spec.image.name }} .
++          docker push {{ spec.image.name }}
++      - name: Install cosign
++        run: |
++          curl -sSL -o cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
++          chmod +x cosign
++      - name: Sign image (KMS)
++        env:
++          COSIGN_KEY_REF: ${{ secrets.COSIGN_KEY_REF }}
++        run: |
++          cosign sign --key "$COSIGN_KEY_REF" {{ spec.image.name }}
++
+*** End File
+*** Add File:services/advisor/templates/k8s_deployment.yaml.j2
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: {{ spec.name }}
++spec:
++  replicas: {{ spec.replicas | default(1) }}
++  selector:
++    matchLabels:
++      app: {{ spec.name }}
++  template:
++    metadata:
++      labels:
++        app: {{ spec.name }}
++    spec:
++      containers:
++        - name: app
++          image: {{ spec.image.name }}
++          resources:
++            limits:
++              nvidia.com/gpu: {{ spec.gpus | default(0) }}
++
+*** End File
+*** Add File:tests/advisor/test_template_generation.py
++import tempfile, os, shutil, subprocess, sys
++sys.path.insert(0, os.path.abspath("services/advisor"))
++from agent import render_templates, run_unit_tests
++
++def test_render_and_unit():
++    spec = {"name":"demo","image":{"name":"example/demo:latest","ami":"ami-123"},"replicas":1}
++    tmp = tempfile.mkdtemp()
++    try:
++        rendered = render_templates(spec, tmp)
++        assert any(p.name.endswith("ci.yml") for p in rendered)
++        errs = run_unit_tests(tmp)
++        assert errs == []
++    finally:
++        shutil.rmtree(tmp)
++
+*** End File
+*** Add File:services/policy/policy_engine.py
++#!/usr/bin/env python3
++"""
++Simple policy engine and RBAC store.
++Policies are JSON/YAML rules that map actions to requirements (roles, approval levels).
++The engine exposes a small HTTP API for evaluation.
++"""
++import yaml, os, json
++from flask import Flask, request, jsonify
++
++POLICY_PATH = os.environ.get("AEGIS_POLICY_PATH","./policies/policies.yaml")
++RBAC_PATH = os.environ.get("AEGIS_RBAC_PATH","./policies/rbac.yaml")
++
++def load_policies():
++    try:
++        return yaml.safe_load(open(POLICY_PATH))
++    except Exception:
++        return {}
++
++def load_rbac():
++    try:
++        return yaml.safe_load(open(RBAC_PATH))
++    except Exception:
++        return {}
++
++def evaluate(action, actor):
++    policies = load_policies()
++    rbac = load_rbac()
++    role = rbac.get("users",{}).get(actor)
++    if not role:
++        return {"allow": False, "reason": "unknown actor"}
++    rule = policies.get("actions",{}).get(action)
++    if not rule:
++        return {"allow": False, "reason": "no policy for action"}
++    required_roles = rule.get("required_roles", [])
++    if role in required_roles or "admin" in required_roles and role=="admin":
++        return {"allow": True, "reason": "role satisfied", "policy": rule}
++    # decision tree: check approval_level
++    approval = rule.get("approval", "manual")
++    return {"allow": False, "reason": "requires approval", "approval": approval}
++
++app = Flask(__name__)
++
++@app.route("/evaluate", methods=["POST"])
++def eval_api():
++    payload = request.get_json(force=True)
++    action = payload.get("action")
++    actor = payload.get("actor")
++    return jsonify(evaluate(action, actor))
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=8085)
++
+*** End File
+*** Add File:policies/policies.yaml
++actions:
++  deploy_low_risk:
++    required_roles: ["automation"]
++    approval: "auto"
++  deploy_high_risk:
++    required_roles: ["platform_lead"]
++    approval: "manual"
++  finance_autoblock:
++    required_roles: ["finance"]
++    approval: "manual"
++
+*** End File
+*** Add File:policies/rbac.yaml
++users:
++  aegis-bot: automation
++  alice: platform_lead
++  finance-bot: finance
++
+*** End File
+*** Add File:services/legal/legal_workflow.py
++#!/usr/bin/env python3
++"""
++Automated legal workflow:
++ - create legal review ticket (via webhook or GitHub issues)
++ - poll for signoff (human completes review)
++ - when signed, create a signoff manifest and cosign-sign it (KMS)
++"""
++import os, json, time, subprocess, requests
++
++LEGAL_WEBHOOK = os.environ.get("LEGAL_WEBHOOK","")
++COSIGN_KEY_REF = os.environ.get("COSIGN_KEY_REF","")
++GITHUB_REPO = os.environ.get("GITHUB_REPO","")
++GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN","")
++
++def create_ticket(title, body):
++    if LEGAL_WEBHOOK:
++        requests.post(LEGAL_WEBHOOK, json={"title": title, "body": body}, timeout=10)
++        return {"status":"webhook_sent"}
++    # fallback to GitHub issue if token set
++    if GITHUB_TOKEN and GITHUB_REPO:
++        url = f"https://api.github.com/repos/{GITHUB_REPO}/issues"
++        headers = {"Authorization": f"token {GITHUB_TOKEN}"}
++        r = requests.post(url, json={"title": title, "body": body}, headers=headers, timeout=10)
++        return r.json()
++    return {"error":"no legal webhook or GH configured"}
++
++def poll_for_signoff(issue_url, timeout=3600, interval=30):
++    # Basic poll: operator updates issue with "SIGNED" tag or comment
++    elapsed = 0
++    while elapsed < timeout:
++        if LEGAL_WEBHOOK:
++            # assume webhook integration will POST back to a callback - no op here
++            time.sleep(interval); elapsed += interval; continue
++        if GITHUB_TOKEN and issue_url:
++            headers = {"Authorization": f"token {GITHUB_TOKEN}"}
++            r = requests.get(issue_url, headers=headers, timeout=10)
++            j = r.json()
++            if "closed_at" in j and j["closed_at"]:
++                return {"signed_by":"legal", "issue": j}
++        time.sleep(interval); elapsed += interval
++    return {"error":"timeout"}
++
++def create_signoff_manifest(artifact_id, legal_actor):
++    manifest = {"artifact_id": artifact_id, "legal_signoff": True, "signed_by": legal_actor, "ts": int(time.time())}
++    path = f"/tmp/legal_signoff_{artifact_id}.json"
++    with open(path,"w") as f:
++        json.dump(manifest,f)
++    if COSIGN_KEY_REF:
++        try:
++            subprocess.check_call(["cosign","sign","--key",COSIGN_KEY_REF, path])
++            return {"manifest": path, "signed": True}
++        except Exception as e:
++            return {"manifest": path, "signed": False, "error": str(e)}
++    return {"manifest": path, "signed": False}
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--artifact-id", required=True)
++    p.add_argument("--title", default="Legal review requested")
++    p.add_argument("--body", default="Please review forensic artifacts.")
++    args = p.parse_args()
++    t = create_ticket(args.title, args.body)
++    print("Ticket created:", t)
++    # In real flow, poll_for_signoff used by operator automation to wait for signoff
++
+*** End File
+*** Add File:services/finance/reconcile_auto.py
++#!/usr/bin/env python3
++"""
++Finance reconcile with automatic ticketing and optional auto-blocking policy.
++On mismatch, create a GitHub issue (or call FINANCE_ALERT_WEBHOOK) and optionally call quota service
++to block tenant if auto-block policy enabled.
++"""
++import os, requests, psycopg2, json
++DATABASE_URL = os.environ.get("DATABASE_URL","postgresql://postgres:postgres@postgres:5432/quota")
++FINANCE_API = os.environ.get("FINANCE_API","")
++ALERT_WEBHOOK = os.environ.get("ALERT_WEBHOOK","")
++GITHUB_REPO = os.environ.get("GITHUB_REPO","")
++GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN","")
++AUTO_BLOCK = os.environ.get("FINANCE_AUTO_BLOCK","false").lower() == "true"
++QUOTA_SERVICE = os.environ.get("QUOTA_SERVICE","http://aegis-quota.ml-serving.svc:8082")
++
++def post_finance_charge(record):
++    if not FINANCE_API:
++        return {"status":"skipped"}
++    r = requests.post(FINANCE_API.rstrip("/") + "/charges", json=record, timeout=10)
++    return {"status": r.status_code, "body": r.text}
++
++def create_issue(title, body):
++    if GITHUB_TOKEN and GITHUB_REPO:
++        url = f"https://api.github.com/repos/{GITHUB_REPO}/issues"
++        headers = {"Authorization": f"token {GITHUB_TOKEN}"}
++        r = requests.post(url, json={"title": title, "body": body}, headers=headers, timeout=10)
++        return r.json()
++    if ALERT_WEBHOOK:
++        requests.post(ALERT_WEBHOOK, json={"title": title, "body": body})
++        return {"status":"webhook_sent"}
++    return {"error":"no alert configured"}
++
++def block_tenant(tenant):
++    # call quota service to set tenant quota to 0 or a block flag (assumes service supports it)
++    try:
++        r = requests.post(f"{QUOTA_SERVICE}/admin/block", json={"tenant": tenant}, timeout=10)
++        return r.status_code == 200
++    except Exception:
++        return False
++
++def reconcile():
++    conn = psycopg2.connect(DATABASE_URL)
++    with conn.cursor() as cur:
++        cur.execute("SELECT rid, tenant, amount, created_at FROM reservations")
++        rows = cur.fetchall()
++        mismatches=[]
++        for rid,tenant,amount,created_at in rows:
++            rec = {"id": rid, "tenant": tenant, "amount": int(amount), "ts": int(created_at)}
++            res = post_finance_charge(rec)
++            if res.get("status") not in (200,201,"skipped"):
++                mismatches.append({"rid": rid, "tenant": tenant, "status": res})
++                # create ticket
++                title = f"Finance reconcile mismatch for {rid}"
++                body = f"Record: {rec}\nResponse: {res}"
++                create_issue(title, body)
++                if AUTO_BLOCK:
++                    ok = block_tenant(tenant)
++                    if ok:
++                        create_issue(f"Tenant {tenant} auto-blocked", f"Auto-block applied for tenant {tenant} due to reconcile mismatch")
++    print("Reconcile done. mismatches:", len(mismatches))
++
++if __name__ == "__main__":
++    reconcile()
++
+*** End File
+*** Add File:ops/attestation/attestation_enhanced.py
++#!/usr/bin/env python3
++"""
++Collect job evidence + hardware inventory, bundle, cosign-sign with KMS, and upload to WORM evidence store.
++Includes driver versions and device IDs for chain-of-custody.
++"""
++import os, tempfile, subprocess, json, time
++from pathlib import Path
++from ops.attestation.hardware_inventory import gather_all
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET","")
++COSIGN_KEY_REF = os.environ.get("COSIGN_KEY_REF","")
++
++def collect_job_evidence(job_id, job_dir="./job_evidence"):
++    # Collect logs/artifacts for a specific job
++    out = []
++    base = Path(job_dir)
++    if base.exists():
++        for p in base.rglob("*"):
++            if p.is_file():
++                out.append(str(p))
++    return out
++
++def bundle_and_sign(items, out_prefix="att"):
++    tmp = tempfile.mkdtemp()
++    bundle = Path(tmp) / f"{out_prefix}-{int(time.time())}.tar.gz"
++    subprocess.check_call(["tar","-czf", str(bundle)] + items)
++    if COSIGN_KEY_REF:
++        subprocess.check_call(["cosign","sign","--key", COSIGN_KEY_REF, str(bundle)])
++    return str(bundle)
++
++def upload(bundle, prefix="attestations"):
++    if not EVIDENCE_BUCKET:
++        print("No EVIDENCE_BUCKET set; skipping upload")
++        return None
++    key = f"{prefix}/{Path(bundle).name}"
++    subprocess.check_call(["aws","s3","cp", bundle, f"{EVIDENCE_BUCKET}/{key}"])
++    return f"{EVIDENCE_BUCKET}/{key}"
++
++def create_attestation(job_id):
++    hw = gather_all()
++    job_items = collect_job_evidence(job_id)
++    # write hw json
++    tmpdir = tempfile.mkdtemp()
++    hw_path = Path(tmpdir) / "hardware.json"
++    hw_path.write_text(json.dumps(hw, indent=2))
++    items = job_items + [str(hw_path)]
++    bundle = bundle_and_sign(items, out_prefix=f"attestation-{job_id}")
++    uri = upload(bundle)
++    meta = {"job_id": job_id, "bundle_uri": uri, "signed": bool(COSIGN_KEY_REF), "ts": int(time.time())}
++    meta_path = Path(tmpdir) / "attestation.json"
++    meta_path.write_text(json.dumps(meta, indent=2))
++    if COSIGN_KEY_REF:
++        subprocess.call(["cosign","sign","--key", COSIGN_KEY_REF, str(meta_path)])
++    if EVIDENCE_BUCKET:
++        subprocess.check_call(["aws","s3","cp", str(meta_path), f"{EVIDENCE_BUCKET}/attestations/{meta_path.name}"])
++    return meta
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--job-id", required=True)
++    args = p.parse_args()
++    print("Creating attestation for job", args.job_id)
++    print(create_attestation(args.job_id))
++
+*** End File
+*** Add File:ops/canary/canary_controller.py
++#!/usr/bin/env python3
++"""
++Simple canary orchestration:
++ - Apply canary change (via GitOps or image update)
++ - Monitor acceptance tests, metrics (placeholder), and either promote to full rollout or create rollback PR
++ - Produce a rollback attestation bundle to evidence store if rollback performed
++"""
++import os, subprocess, time
++from ops.self_heal.gitops_rollback import create_rollback_pr
++from ops.attestation.attestation_enhanced import create_attestation
++
++GITOPS_REPO = os.environ.get("GITOPS_REPO","")
++MANIFEST_PATH = os.environ.get("GITOPS_MANIFEST_PATH","")
++DEPLOYMENT = os.environ.get("CANARY_DEPLOYMENT","aegis-diffusers")
++CANARY_OBSERVATION_SECONDS = int(os.environ.get("CANARY_OBSERVATION_SECONDS", "300"))
++
++def run_acceptance_tests():
++    # Placeholder: run acceptance harness
++    try:
++        subprocess.check_call(["python3", "services/telemetry/level4_acceptance/acceptance_suite.sh"])
++        return True
++    except Exception:
++        return False
++
++def promote():
++    # In GitOps, promotion is merging branch or updating manifest. Placeholder: operator action.
++    print("Promotion step - operator should merge GitOps PR or CI can auto-merge per policy")
++
++def rollback(prev_tag="stable", reason="canary-failed"):
++    # Create rollback PR via gitops helper
++    info = {"target_deployment": DEPLOYMENT, "gitops_repo": GITOPS_REPO, "manifest_path": MANIFEST_PATH, "prev_tag": prev_tag}
++    create_rollback_pr(GITOPS_REPO, MANIFEST_PATH, DEPLOYMENT, prev_tag)
++    # create attestation/evidence for rollback
++    att = create_attestation(f"rollback-{int(time.time())}")
++    print("Rollback attestation:", att)
++
++def main():
++    # Assume canary was applied externally (branch merged). We just observe and decide.
++    print("Observing canary for", CANARY_OBSERVATION_SECONDS, "seconds")
++    time.sleep(CANARY_OBSERVATION_SECONDS)
++    ok = run_acceptance_tests()
++    if ok:
++        print("Canary acceptance ok; promote")
++        promote()
++    else:
++        print("Canary failed; creating rollback PR and attestation")
++        rollback()
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:ops/kill_switch/kill_switch.py
++#!/usr/bin/env python3
++"""
++Kill-switch checker: consult Vault (or a config file) to determine if automated actions are allowed.
++All automation entrypoints should call check() before performing destructive actions.
++"""
++import os
++import subprocess
++
++VAULT_PATH = os.environ.get("KILL_SWITCH_VAULT_PATH","secret/data/aegis/kill_switch")
++
++def check_vault_kill_switch():
++    try:
++        out = subprocess.check_output(["vault","kv","get","-field=value", VAULT_PATH], universal_newlines=True)
++        if out.strip().lower() == "on":
++            return True
++    except Exception:
++        # If Vault not available, default to safe: enabled kill switch (don't proceed)
++        return True
++    return False
++
++def is_killed():
++    return check_vault_kill_switch()
++
++if __name__ == "__main__":
++    print("kill_switch enabled:", is_killed())
++
+*** End File
+*** Add File:deploy/otel/otel-collector.yaml
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: observability
++
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: otel-collector
++  namespace: observability
++
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: otel-collector
++  namespace: observability
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: otel-collector
++  template:
++    metadata:
++      labels:
++        app: otel-collector
++    spec:
++      serviceAccountName: otel-collector
++      containers:
++        - name: otel-collector
++          image: otel/opentelemetry-collector-contrib:0.77.0
++          args: ["--config=/etc/otel-collector-config.yaml"]
++          volumeMounts:
++            - name: config
++              mountPath: /etc/otel-collector-config.yaml
++              subPath: otel-collector-config.yaml
++      volumes:
++        - name: config
++          configMap:
++            name: otel-collector-config
++
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: otel-collector-config
++  namespace: observability
++data:
++  otel-collector-config.yaml: |
++    receivers:
++      otlp:
++        protocols:
++          grpc:
++          http:
++    processors:
++      batch:
++    exporters:
++      logging:
++    service:
++      pipelines:
++        traces:
++          receivers: [otlp]
++          processors: [batch]
++          exporters: [logging]
++
+*** End File
+*** Add File:docs/runbooks/automation_control.md
++# Automation Control & Safety Runbook
++
++Overview
++- Every automated workflow must verify:
++  - policy evaluation (services/policy/policy_engine.py)
++  - kill switch state (ops/kill_switch/kill_switch.py)
++  - create audit trace (OpenTelemetry) and attestation evidence when performing destructive actions
++
++Kill switch
++- Store kill switch in Vault at path secret/data/aegis/kill_switch with value "on" to pause automation.
++- Example: vault kv put secret/aegis/kill_switch value=on
++
++Emergency stop
++- Operators call: vault kv put secret/aegis/kill_switch value=on
++- All automation entrypoints must call ops/kill_switch/kill_switch.py:is_killed() and abort if True
++
++Policy checks
++- Use services/policy/policy_engine.py to evaluate action permissions and required approvals before execution.
++
++Audit & tracing
++- Ensure services send OTLP traces to the deployed OpenTelemetry collector.
++- Attest rollback and high-risk actions via ops/attestation/attestation_enhanced.py
++
++Approval flows
++- Low-risk actions can be automated if policy allows; high-risk actions require manual signoff (legal/finance) recorded via services/legal/legal_workflow.py
++
+*** End File
+*** End Patch

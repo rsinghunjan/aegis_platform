@@ -1,0 +1,575 @@
+*** Begin Patch
+*** Add File:services/sandbox/requirements.txt
++fastapi
++uvicorn[standard]
++boto3
++python-multipart
++requests
++psycopg2-binary
++python-jose
++
+*** End File
+*** Add File:services/sandbox/sandbox_worker.py
++#!/usr/bin/env python3
++"""
++Hardened action-execution sandbox (starter implementation).
++- Accepts action requests over HTTP and runs them in an isolated subprocess with timeouts.
++- Produces signed receipts (using AWS KMS) and writes audit records to MCP.
++- NOTE: For production, run sandbox in an isolated runtime (gVisor/Kata) and enforce RBAC via k8s ServiceAccount.
++"""
++import os, subprocess, uuid, time, json, logging
++from fastapi import FastAPI, HTTPException, BackgroundTasks
++from pydantic import BaseModel
++import boto3, requests
++
++LOG = logging.getLogger("aegis.sandbox")
++app = FastAPI(title="Aegis Sandbox Worker")
++
++KMS_KEY_ID = os.environ.get("SANDBOX_KMS_KEY_ID")
++AEGIS_MCP_API = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++SANDBOX_ALLOWED_CMDS = os.environ.get("SANDBOX_ALLOWED_CMDS", "echo,date,ls").split(",")
++
++kms = boto3.client("kms") if KMS_KEY_ID else None
++
++class ActionReq(BaseModel):
++    action_id: str = None
++    cmd: str
++    args: list = []
++    timeout_s: int = 10
++    requestor: str = "unknown"
++
++def sign_receipt(payload_bytes: bytes):
++    if not kms or not KMS_KEY_ID:
++        return None
++    # Use KMS sign (asymmetric key). In practice ensure key supports signing (asymmetric).
++    resp = kms.sign(KeyId=KMS_KEY_ID, Message=payload_bytes, MessageType='RAW', SigningAlgorithm='RSASSA_PKCS1_V1_5_SHA_256')
++    return resp.get("Signature")
++
++def store_audit(record: dict):
++    try:
++        # Write to MCP evidence endpoint; accept best-effort
++        requests.post(f"{AEGIS_MCP_API.rstrip('/')}/sandbox/audit", json=record, timeout=5.0)
++    except Exception as e:
++        LOG.warning("failed storing audit to MCP: %s", e)
++
++@app.post("/run")
++def run_action(req: ActionReq, background: BackgroundTasks):
++    # basic allowlist check
++    cmd_base = req.cmd.split()[0]
++    if cmd_base not in SANDBOX_ALLOWED_CMDS:
++        raise HTTPException(status_code=403, detail="command not allowed")
++    aid = req.action_id or str(uuid.uuid4())
++    start = int(time.time())
++    try:
++        # run command in subprocess; production: use isolated container runtime
++        proc = subprocess.run([req.cmd] + req.args, capture_output=True, timeout=req.timeout_s, check=False, text=True)
++        out = proc.stdout
++        err = proc.stderr
++        rc = proc.returncode
++    except subprocess.TimeoutExpired:
++        out = ""
++        err = "timeout"
++        rc = -1
++    end = int(time.time())
++    receipt = {
++        "action_id": aid,
++        "requestor": req.requestor,
++        "cmd": req.cmd,
++        "args": req.args,
++        "start_ts": start,
++        "end_ts": end,
++        "return_code": rc,
++        "stdout": out[:4096],
++        "stderr": err[:4096],
++    }
++    payload = json.dumps(receipt).encode("utf-8")
++    sig = None
++    try:
++        sig = sign_receipt(payload)
++    except Exception as e:
++        LOG.warning("signing failed: %s", e)
++    receipt_record = {"receipt": receipt, "signature": sig.hex() if sig else None}
++    # store audit asynchronously
++    background.add_task(store_audit, receipt_record)
++    return {"action_id": aid, "signed": bool(sig), "return_code": rc, "stdout": receipt["stdout"], "stderr": receipt["stderr"]}
++
++@app.get("/health")
++def health():
++    return {"ok": True}
++
+*** End File
+*** Add File:services/sandbox/Dockerfile
++FROM python:3.10-slim
++WORKDIR /app
++COPY requirements.txt .
++RUN pip install --no-cache-dir -r requirements.txt
++COPY sandbox_worker.py /app/sandbox_worker.py
++EXPOSE 8000
++CMD ["uvicorn", "sandbox_worker:app", "--host", "0.0.0.0", "--port", "8000"]
++
+*** End File
+*** Add File:k8s/sandbox/deployment.yaml
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: sandbox
++
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: sandbox-sa
++  namespace: sandbox
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: sandbox-role
++  namespace: sandbox
++rules:
++  - apiGroups: [""]
++    resources: ["pods"]
++    verbs: ["get","list","create","delete"]
++  - apiGroups: [""]
++    resources: ["secrets","configmaps"]
++    verbs: ["get"]
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: sandbox-rb
++  namespace: sandbox
++subjects:
++  - kind: ServiceAccount
++    name: sandbox-sa
++    namespace: sandbox
++roleRef:
++  kind: Role
++  name: sandbox-role
++  apiGroup: rbac.authorization.k8s.io
++
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: sandbox-worker
++  namespace: sandbox
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: sandbox-worker
++  template:
++    metadata:
++      labels:
++        app: sandbox-worker
++    spec:
++      serviceAccountName: sandbox-sa
++      containers:
++      - name: sandbox
++        image: aegis/sandbox:latest
++        env:
++          - name: SANDBOX_KMS_KEY_ID
++            valueFrom:
++              secretKeyRef:
++                name: sandbox-kms
++                key: key-id
++          - name: AEGIS_MCP_API
++            value: "http://mcp:8082"
++        resources:
++          limits:
++            cpu: "500m"
++            memory: "512Mi"
++          requests:
++            cpu: "100m"
++            memory: "128Mi"
++
+*** End File
+*** Add File:k8s/sandbox/secret.template.yaml
++apiVersion: v1
++kind: Secret
++metadata:
++  name: sandbox-kms
++  namespace: sandbox
++type: Opaque
++stringData:
++  key-id: "<KMS_KEY_ID_OR_ALIAS>"
++
+*** End File
+*** Add File:helm/milvus/README.md
++Milvus is best deployed via its official Helm chart. Example (quick):
++
++helm repo add milvus https://milvus-io.github.io/milvus-helm
++helm repo update
++helm install milvus milvus/milvus --namespace milvus --create-namespace
++
++After deployment, update your RAG retriever to point to Milvus service (host: milvus.milvus, port: 19530).
++
+*** End File
+*** Add File:services/verifier/cross_encoder/requirements.txt
++fastapi
++uvicorn[standard]
++sentence-transformers>=2.2.0
++torch
++prometheus-client
++requests
++
+*** End File
+*** Add File:services/verifier/cross_encoder/app.py
++#!/usr/bin/env python3
++"""
++Cross-encoder verifier for RAG / hallucination prevention.
++- Uses a CrossEncoder to score (premise, claim) pairs for entailment / support.
++"""
++import os, logging
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++from sentence_transformers import CrossEncoder
++from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
++from fastapi.responses import Response
++
++LOG = logging.getLogger("aegis.verifier.cross")
++app = FastAPI(title="Aegis CrossEncoder Verifier")
++
++MODEL = os.environ.get("CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
++THRESH = float(os.environ.get("CROSS_ENCODER_MIN_SCORE", "0.3"))
++
++REQ_COUNTER = Counter("aegis_crossreq_total", "Cross encoder requests")
++FAIL_COUNTER = Counter("aegis_crossfail_total", "Cross encoder failures")
++
++try:
++    ce = CrossEncoder(MODEL)
++except Exception as e:
++    LOG.error("failed loading model: %s", e)
++    ce = None
++
++class VerifyReq(BaseModel):
++    text: str
++    retrieved_docs: list
++
++@app.get("/metrics")
++def metrics():
++    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
++
++@app.post("/verify")
++def verify(req: VerifyReq):
++    REQ_COUNTER.inc()
++    if not ce:
++        FAIL_COUNTER.inc()
++        raise HTTPException(status_code=503, detail="verifier model unavailable")
++    # Score each doc as (doc_text, claim)
++    pairs = [[d.get("text", ""), req.text] for d in req.retrieved_docs]
++    if not pairs:
++        FAIL_COUNTER.inc()
++        return {"allow": False, "score": 0.0, "reasons": ["no_docs"]}
++    scores = ce.predict(pairs)
++    best = max(scores)
++    allow = best >= THRESH
++    return {"allow": allow, "score": float(best), "all_scores": [float(s) for s in scores]}
++
+*** End File
+*** Add File:services/verifier/cross_encoder/Dockerfile
++FROM python:3.10-slim
++WORKDIR /app
++COPY requirements.txt .
++RUN pip install --no-cache-dir -r requirements.txt
++COPY app.py /app/app.py
++EXPOSE 8000
++CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
++
+*** End File
+*** Add File:k8s/verifier/cross-encoder-deploy.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: verifier-cross-encoder
++  namespace: default
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: verifier-cross-encoder
++  template:
++    metadata:
++      labels:
++        app: verifier-cross-encoder
++    spec:
++      nodeSelector:
++        aegis/worker: "true"
++      containers:
++      - name: verifier
++        image: aegis/verifier-cross-encoder:latest
++        env:
++          - name: CROSS_ENCODER_MIN_SCORE
++            value: "0.35"
++        resources:
++          requests:
++            cpu: "1000m"
++            memory: "2Gi"
++          limits:
++            cpu: "4000m"
++            memory: "16Gi"
++
+*** End File
+*** Add File:services/pii/originals_api/requirements.txt
++fastapi
++uvicorn[standard]
++boto3
++requests
++
+*** End File
+*** Add File:services/pii/originals_api/app.py
++#!/usr/bin/env python3
++"""
++Original artifacts retrieval service that enforces A2A approvals.
++- GET /get_original?s3_key=...&approval_id=... -> returns presigned S3 URL if approver confirms.
++"""
++import os, boto3, requests
++from fastapi import FastAPI, HTTPException, Query
++
++APP = FastAPI(title="Aegis Originals Retrieval")
++S3_BUCKET = os.environ.get("ORIGINALS_S3_BUCKET")
++REGION = os.environ.get("AWS_REGION", "us-east-1")
++APPROVER_API = os.environ.get("A2A_API", "http://approver:8080")
++
++s3 = boto3.client("s3", region_name=REGION)
++
++@APP.get("/get_original")
++def get_original(s3_key: str = Query(...), approval_id: str = Query(...)):
++    # verify approval exists and corresponds to s3_key
++    try:
++        r = requests.get(f"{APPROVER_API}/approve_status/{approval_id}", timeout=5.0)
++        if r.status_code != 200:
++            raise HTTPException(status_code=403, detail="approval not found")
++        data = r.json()
++        if data.get("artifact_uri") != s3_key:
++            raise HTTPException(status_code=403, detail="approval does not match artifact")
++        if data.get("decision") != "approved":
++            raise HTTPException(status_code=403, detail="not approved")
++    except HTTPException:
++        raise
++    except Exception as e:
++        raise HTTPException(status_code=500, detail=f"approver check failed: {e}")
++    # produce presigned URL
++    url = s3.generate_presigned_url('get_object', Params={'Bucket': S3_BUCKET, 'Key': s3_key}, ExpiresIn=3600)
++    return {"presigned_url": url}
++
+*** End File
+*** Add File:services/pii/originals_api/Dockerfile
++FROM python:3.10-slim
++WORKDIR /app
++COPY requirements.txt .
++RUN pip install --no-cache-dir -r requirements.txt
++COPY app.py /app/app.py
++EXPOSE 8000
++CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
++
+*** End File
+*** Add File:k8s/pii/originals-api-deploy.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: originals-api
++  namespace: default
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: originals-api
++  template:
++    metadata:
++      labels:
++        app: originals-api
++    spec:
++      containers:
++      - name: originals
++        image: aegis/originals-api:latest
++        env:
++          - name: ORIGINALS_S3_BUCKET
++            value: "aegis-originals"
++          - name: A2A_API
++            value: "http://approver:8080"
++        resources:
++          requests:
++            cpu: 100m
++            memory: 128Mi
++
+*** End File
+*** Add File:k8s/runtimeclass/preempt-rt.yaml
++apiVersion: node.k8s.io/v1
++kind: RuntimeClass
++metadata:
++  name: preempt-rt
++handler: runc   # for real PREEMPT_RT, the node image must provide RT kernel and runtimeClass driver configured
++
+*** End File
+*** Add File:services/safety/monitor/requirements.txt
++fastapi
++uvicorn[standard]
++requests
++prometheus-client
++
+*** End File
+*** Add File:services/safety/monitor/app.py
++#!/usr/bin/env python3
++"""
++Safety monitor that accepts telemetry webhooks and triggers emergency stop via sandbox if thresholds exceeded.
++It also writes signed evidence to MCP for traceability.
++"""
++import os, time, json, logging, requests
++from fastapi import FastAPI, Request
++
++LOG = logging.getLogger("aegis.safety")
++app = FastAPI(title="Aegis Safety Monitor")
++
++SANDBOX_API = os.environ.get("SANDBOX_API", "http://sandbox.sandbox.svc.cluster.local:8000/run")
++AEGIS_MCP_API = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++EMERGENCY_THRESHOLD = float(os.environ.get("EMERGENCY_THRESHOLD", "0.9"))
++
++@app.post("/telemetry")
++async def telemetry(req: Request):
++    body = await req.json()
++    # example: body contains {"metric":"cpu_miss", "value": 0.95}
++    metric = body.get("metric")
++    value = float(body.get("value", 0.0))
++    if value >= EMERGENCY_THRESHOLD:
++        # trigger emergency stop action in sandbox
++        action = {"cmd": "echo", "args": ["EMERGENCY STOP"], "requestor": "safety-monitor"}
++        try:
++            r = requests.post(SANDBOX_API, json=action, timeout=5.0)
++            # write evidence to MCP
++            ev = {"type": "safety_event", "metric": metric, "value": value, "sandbox_resp": r.json()}
++            requests.post(f"{AEGIS_MCP_API.rstrip('/')}/safety/events", json=ev, timeout=5.0)
++        except Exception as e:
++            LOG.error("failed to call sandbox or MCP: %s", e)
++        return {"stopped": True}
++    return {"stopped": False}
++
+*** End File
+*** Add File:services/safety/monitor/Dockerfile
++FROM python:3.10-slim
++WORKDIR /app
++COPY requirements.txt .
++RUN pip install --no-cache-dir -r requirements.txt
++COPY app.py /app/app.py
++EXPOSE 8000
++CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
++
+*** End File
+*** Add File:services/ops/auto_rollback/requirements.txt
++kubernetes
++requests
++prometheus-api-client
++pyyaml
++
+*** End File
+*** Add File:services/ops/auto_rollback/auto_rollback.py
++#!/usr/bin/env python3
++"""
++Simple automated rollback controller.
++- Polls Prometheus for a configured alert/metric (e.g. verifier_failures_total) and if threshold breached,
++  marks the offending deployment with an annotation and scales rollout to zero (safe-stop).
++ - This is a conservative example — in production, integrate with your CD system and use rollout/undo APIs.
++"""
++import os, time, logging
++from kubernetes import client, config
++import requests
++
++PROM_URL = os.environ.get("PROM_URL", "http://prometheus.monitoring.svc:9090")
++CHECK_QUERY = os.environ.get("PROM_QUERY", 'increase(aegis_preflight_verifier_fail_total[5m])')
++THRESH = float(os.environ.get("ROLLBACK_THRESHOLD", "5"))
++TARGET_NAMESPACE = os.environ.get("TARGET_NAMESPACE", "default")
++TARGET_DEPLOYMENT = os.environ.get("TARGET_DEPLOYMENT", "")
++SLEEP = int(os.environ.get("CHECK_INTERVAL", "30"))
++
++logging.basicConfig(level=logging.INFO)
++LOG = logging.getLogger("aegis.autorollback")
++
++def query_prometheus(query):
++    try:
++        r = requests.get(f"{PROM_URL.rstrip('/')}/api/v1/query", params={"query": query}, timeout=5.0)
++        r.raise_for_status()
++        data = r.json()
++        if data.get("status") == "success":
++            v = float(data["data"]["result"][0]["value"][1]) if data["data"]["result"] else 0.0
++            return v
++    except Exception as e:
++        LOG.warning("prometheus query failed: %s", e)
++    return 0.0
++
++def do_rollback(namespace, deployment):
++    try:
++        config.load_incluster_config()
++    except:
++        config.load_kube_config()
++    apps = client.AppsV1Api()
++    LOG.info("Scaling deployment %s/%s to 0 (safe-stop)", namespace, deployment)
++    apps.patch_namespaced_deployment_scale(deployment, namespace, {"spec": {"replicas": 0}})
++    # annotate
++    body = {"metadata": {"annotations": {"aegis.autorollback/rolled-back": str(int(time.time()))}}}
++    apps.patch_namespaced_deployment(deployment, namespace, body)
++
++if __name__ == "__main__":
++    if not TARGET_DEPLOYMENT:
++        LOG.error("TARGET_DEPLOYMENT not set; exiting")
++        exit(2)
++    while True:
++        v = query_prometheus(CHECK_QUERY)
++        LOG.info("Prometheus query value: %s", v)
++        if v >= THRESH:
++            LOG.warning("Threshold exceeded (%s >= %s) -> initiating rollback", v, THRESH)
++            do_rollback(TARGET_NAMESPACE, TARGET_DEPLOYMENT)
++            # sleep longer after a rollback
++            time.sleep(SLEEP * 6)
++        else:
++            time.sleep(SLEEP)
++
+*** End File
+*** Add File:services/ops/auto_rollback/Dockerfile
++FROM python:3.10-slim
++WORKDIR /app
++COPY requirements.txt .
++RUN pip install --no-cache-dir -r requirements.txt
++COPY auto_rollback.py /app/auto_rollback.py
++CMD ["python", "/app/auto_rollback.py"]
++
+*** End File
+*** Add File:k8s/ops/auto-rollback-deploy.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-auto-rollback
++  namespace: default
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-auto-rollback
++  template:
++    metadata:
++      labels:
++        app: aegis-auto-rollback
++    spec:
++      containers:
++      - name: auto-rollback
++        image: aegis/auto-rollback:latest
++        env:
++          - name: PROM_URL
++            value: "http://prometheus.monitoring.svc:9090"
++          - name: PROM_QUERY
++            value: 'increase(aegis_preflight_verifier_fail_total[5m])'
++          - name: ROLLBACK_THRESHOLD
++            value: "5"
++          - name: TARGET_NAMESPACE
++            value: "default"
++          - name: TARGET_DEPLOYMENT
++            value: "your-model-deployment"
++        resources:
++          requests:
++            cpu: 100m
++            memory: 128Mi
++
+*** End File
+*** End Patch

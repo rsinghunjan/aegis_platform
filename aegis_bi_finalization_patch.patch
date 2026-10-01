@@ -1,0 +1,440 @@
+*** Begin Patch
+*** Add File:data_quality/expectations/core_job_runs_suite.json
+{
+  "data_asset_type": "table",
+  "expectation_suite_name": "core_job_runs_suite",
+  "expectations": [
+    {
+      "expectation_type": "expect_table_row_count_to_be_between",
+      "kwargs": {"min_value": 0}
+    },
+    {
+      "expectation_type": "expect_column_values_to_not_be_null",
+      "kwargs": {"column": "job_id"}
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_unique",
+      "kwargs": {"column": "job_id"}
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_between",
+      "kwargs": {"column": "estimated_kg", "min_value": 0}
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_between",
+      "kwargs": {"column": "duration_s", "min_value": 0}
+    }
+  ],
+  "meta": {
+    "notes": "Basic expectations for core_job_runs mart. Extend with business-specific assertions."
+  }
+}
+*** End Patch
+*** Begin Patch
+*** Add File:data_quality/ge_integration.sh
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# Entrypoint to run Great Expectations validations and emit Prometheus metrics + upload results to S3
+GE_DIR=${GE_DIR:-/opt/data_quality/great_expectations}
+EVIDENCE_BUCKET=${EVIDENCE_BUCKET:-aegis-evidence}
+PROM_PUSHGATEWAY=${PROM_PUSHGATEWAY:-pushgateway.monitoring.svc:9091}
+HOSTNAME=$(hostname -f)
+TMP=/tmp/ge_run_$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "${TMP}"
+cd "${GE_DIR}"
+python3 run_expectations.py || true
+# Upload rendered data_docs and results to S3 (best-effort)
+if [ -d "${GE_DIR}/uncommitted/data_docs/local_site" ]; then
+  tar czf "${TMP}/ge_docs.tgz" -C "${GE_DIR}/uncommitted/data_docs/local_site" .
+  aws s3 cp "${TMP}/ge_docs.tgz" "s3://${EVIDENCE_BUCKET}/data-quality/docs/ge_docs_$(date -u +%Y%m%dT%H%M%SZ).tgz" || true
+fi
+# push a metric to pushgateway to indicate last run success (0/1)
+# for simplicity, we write a small metric file
+cat > "${TMP}/ge_status.prom" <<EOF
+# HELP aegis_ge_last_run_ok 1 if last GE run succeeded
+# TYPE aegis_ge_last_run_ok gauge
+aegis_ge_last_run_ok 1
+EOF
+curl --data-binary @"${TMP}/ge_status.prom" "http://${PROM_PUSHGATEWAY}/metrics/job/ge_validation/instance/${HOSTNAME}" || true
+echo "GE integration complete"
+*** End Patch
+*** Begin Patch
+*** Add File:ingest/s3_parquet_pipeline_v2.py
+#!/usr/bin/env python3
+"""
+Bulk ingestion pipeline (v2)
+ - Convert evidence JSON files in S3 to Parquet, partition by date
+ - Produce manifest file listing parquet objects for bulk loading into warehouse (e.g., Redshift COPY or BigQuery load)
+ - Keeps progress via a checkpoint object in S3 to make idempotent (prefix/.checkpoint)
+"""
+import os
+import json
+import boto3
+import tempfile
+import math
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pandas as pd
+from datetime import datetime, timezone
+
+S3_BUCKET = os.environ.get("EVIDENCE_BUCKET", "aegis-evidence")
+PREFIX = os.environ.get("EVIDENCE_PREFIX", "evidence/")
+OUT_PREFIX = os.environ.get("PARQUET_OUT_PREFIX", "parquet/evidence")
+AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
+BATCH_SIZE = int(os.environ.get("PARQUET_BATCH_SIZE", "2000"))
+CHECKPOINT_KEY = os.environ.get("PARQUET_CHECKPOINT_KEY", f"{PREFIX}.parquet_checkpoint.json")
+
+s3 = boto3.client("s3", region_name=AWS_REGION)
+
+def list_keys_after(prefix, marker=None):
+    paginator = s3.get_paginator("list_objects_v2")
+    kwargs = {"Bucket": S3_BUCKET, "Prefix": prefix}
+    for page in paginator.paginate(**kwargs):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if marker and key <= marker:
+                continue
+            yield key
+
+def read_checkpoint():
+    try:
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=CHECKPOINT_KEY)
+        return json.loads(obj["Body"].read().decode("utf-8"))
+    except Exception:
+        return {"last_key": None}
+
+def write_checkpoint(last_key):
+    payload = {"last_key": last_key, "ts": datetime.now(timezone.utc).isoformat()}
+    s3.put_object(Bucket=S3_BUCKET, Key=CHECKPOINT_KEY, Body=json.dumps(payload).encode("utf-8"))
+
+def convert_and_upload(keys):
+    rows = []
+    for k in keys:
+        if not k.endswith(".json"):
+            continue
+        try:
+            obj = s3.get_object(Bucket=S3_BUCKET, Key=k)
+            body = obj["Body"].read().decode("utf-8")
+            j = json.loads(body)
+            rows.append({
+                "s3_key": k,
+                "job_id": j.get("job_id"),
+                "team": j.get("team"),
+                "start_ts": j.get("start_ts"),
+                "end_ts": j.get("end_ts"),
+                "estimated_kg": j.get("estimated_kg"),
+                "model_name": j.get("model_name")
+            })
+        except Exception:
+            continue
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    # partition by date of start_ts
+    df["start_dt"] = pd.to_datetime(df["start_ts"]).dt.date.astype(str)
+    # write one parquet per partition
+    uploaded = []
+    tmpdir = tempfile.mkdtemp()
+    for part, subdf in df.groupby("start_dt"):
+        out_path = os.path.join(tmpdir, f"batch_{part}_{int(datetime.now(timezone.utc).timestamp())}.parquet")
+        table = pa.Table.from_pandas(subdf.drop(columns=["start_dt"]))
+        pq.write_table(table, out_path, compression="snappy")
+        s3_key = f"{OUT_PREFIX}/start_dt={part}/{os.path.basename(out_path)}"
+        s3.upload_file(out_path, S3_BUCKET, s3_key)
+        uploaded.append(s3_key)
+    return uploaded
+
+def main():
+    cp = read_checkpoint()
+    last = cp.get("last_key")
+    keys = list(list_keys_after(PREFIX, marker=last))
+    batch = []
+    uploaded_any = False
+    for k in keys:
+        batch.append(k)
+        if len(batch) >= BATCH_SIZE:
+            uploaded = convert_and_upload(batch)
+            if uploaded:
+                write_checkpoint(batch[-1])
+                uploaded_any = True
+            batch = []
+    if batch:
+        uploaded = convert_and_upload(batch)
+        if uploaded:
+            write_checkpoint(batch[-1])
+            uploaded_any = True
+    if uploaded_any:
+        print("Uploaded parquet batches")
+    else:
+        print("No new objects to convert")
+
+if __name__ == "__main__":
+    main()
+*** End Patch
+*** Begin Patch
+*** Add File:ingest/redshift_bulk_loader.sh
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# Example script: bulk-load parquet artifacts into Amazon Redshift using COPY.
+# Requires that Redshift cluster has an IAM role with S3 read access.
+PARQUET_S3_PREFIX=${PARQUET_S3_PREFIX:-parquet/evidence}
+REDSHIFT_CLUSTER=${REDSHIFT_CLUSTER:-redshift-cluster.example}
+REDSHIFT_DB=${REDSHIFT_DB:-dev}
+REDSHIFT_USER=${REDSHIFT_USER:-admin}
+REDSHIFT_IAM_ROLE=${REDSHIFT_IAM_ROLE:-arn:aws:iam::123456789012:role/RedshiftCopyRole}
+WAREHOUSE_DSN=${WAREHOUSE_DSN:-postgresql://user:pass@redshift-host:5439/dev}
+# This is an example using psql to execute COPY (for Redshift using postgres-compatible endpoint)
+SQL="COPY raw.raw_job_runs FROM 's3://${EVIDENCE_BUCKET}/${PARQUET_S3_PREFIX}/' IAM_ROLE '${REDSHIFT_IAM_ROLE}' FORMAT AS PARQUET;"
+echo "Running COPY command (ensure role & network access)"
+psql "${WAREHOUSE_DSN}" -c "${SQL}"
+echo "Redshift COPY triggered"
+*** End Patch
+*** Begin Patch
+*** Add File:ingest/bigquery_load_example.sh
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# Example: load parquet files from GCS or S3 (via GCS connector) into BigQuery
+BQ_PROJECT=${BQ_PROJECT:-my-project}
+BQ_DATASET=${BQ_DATASET:-aegis_dw}
+PARQUET_URI=${PARQUET_URI:-"gs://my-bucket/parquet/evidence/*"}
+TABLE=${TABLE:-raw_job_runs}
+bq load --autodetect --source_format=PARQUET ${BQ_PROJECT}:${BQ_DATASET}.${TABLE} ${PARQUET_URI}
+echo "BigQuery load submitted"
+*** End Patch
+*** Begin Patch
+*** Add File:airflow/dags/aegis_etl_robust.py
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.operators.bash import BashOperator
+import subprocess, os, requests
+
+DEFAULT_ARGS = {
+    'owner': 'aegis',
+    'depends_on_past': False,
+    'email_on_failure': False,
+    'retries': 2,
+    'retry_delay': timedelta(minutes=5),
+}
+
+def push_prom_metric(name, value, pushgateway=None):
+    if not pushgateway:
+        pushgateway = os.environ.get("PROM_PUSHGATEWAY")
+    if not pushgateway:
+        return
+    payload = f"{name} {value}\n"
+    host = os.environ.get("PUSHGATEWAY_HOST", pushgateway)
+    try:
+        requests.post(f"http://{host}/metrics/job/aegis_etl", data=payload, timeout=5)
+    except Exception:
+        pass
+
+def run_parquet(**kwargs):
+    ret = subprocess.run("python3 /opt/ingest/s3_parquet_pipeline_v2.py", shell=True)
+    if ret.returncode != 0:
+        push_prom_metric("aegis_etl_parquet_failed", 1)
+        raise RuntimeError("parquet pipeline failed")
+    push_prom_metric("aegis_etl_parquet_failed", 0)
+
+def run_bulk_load(**kwargs):
+    # choose loader based on env
+    loader = os.environ.get("BULK_LOADER", "redshift")
+    if loader == "redshift":
+        ret = subprocess.run("/opt/ingest/redshift_bulk_loader.sh", shell=True)
+    else:
+        ret = subprocess.run("/opt/ingest/bigquery_load_example.sh", shell=True)
+    if ret.returncode != 0:
+        push_prom_metric("aegis_etl_bulk_load_failed", 1)
+        raise RuntimeError("bulk load failed")
+    push_prom_metric("aegis_etl_bulk_load_failed", 0)
+
+def run_ge(**kwargs):
+    ret = subprocess.run("python3 /opt/data_quality/ge_integration.sh", shell=True)
+    if ret.returncode != 0:
+        push_prom_metric("aegis_ge_failed", 1)
+        raise RuntimeError("GE failed")
+    push_prom_metric("aegis_ge_failed", 0)
+
+def run_dbt(**kwargs):
+    ret = subprocess.run("cd /opt/bi && dbt deps && dbt run --profiles-dir /opt/bi/profiles", shell=True)
+    if ret.returncode != 0:
+        push_prom_metric("aegis_dbt_failed", 1)
+        raise RuntimeError("dbt failed")
+    push_prom_metric("aegis_dbt_failed", 0)
+
+def notify_success(**kwargs):
+    webhook = os.environ.get("SLACK_WEBHOOK_URL")
+    if webhook:
+        requests.post(webhook, json={"text": "Aegis ETL pipeline succeeded"}, timeout=5)
+
+with DAG(
+    dag_id="aegis_etl_robust",
+    default_args=DEFAULT_ARGS,
+    schedule_interval="@daily",
+    start_date=datetime(2025,1,1),
+    catchup=False,
+    max_active_runs=1,
+) as dag:
+
+    parquet = PythonOperator(task_id="s3_to_parquet", python_callable=run_parquet)
+    bulk = PythonOperator(task_id="bulk_load", python_callable=run_bulk_load)
+    ge = PythonOperator(task_id="great_expectations", python_callable=run_ge)
+    dbt = PythonOperator(task_id="dbt_run", python_callable=run_dbt)
+    notify = PythonOperator(task_id="notify_success", python_callable=notify_success)
+
+    parquet >> bulk >> ge >> dbt >> notify
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/data_quality_exporter.py
+#!/usr/bin/env python3
+"""
+A small Prometheus exporter that reads validation results (local or S3) and exposes metrics for scraping.
+- Exposes:
+  - aegis_ge_latest_success (gauge 0/1)
+  - aegis_ge_last_run_ts (gauge)
+  - aegis_data_drift_score (gauge; placeholder)
+"""
+from prometheus_client import start_http_server, Gauge
+import time, os, json, boto3
+
+EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
+GE_RESULTS_PREFIX = os.environ.get("GE_RESULTS_PREFIX", "data-quality/validations")
+PORT = int(os.environ.get("DQ_EXPORTER_PORT", "9612"))
+
+g_success = Gauge("aegis_ge_latest_success", "1 if last GE run succeeded")
+g_ts = Gauge("aegis_ge_last_run_ts", "Timestamp of last GE run")
+g_drift = Gauge("aegis_data_drift_score", "Data drift score (0-1)")
+
+s3 = boto3.client("s3") if EVIDENCE_BUCKET else None
+
+def fetch_latest():
+    # find latest result JSON in S3 prefix
+    if not s3:
+        return None
+    res = s3.list_objects_v2(Bucket=EVIDENCE_BUCKET, Prefix=GE_RESULTS_PREFIX, MaxKeys=50)
+    items = res.get("Contents", [])
+    if not items:
+        return None
+    latest = sorted(items, key=lambda x: x["LastModified"], reverse=True)[0]
+    obj = s3.get_object(Bucket=EVIDENCE_BUCKET, Key=latest["Key"])
+    data = json.loads(obj["Body"].read().decode("utf-8"))
+    return data, latest["LastModified"].timestamp()
+
+def main():
+    start_http_server(PORT)
+    while True:
+        try:
+            val = fetch_latest()
+            if val:
+                data, ts = val
+                success = 1 if data.get("success", False) else 0
+                g_success.set(success)
+                g_ts.set(ts)
+                # placeholder drift: sum of metric in data if present
+                drift = data.get("result", {}).get("meta", {}).get("drift_score", 0) or 0
+                g_drift.set(drift)
+        except Exception:
+            pass
+        time.sleep(30)
+
+if __name__ == "__main__":
+    main()
+*** End Patch
+*** Begin Patch
+*** Add File:governance/superset_config_oidc.py
+# superset_config.py (snippet) - configure OIDC + role mapping
+# Place this into your Superset config (e.g., /etc/superset/superset_config.py)
+from flask_appbuilder.security.manager import AUTH_OID
+AUTH_TYPE = AUTH_OID
+OPENID_PROVIDERS = [
+    {
+      'name': 'keycloak',
+      'token_key': 'access_token',
+      'icon': 'fa-address-card',
+      'remote_app': {
+          'client_id': 'superset-client',
+          'client_secret': 'SUPERSECRET',
+          'api_base_url': 'https://keycloak.example.com/auth/realms/aegis',
+          'access_token_url': 'https://keycloak.example.com/auth/realms/aegis/protocol/openid-connect/token',
+          'authorize_url': 'https://keycloak.example.com/auth/realms/aegis/protocol/openid-connect/auth',
+          'client_kwargs': {'scope': 'openid email profile'}
+      }
+    }
+]
+# Map OIDC groups to Superset roles via SECURITY_MANAGER_CLASS customization or use FAB role mapping extensions.
+# For RBAC, create roles in Superset: team_role_<teamname> and assign dataset/dashboard permissions accordingly.
+*** End Patch
+*** Begin Patch
+*** Add File:governance/row_level_security.sql
+-- Example Postgres RLS policy pattern for per-team row-level access
+-- Assumes a session variable "app.team" is set for the DB connection (e.g., via Superset pre-query)
+ALTER TABLE marts.core_job_runs ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY team_policy ON marts.core_job_runs
+USING (team = current_setting('app.team', true)::text OR current_setting('app.team', true) = '');
+
+-- Example: set app.team in connection pre-query
+-- SET app.team = 'team-a';
+*** End Patch
+*** Begin Patch
+*** Add File:ui/superset_schedule_report.sh
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# Export a Superset dashboard to PDF/PNG using superset CLI (superset==2.x)
+DASHBOARD_ID=${1:-1}
+OUT_DIR=${OUT_DIR:-/tmp/superset_reports}
+S3_BUCKET=${EVIDENCE_BUCKET:-aegis-evidence}
+mkdir -p "${OUT_DIR}"
+OUT_FILE="${OUT_DIR}/dashboard_${DASHBOARD_ID}_$(date -u +%Y%m%dT%H%M%SZ).pdf"
+# Example using `superset export-dashboard` or headless chrome; below is placeholder using superset-export tool
+superset export-dashboard --dashboard-id "${DASHBOARD_ID}" --output "${OUT_FILE}" || true
+# Sign & upload
+cosign sign --key "awskms://${COSIGN_KMS_KEY_ARN:-}" "${OUT_FILE}" || true
+aws s3 cp "${OUT_FILE}" "s3://${S3_BUCKET}/reports/$(basename ${OUT_FILE})" || true
+echo "Uploaded signed report to s3://${S3_BUCKET}/reports/$(basename ${OUT_FILE})"
+*** End Patch
+*** Begin Patch
+*** Add File:runbooks/BI_operational_playbook.md
+# BI Operational Playbook (staging → prod)
+
+This playbook describes operator tasks to ensure Data Quality, Lineage, Governance and Robust ETL for Aegis BI.
+
+1) Deploy components
+ - Deploy DataHub ingestion (use datahub/datahub_ingest_recipe.yml previously added)
+ - Deploy Great Expectations runner and exporter (data_quality/*)
+ - Deploy the enhanced parquet pipeline and bulk loaders
+ - Configure Superset SSO (superset_config_oidc.py) and create team roles
+
+2) Idempotent ingestion
+ - The parquet pipeline writes a checkpoint file in S3 (.parquet_checkpoint.json). If a run fails, re-run the pipeline and it will continue from last checkpoint.
+ - Always monitor the checkpoint timestamp after runs.
+
+3) Data quality & lineage
+ - Schedule GE validation weekly; failures are uploaded to S3 and exposed as Prometheus metrics by data_quality_exporter.
+ - Run DataHub ingestion after dbt run to capture lineage.
+
+4) Governance & RLS
+ - Configure DB session setting for Superset connections (e.g., via pre-query) to set `app.team` per user and enable RLS policies.
+ - Create Superset roles per team and grant dataset access only to the relevant roles.
+
+5) Alerts & operations
+ - Airflow alerts (Slack) are configured in the DAG. Set SLACK_WEBHOOK_URL and PROM_PUSHGATEWAY for metric integration.
+ - Monitor Prometheus rules (prometheus_rules_bi.yaml) to detect failures and drift.
+
+6) BI UX & scheduled reports
+ - Curate dashboards in Superset and use superset_schedule_report.sh to export and sign daily/weekly reports uploaded to evidence S3.
+ - Provide a feedback loop with analysts to refine KPIs and models.
+
+7) Continuous improvement
+ - Use reconciliation reports to trigger auto-calibration drafts; human operator should review drafts in approve_service before applying to production profiles.
+
+Security notes
+ - Use corporate PKI for certs; ensure Superset SSO is enforced and RBAC roles are aligned to organizational groups.
+ - Protect S3 buckets and KMS keys; restrict cosign signing keys.
+
+*** End Patch
+*** End Patch

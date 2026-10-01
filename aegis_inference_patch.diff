@@ -1,0 +1,445 @@
+diff --git a/inference/requirements.txt b/inference/requirements.txt
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/inference/requirements.txt
+@@ -0,0 +1,8 @@
++fastapi==0.95.2
++uvicorn[standard]==0.22.0
++requests==2.31.0
++redis==5.3.7
++prometheus_client==0.16.0
++python-dotenv==1.0.0
++hashlib
++typing-extensions==4.6.3
+diff --git a/inference/Dockerfile b/inference/Dockerfile
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/inference/Dockerfile
+@@ -0,0 +1,34 @@
++FROM python:3.10-slim
++WORKDIR /app
++COPY inference/requirements.txt /app/requirements.txt
++RUN apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev \
++    && pip install --upgrade pip \
++    && pip install -r /app/requirements.txt \
++    && apt-get remove -y gcc \
++    && apt-get autoremove -y \
++    && rm -rf /var/lib/apt/lists/*
++COPY inference/gateway.py /app/gateway.py
++COPY tools/decisionlog_client.py /app/tools/decisionlog_client.py
++ENV PYTHONUNBUFFERED=1
++EXPOSE 8080
++CMD ["uvicorn", "gateway:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+diff --git a/inference/gateway.py b/inference/gateway.py
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/inference/gateway.py
+@@ -0,0 +1,360 @@
++#!/usr/bin/env python3
++"""
++Inference Gateway for Aegis
++
++Features:
++ - Routes requests to vLLM or Triton inference backends
++ - Caching via Redis (prompt+model key)
++ - Prometheus metrics (requests, latency, cache hits)
++ - Logs audit/usage events to decision_log (if POSTGRES_URL configured) via tools.decisionlog_client
++ - Simple backend selection via `backend` param ("vllm" or "triton")
++
++Environment variables:
++ - VLLM_URL (http://vllm-service:8000/generate or similar)
++ - TRITON_URL (http://triton-server:8000)
++ - REDIS_URL (redis://host:6379/0)
++ - CACHE_TTL_SECONDS (default 300)
++ - POSTGRES_URL (optional, used by tools.decisionlog_client)
++ - DEFAULT_MODEL (optional)
++
++Usage:
++  docker build -t aegis-inference-gateway:latest inference/
++  kubectl apply -f k8s/manifests/inference-gateway-deployment.yaml
++"""
++import os
++import time
++import json
++import hashlib
++import logging
++from typing import Optional
++
++from fastapi import FastAPI, HTTPException, Request
++from pydantic import BaseModel
++import requests
++import redis
++from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
++
++try:
++    from tools.decisionlog_client import insert_decision
++except Exception:
++    def insert_decision(agent, action, payload, evidence):
++        # Fallback: log to stdout
++        print("decision_log stub:", agent, action, payload, evidence)
++        return None
++
++LOG = logging.getLogger("aegis.inference.gateway")
++logging.basicConfig(level=logging.INFO)
++
++# Config from env
++VLLM_URL = os.environ.get("VLLM_URL", "http://vllm.aegis-ml.svc.cluster.local:8000/generate")
++TRITON_URL = os.environ.get("TRITON_URL", "http://triton.aegis-ml.svc.cluster.local:8000")
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis.aegis-ml.svc.cluster.local:6379/0")
++CACHE_TTL = int(os.environ.get("CACHE_TTL_SECONDS", "300"))
++DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "aegis-ggml")
++
++# Prometheus metrics
++REQUEST_COUNT = Counter("aegis_inference_requests_total", "Total inference requests", ["backend", "model"])
++REQUEST_LATENCY = Histogram("aegis_inference_request_latency_seconds", "Inference request latency seconds", ["backend", "model"])
++CACHE_HITS = Counter("aegis_inference_cache_hits_total", "Cache hits for inference", ["backend", "model"])
++CACHE_MISSES = Counter("aegis_inference_cache_misses_total", "Cache misses for inference", ["backend", "model"])
++
++# Redis client (for caching)
++redis_client = redis.from_url(REDIS_URL, decode_responses=False)
++
++app = FastAPI(title="Aegis Inference Gateway")
++
++class GenerateRequest(BaseModel):
++    prompt: str
++    model: Optional[str] = None
++    backend: Optional[str] = None  # "vllm" or "triton"
++    max_tokens: Optional[int] = 256
++    temperature: Optional[float] = 0.0
++    top_k: Optional[int] = None
++    top_p: Optional[float] = None
++    stop: Optional[list] = None
++
++def make_cache_key(prompt: str, model: str, backend: str, params: dict) -> str:
++    m = hashlib.sha256()
++    m.update(backend.encode())
++    m.update(model.encode())
++    m.update(json.dumps(params, sort_keys=True).encode())
++    m.update(prompt.encode())
++    return "inference_cache:" + m.hexdigest()
++
++def call_vllm(prompt: str, model: str, params: dict) -> dict:
++    # vLLM server implementations differ; this expects a generic HTTP endpoint accepting JSON {prompt, parameters...}
++    payload = {"prompt": prompt, "model": model, **params}
++    r = requests.post(VLLM_URL, json=payload, timeout=60)
++    r.raise_for_status()
++    return r.json()
++
++def call_triton(prompt: str, model: str, params: dict) -> dict:
++    # Triton expects model-specific payloads. This example assumes a simple HTTP-text model interface:
++    # POST /v2/models/{model}/infer with JSON body per Triton Inference HTTP API.
++    # Production code must conform to your Triton model config (input names, dtypes, shapes).
++    url = f"{TRITON_URL}/v2/models/{model}/infer"
++    # Naive wrapper: pack prompt as a single string input named "TEXT" -- adjust to your model.
++    infer_request = {
++        "inputs": [
++            {"name": "TEXT", "shape": [1], "datatype": "BYTES", "data": [prompt.encode("utf-8")]},
++        ],
++        "parameters": params,
++    }
++    r = requests.post(url, json=infer_request, timeout=60)
++    r.raise_for_status()
++    return r.json()
++
++@app.post("/generate")
++async def generate(req: GenerateRequest):
++    model = req.model or DEFAULT_MODEL
++    backend = (req.backend or "vllm").lower()
++    params = {
++        "max_tokens": req.max_tokens,
++        "temperature": req.temperature,
++        "top_k": req.top_k,
++        "top_p": req.top_p,
++        "stop": req.stop,
++    }
++
++    cache_key = make_cache_key(req.prompt, model, backend, params)
++
++    # Try cache
++    try:
++        cached = redis_client.get(cache_key)
++        if cached:
++            CACHE_HITS.labels(backend=backend, model=model).inc()
++            REQUEST_COUNT.labels(backend=backend, model=model).inc()
++            return json.loads(cached)
++        else:
++            CACHE_MISSES.labels(backend=backend, model=model).inc()
++    except Exception:
++        LOG.exception("Redis unavailable; continuing without cache")
++
++    # Call backend and measure latency
++    start = time.time()
++    REQUEST_COUNT.labels(backend=backend, model=model).inc()
++    try:
++        if backend == "vllm":
++            resp = call_vllm(req.prompt, model, params)
++        elif backend == "triton":
++            resp = call_triton(req.prompt, model, params)
++        else:
++            raise HTTPException(status_code=400, detail=f"Unknown backend '{backend}'")
++    except requests.HTTPError as e:
++        LOG.exception("Backend error")
++        raise HTTPException(status_code=502, detail=str(e))
++    finally:
++        elapsed = time.time() - start
++        REQUEST_LATENCY.labels(backend=backend, model=model).observe(elapsed)
++
++    # Store in cache
++    try:
++        redis_client.setex(cache_key, CACHE_TTL, json.dumps(resp))
++    except Exception:
++        LOG.exception("Failed to write cache")
++
++    # Log usage to decision_log (best-effort)
++    try:
++        evidence = {"backend": backend, "model": model, "params": params}
++        payload = {"prompt_hash": hashlib.sha256(req.prompt.encode()).hexdigest(), "backend": backend, "model": model}
++        insert_decision(agent="aegis-inference-gateway", action="generate_requested", payload=payload, evidence=evidence)
++    except Exception:
++        LOG.exception("Failed to write decision_log event")
++
++    return resp
++
++@app.get("/healthz")
++async def healthz():
++    return {"status": "ok"}
++
++@app.get("/metrics")
++async def metrics():
++    data = generate_latest()
++    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
++
++from fastapi.responses import Response
++
++@app.get("/")
++async def root():
++    return {"service": "aegis-inference-gateway", "vllm_url": VLLM_URL, "triton_url": TRITON_URL}
++
++if __name__ == "__main__":
++    import uvicorn
++    uvicorn.run("gateway:app", host="0.0.0.0", port=int(os.environ.get("PORT", "8080")), log_level="info")
+diff --git a/k8s/manifests/vllm-deployment.yaml b/k8s/manifests/vllm-deployment.yaml
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/k8s/manifests/vllm-deployment.yaml
+@@ -0,0 +1,120 @@
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-vllm
++  namespace: aegis-ml
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-vllm
++  template:
++    metadata:
++      labels:
++        app: aegis-vllm
++    spec:
++      serviceAccountName: aegis-agent-sa
++      containers:
++        - name: vllm
++          # Example image: replace with your vllm server image that exposes a /generate HTTP endpoint
++          image: vllm/vllm:latest
++          args: ["--host", "0.0.0.0", "--port", "8000"]
++          env:
++            - name: MODEL_DIR
++              value: "/models"
++          ports:
++            - containerPort: 8000
++          volumeMounts:
++            - name: model-repo
++              mountPath: /models
++      volumes:
++        - name: model-repo
++          persistentVolumeClaim:
++            claimName: aegis-vllm-model-pvc
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: vllm
++  namespace: aegis-ml
++spec:
++  selector:
++    app: aegis-vllm
++  ports:
++    - port: 8000
++      targetPort: 8000
+diff --git a/k8s/manifests/triton-deployment.yaml b/k8s/manifests/triton-deployment.yaml
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/k8s/manifests/triton-deployment.yaml
+@@ -0,0 +1,200 @@
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-triton
++  namespace: aegis-ml
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-triton
++  template:
++    metadata:
++      labels:
++        app: aegis-triton
++    spec:
++      serviceAccountName: aegis-agent-sa
++      containers:
++        - name: triton
++          image: nvcr.io/nvidia/tritonserver:23.09-py3
++          args: [
++            "tritonserver",
++            "--model-repository=/models",
++            "--log-verbose=1"
++          ]
++          env:
++            - name: TRITON_SERVER_HTTP_PORT
++              value: "8000"
++          ports:
++            - containerPort: 8000
++            - containerPort: 8001
++          resources:
++            limits:
++              nvidia.com/gpu: 1
++          volumeMounts:
++            - name: model-repo
++              mountPath: /models
++      volumes:
++        - name: model-repo
++          persistentVolumeClaim:
++            claimName: aegis-triton-model-pvc
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: triton
++  namespace: aegis-ml
++spec:
++  selector:
++    app: aegis-triton
++  ports:
++    - port: 8000
++      targetPort: 8000
++    - port: 8001
++      targetPort: 8001
+diff --git a/k8s/manifests/inference-gateway-deployment.yaml b/k8s/manifests/inference-gateway-deployment.yaml
+new file mode 100644
+index 0000000..6666666
+--- /dev/null
++++ b/k8s/manifests/inference-gateway-deployment.yaml
+@@ -0,0 +1,180 @@
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-inference-gateway
++  namespace: aegis-ml
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: aegis-inference-gateway
++  template:
++    metadata:
++      labels:
++        app: aegis-inference-gateway
++      annotations:
++        # Example: if Vault injector is enabled, operator can mount secrets into /vault/secrets
++        vault.hashicorp.com/agent-inject: "true"
++        vault.hashicorp.com/role: "aegis-agent"
++        # Add specific templates for secrets as needed
++    spec:
++      serviceAccountName: aegis-agent-sa
++      containers:
++        - name: gateway
++          image: <REGISTRY>/aegis-inference-gateway:latest
++          env:
++            - name: VLLM_URL
++              value: "http://vllm.aegis-ml.svc.cluster.local:8000/generate"
++            - name: TRITON_URL
++              value: "http://triton.aegis-ml.svc.cluster.local:8000"
++            - name: REDIS_URL
++              value: "redis://redis.aegis-ml.svc.cluster.local:6379/0"
++            - name: DEFAULT_MODEL
++              value: "aegis-llm-default"
++          ports:
++            - containerPort: 8080
++          resources:
++            requests:
++              cpu: "200m"
++              memory: "512Mi"
++      imagePullSecrets:
++        - name: aegis-registry-secret
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: aegis-inference-gateway
++  namespace: aegis-ml
++spec:
++  selector:
++    app: aegis-inference-gateway
++  ports:
++    - port: 80
++      targetPort: 8080
++
+diff --git a/README_inference.md b/README_inference.md
+new file mode 100644
+index 0000000..7777777
+--- /dev/null
++++ b/README_inference.md
+@@ -0,0 +1,220 @@
++# Aegis Inference Serving (vLLM / Triton + Gateway)
++
++This patch provides a production-oriented starting point for inference serving:
++- vLLM deployment (simple HTTP-based vLLM server)
++- Triton Inference Server deployment (for optimized model serving)
++- An inference gateway (FastAPI) that routes requests, caches responses in Redis, emits Prometheus metrics and logs events to decision_log
++- Dockerfile and requirements for the gateway
++- Kubernetes manifests for gateway, vLLM and Triton
++
++Design notes
++- The gateway provides a single entrypoint for clients. It can route to multiple backends (vLLM or Triton) depending on model/latency/cost needs.
++- Caching reduces repeated token costs; TTL and cache strategy can be tuned.
++- Prometheus metrics expose per-backend, per-model request counts, latencies and cache hit/miss rates.
++- The gateway logs "generate_requested" events to decision_log via tools/decisionlog_client.insert_decision for auditability.
++
++Quickstart (local/prototype)
++1. Build gateway image:
++   ```bash
++   docker build -t aegis-inference-gateway:latest -f inference/Dockerfile .
++   ```
++2. Run Redis (local) and vLLM stub or a Triton dev server, then start the gateway:
++   ```bash
++   docker run -d --name redis -p 6379:6379 redis:7
++   export REDIS_URL=redis://localhost:6379/0
++   uvicorn inference.gateway:app --host 0.0.0.0 --port 8080
++   ```
++3. Call the gateway:
++   ```bash
++   curl -X POST http://localhost:8080/generate -H "Content-Type: application/json" -d '{"prompt":"Summarize the Aegis project","backend":"vllm"}'
++   ```
++
++Production notes & next steps
++- vLLM: replace the example image with your vLLM HTTP server image and ensure the endpoint matches VLLM_URL. For multi-node or high-throughput vLLM, coordinate GPU topology & RDMA settings.
++- Triton: populate PVC `aegis-triton-model-pvc` with model repository (model config.pbtxt and model files). Triton requires model repo in a layout it understands.
++- Vault: swap secrets in k8s manifests to use Vault CSI / Injector annotations for POSTGRES_URL, OPENAI_API_KEY, etc.
++- Autoscaling: attach HPA or KEDA for gateway and inference backends depending on metrics (QPS, GPU utilization).
++- Security: enforce mTLS, network policies and authenticate clients to the gateway (e.g., via JWT that maps to Vault policies).
++- Observability: add ServiceMonitor or PodMonitor to scrape /metrics, and create Grafana dashboards for model health, latency, cost.
++
++If you'd like, I can:
++- Add Triton model-repo bootstrap scripts and an example model config for a text model.
++- Add vLLM server Helm chart or StatefulSet for multi-node deployments with RDMA/NCCL hints.
++- Add a small CI job to run basic smoke tests against the gateway and backends.
++
++``` 

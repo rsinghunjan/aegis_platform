@@ -1,0 +1,511 @@
+*** Begin Patch
+*** Add File: provider/procurement_package_generator.py
++#!/usr/bin/env python3
++"""
++Assemble a procurement package for providers: contract template, sample attestations,
++onboarding runbook and ingestion test. Uploads a tarball to COMPLIANCE_BUCKET for legal/procurement.
++"""
++import os, tarfile
++from datetime import datetime
++import boto3
++
++FILES = [
++    "provider/onboarding/PROVIDER_CONTRACT_FINAL_TEMPLATE.md",
++    "provider/onboarding/provider_attestation_example.json",
++    "provider/onboarding/onboarding_runbook.md",
++    "provider/onboarding/ingestion_test.py",
++]
++OUT = f"/tmp/provider_procurement_package_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.tgz"
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++
++def make_package():
++    with tarfile.open(OUT, "w:gz") as tg:
++        for p in FILES:
++            if os.path.exists(p):
++                tg.add(p, arcname=os.path.basename(p))
++    print("Wrote", OUT)
++    if COMPLIANCE_BUCKET:
++        s3 = boto3.client("s3")
++        key = f"procurement/{os.path.basename(OUT)}"
++        s3.upload_file(OUT, COMPLIANCE_BUCKET, key)
++        print("Uploaded s3://{}/{}".format(COMPLIANCE_BUCKET, key))
++
++if __name__=="__main__":
++    make_package()
++
+*** End Patch
+*** Begin Patch
+*** Add File: provider/attestation_enforcer.py
++#!/usr/bin/env python3
++"""
++Enforce that provider attestations used in accounting are signed and have Rekor evidence.
++This script is intended to run before snapshots or reconciliation logic marks provider data as 'authoritative'.
++"""
++import os, json, subprocess, tempfile, requests
++from datetime import datetime, timezone, timedelta
++
++ATTEST_S3_BUCKET = os.environ.get("ATTEST_S3_BUCKET", "aegis-provider-attestations")
++ATTEST_S3_PREFIX = os.environ.get("ATTEST_S3_PREFIX", "provider-attestations/")
++REKOR_SERVER = os.environ.get("REKOR_SERVER")
++TRUSTED_REGISTRY = os.environ.get("TRUSTED_REGISTRY_URL", "http://trusted-source-registry.aegis.svc:8200/get")
++MAX_AGE_MIN = int(os.environ.get("PROVIDER_MAX_AGE_MIN","15"))
++
++def download_s3(bucket, key, dst):
++    subprocess.check_call(["aws","s3","cp", f"s3://{bucket}/{key}", dst])
++
++def has_rekor(local_path):
++    if not REKOR_SERVER:
++        return False, None
++    try:
++        out = subprocess.check_output(["rekor-cli","search","--rekor_server",REKOR_SERVER,"--artifact", local_path])
++        return True, out.decode()
++    except Exception as e:
++        return False, str(e)
++
++def verify_cosign(local):
++    try:
++        subprocess.check_output(["cosign","verify-blob", local], stderr=subprocess.STDOUT)
++        return True, None
++    except Exception as e:
++        return False, str(e)
++
++def enforce(provider, s3_key):
++    tmp = tempfile.NamedTemporaryFile(delete=False)
++    download_s3(ATTEST_S3_BUCKET, s3_key, tmp.name)
++    verified, v_err = verify_cosign(tmp.name)
++    rekor_ok, r_out = has_rekor(tmp.name)
++    try:
++        j = json.load(open(tmp.name))
++        pe = j.get("period_end")
++        if pe:
++            age = datetime.fromisoformat(pe.replace("Z","+00:00"))
++            if datetime.now(timezone.utc) - age > timedelta(minutes=MAX_AGE_MIN):
++                return {"ok": False, "reason":"stale"}
++    except Exception:
++        pass
++    if not verified or not rekor_ok:
++        return {"ok": False, "reason": "missing_proof", "verify_err": v_err, "rekor": r_out}
++    return {"ok": True, "s3_key": s3_key}
++
++if __name__=="__main__":
++    import argparse
++    p=argparse.ArgumentParser()
++    p.add_argument("--provider", required=True)
++    p.add_argument("--s3-key", required=True)
++    args=p.parse_args()
++    print(enforce(args.provider, args.s3_key))
++
+*** End Patch
+*** Begin Patch
+*** Add File: measurement/mapping_verifier.py
++#!/usr/bin/env python3
++"""
++Validate device↔job mappings at scale:
++ - sample recent jobs and confirm mapping exists and exporter metrics are present
++ - produce a coverage matrix per node/rack and flag unmapped or unmeasured hosts
++"""
++import os, json
++from sqlalchemy import create_engine, text
++from datetime import datetime, timedelta
++import boto3
++
++DB_URL = os.environ.get("DATABASE_URL", "postgresql://aegis:aegis@localhost:5432/aegis")
++engine = create_engine(DB_URL)
++OUT = "/tmp/mapping_verification.json"
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++
++def run(window_hours=24, sample_limit=1000):
++    since = datetime.utcnow() - timedelta(hours=window_hours)
++    with engine.connect() as conn:
++        jobs = conn.execute(text("SELECT job_id, tenant, created_at FROM job_ledger WHERE created_at >= :since ORDER BY created_at DESC LIMIT :lim"), {"since": since, "lim": sample_limit}).fetchall()
++        results=[]
++        for j in jobs:
++            jobid = j.job_id
++            map_row = conn.execute(text("SELECT device_id FROM job_device_map WHERE job_id=:job"), {"job": jobid}).fetchone()
++            measured = conn.execute(text("SELECT count(*) FROM job_events WHERE job_id=:job AND event='measured'"), {"job":jobid}).scalar() or 0
++            results.append({"job_id": jobid, "mapped": bool(map_row), "measured": bool(measured)})
++    out = {"ts": datetime.utcnow().isoformat(), "sample_count": len(results), "jobs": results}
++    open(OUT,"w").write(json.dumps(out, indent=2))
++    if COMPLIANCE_BUCKET:
++        s3=boto3.client("s3"); s3.upload_file(OUT, COMPLIANCE_BUCKET, f"mapping_verification/{os.path.basename(OUT)}")
++    print("Wrote", OUT)
++
++if __name__=="__main__":
++    run()
++
+*** End Patch
+*** Begin Patch
+*** Add File: telemetry/calibration_runner_improved.py
++#!/usr/bin/env python3
++"""
++Calibration runner that computes per-device bias and error bounds and produces a reconciliation-ready report.
++Stores power profiles and a per-device error estimate used for accounting bounds.
++"""
++import os, json, statistics, boto3
++from datetime import datetime
++DEVICES = os.environ.get("CALIB_DEVICES","device-1,device-2").split(",")
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++OUT = f"/tmp/calibration_report_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.json"
++
++def load_samples(device):
++    f = f"/tmp/{device}_power_samples.jsonl"
++    if not os.path.exists(f):
++        return []
++    return [json.loads(l).get("w",0.0) for l in open(f).read().splitlines() if l.strip()]
++
++report={"ts": datetime.utcnow().isoformat(), "devices": {}}
++for d in DEVICES:
++    s = load_samples(d)
++    if not s:
++        report["devices"][d] = {"error":"no_samples"}
++        continue
++    mean = statistics.mean(s)
++    stdev = statistics.pstdev(s) if len(s)>1 else 0.0
++    bias = mean - statistics.median(s)
++    # store a profile including 95% CI
++    profile = {"count": len(s), "mean": mean, "stdev": stdev, "bias": bias, "ci95_low": mean - 1.96*stdev, "ci95_high": mean + 1.96*stdev}
++    report["devices"][d] = profile
++    os.makedirs("/etc/aegis/power_profiles", exist_ok=True)
++    open(f"/etc/aegis/power_profiles/{d}.json","w").write(json.dumps(profile))
++
++open(OUT,"w").write(json.dumps(report, indent=2))
++if COMPLIANCE_BUCKET:
++    s3=boto3.client("s3"); s3.upload_file(OUT, COMPLIANCE_BUCKET, f"calibration/{os.path.basename(OUT)}")
++print("Wrote calibration report", OUT)
++
+*** End Patch
+*** Begin Patch
+*** Add File: forecast/pi_calibrator_improved.py
++#!/usr/bin/env python3
++"""
++Calibrate PI coverage per region and write calibration metadata used by forecast API to adjust interval width.
++Also generate region-specific drift thresholds for alerting.
++"""
++import os, json
++from forecast.backtest_calibrate import load_series, sliding_backtest
++from datetime import datetime
++
++OUT = "/etc/aegis/forecast_calibration.json"
++REGIONS = os.environ.get("FORECAST_REGIONS", "US,EU").split(",")
++TARGET = float(os.environ.get("PI_TARGET", "0.9"))
++
++def calibrate_region(region):
++    df = load_series(region)
++    if df.empty:
++        return None
++    metrics = sliding_backtest(df)
++    coverages = [m['pi_coverage'] for m in metrics if m.get('pi_coverage') is not None]
++    emp = sum(coverages)/len(coverages) if coverages else 0.0
++    multiplier = 1.0
++    if emp > 0:
++        multiplier = TARGET / emp if emp < TARGET else 1.0
++    # drift threshold: set to avg mae * 1.5 by default
++    maes = [m['mae'] for m in metrics if m.get('mae') is not None]
++    avg_mae = sum(maes)/len(maes) if maes else None
++    drift_threshold = avg_mae * 1.5 if avg_mae else None
++    return {"region": region, "empirical_coverage": emp, "multiplier": multiplier, "avg_mae": avg_mae, "drift_threshold": drift_threshold}
++
++def main():
++    out = {"ts": datetime.utcnow().isoformat(), "regions": {}}
++    for r in REGIONS:
++        res = calibrate_region(r)
++        if res:
++            out["regions"][r] = res
++    os.makedirs(os.path.dirname(OUT), exist_ok=True)
++    open(OUT,"w").write(json.dumps(out, indent=2))
++    print("Wrote", OUT)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: forecast/drift_test_harness.py
++#!/usr/bin/env python3
++"""
++Simulate forecast drift: injects synthetic errors into monitoring files to validate post-promotion monitor and auto-rollback.
++Use carefully in staging only.
++"""
++import os, json, time, boto3
++from datetime import datetime
++
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++REGION = os.environ.get("REGION","US")
++S3 = boto3.client("s3")
++
++def push_fake_monitor(mae):
++    key = f"forecast_monitor/prophet_monitor_{REGION}.json"
++    obj = {"region": REGION, "mae": mae, "ts": datetime.utcnow().isoformat()}
++    tmp = f"/tmp/fake_monitor_{int(time.time())}.json"
++    open(tmp,"w").write(json.dumps(obj))
++    S3.upload_file(tmp, COMPLIANCE_BUCKET, key)
++    print("Uploaded fake monitor", key)
++
++if __name__=="__main__":
++    import argparse
++    p=argparse.ArgumentParser()
++    p.add_argument("--mae", type=float, required=True)
++    args=p.parse_args()
++    push_fake_monitor(args.mae)
++
+*** End Patch
+*** Begin Patch
+*** Add File: hsm/multi_hsm_drill_cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: aegis-multi-hsm-drill
++  namespace: aegis
++spec:
++  schedule: "0 6 1 * *" # monthly
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          containers:
++            - name: drill
++              image: python:3.10-slim
++              env:
++                - name: HSM_ADMIN_HOSTS
++                  valueFrom:
++                    secretKeyRef:
++                      name: aegis-secrets
++                      key: hsm-admin-hosts
++                - name: COMPLIANCE_BUCKET
++                  valueFrom:
++                    secretKeyRef:
++                      name: aegis-secrets
++                      key: compliance-bucket
++              command: ["/bin/sh","-c"]
++              args:
++                - pip install boto3 >/dev/null 2>&1 || true; python /opt/scripts/multi_hsm_recovery_validator.py
++              volumeMounts:
++                - name: scripts
++                  mountPath: /opt/scripts
++          restartPolicy: OnFailure
++          volumes:
++            - name: scripts
++              configMap:
++                name: aegis-hsm-scripts
++
+*** End Patch
+*** Begin Patch
+*** Add File: hsm/vault_integration_doc.md
++# Vault integration for HSM/Cosign keys (Operator guidance)
++
++1. Keep private key material in HSM devices only. Do not export private keys.
++2. Store operator-facing metadata and public verification keys in Vault at path secret/aegis/cosign.
++3. Use a trusted operator host with Vault auth to perform signing via PKCS11. CI must never have signing keys.
++4. Record key rotation events using hsm/key_rotation_tracker.py and upload to COMPLIANCE_BUCKET.
++
+*** End Patch
+*** Begin Patch
+*** Add File: admission/hpa_redis_consumer_hpa.yaml
++apiVersion: autoscaling/v2beta2
++kind: HorizontalPodAutoscaler
++metadata:
++  name: aegis-redis-consumer-hpa
++  namespace: aegis
++spec:
++  scaleTargetRef:
++    apiVersion: apps/v1
++    kind: Deployment
++    name: aegis-redis-queue-consumer
++  minReplicas: 2
++  maxReplicas: 10
++  metrics:
++    - type: Resource
++      resource:
++        name: cpu
++        target:
++          type: Utilization
++          averageUtilization: 60
++
+*** End Patch
+*** Begin Patch
+*** Add File: measurement/smoothing_service.py
++#!/usr/bin/env python3
++"""
++Smoothing service to reduce noisy instantaneous measurements:
++ - consume raw measured events, produce rolling averages per device and flag anomalies
++ - intended to run as a lightweight microservice and expose Prometheus metrics
++"""
++import os, time, json, statistics
++from collections import deque
++from prometheus_client import start_http_server, Gauge, Counter
++from datetime import datetime
++
++WINDOW = int(os.environ.get("SMOOTH_WINDOW", "5"))  # samples
++G_DEVICE_BIAS = Gauge("aegis_device_bias_estimate", "Estimated device bias")
++G_ROLLING_MEAN = Gauge("aegis_device_rolling_mean", "Device rolling mean power")
++C_ANOM = Counter("aegis_device_anomaly_total", "Anomalies detected")
++
++# For demo, read sample files from /tmp/<device>_power_samples.jsonl
++def compute(device):
++    f = f"/tmp/{device}_power_samples.jsonl"
++    if not os.path.exists(f):
++        return None
++    vals = [json.loads(l).get("w",0.0) for l in open(f).read().splitlines() if l.strip()]
++    if not vals:
++        return None
++    window = vals[-WINDOW:]
++    mean = statistics.mean(window)
++    stdev = statistics.pstdev(window) if len(window)>1 else 0.0
++    return {"mean": mean, "stdev": stdev}
++
++def run_loop(devices):
++    start_http_server(int(os.environ.get("METRICS_PORT","9120")))
++    while True:
++        for d in devices:
++            res = compute(d)
++            if not res: continue
++            G_ROLLING_MEAN.set(res["mean"])
++            G_DEVICE_BIAS.set(0.0)
++            if res["stdev"] > 0 and abs(res["mean"]) > 3 * res["stdev"]:
++                C_ANOM.inc()
++        time.sleep(10)
++
++if __name__=="__main__":
++    DEVICES = os.environ.get("SMOOTH_DEVICES","device-1,device-2").split(",")
++    run_loop(DEVICES)
++
+*** End Patch
+*** Begin Patch
+*** Add File: .github/workflows/pre_promotion_sop.yml
++name: Pre-Promotion SOP Enforcement
++on:
++  workflow_dispatch:
++    inputs:
++      meta-path:
++        required: true
++
++jobs:
++  enforce-sop:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Enforce experiment SOP
++        run: |
++          python experiments/sop_enforcer.py "${{ github.event.inputs.meta-path }}"
++      - name: Run randomization audit hook (if assignments exist)
++        run: |
++          if [ -f experiments/ab_inputs/assignments.json ]; then
++            python experiments/randomization_audit_hook.py
++          else
++            echo "no assignments.json, skipping"
++          fi
++
+*** End Patch
+*** Begin Patch
+*** Add File: compliance/auditor_close_workflow.py
++#!/usr/bin/env python3
++"""
++Check open pen-test findings and require auditor signoff before closing release branch.
++ - If there are open findings, exit non-zero; else place a signoff record.
++"""
++import os, json
++DB = "compliance/pen_findings.json"
++SIGNOFF_DB = "compliance/auditor_signoffs.json"
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++import boto3
++
++def open_findings():
++    if not os.path.exists(DB):
++        return []
++    d = json.load(open(DB))
++    return [f for f in d.get("findings",[]) if f.get("status") != "closed"]
++
++def signoff(auditor, note=""):
++    if not os.path.exists(SIGNOFF_DB):
++        open(SIGNOFF_DB,"w").write(json.dumps({"signoffs":[]}, indent=2))
++    db = json.load(open(SIGNOFF_DB))
++    rec = {"auditor": auditor, "note": note}
++    db["signoffs"].append(rec)
++    open(SIGNOFF_DB,"w").write(json.dumps(db, indent=2))
++    if COMPLIANCE_BUCKET:
++        s3 = boto3.client("s3"); s3.upload_file(SIGNOFF_DB, COMPLIANCE_BUCKET, f"auditor_signoffs/{os.path.basename(SIGNOFF_DB)}")
++
++if __name__=="__main__":
++    import argparse
++    p=argparse.ArgumentParser()
++    p.add_argument("--auditor", required=True)
++    p.add_argument("--note", default="")
++    args=p.parse_args()
++    ofs = open_findings()
++    if ofs:
++        print("Open findings exist; cannot sign off", ofs); raise SystemExit(2)
++    signoff(args.auditor, args.note)
++    print("Auditor signoff recorded")
++
+*** End Patch
+*** Begin Patch
+*** Add File: security/ingress_rate_limit.yaml
++apiVersion: networking.k8s.io/v1
++kind: Ingress
++metadata:
++  name: aegis-ui-ingress
++  namespace: aegis
++  annotations:
++    nginx.ingress.kubernetes.io/limit-connections: "10"
++    nginx.ingress.kubernetes.io/limit-rps: "20"
++    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
++spec:
++  rules:
++    - host: aegis-ui.example.com
++      http:
++        paths:
++          - path: /
++            pathType: Prefix
++            backend:
++              service:
++                name: tenant-ui
++                port:
++                  number: 80
++
+*** End Patch
+*** Begin Patch
+*** Add File: ha/restore_drill_cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: aegis-restore-drill
++  namespace: aegis
++spec:
++  schedule: "0 4 1 * *" # monthly
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          containers:
++            - name: restore-drill
++              image: python:3.10-slim
++              env:
++                - name: PG_S3_PATH
++                  valueFrom:
++                    secretKeyRef:
++                      name: aegis-secrets
++                      key: pg-s3-path
++                - name: PG_RESTORE_CMD
++                  valueFrom:
++                    secretKeyRef:
++                      name: aegis-secrets
++                      key: pg-restore-cmd
++                - name: COMPLIANCE_BUCKET
++                  valueFrom:
++                    secretKeyRef:
++                      name: aegis-secrets
++                      key: compliance-bucket
++              command: ["/bin/sh","-c"]
++              args:
++                - pip install boto3 >/dev/null 2>&1 || true; python /opt/scripts/ha/automated_restore_and_rto.py
++              volumeMounts:
++                - name: scripts
++                  mountPath: /opt/scripts
++          restartPolicy: OnFailure
++          volumes:
++            - name: scripts
++              configMap:
++                name: aegis-ha-scripts
++
+*** End Patch
+*** End Patch

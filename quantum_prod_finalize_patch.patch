@@ -1,0 +1,643 @@
+*** Begin Patch
+*** Add File: controller/quantum_controller_hardened.py
++"""
++Hardened QuantumJob controller (PoC)
++- Leader election via a ConfigMap lock (simple TTL-based)
++- Enqueue jobs into Redis persistent queue
++- Reconciler improvements: idempotent status updates, retries and backoff
++
++Notes:
++- This PoC uses Redis for persistent queue; configure REDIS_URL env var.
++- Leader election is intentionally simple: controller attempts to acquire a ConfigMap
++  named "quantum-controller-leader" in the target namespace and refreshes the lock.
++  A production system should use the Kubernetes leader election primitives.
++"""
++from __future__ import annotations
++import json
++import logging
++import os
++import socket
++import time
++from datetime import datetime, timedelta
++from typing import Dict, Any
++
++import redis
++from kubernetes import client, config, watch
++
++LOG = logging.getLogger("quantum-controller-hardened")
++logging.basicConfig(level=logging.INFO)
++
++NAMESPACE = os.environ.get("NAMESPACE", "aegis")
++LEADER_CM = "quantum-controller-leader"
++LEADER_TTL = int(os.environ.get("LEADER_TTL", "30"))  # seconds
++REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
++QUEUE_KEY = "quantum:jobs:queue"
++
++
++def load_kube():
++    try:
++        config.load_incluster_config()
++    except Exception:
++        config.load_kube_config()
++
++
++def try_acquire_leader(identity: str) -> bool:
++    v1 = client.CoreV1Api()
++    now = datetime.utcnow().isoformat() + "Z"
++    body = client.V1ConfigMap(metadata=client.V1ObjectMeta(name=LEADER_CM, namespace=NAMESPACE), data={"owner": identity, "timestamp": now})
++    try:
++        v1.create_namespaced_config_map(namespace=NAMESPACE, body=body)
++        LOG.info("Acquired leadership (created CM)")
++        return True
++    except client.exceptions.ApiException as e:
++        if e.status != 409:
++            LOG.exception("Failed to create leader CM")
++            return False
++        # CM exists: check age
++        try:
++            existing = v1.read_namespaced_config_map(name=LEADER_CM, namespace=NAMESPACE)
++            data = existing.data or {}
++            ts = data.get("timestamp")
++            owner = data.get("owner")
++            if not ts:
++                # attempt to take over
++                v1.replace_namespaced_config_map(name=LEADER_CM, namespace=NAMESPACE, body=body)
++                LOG.info("Replaced stale leader CM")
++                return True
++            t = datetime.fromisoformat(ts.replace("Z", ""))
++            if datetime.utcnow() - t > timedelta(seconds=LEADER_TTL):
++                # steal leadership
++                v1.replace_namespaced_config_map(name=LEADER_CM, namespace=NAMESPACE, body=body)
++                LOG.info("Stole leadership from %s", owner)
++                return True
++            else:
++                LOG.debug("Leader %s is active (ts=%s)", owner, ts)
++                return owner == identity
++        except Exception:
++            LOG.exception("Error checking leader CM")
++            return False
++
++
++def refresh_leader(identity: str):
++    v1 = client.CoreV1Api()
++    now = datetime.utcnow().isoformat() + "Z"
++    try:
++        cm = v1.read_namespaced_config_map(name=LEADER_CM, namespace=NAMESPACE)
++        owner = (cm.data or {}).get("owner")
++        if owner == identity:
++            cm.data["timestamp"] = now
++            v1.replace_namespaced_config_map(name=LEADER_CM, namespace=NAMESPACE, body=cm)
++            LOG.debug("Refreshed leadership timestamp")
++            return True
++    except client.exceptions.ApiException:
++        LOG.exception("Failed to refresh leader CM")
++    return False
++
++
++def enqueue_job(redis_client: redis.Redis, name: str, payload: Dict[str, Any]):
++    redis_client.rpush(QUEUE_KEY, json.dumps({"name": name, "spec": payload}))
++    LOG.info("Enqueued job %s", name)
++
++
++def controller_watch_loop():
++    load_kube()
++    api = client.CustomObjectsApi()
++    r = redis.from_url(REDIS_URL)
++    identity = f"{socket.gethostname()}-{os.getpid()}"
++    LOG.info("Controller identity: %s", identity)
++    # leader election simple loop
++    while True:
++        has_lead = try_acquire_leader(identity)
++        if not has_lead:
++            LOG.info("Not leader, sleeping then re-checking")
++            time.sleep(5)
++            continue
++        # leader duties: watch CRs and enqueue jobs
++        LOG.info("Acting as leader")
++        w = watch.Watch()
++        try:
++            for event in w.stream(api.list_namespaced_custom_object, group="aegis.ai", version="v1alpha1", namespace=NAMESPACE, plural="quantumjobs", timeout_seconds=30):
++                typ = event["type"]
++                obj = event["object"]
++                meta = obj.get("metadata", {})
++                name = meta.get("name")
++                spec = obj.get("spec", {}) or {}
++                status = obj.get("status", {}) or {}
++                LOG.info("Event %s for %s status=%s", typ, name, status.get("phase"))
++                # Idempotent handling
++                if status.get("phase") in ("Running", "Completed", "Rejected", "Failed"):
++                    continue
++                # Enqueue job for processing
++                enqueue_job(r, name, spec)
++                # mark queued
++                api.patch_namespaced_custom_object_status(group="aegis.ai", version="v1alpha1", namespace=NAMESPACE, plural="quantumjobs", name=name, body={"status": {"phase": "Queued", "queuedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ")}})
++                # refresh leader heartbeat
++                refresh_leader(identity)
++        except Exception:
++            LOG.exception("Watch loop error; will reattempt leadership")
++        # sleep briefly before re-acquiring
++        time.sleep(2)
++
++
++if __name__ == "__main__":
++    controller_watch_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/redis_queue_worker.py
++"""
++Worker that consumes jobs from Redis queue and executes them.
++Implements retry/backoff and writes status updates to the QuantumJob CR.
++"""
++from __future__ import annotations
++import json
++import logging
++import os
++import time
++from typing import Dict, Any
++
++import redis
++from kubernetes import client, config
++
++from inference.quantum_adapter import QuantumAdapter, QuantumAdapterError
++
++LOG = logging.getLogger("redis-queue-worker")
++logging.basicConfig(level=logging.INFO)
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
++QUEUE_KEY = "quantum:jobs:queue"
++NAMESPACE = os.environ.get("NAMESPACE", "aegis")
++MAX_RETRIES = int(os.environ.get("JOB_MAX_RETRIES", "3"))
++
++
++def load_kube():
++    try:
++        config.load_incluster_config()
++    except Exception:
++        config.load_kube_config()
++
++
++def patch_status(name: str, status: Dict[str, Any]):
++    api = client.CustomObjectsApi()
++    try:
++        api.patch_namespaced_custom_object_status(group="aegis.ai", version="v1alpha1", namespace=NAMESPACE, plural="quantumjobs", name=name, body={"status": status})
++    except Exception:
++        LOG.exception("Failed to patch status for %s", name)
++
++
++def process_job(name: str, spec: Dict[str, Any]):
++    backend = spec.get("backend", "pennylane")
++    params = spec.get("params", [])
++    artifact = spec.get("artifact", "")
++    adapter = QuantumAdapter(backend=backend)
++    if artifact and os.path.exists(artifact) and artifact.endswith(".json"):
++        adapter.load_spec(artifact)
++    if params:
++        adapter.load_params(params)
++    result = adapter.predict(params=params)
++    # save result to /tmp and report path
++    out_dir = "/tmp/quantum_results"
++    os.makedirs(out_dir, exist_ok=True)
++    out_path = os.path.join(out_dir, f"{name}_result.json")
++    with open(out_path, "w") as fh:
++        json.dump({"result": result, "backend": backend, "timestamp": time.time()}, fh)
++    return out_path
++
++
++def worker_loop():
++    load_kube()
++    r = redis.from_url(REDIS_URL)
++    LOG.info("Worker connected to Redis %s", REDIS_URL)
++    while True:
++        item = r.blpop(QUEUE_KEY, timeout=10)
++        if not item:
++            continue
++        _, payload = item
++        job = json.loads(payload)
++        name = job["name"]
++        spec = job["spec"]
++        LOG.info("Processing job %s", name)
++        retries = 0
++        patch_status(name, {"phase": "Running", "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ")})
++        while retries <= MAX_RETRIES:
++            try:
++                out_path = process_job(name, spec)
++                patch_status(name, {"phase": "Completed", "completedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ"), "resultPath": out_path})
++                LOG.info("Job %s completed", name)
++                break
++            except QuantumAdapterError as e:
++                LOG.exception("Quantum adapter failed for %s: %s", name, e)
++                retries += 1
++                time.sleep(2 ** retries)
++            except Exception:
++                LOG.exception("Job %s failed", name)
++                retries += 1
++                time.sleep(2 ** retries)
++        if retries > MAX_RETRIES:
++            patch_status(name, {"phase": "Failed", "message": f"exceeded retries ({MAX_RETRIES})"})
++
++
++if __name__ == "__main__":
++    worker_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File: utils/vault_client.py
++"""
++Vault client helper for provider credential retrieval and scoped token creation.
++PoC implementation using HTTP API.
++Requires VAULT_ADDR and VAULT_TOKEN (the latter should be a CI/controller token with limited powers).
++"""
++from __future__ import annotations
++import base64
++import json
++import logging
++import os
++import time
++from pathlib import Path
++from typing import Dict, Any, Optional
++
++import requests
++
++LOG = logging.getLogger("vault-client")
++logging.basicConfig(level=logging.INFO)
++
++VAULT_ADDR = os.environ.get("VAULT_ADDR", "")
++VAULT_TOKEN = os.environ.get("VAULT_TOKEN", "")
++
++
++class VaultClientError(RuntimeError):
++    pass
++
++
++class VaultClient:
++    def __init__(self, addr: str = None, token: str = None):
++        self.addr = (addr or VAULT_ADDR).rstrip("/") if (addr or VAULT_ADDR) else None
++        self.token = token or VAULT_TOKEN
++        if not self.addr or not self.token:
++            raise VaultClientError("Vault not configured (VAULT_ADDR + VAULT_TOKEN required)")
++
++    def _url(self, path: str) -> str:
++        return f"{self.addr}/{path.lstrip('/')}"
++
++    def get_provider_creds(self, provider: str) -> Dict[str, Any]:
++        """
++        Reads secrets at path secret/data/quantum/providers/<provider>
++        Returns the inner data dict or raises error.
++        """
++        path = f"v1/secret/data/quantum/providers/{provider}"
++        r = requests.get(self._url(path), headers={"X-Vault-Token": self.token}, timeout=10)
++        if r.status_code != 200:
++            raise VaultClientError(f"Failed to read provider secret: {r.status_code} {r.text}")
++        j = r.json()
++        return j.get("data", {}).get("data", {})
++
++    def create_scoped_token(self, policies: Optional[list[str]] = None, ttl: str = "1h") -> str:
++        """
++        Create a new token with limited policies and TTL. Requires Vault token with the capability to create tokens.
++        Returns client_token string.
++        """
++        payload = {"policies": policies or [], "ttl": ttl}
++        r = requests.post(self._url("v1/auth/token/create"), headers={"X-Vault-Token": self.token}, json=payload, timeout=10)
++        if r.status_code != 200:
++            raise VaultClientError(f"Failed to create token: {r.status_code} {r.text}")
++        return r.json().get("auth", {}).get("client_token", "")
++
++    def write_secret(self, path: str, data: Dict[str, Any]):
++        r = requests.post(self._url(f"v1/secret/data/{path}"), headers={"X-Vault-Token": self.token}, json={"data": data}, timeout=10)
++        if r.status_code not in (200, 204):
++            LOG.error("write_secret failed: %s %s", r.status_code, r.text)
++            raise VaultClientError("Failed to write secret")
++
+*** End Patch
+*** Begin Patch
+*** Add File: providers/qiskit_runtime_adapter.py
++"""
++Adapter for Qiskit Runtime provider submission using qiskit-ibm-runtime.
++This PoC fetches IBM_TOKEN from Vault (via VaultClient) and performs a preflight
++transpile step before submission. The actual submission is stubbed unless the
++environment has qiskit-ibm-runtime installed and valid creds.
++"""
++from __future__ import annotations
++import logging
++import os
++from typing import Dict, Any
++
++from utils.vault_client import VaultClient, VaultClientError
++
++LOG = logging.getLogger("qiskit-adapter")
++logging.basicConfig(level=logging.INFO)
++
++
++class QiskitRuntimeAdapterError(RuntimeError):
++    pass
++
++
++class QiskitRuntimeAdapter:
++    def __init__(self, provider_name: str = "ibm"):
++        self.provider = provider_name
++        try:
++            from qiskit import transpile  # type: ignore
++            from qiskit_ibm_runtime import QiskitRuntimeService  # type: ignore
++            self.transpile = transpile
++            self.QiskitRuntimeService = QiskitRuntimeService
++        except Exception:
++            raise QiskitRuntimeAdapterError("qiskit runtime dependencies not available")
++        # fetch provider creds via Vault
++        if os.environ.get("VAULT_ADDR") and os.environ.get("VAULT_TOKEN"):
++            vc = VaultClient()
++            creds = vc.get_provider_creds(self.provider)
++            self.ibm_token = creds.get("ibm_token") or creds.get("token") or os.environ.get("IBM_TOKEN")
++            self.ibm_url = creds.get("url") or os.environ.get("IBM_URL")
++            if not self.ibm_token:
++                raise QiskitRuntimeAdapterError("No IBM token found in Vault provider secret")
++            try:
++                self.service = self.QiskitRuntimeService(token=self.ibm_token, url=self.ibm_url or None)
++            except Exception as e:
++                LOG.exception("Failed to create QiskitRuntimeService: %s", e)
++                self.service = None
++        else:
++            raise QiskitRuntimeAdapterError("Vault not configured for provider creds")
++
++    def preflight_transpile(self, circuit, backend_name: str = "ibmq_qasm_simulator"):
++        """
++        Attempt a transpile for the target backend to check for compatibility.
++        circuit: qiskit.QuantumCircuit
++        Returns the transpiled circuit or raises on failure.
++        """
++        try:
++            transpiled = self.transpile(circuit, basis_gates=None, optimization_level=1, backend=backend_name)
++            return transpiled
++        except Exception as e:
++            LOG.exception("Transpile failed: %s", e)
++            raise QiskitRuntimeAdapterError("Transpile failed") from e
++
++    def submit(self, program, params: Dict[str, Any], shots: int = 1024):
++        if not self.service:
++            raise QiskitRuntimeAdapterError("Service not initialized")
++        # PoC: show how to call service.run() with a program; actual call depends on program type
++        try:
++            LOG.info("Submitting job to Qiskit Runtime (PoC) - not executing in PoC environment")
++            # Example (commented): result = self.service.run(program=program, options={"shots": shots}, params=params)
++            return {"status": "submitted", "provider": "qiskit", "shots": shots}
++        except Exception as e:
++            LOG.exception("Submit failed")
++            raise QiskitRuntimeAdapterError("Submission failed") from e
++
+*** End Patch
+*** Begin Patch
+*** Add File: utils/rekor_client.py
++"""
++Minimal Rekor client to submit artifact metadata/attestations.
++This helper accepts a base64 artifact payload and signature string and posts to REKOR_URL.
++"""
++from __future__ import annotations
++import base64
++import json
++import os
++import logging
++from typing import Optional
++
++import requests
++
++LOG = logging.getLogger("rekor-client")
++logging.basicConfig(level=logging.INFO)
++
++REKOR_URL = os.environ.get("REKOR_URL", "")
++REKOR_API_KEY = os.environ.get("REKOR_API_KEY", "")
++
++
++def submit_to_rekor(artifact_path: str, signature_b64: str, metadata: Optional[dict] = None) -> dict:
++    if not REKOR_URL:
++        raise RuntimeError("REKOR_URL not configured")
++    with open(artifact_path, "rb") as fh:
++        art_b64 = base64.b64encode(fh.read()).decode("ascii")
++    payload = {"artifact": art_b64, "signature": signature_b64, "metadata": metadata or {}}
++    headers = {"Content-Type": "application/json"}
++    if REKOR_API_KEY:
++        headers["X-API-Key"] = REKOR_API_KEY
++    r = requests.post(f"{REKOR_URL.rstrip('/')}/api/v1/log", json=payload, headers=headers, timeout=10)
++    if r.status_code not in (200, 201):
++        LOG.error("Rekor submission failed: %s %s", r.status_code, r.text)
++        return {"ok": False, "status": r.status_code, "text": r.text}
++    return r.json()
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/quantum_sign_and_rekor.py
++#!/usr/bin/env python3
++"""
++Sign an artifact (calls quantum_sign_artifact.py) and submit attestation to Rekor if configured.
++Produces <artifact>.sig.json and, if REKOR_URL present, posts a minimal entry.
++"""
++from __future__ import annotations
++import argparse
++import json
++import os
++import subprocess
++from pathlib import Path
++
++from utils.rekor_client import submit_to_rekor
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--artifact", required=True)
++    p.add_argument("--local-key", default="")
++    args = p.parse_args()
++    out_sig = f"{args.artifact}.sig.json"
++    cmd = ["python", "scripts/quantum_sign_artifact.py", "--artifact", args.artifact, "--out", out_sig]
++    if args.local_key:
++        cmd += ["--local-key", args.local_key]
++    subprocess.check_call(cmd)
++    print("Signed artifact:", out_sig)
++    if os.environ.get("REKOR_URL"):
++        with open(out_sig) as fh:
++            sig_json = json.load(fh)
++        res = submit_to_rekor(args.artifact, sig_json.get("signature"), metadata={"tool": "aegis-quantum"})
++        print("Rekor response:", res)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: admin_ui/app.py
++"""
++Minimal admin web UI (Flask) to list QuantumJobs in PendingApproval and approve/reject them.
++This PoC uses the Kubernetes API and requires KUBECONFIG or in-cluster config.
++"""
++from __future__ import annotations
++import json
++import logging
++import os
++from flask import Flask, jsonify, request, redirect, url_for
++from kubernetes import client, config
++
++LOG = logging.getLogger("admin-ui")
++logging.basicConfig(level=logging.INFO)
++
++app = Flask(__name__)
++NAMESPACE = os.environ.get("NAMESPACE", "aegis")
++
++def kube_client():
++    try:
++        config.load_incluster_config()
++    except Exception:
++        config.load_kube_config()
++    return client.CustomObjectsApi()
++
++@app.route("/pending")
++def pending_jobs():
++    api = kube_client()
++    objs = api.list_namespaced_custom_object(group="aegis.ai", version="v1alpha1", namespace=NAMESPACE, plural="quantumjobs")
++    pending = []
++    for item in objs.get("items", []):
++        s = item.get("status", {}) or {}
++        if s.get("phase") == "PendingApproval":
++            pending.append({"name": item["metadata"]["name"], "spec": item.get("spec", {})})
++    return jsonify(pending)
++
++@app.route("/approve", methods=["POST"])
++def approve():
++    data = request.json or {}
++    name = data.get("name")
++    if not name:
++        return jsonify({"error": "name required"}), 400
++    # annotate the CR with approved=true (controller checks annotation)
++    os.system(f"kubectl annotate quantumjob {name} -n {NAMESPACE} quantum.aegis/approved=true --overwrite")
++    return jsonify({"ok": True})
++
++@app.route("/")
++def index():
++    return redirect(url_for("pending_jobs"))
++
++if __name__ == "__main__":
++    port = int(os.environ.get("ADMIN_UI_PORT", "8080"))
++    app.run(host="0.0.0.0", port=port)
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/readiness_check.py
++#!/usr/bin/env python3
++"""
++Readiness check harness for quantum capabilities.
++Performs a series of checks (CRD presence, Vault connectivity, Redis queue, CI tests)
++and outputs a JSON report with a readiness score (0-100).
++"""
++from __future__ import annotations
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++from typing import Dict, Any
++
++from kubernetes import config, client
++
++REPORT_PATH = Path("readiness_report.json")
++
++def check_crd_exists():
++    try:
++        config.load_kube_config()
++        api = client.ApiextensionsV1Api()
++        crds = api.list_custom_resource_definition()
++        names = [c.metadata.name for c in crds.items]
++        return "quantumjobs.aegis.ai" in names
++    except Exception:
++        return False
++
++def check_vault():
++    if os.environ.get("VAULT_ADDR") and os.environ.get("VAULT_TOKEN"):
++        return True
++    return False
++
++def check_redis():
++    try:
++        import redis  # type: ignore
++        r = redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
++        r.ping()
++        return True
++    except Exception:
++        return False
++
++def run_pytests():
++    try:
++        res = subprocess.run([sys.executable, "-m", "pytest", "-q", "tests/test_quantum_adapter.py", "tests/test_quantum_noise.py"], capture_output=True, text=True, timeout=600)
++        return res.returncode == 0, res.stdout + res.stderr
++    except Exception as e:
++        return False, str(e)
++
++def main():
++    score = 0
++    details: Dict[str, Any] = {}
++    crd = check_crd_exists()
++    details["crd_present"] = crd
++    score += 10 if crd else 0
++    vault = check_vault()
++    details["vault_configured"] = vault
++    score += 20 if vault else 0
++    redis_ok = check_redis()
++    details["redis"] = redis_ok
++    score += 15 if redis_ok else 0
++    tests_ok, test_output = run_pytests()
++    details["tests_ok"] = tests_ok
++    details["tests_output"] = test_output
++    score += 25 if tests_ok else 0
++    # basic provider adapter availability
++    try:
++        import qiskit  # type: ignore
++        details["qiskit"] = True
++        score += 10
++    except Exception:
++        details["qiskit"] = False
++    try:
++        import pennylane  # type: ignore
++        details["pennylane"] = True
++        score += 10
++    except Exception:
++        details["pennylane"] = False
++    try:
++        import cirq  # type: ignore
++        details["cirq"] = True
++        score += 10
++    except Exception:
++        details["cirq"] = False
++    # clamp score
++    score = max(0, min(100, score))
++    report = {"score": score, "details": details}
++    REPORT_PATH.write_text(json.dumps(report, indent=2))
++    print("Readiness report written to", REPORT_PATH)
++    print(json.dumps(report, indent=2))
++    return 0 if score >= 70 else 1
++
++if __name__ == "__main__":
++    sys.exit(main())
++
+*** End Patch
+*** Begin Patch
+*** Update File: README.edge.md
+@@
+ - Quantum & Job orchestration (new)
+ +- Quantum SLOs & use-case specification (docs/quantum_slos.md)
+ +- QuantumJob CRD + controller PoC (k8s/crd/quantumjob_crd.yaml, controller/quantum_job_controller.py)
+ +- CLI & admin helpers (cli/quantum_cli.py, cli/quantum_admin.py) to submit, approve and manage quotas
+ +- Vault-backed artifact signing & job credential hooks (scripts/quantum_sign_artifact.py, inference/quantum_provider_adapters.py)
+ +- Expanded CI for simulator & noise tests (.github/workflows/quantum-ci-expanded.yml)
+ +- Packaging and metadata for quantum artifacts (scripts/quantum_package_metadata.py)
++-
++New in this patch (productionizing & readiness)
++- Hardened controller with leader election and Redis-backed persistent job queue (controller/quantum_controller_hardened.py + scripts/redis_queue_worker.py)
++- Vault client helper for provider credential retrieval and scoped token creation (utils/vault_client.py)
++- Qiskit Runtime provider adapter with preflight transpile (providers/qiskit_runtime_adapter.py)
++- Rekor client and sign+submit helper (utils/rekor_client.py, scripts/quantum_sign_and_rekor.py)
++- Minimal admin web UI for approvals (admin_ui/app.py)
++- Readiness check harness that emits a JSON readiness score (scripts/readiness_check.py)
++
++Notes:
++- These components are PoC/hardened examples. For production you should:
++  - run Redis in a durable HA configuration and secure it
++  - run the controller/worker as Kubernetes deployments with proper RBAC and leader election
++  - ensure Vault token used by controller has least privileges and rotate it regularly
++  - secure the admin UI behind auth (this PoC is unauthenticated for brevity)
++
+*** End Patch

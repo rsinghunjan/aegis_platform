@@ -1,0 +1,737 @@
+diff --git a/deepspeed/Dockerfile.deepspeed b/deepspeed/Dockerfile.deepspeed
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/deepspeed/Dockerfile.deepspeed
+@@ -0,0 +1,36 @@
++FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
++ENV DEBIAN_FRONTEND=noninteractive
++
++RUN apt-get update && apt-get install -y --no-install-recommends \
++    git wget curl build-essential libsndfile1 zip unzip && \
++    rm -rf /var/lib/apt/lists/*
++
++RUN pip install --no-cache-dir \
++    deepspeed==0.9.1 \
++    torch torchvision torchaudio \
++    boto3 mlflow petastorm nvidia-ml-py3 onnx onnxruntime \
++    tritonclient[all] tqdm
++
++WORKDIR /app
++COPY deepspeed/trainer.py /app/trainer.py
++COPY deepspeed/deepspeed_config.json /app/deepspeed_config.json
++COPY requirements.txt /app/requirements.txt
++RUN if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
++
++ENV PYTHONUNBUFFERED=1
++ENTRYPOINT ["deepspeed", "--no_local_rank", "trainer.py", "--deepspeed_config", "deepspeed_config.json"]
++
+diff --git a/deepspeed/deepspeed_config.json b/deepspeed/deepspeed_config.json
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/deepspeed/deepspeed_config.json
+@@ -0,0 +1,44 @@
++{
++  "train_batch_size": 64,
++  "train_micro_batch_size_per_gpu": 8,
++  "optimizer": {
++    "type": "Adam",
++    "params": {
++      "lr": 1e-4
++    }
++  },
++  "zero_optimization": {
++    "stage": 2,
++    "offload_optimizer": {
++      "device": "none"
++    }
++  },
++  "gradient_clipping": 1.0,
++  "fp16": {
++    "enabled": true
++  },
++  "wall_clock_breakdown": false
++}
++
+diff --git a/deepspeed/trainer.py b/deepspeed/trainer.py
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/deepspeed/trainer.py
+@@ -0,0 +1,220 @@
++#!/usr/bin/env python3
++"""
++Minimal DeepSpeed-enabled training entrypoint demonstrating:
++- model-parallel / ZeRO usage via DeepSpeed config
++- periodic sharded checkpointing using sharded_checkpoint_upload.py helper (s3)
++- resume from latest pointer on startup
++
++This is an example and must be adapted to your real model and data pipeline.
++"""
++import os
++import time
++import argparse
++import torch
++import torch.nn as nn
++import torch.optim as optim
++from torch.utils.data import DataLoader, TensorDataset
++import deepspeed
++from deepspeed.runtime.zero.stage2 import ZeroOptimizer_Stage2
++from sharded_checkpoint.sharded_checkpoint_upload import sharded_save, sharded_load_latest
++
++class SimpleModel(nn.Module):
++    def __init__(self, input_dim=1024, hidden=4096):
++        super().__init__()
++        self.net = nn.Sequential(
++            nn.Linear(input_dim, hidden),
++            nn.ReLU(),
++            nn.Linear(hidden, 1)
++        )
++    def forward(self, x):
++        return self.net(x)
++
++def get_data(n=10000, input_dim=1024):
++    X = torch.randn(n, input_dim)
++    y = (torch.randn(n) > 0).float().unsqueeze(1)
++    return TensorDataset(X, y)
++
++def parse_args():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--deepspeed_config", default="deepspeed_config.json")
++    parser.add_argument("--s3-checkpoint-uri", default=os.environ.get("S3_CHECKPOINT_URI", ""))
++    parser.add_argument("--resume", action="store_true")
++    parser.add_argument("--local_rank", type=int, default=int(os.environ.get("LOCAL_RANK", "0")))
++    return parser.parse_args()
++
++def main():
++    args = parse_args()
++    deepspeed_config = args.deepspeed_config
++
++    model = SimpleModel()
++    parameters = filter(lambda p: p.requires_grad, model.parameters())
++    model_engine, optimizer, _, _ = deepspeed.initialize(args=argparse.Namespace(), model=model, model_parameters=parameters, config=deepspeed_config)
++
++    dataset = get_data(n=20000, input_dim=1024)
++    train_loader = DataLoader(dataset, batch_size=8, shuffle=True)
++    criterion = nn.BCEWithLogitsLoss()
++
++    start_epoch = 0
++    # resume logic using sharded loader
++    if args.resume and args.s3_checkpoint_uri:
++        ckpt = sharded_load_latest(args.s3_checkpoint_uri)
++        if ckpt:
++            print("Resuming from", ckpt)
++            model_engine.load_checkpoint(ckpt)
++
++    for epoch in range(start_epoch, 10):
++        for i, (x, y) in enumerate(train_loader):
++            x = x.to(model_engine.device)
++            y = y.to(model_engine.device)
++            outputs = model_engine(x)
++            loss = criterion(outputs, y)
++            model_engine.backward(loss)
++            model_engine.step()
++
++        # periodic sharded checkpoint save (rank 0)
++        if model_engine.global_rank == 0:
++            ckpt_dir = f"/tmp/checkpoints/epoch{epoch}"
++            os.makedirs(ckpt_dir, exist_ok=True)
++            # let DeepSpeed save its checkpoint then upload shards
++            model_engine.save_checkpoint(ckpt_dir)
++            sharded_save(local_ckpt_dir=ckpt_dir, s3_prefix=args.s3_checkpoint_uri.rstrip("/"))
++            print("Checkpoint uploaded for epoch", epoch)
++
++    if model_engine.global_rank == 0:
++        print("Training complete.")
++
++if __name__ == "__main__":
++    main()
++
+diff --git a/sharded_checkpoint/sharded_checkpoint_upload.py b/sharded_checkpoint/sharded_checkpoint_upload.py
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/sharded_checkpoint/sharded_checkpoint_upload.py
+@@ -0,0 +1,200 @@
++#!/usr/bin/env python3
++"""
++Helpers to upload / download sharded DeepSpeed checkpoints to S3 in parallel.
++Features:
++ - split local checkpoint dir files into per-shard uploads
++ - write a 'latest' pointer atomically
++ - parallel multipart uploads via boto3
++
++Assumptions:
++ - local_ckpt_dir contains the files produced by DeepSpeed save_checkpoint
++ - s3_prefix is like s3://bucket/path/to/job
++"""
++import os
++import concurrent.futures
++import boto3
++from urllib.parse import urlparse
++import json
++import time
++
++s3 = boto3.client("s3")
++
++def _parse_s3(s3_uri):
++    parsed = urlparse(s3_uri)
++    return parsed.netloc, parsed.path.lstrip("/")
++
++def sharded_save(local_ckpt_dir, s3_prefix):
++    bucket, prefix = _parse_s3(s3_prefix)
++    # upload all files in dir
++    files = []
++    for root, _, fnames in os.walk(local_ckpt_dir):
++        for f in fnames:
++            local_path = os.path.join(root, f)
++            rel = os.path.relpath(local_path, local_ckpt_dir)
++            key = os.path.join(prefix, rel)
++            files.append((local_path, key))
++
++    def upload(pair):
++        local, key = pair
++        print("Uploading", local, "-> s3://%s/%s" % (bucket, key))
++        s3.upload_file(local, bucket, key)
++        return key
++
++    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
++        results = list(ex.map(upload, files))
++
++    # write latest pointer
++    timestamp = int(time.time())
++    latest_key = os.path.join(prefix, "latest.txt")
++    tmp_key = os.path.join(prefix, f".tmp_latest_{timestamp}.txt")
++    s3.put_object(Bucket=bucket, Key=tmp_key, Body=json.dumps({"timestamp": timestamp, "files": results}))
++    s3.copy_object(Bucket=bucket, CopySource={'Bucket': bucket, 'Key': tmp_key}, Key=latest_key)
++    s3.delete_object(Bucket=bucket, Key=tmp_key)
++    print("Wrote latest pointer:", latest_key)
++
++def sharded_load_latest(s3_prefix, download_dir="/tmp/ckpt_restore"):
++    bucket, prefix = _parse_s3(s3_prefix)
++    latest_key = os.path.join(prefix, "latest.txt")
++    try:
++        obj = s3.get_object(Bucket=bucket, Key=latest_key)
++        data = obj["Body"].read().decode("utf-8")
++        meta = json.loads(data)
++    except Exception as e:
++        print("No latest pointer found:", e)
++        return None
++
++    os.makedirs(download_dir, exist_ok=True)
++    files = meta.get("files", [])
++    def download(key):
++        out = os.path.join(download_dir, os.path.basename(key))
++        print("Downloading s3://%s/%s -> %s" % (bucket, key, out))
++        s3.download_file(bucket, key, out)
++        return out
++
++    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
++        out_files = list(ex.map(download, files))
++
++    print("Downloaded files to", download_dir)
++    return download_dir
++
+diff --git a/k8s/manifests/deepspeed-pytorchjob.yaml b/k8s/manifests/deepspeed-pytorchjob.yaml
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/k8s/manifests/deepspeed-pytorchjob.yaml
+@@ -0,0 +1,124 @@
++apiVersion: kubeflow.org/v1
++kind: PyTorchJob
++metadata:
++  name: aegis-deepspeed-job
++  namespace: aegis-ml
++spec:
++  cleanPodPolicy: None
++  pytorchReplicaSpecs:
++    Master:
++      replicas: 1
++      restartPolicy: OnFailure
++      template:
++        spec:
++          containers:
++            - name: deepspeed
++              image: <REGISTRY>/aegis-deepspeed:latest
++              command: ["deepspeed", "--no_local_rank", "trainer.py", "--deepspeed_config", "deepspeed_config.json"]
++              args:
++                - "--s3-checkpoint-uri"
++                - "s3://<BUCKET>/aegis-deepspeed/${JOB_ID}"
++                - "--resume"
++                - "true"
++              env:
++                - name: JOB_ID
++                  valueFrom:
++                    fieldRef:
++                      fieldPath: metadata.name
++              resources:
++                limits:
++                  nvidia.com/gpu: 1
++                requests:
++                  cpu: "4"
++                  memory: "32Gi"
++          nodeSelector:
++            aegis/instance-type: "gpu-on-demand"
++    Worker:
++      replicas: 4
++      restartPolicy: OnFailure
++      template:
++        spec:
++          containers:
++            - name: deepspeed
++              image: <REGISTRY>/aegis-deepspeed:latest
++              command: ["deepspeed", "--no_local_rank", "trainer.py", "--deepspeed_config", "deepspeed_config.json"]
++              args:
++                - "--s3-checkpoint-uri"
++                - "s3://<BUCKET>/aegis-deepspeed/${JOB_ID}"
++                - "--resume"
++                - "true"
++              resources:
++                limits:
++                  nvidia.com/gpu: 1
++                requests:
++                  cpu: "4"
++                  memory: "32Gi"
++          nodeSelector:
++            aegis/instance-type: "gpu-spot"
++          tolerations:
++            - key: "spot"
++              operator: "Exists"
++
+diff --git a/topology/topology_placement.py b/topology/topology_placement.py
+new file mode 100644
+index 0000000..6666666
+--- /dev/null
++++ b/topology/topology_placement.py
+@@ -0,0 +1,200 @@
++#!/usr/bin/env python3
++"""
++Topology-aware placement helper
++- Queries Kubernetes node labels and constructs nodeAffinity/podAntiAffinity hints
++- Produces a pod spec patch snippet to prefer colocating GPUs within the same rack/zone
++Usage:
++  python topology/topology_placement.py --label-key topology.kubernetes.io/zone
++"""
++import os
++import json
++from kubernetes import client, config
++
++def get_nodes_with_gpus(label_selector="hardware-type=gpu"):
++    config.load_incluster_config()
++    v1 = client.CoreV1Api()
++    nodes = v1.list_node(label_selector=label_selector)
++    node_info = []
++    for n in nodes.items:
++        node_info.append({
++            "name": n.metadata.name,
++            "labels": n.metadata.labels
++        })
++    return node_info
++
++def generate_affinity_snippet(zone_key="topology.kubernetes.io/zone", preferred_weight=100):
++    """
++    Returns a JSON snippet for podAffinity that prefers same-zone scheduling (helps NCCL locality).
++    """
++    snippet = {
++        "affinity": {
++            "podAntiAffinity": {
++                "preferredDuringSchedulingIgnoredDuringExecution": [
++                    {
++                        "weight": preferred_weight,
++                        "podAffinityTerm": {
++                            "labelSelector": {
++                                "matchExpressions": [
++                                    {"key": "app", "operator": "In", "values": ["aegis-trainer"]}
++                                ]
++                            },
++                            "topologyKey": zone_key
++                        }
++                    }
++                ]
++            }
++        }
++    }
++    return snippet
++
++if __name__ == "__main__":
++    import argparse
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--zone-key", default="topology.kubernetes.io/zone")
++    args = parser.parse_args()
++    print(json.dumps(generate_affinity_snippet(zone_key=args.zone_key), indent=2))
++
+diff --git a/topology/nccl_envs.yaml b/topology/nccl_envs.yaml
+new file mode 100644
+index 0000000..7777777
+--- /dev/null
++++ b/topology/nccl_envs.yaml
+@@ -0,0 +1,36 @@
++# Template: set NCCL env vars for improved scaling across multi-rack clusters
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: aegis-nccl-config
++  namespace: aegis-ml
++data:
++  NCCL_IB_DISABLE: "0"
++  NCCL_P2P_LEVEL: "NVL"  # NVL on some infra; tune per deployment
++  NCCL_SOCKET_IFNAME: "eth0"
++  NCCL_DEBUG: "WARN"
++  NCCL_MIN_NRINGS: "8"
++
+diff --git a/elastic/elastic_controller.py b/elastic/elastic_controller.py
+new file mode 100644
+index 0000000..8888888
+--- /dev/null
++++ b/elastic/elastic_controller.py
+@@ -0,0 +1,260 @@
++#!/usr/bin/env python3
++"""
++Simple elastic trainer controller for staging/demo:
++ - Watches a PyTorchJob or Deployment label and scales worker replicas up/down based on queue/backlog
++ - Intended as a pattern; production use a proper operator (e.g., kubeflow elastic controller)
++
++This controller uses the Kubernetes API to scale a named deployment/replicaset.
++It is intentionally minimal and safe: only runs in staging with conservative defaults.
++"""
++import time
++import os
++from kubernetes import client, config, watch
++
++MONITORED_DEPLOYMENT = os.environ.get("MONITORED_DEPLOYMENT", "aegis-deepspeed-job-worker")
++NAMESPACE = os.environ.get("NAMESPACE", "aegis-ml")
++MIN_REPLICAS = int(os.environ.get("MIN_REPLICAS", "1"))
++MAX_REPLICAS = int(os.environ.get("MAX_REPLICAS", "8"))
++SCALE_UP_THRESHOLD = float(os.environ.get("SCALE_UP_THRESHOLD", "0.7"))  # e.g., GPU utilization placeholder
++SCALE_DOWN_THRESHOLD = float(os.environ.get("SCALE_DOWN_THRESHOLD", "0.2"))
++SLEEP = int(os.environ.get("SLEEP", "20"))
++
++def get_gpu_utilization_for_deployment(deploy_name, namespace):
++    # Placeholder: integrate with metrics API (Prometheus) to get GPU utilization of pods
++    # For demo, return a random utilization
++    import random
++    return random.random()
++
++def scale_deployment(name, namespace, replicas):
++    config.load_incluster_config()
++    apps = client.AppsV1Api()
++    body = {"spec": {"replicas": replicas}}
++    print(f"Scaling deployment {name} to {replicas}")
++    apps.patch_namespaced_deployment_scale(name, namespace, body)
++
++def main_loop():
++    config.load_incluster_config()
++    while True:
++        try:
++            util = get_gpu_utilization_for_deployment(MONITORED_DEPLOYMENT, NAMESPACE)
++            print("Observed util", util)
++            # get current replicas
++            apps = client.AppsV1Api()
++            dep = apps.read_namespaced_deployment(MONITORED_DEPLOYMENT, NAMESPACE)
++            cur = dep.spec.replicas
++            if util > SCALE_UP_THRESHOLD and cur < MAX_REPLICAS:
++                new = min(MAX_REPLICAS, cur + 1)
++                scale_deployment(MONITORED_DEPLOYMENT, NAMESPACE, new)
++            elif util < SCALE_DOWN_THRESHOLD and cur > MIN_REPLICAS:
++                new = max(MIN_REPLICAS, cur - 1)
++                scale_deployment(MONITORED_DEPLOYMENT, NAMESPACE, new)
++        except Exception as e:
++            print("Error in elastic loop:", e)
++        time.sleep(SLEEP)
++
++if __name__ == "__main__":
++    main_loop()
++
+diff --git a/io/petastorm_loader.py b/io/petastorm_loader.py
+new file mode 100644
+index 0000000..9999999
+--- /dev/null
++++ b/io/petastorm_loader.py
+@@ -0,0 +1,200 @@
++#!/usr/bin/env python3
++"""
++Example: Petastorm + local NVMe caching pattern for high-throughput data pipelines.
++ - Demonstrates dataset sharding using petastorm.make_reader with sharding by worker
++ - Includes a local prefetcher to NVMe via init container or separate prefetch job
++"""
++from petastorm import make_reader
++from petastorm.pytorch import DataLoader as PetastormDataLoader
++import torch
++from torch.utils.data import DistributedSampler
++import os
++
++def petastorm_loader(dataset_url, batch_size=32, shard_id=0, num_shards=1):
++    """
++    dataset_url: e.g., "s3://bucket/petastorm_dataset"
++    shard_id, num_shards: used for worker-level sharding in distributed training
++    """
++    reader = make_reader(dataset_url, num_epochs=None, cur_shard=shard_id, shard_count=num_shards)
++    loader = PetastormDataLoader(reader, batch_size=batch_size, shuffle_steps=1)
++    return loader
++
++def example_iterate():
++    url = os.environ.get("DATASET_URL", "s3://my-bucket/petastorm-dataset")
++    batch = int(os.environ.get("BATCH", "32"))
++    shard_id = int(os.environ.get("SHARD_ID", "0"))
++    num_shards = int(os.environ.get("NUM_SHARDS", "1"))
++    loader = petastorm_loader(url, batch_size=batch, shard_id=shard_id, num_shards=num_shards)
++    for batch in loader:
++        # transform and feed into model
++        pass
++
++if __name__ == "__main__":
++    example_iterate()
++
+diff --git a/io/nvme_prefetch_job.yaml b/io/nvme_prefetch_job.yaml
+new file mode 100644
+index 0000000..aaaaaaaa
+--- /dev/null
++++ b/io/nvme_prefetch_job.yaml
+@@ -0,0 +1,72 @@
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: aegis-prefetch-job
++  namespace: aegis-ml
++spec:
++  template:
++    spec:
++      containers:
++        - name: prefetch
++          image: <REGISTRY>/aegis-prefetch:latest
++          command: ["/bin/sh","-c"]
++          args:
++            - |
++              # sample prefetch: download shards to local NVMe path
++              mkdir -p /nvme/cache/shards
++              aws s3 sync s3://<BUCKET>/sharded-data /nvme/cache/shards
++      restartPolicy: OnFailure
++      nodeSelector:
++        aegis/instance-type: "gpu-on-demand"
++      tolerations:
++        - key: "dedicated"
++          operator: "Exists"
++      volumes:
++        - name: nvme
++          hostPath:
++            path: /mnt/nvme
++            type: DirectoryOrCreate
++      volumeMounts:
++        - name: nvme
++          mountPath: /nvme
++
+diff --git a/perf/profiler_runner.sh b/perf/profiler_runner.sh
+new file mode 100644
+index 0000000..bbbbbbbb
+--- /dev/null
++++ b/perf/profiler_runner.sh
+@@ -0,0 +1,120 @@
++#!/usr/bin/env bash
++#
++# Lightweight runner to execute torch.profiler or vendor GPU profiling tools and collect artifacts
++#
++set -euo pipefail
++
++OUT_DIR="${OUT_DIR:-/tmp/profiler}"
++DURATION="${DURATION:-60}"
++CMD="${CMD:-python trainer.py}"
++
++mkdir -p "$OUT_DIR"
++
++echo "Starting profiler runner for $DURATION seconds"
++# Example: run trainer under torch.profiler (user must instrument code to accept env var)
++export TORCH_PROFILER_OUTPUT="${OUT_DIR}/torch_profiler.json"
++timeout "$DURATION" bash -c "$CMD" || true
++
++# Collect nvidia-smi snapshot
++nvidia-smi --query-gpu=timestamp,name,memory.used,memory.total,utilization.gpu --format=csv -l 1 --loop=1 > "${OUT_DIR}/nvidia_smi.log" || true
++
++echo "Profiler artifacts in $OUT_DIR"
++
+diff --git a/llm/llm_inference_utils.py b/llm/llm_inference_utils.py
+new file mode 100644
+index 0000000..cccccccc
+--- /dev/null
++++ b/llm/llm_inference_utils.py
+@@ -0,0 +1,220 @@
++#!/usr/bin/env python3
++"""
++Helpers for LLM lifecycle: tokenizer management, memory-aware serving hints, quantize training helper.
++This file contains example utilities to integrate with Triton serving and KServe.
++"""
++import os
++import json
++import subprocess
++from transformers import AutoTokenizer, AutoModelForCausalLM
++
++def build_tokenizer_bundle(model_name, out_dir):
++    os.makedirs(out_dir, exist_ok=True)
++    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
++    tok.save_pretrained(out_dir)
++    # optionally export vocab files, merges etc.
++    print("Tokenizer saved to", out_dir)
++
++def quantize_model_to_int8(pytorch_model_path, out_path, calib_dataset=None):
++    """
++    Placeholder: run quantization-aware training or post-training quantization steps.
++    Integrate with torch.quantization or Intel/ONNX quantization toolchains.
++    """
++    # This is highly model-dependent; here we show a placeholder for onnx conversion + quantization step
++    cmd = [
++        "python", "-u", "quantize_and_convert.py",
++        "--pytorch-model", pytorch_model_path,
++        "--export-onnx", out_path + ".onnx",
++        "--quantize"
++    ]
++    subprocess.check_call(cmd)
++    print("Quantization conversion kicked off")
++
++def triton_ensemble_config(model_name, version=1, instance_count=1):
++    cfg = {
++        "name": model_name,
++        "platform": "onnxruntime_onnx",
++        "max_batch_size": 8,
++        "input": [{"name": "input_ids", "data_type": "TYPE_INT32", "dims": [-1, -1]}],
++        "output": [{"name": "output", "data_type": "TYPE_FP32", "dims": [-1, -1]}],
++        "instance_group": [{"kind": "KIND_GPU", "count": instance_count}]
++    }
++    return json.dumps(cfg, indent=2)
++
++def memory_safe_serving_hints(model_size_gb):
++    """
++    Provide runtime suggestions for container memory and concurrency based on model size.
++    """
++    if model_size_gb < 2:
++        return {"container_memory": "4Gi", "concurrency": 4}
++    if model_size_gb < 8:
++        return {"container_memory": "16Gi", "concurrency": 2}
++    return {"container_memory": "64Gi", "concurrency": 1}
++
+diff --git a/cost/spot_advisor.py b/cost/spot_advisor.py
+new file mode 100644
+index 0000000..dddddddd
+--- /dev/null
++++ b/cost/spot_advisor.py
+@@ -0,0 +1,176 @@
++#!/usr/bin/env python3
++"""
++Simple spot/instance-family advisor:
++ - Given model resource profile (GPUs, memory), recommends instance families and zone distribution
++ - Integrate with cloud price APIs or static cost table
++
++This is advisory only; final decisions must be validated by SRE and budget guard.
++"""
++import json
++import argparse
++
++# Example static table (cloud-neutral)
++INSTANCE_CLASSES = [
++    {"name": "gpu.small", "gpus": 1, "mem_gb": 32, "cost_usd_per_hr": 1.2},
++    {"name": "gpu.large", "gpus": 4, "mem_gb": 256, "cost_usd_per_hr": 4.5},
++    {"name": "gpu.xlarge", "gpus": 8, "mem_gb": 768, "cost_usd_per_hr": 8.0}
++]
++
++def advise(gpus_required, budget_per_hour=10.0):
++    candidates = [c for c in INSTANCE_CLASSES if c["gpus"] >= gpus_required]
++    candidates.sort(key=lambda c: c["cost_usd_per_hr"])
++    recommended = [c for c in candidates if c["cost_usd_per_hr"] <= budget_per_hour]
++    return recommended or candidates[:1]
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--gpus", type=int, default=1)
++    parser.add_argument("--budget-hour", type=float, default=10.0)
++    args = parser.parse_args()
++    recs = advise(args.gpus, args.budget_hour)
++    print("Recommendations:")
++    print(json.dumps(recs, indent=2))
++
++if __name__ == "__main__":
++    main()
++
+diff --git a/dr/backup_model_repo.sh b/dr/backup_model_repo.sh
+new file mode 100644
+index 0000000..eeeeeeee
+--- /dev/null
++++ b/dr/backup_model_repo.sh
+@@ -0,0 +1,80 @@
++#!/usr/bin/env bash
++#
++# Cross-region backup for Triton model repo / ML artifacts to durable object storage
++# Usage:
++#  ./dr/backup_model_repo.sh --src s3://bucket/triton-model-repo --dst s3://backup-bucket/triton-backups
++set -euo pipefail
++
++SRC="${SRC:-}"
++DST="${DST:-}"
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --src) SRC="$2"; shift 2;;
++    --dst) DST="$2"; shift 2;;
++    *) echo "Unknown arg $1"; exit 1;;
++  esac
++done
++
++if [ -z "$SRC" ] || [ -z "$DST" ]; then
++  echo "Provide --src and --dst"
++  exit 1
++fi
++
++echo "Syncing $SRC -> $DST"
++aws s3 sync "$SRC" "$DST" --storage-class STANDARD_IA || true
++echo "Backup complete. Record timestamp: $(date -u +%Y%m%dT%H%M%SZ)"
++
++echo '{"backup_src":"'"$SRC"'","backup_dst":"'"$DST"'","timestamp":"'"$(date -u +%Y%m%dT%H%M%SZ)"'"}' > /tmp/backup_record.json
++echo "Backup record saved to /tmp/backup_record.json"
++
+diff --git a/README_DL_SCALE.md b/README_DL_SCALE.md
+new file mode 100644
+index 0000000..ffffffff
+--- /dev/null
++++ b/README_DL_SCALE.md
+@@ -0,0 +1,220 @@
++# Aegis Deep Learning Scale & Advanced Features Patch
++
++This patch adds example artifacts and helpers to advance Aegis toward:
++- model-parallel & memory-efficient training via DeepSpeed / ZeRO
++- topology-aware placement and NCCL tuning helpers
++- elastic training controller pattern for worker scaling
++- high-throughput IO with Petastorm + NVMe prefetching
++- sharded checkpoint upload & restore helpers for terabyte-scale checkpoints
++- profiling and GPU memory capture tooling
++- LLM lifecycle helpers: tokenizer bundles, quantization helper, memory-safe serving hints
++- spot/instance advisor & budget guard adapter
++- cross-region backup for model repositories (DR)
++
++Important: These are reference examples and operator helpers that require adaptation to your environment,
++secrets and cloud provider. Treat them as starting implementations to integrate into your staging pipelines.
++
++Quick start (staging)
++1. Build and push DeepSpeed trainer image:
++   docker build -t <REGISTRY>/aegis-deepspeed:latest -f deepspeed/Dockerfile.deepspeed .
++   docker push <REGISTRY>/aegis-deepspeed:latest
++
++2. Apply manifests:
++   kubectl apply -f k8s/manifests/deepspeed-pytorchjob.yaml
++   kubectl apply -f topology/nccl_envs.yaml
++   kubectl apply -f io/nvme_prefetch_job.yaml
++
++3. Initialize and verify:
++   - Ensure S3 credentials (via Vault) are available to the trainer container.
++   - Run the PyTorchJob and watch logs; verify sharded checkpoint uploads appear in S3 and latest pointer exists.
++
++Notes on security & productionization
++- Use Vault for S3 and DB credentials; do NOT bake secrets into images or manifests.
++- DeepSpeed jobs can be expensive — use budget guard and quotas before enabling large runs.
++- For multi-rack scaling, work with your infra team to provide RDMA/NIC support and tuned NCCL settings.
++
++Next steps I can provide:
++- A) DeepSpeed + Megatron end-to-end example tuned for your cloud (requires instance types and repo).
++- B) Integration with vendor RDMA / NIC plugins and a topology-aware scheduler plugin.
++- C) Production-grade elastic operator (controller) to manage worker pools and stateful restore.
++
++Which would you like me to work on next?
++

@@ -1,0 +1,303 @@
+*** Begin Patch
+*** Add File: k8s/rlhf/distributed-accelerate-job.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: rlhf-distributed-accelerate
++  namespace: aegis-ml
++spec:
++  template:
++    spec:
++      serviceAccountName: rlhf-trainer-sa
++      containers:
++        - name: accelerator-launcher
++          image: aegis/rlhf:latest
++          # This launcher will run accelerate launch which coordinates distributed workers
++          command:
++            - /bin/sh
++            - -c
++            - |
++              set -e
++              echo "Starting distributed RLHF accelerate run"
++              # Ensure accelerate config and MLflow env are present
++              export MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI}"
++              accelerate launch --config_file /configs/accelerate_config.yaml rl/accelerate_multi_node.sh --mlflow "${MLFLOW_TRACKING_URI}"
++          env:
++            - name: MLFLOW_TRACKING_URI
++              valueFrom:
++                secretKeyRef:
++                  name: mlflow-secrets
++                  key: tracking-uri
++            - name: AWS_S3_BUCKET
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-secrets
++                  key: artifact-bucket
++            - name: AWS_ACCESS_KEY_ID
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-aws
++                  key: access-key
++            - name: AWS_SECRET_ACCESS_KEY
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-aws
++                  key: secret-key
++          resources:
++            limits:
++              nvidia.com/gpu: 1
++              memory: "48Gi"
++              cpu: "12"
++            requests:
++              nvidia.com/gpu: 1
++              memory: "24Gi"
++              cpu: "6"
++          volumeMounts:
++            - name: configs
++              mountPath: /configs
++      restartPolicy: Never
++  backoffLimit: 1
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: rlhf-trainer-sa
++  namespace: aegis-ml
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: rlhf-trainer-role
++  namespace: aegis-ml
++rules:
++- apiGroups: [""]
++  resources: ["pods","pods/log","configmaps"]
++  verbs: ["get","list","watch"]
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: rlhf-trainer-binding
++  namespace: aegis-ml
++subjects:
++- kind: ServiceAccount
++  name: rlhf-trainer-sa
++  namespace: aegis-ml
++roleRef:
++  kind: Role
++  name: rlhf-trainer-role
++  apiGroup: rbac.authorization.k8s.io
++
+*** End Patch
+*** Begin Patch
+*** Add File: configs/accelerate_config.yaml
++compute_environment: LOCAL_MACHINE
++deepspeed_config: {}
++distributed_type: MULTI_GPU
++downcast_bfloat16: "no"
++mixed_precision: "fp16"
++machine_rank: 0
++main_process_ip: "launcher-host"
++main_process_port: 29500
++num_machines: 1
++num_processes: 1
++use_cpu: false
++
++# Operators: adapt machine_rank/main_process_ip/num_machines at job launch time for multi-node runs.
++
+*** End Patch
+*** Begin Patch
+*** Add File: rl/restore_and_evaluate.py
++#!/usr/bin/env python3
++"""
++Restore checkpoint from artifact store, validate with checkpoint_validate.py, run evaluation suite and adversarial check.
++ - Downloads checkpoint configured by S3 path (s3://bucket/key) or local path
++ - Runs rl/checkpoint_validate.py to ensure loadability
++ - Runs safety/hallu_evaluator.py against validation prompts
++ - Logs results to MLflow and writes a small report to /tmp
++
++Usage:
++  python rl/restore_and_evaluate.py --checkpoint s3://bucket/path/to/ckpt --mlflow http://mlflow:5000 --validation tests/hallu_validation.jsonl
++"""
++import os, argparse, tempfile, subprocess, json
++from rl.checkpoint_manager import sha256
++
++def download_s3(s3_path, out):
++    # simple aws cli fallback (operator must ensure AWS creds)
++    if s3_path.startswith("s3://"):
++        cmd = ["aws","s3","cp", s3_path, out]
++        subprocess.check_call(cmd)
++    else:
++        raise RuntimeError("Unsupported path")
++
++def validate_and_eval(local_ckpt, mlflow_uri=None, validation_manifest=None):
++    # validate checkpoint loadability
++    print("Validating checkpoint", local_ckpt)
++    res = subprocess.run(["python","rl/checkpoint_validate.py","--ckpt", local_ckpt], capture_output=True, text=True)
++    print("validate output:", res.stdout, res.stderr)
++    ok = res.returncode == 0
++    report = {"ckpt": local_ckpt, "validate_ok": ok}
++    # run hallucination evaluator if validation passes
++    if ok and validation_manifest:
++        env = os.environ.copy()
++        env["HALLU_VALIDATION"] = validation_manifest
++        env["LLM_ENDPOINT"] = os.environ.get("LLM_ENDPOINT", "http://llm-gateway.aegis.svc/v1/generate")
++        r = subprocess.run(["python","safety/hallu_evaluator.py"], env=env, capture_output=True, text=True)
++        report["hallu_eval_stdout"] = r.stdout
++        report["hallu_eval_stderr"] = r.stderr
++        report["hallu_eval_ret"] = r.returncode
++        report["hallu_pass"] = (r.returncode == 0)
++    return report
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--checkpoint", required=True)
++    p.add_argument("--mlflow", default=os.environ.get("MLFLOW_TRACKING_URI"))
++    p.add_argument("--validation", default="tests/hallu_validation.jsonl")
++    args = p.parse_args()
++    tmp = tempfile.NamedTemporaryFile(delete=False)
++    local = tmp.name; tmp.close()
++    print("Downloading", args.checkpoint, "to", local)
++    download_s3(args.checkpoint, local)
++    rpt = validate_and_eval(local, args.mlflow, args.validation)
++    outf = "/tmp/restore_eval_report.json"
++    with open(outf,"w") as fh:
++        json.dump(rpt, fh, indent=2)
++    print("Wrote report", outf)
++    if not rpt.get("hallu_pass", True):
++        raise SystemExit(2)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/wait_for_k8s_job.sh
++#!/usr/bin/env bash
++set -euo pipefail
++JOB_NAME="$1"
++NAMESPACE="${2:-aegis-ml}"
++TIMEOUT="${3:-1800}" # 30m
++INTERVAL=10
++START=$(date +%s)
++echo "Waiting for job $JOB_NAME in namespace $NAMESPACE to complete"
++while true; do
++  if kubectl get job "$JOB_NAME" -n "$NAMESPACE" -o jsonpath='{.status.succeeded}' 2>/dev/null | grep -q '[1-9]'; then
++    echo "Job succeeded"
++    exit 0
++  fi
++  if kubectl get job "$JOB_NAME" -n "$NAMESPACE" -o jsonpath='{.status.failed}' 2>/dev/null | grep -q '[1-9]'; then
++    echo "Job failed"
++    exit 2
++  fi
++  NOW=$(date +%s)
++  if [ $((NOW-START)) -gt "$TIMEOUT" ]; then
++    echo "Timeout waiting for job"
++    exit 3
++  fi
++  sleep "$INTERVAL"
++done
++
+*** End Patch
+*** Begin Patch
+*** Add File: ci/rlhf_end_to_end_pipeline.yml
++name: RLHF End-to-End Staging Pipeline
++on:
++  workflow_dispatch:
++    inputs:
++      checkpoint_s3:
++        required: true
++      model_id:
++        required: true
++
++jobs:
++  deploy-and-train:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Apply distributed training Job
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG_STAGING }}
++        run: |
++          kubectl apply -f k8s/rlhf/distributed-accelerate-job.yaml
++      - name: Wait for distributed job to complete
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG_STAGING }}
++        run: |
++          chmod +x scripts/wait_for_k8s_job.sh
++          ./scripts/wait_for_k8s_job.sh rlhf-distributed-accelerate aegis-ml 3600
++  validate-and-adversarial:
++    needs: deploy-and-train
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Restore checkpoint and run evaluation
++        env:
++          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
++          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
++          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
++          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
++          ADV_MANIFEST: tests/adversarial_prompts.jsonl
++        run: |
++          python rl/restore_and_evaluate.py --checkpoint "${{ github.event.inputs.checkpoint_s3 }}" --mlflow "${MLFLOW_TRACKING_URI}" --validation tests/hallu_validation.jsonl || (echo "restore/eval failed"; exit 2)
++      - name: Run adversarial harness against staging canary
++        env:
++          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
++          ADV_MANIFEST: tests/adversarial_prompts.jsonl
++          COMPLIANCE_BUCKET: ${{ secrets.COMPLIANCE_BUCKET }}
++        run: |
++          python safety/adversarial_harness.py || (echo "Adversarial harness failed - triggering rollback"; exit 2)
++      - name: On success promote model (auto canary manager)
++        if: success()
++        env:
++          ES_HOST: ${{ secrets.ES_HOST }}
++          PROM_URL: ${{ secrets.PROM_URL }}
++          MODEL_REGISTRY_API: ${{ secrets.MODEL_REGISTRY_API }}
++          COMPLIANCE_BUCKET: ${{ secrets.COMPLIANCE_BUCKET }}
++        run: |
++          python ci/canary_promote_manager.py "${{ github.event.inputs.model_id }}"
++      - name: On failure rollback model in registry
++        if: failure()
++        env:
++          MODEL_REGISTRY_API: ${{ secrets.MODEL_REGISTRY_API }}
++        run: |
++          curl -s -XPOST "${{ secrets.MODEL_REGISTRY_API }}/models/rollback" -H "Content-Type: application/json" -d "{\"model\":\"${{ github.event.inputs.model_id }}\"}" || true
++
+*** End Patch
+*** Begin Patch
+*** Add File: tests/checkpoint_restore_test.sh
++#!/usr/bin/env bash
++#
++# Local test to validate checkpoint restore & adversarial evaluator integration
++# Usage: CHECKPOINT_S3=s3://bucket/key ./tests/checkpoint_restore_test.sh
++set -euo pipefail
++: "${CHECKPOINT_S3:?Please set CHECKPOINT_S3 env var}"
++
++echo "Downloading and validating checkpoint..."
++python rl/restore_and_evaluate.py --checkpoint "${CHECKPOINT_S3}" --mlflow "${MLFLOW_TRACKING_URI:-}" --validation tests/hallu_validation.jsonl
++echo "Checkpoint restore + eval succeeded"
++
+*** End Patch
+*** Begin Patch
+*** Add File: rl/README_rlhf_e2e.md
++# RLHF End-to-End (Staging) Guide
++
++This document describes how to run a distributed RLHF staging run end-to-end, validate checkpoints and run the adversarial gate.
++
++Steps:
++1. Adjust configs/accelerate_config.yaml for the target cluster (set main_process_ip, num_machines, num_processes).
++2. Ensure MLflow and S3 credentials are available to the Job via secrets (mlflow-secrets, aegis-aws).
++3. Launch the training job:
++   kubectl apply -f k8s/rlhf/distributed-accelerate-job.yaml
++4. Wait for job completion (scripts/wait_for_k8s_job.sh rlhf-distributed-accelerate aegis-ml)
++5. After job completes, validate checkpoint and run adversarial harness:
++   python rl/restore_and_evaluate.py --checkpoint s3://bucket/path/to/ckpt --validation tests/hallu_validation.jsonl
++6. If adversarial harness passes, promote the canary via ci/canary_promote_manager.py; on failure, rollback via model_registry.
++
++CI:
++- The GitHub workflow ci/rlhf_end_to_end_pipeline.yml runs all steps automatically in staging and will call model_registry to promote/rollback depending on adversarial gate outcome.
++
+*** End Patch
+*** End Patch

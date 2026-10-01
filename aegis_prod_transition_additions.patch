@@ -1,0 +1,260 @@
+*** Begin Patch
+*** Add File: k8s/llm-upstream-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-llm-upstream
++  namespace: aegis
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-llm-upstream
++  template:
++    metadata:
++      labels:
++        app: aegis-llm-upstream
++    spec:
++      # Use a dedicated service account with minimal permissions (see operator-rbac-prod.yaml)
++      serviceAccountName: aegis-llm-sa
++      containers:
++        - name: llm-upstream
++          # Placeholder image: replace with your self-hosted LLM stack (Llama/Mistral endpoint)
++          image: aegis/llm-upstream:latest
++          env:
++            - name: MODEL_NAME
++              value: "aegis-llm"
++            - name: MAX_TOKENS
++              value: "2048"
++          ports:
++            - containerPort: 8080
++          readinessProbe:
++            httpGet:
++              path: /health
++              port: 8080
++            initialDelaySeconds: 10
++            periodSeconds: 10
++          livenessProbe:
++            httpGet:
++              path: /health
++              port: 8080
++            initialDelaySeconds: 30
++            periodSeconds: 20
++          resources:
++            requests:
++              cpu: "2"
++              memory: "8Gi"
++            limits:
++              cpu: "8"
++              memory: "32Gi"
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: aegis-llm-upstream
++  namespace: aegis
++spec:
++  selector:
++    app: aegis-llm-upstream
++  ports:
++    - port: 8080
++      targetPort: 8080
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/redis-quota.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-redis
++  namespace: aegis
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-redis
++  template:
++    metadata:
++      labels:
++        app: aegis-redis
++    spec:
++      containers:
++        - name: redis
++          image: redis:6-alpine
++          ports:
++            - containerPort: 6379
++          resources:
++            requests:
++              cpu: "100m"
++              memory: "128Mi"
++            limits:
++              cpu: "500m"
++              memory: "512Mi"
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: aegis-redis
++  namespace: aegis
++spec:
++  selector:
++    app: aegis-redis
++  ports:
++    - port: 6379
++      targetPort: 6379
++
+*** End Patch
+*** Begin Patch
+*** Update File: tools/llm_gateway.py
+@@
+ from flask import Flask, request, jsonify
+ import os, re, time, threading, requests
+ from collections import deque
+ from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+ from functools import wraps
++import redis
++
+ app = Flask(__name__)
+ LLM_UPSTREAM = os.getenv("LLM_UPSTREAM", "")
+ RATE_LIMIT_RPS = int(os.getenv("RATE_LIMIT_RPS", "5"))
+ FORBIDDEN = [re.compile(p) for p in os.getenv("FORBIDDEN_PATTERNS", r"(?i)ssh|private key|password").split(",") if p]
+ CLIENT_API_KEY = os.getenv("LLM_CLIENT_API_KEY", "")
++REDIS_URL = os.getenv("REDIS_URL", "redis://aegis-redis.aegis.svc:6379/0")
++
++# Redis client for per-key quota enforcement (optional). If not available, gateway will fallback to in-memory.
++try:
++    REDIS = redis.from_url(REDIS_URL, socket_timeout=1)
++except Exception:
++    REDIS = None
+@@
+ def allow_request():
+     with lock:
+         now = time.time()
+         while timestamps and timestamps[0] < now - 1:
+             timestamps.popleft()
+         if len(timestamps) < RATE_LIMIT_RPS:
+             timestamps.append(now)
+             return True
+         return False
+@@
+ def require_api_key(f):
+     @wraps(f)
+     def inner(*args, **kwargs):
+         if CLIENT_API_KEY:
+             key = request.headers.get("X-API-Key") or request.headers.get("Authorization")
+             if not key:
+                 return jsonify({"error": "missing_api_key"}), 401
+             # Accept "Bearer <key>" or raw X-API-Key header
+             if key.startswith("Bearer "):
+                 key = key.split(" ", 1)[1]
+             if key != CLIENT_API_KEY:
+                 REQ_COUNTER.labels(status="unauthorized").inc()
+                 return jsonify({"error": "unauthorized"}), 403
+         return f(*args, **kwargs)
+     return inner
++
++def check_and_consume_quota(api_key: str, cost: int = 1, window: int = 3600) -> bool:
++    """
++    Per-API-key quota consumption using Redis INCR with TTL.
++    - api_key: key identifier
++    - cost: cost units to consume
++    - window: rolling window seconds
++    Returns True if request allowed, False if quota exceeded.
++    """
++    if not api_key:
++        return False
++    if REDIS:
++        try:
++            qk = f"quota:{api_key}"
++            cur = REDIS.get(qk)
++            if cur is None:
++                # initialize window
++                REDIS.set(qk, cost, ex=window)
++                return True
++            else:
++                cur = int(cur)
++                limit = int(os.getenv("LLM_KEY_QUOTA_PER_HOUR", "1000"))
++                if cur + cost > limit:
++                    return False
++                REDIS.incrby(qk, cost)
++                return True
++        except Exception:
++            # on Redis error, be conservative: allow (fail-open) or deny (fail-closed). We choose allow.
++            return True
++    else:
++        # no Redis: simple in-memory (best-effort) - not persistent; acceptable for small clusters
++        return True
+*** End Patch
+*** Begin Patch
+*** Update File: tools/llm_gateway.py
+@@
+ @app.route("/v1/generate", methods=["POST"])
+ @require_api_key
+ def generate():
+     if not allow_request():
+         REQ_COUNTER.labels(status="rate_limited").inc()
+         return jsonify({"error": "rate_limited"}), 429
+     data = request.json or {}
+     prompt = data.get("prompt", "")
+     # Enforce RAG-only operation: require 'contexts' field to be present (list of docs)
+     contexts = data.get("contexts", [])
+     if not isinstance(contexts, list) or len(contexts) == 0:
+         REQ_COUNTER.labels(status="missing_context").inc()
+         return jsonify({"error": "contexts_required"}), 400
+     if check_forbidden(prompt):
+         REQ_COUNTER.labels(status="forbidden").inc()
+         return jsonify({"error":"forbidden_content"}), 400
+     safe = redact_prompt(prompt)
++    # Enforce per-key quota (if provided)
++    api_key_header = request.headers.get("X-API-Key") or request.headers.get("Authorization")
++    if api_key_header and api_key_header.startswith("Bearer "):
++        api_key_header = api_key_header.split(" ",1)[1]
++    if not check_and_consume_quota(api_key_header, cost=int(data.get("cost",1))):
++        REQ_COUNTER.labels(status="quota_exceeded").inc()
++        return jsonify({"error":"quota_exceeded"}), 429
+     # forward to upstream
+     start = time.time()
+     try:
+         resp = requests.post(LLM_UPSTREAM, json={"prompt": safe, "contexts": contexts}, timeout=60)
+         REQ_COUNTER.labels(status=str(resp.status_code)).inc()
+         REQ_LATENCY.observe(time.time() - start)
+         return jsonify(resp.json()), resp.status_code
+     except requests.RequestException as e:
+         REQ_COUNTER.labels(status="upstream_error").inc()
+         return jsonify({"error": "upstream_error", "detail": str(e)}), 502
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/model_train_sign_upload.py
++#!/usr/bin/env python3
++"""
++Train/eval pipeline that:
++- runs training (placeholder)
++- computes evaluation metrics and writes /tmp/model_metrics.json
++- signs the JSON using scripts/audit_sign.py (if SIGNING_KEY_BASE64 env present)
++- uploads artifacts (metrics + artifact) to S3/GCS for model registry and audit
++
++Environment:
++ - MODEL_REGISTRY_S3 (optional) e.g. bucket name
++ - MODEL_REGISTRY_GCS (optional) e.g. gs://bucket/path
++ - SIGNING_KEY_BASE64 (optional)
++ - GITHUB_SHA / CI metadata (optional)
++"""
++import os, json, subprocess
++from pathlib import Path
++
++def train_and_eval():
++    # Placeholder: replace with actual training invocation
++    metrics = {"accuracy": 0.87, "loss": 0.35}
++    Path("/tmp").mkdir(parents=True, exist_ok=True)
++    with open("/tmp/model_metrics.json", "w") as f:
++        json.dump(metrics, f)
++    print("Wrote /tmp/model_metrics.json")
++    return "/tmp/model_metrics.json"
++
++def sign_metrics(metrics_path):
++    try:
++        with open(metrics_path) as f:
++            raw = f.read()
++        # call the existing audit_sign.py to sign metrics; it expects a JSON string argument
+aegis

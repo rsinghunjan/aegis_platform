@@ -1,0 +1,502 @@
+diff --git a/scripts/dgx/prod_validate_and_run.sh b/scripts/dgx/prod_validate_and_run.sh
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/scripts/dgx/prod_validate_and_run.sh
+@@ -0,0 +1,320 @@
++#!/usr/bin/env bash
++#
++# Run a production validation for DGX DeepSpeed runs:
++#  - verify signed image & SBOM
++#  - check GPU Operator driver policy
++#  - ensure DGX node labeling
++#  - run NCCL tuning and generate env suggestions
++#  - schedule a tuned DeepSpeed k8s Job (multi-GPU) and collect artifacts
++#  - record provenance (SBOM + signed digest + job logs) to artifacts and optional decision_log endpoint
++#
++# Prereqs: kubectl, helm, yq (optional), syft, trivy, cosign, docker or skopeo, jq
++#
++# Usage:
++#   REGISTRY=ghcr.io/org IMAGE_TAG=aegis-deepspeed:h100-cuda12.1-pytorch2.2 \
++#   KUBECONFIG=./kubeconfig-dgx ./scripts/dgx/prod_validate_and_run.sh
++
++set -euo pipefail
++
++# Inputs via env / args
++REGISTRY="${REGISTRY:-}"
++IMAGE_TAG="${IMAGE_TAG:-}"
++IMAGE_FULL="${REGISTRY}/${IMAGE_TAG}"
++KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
++EXPECTED_GPU_OPERATOR_AUTOINSTALL="${EXPECTED_GPU_OPERATOR_AUTOINSTALL:-false}" # set to true if you want driver auto-install
++NAMESPACE="${NAMESPACE:-aegis-ml}"
++JOB_TEMPLATE="${JOB_TEMPLATE:-k8s/manifests/dgx/deepspeed-dgx-job.template.yaml}"
++ARTIFACTS_DIR="${ARTIFACTS_DIR:-./artifacts/dgx_prod_validate}"
++DECISION_LOG_URL="${DECISION_LOG_URL:-}" # optional: POST provenance here
++TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-1200}"
++
++if [[ -z "$REGISTRY" || -z "$IMAGE_TAG" ]]; then
++  echo "REGISTRY and IMAGE_TAG environment variables must be set."
++  echo "Example: REGISTRY=ghcr.io/org IMAGE_TAG=aegis-deepspeed:h100-cuda12.1-pytorch2.2 KUBECONFIG=./kubeconfig-dgx $0"
++  exit 2
++fi
++
++mkdir -p "$ARTIFACTS_DIR"
++
++export KUBECONFIG
++
++echo "1) Verify cosign signature (keyless or key-based)"
++COSIGN_VERIFY_RESULT="not-run"
++if command -v cosign >/dev/null 2>&1; then
++  if cosign verify "$IMAGE_FULL" > "$ARTIFACTS_DIR/cosign_verify.txt" 2>&1; then
++    COSIGN_VERIFY_RESULT="verified"
++    echo "cosign verification succeeded"
++  else
++    COSIGN_VERIFY_RESULT="failed"
++    echo "cosign verification failed; see $ARTIFACTS_DIR/cosign_verify.txt"
++    cat "$ARTIFACTS_DIR/cosign_verify.txt" || true
++    # continue but mark failure
++  fi
++else
++  echo "cosign not installed; skipping verification. Install cosign for image signing checks."
++  COSIGN_VERIFY_RESULT="skipped"
++fi
++
++echo "2) Generate or fetch SBOM (syft)"
++SBOM_FILE="$ARTIFACTS_DIR/$(echo $IMAGE_TAG | tr '/:' '__')-sbom.json"
++if command -v syft >/dev/null 2>&1; then
++  echo "Generating SBOM with syft..."
++  syft "$IMAGE_FULL" -o json > "$SBOM_FILE" 2> "$ARTIFACTS_DIR/syft.log" || echo "syft failed, check $ARTIFACTS_DIR/syft.log"
++else
++  echo "syft not found; skipping SBOM generation."
++fi
++
++echo "3) Scan image for critical/high vulns with Trivy"
++TRIVY_RESULT="not-run"
++if command -v trivy >/dev/null 2>&1; then
++  echo "Running trivy (CRITICAL/HIGH will cause non-zero exit)"
++  if trivy image --severity CRITICAL,HIGH --no-progress "$IMAGE_FULL" > "$ARTIFACTS_DIR/trivy.txt" 2>&1; then
++    TRIVY_RESULT="clean"
++    echo "trivy: no HIGH/CRITICAL findings"
++  else
++    TRIVY_RESULT="vulns-found"
++    echo "trivy found HIGH/CRITICAL issues; see $ARTIFACTS_DIR/trivy.txt"
++  fi
++else
++  echo "trivy not found; skipping vulnerability scan."
++fi
++
++echo "4) Determine image digest (for provenance)"
++IMAGE_DIGEST="unknown"
++if command -v docker >/dev/null 2>&1; then
++  echo "Pulling image to inspect digest..."
++  docker pull "$IMAGE_FULL" > "$ARTIFACTS_DIR/docker_pull.txt" 2>&1 || true
++  IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE_FULL" 2>/dev/null || true)
++  echo "Docker image digest: $IMAGE_DIGEST" > "$ARTIFACTS_DIR/image_digest.txt"
++elif command -v skopeo >/dev/null 2>&1; then
++  echo "Using skopeo to inspect remote digest..."
++  skopeo inspect "docker://${IMAGE_FULL}" > "$ARTIFACTS_DIR/skopeo_inspect.json" 2>&1 || true
++  IMAGE_DIGEST=$(jq -r '.Digest' "$ARTIFACTS_DIR/skopeo_inspect.json" 2>/dev/null || echo "unknown")
++  echo "skopeo image digest: $IMAGE_DIGEST" > "$ARTIFACTS_DIR/image_digest.txt"
++else
++  echo "Neither docker nor skopeo available; image digest check skipped."
++fi
++
++echo "5) Check GPU Operator driver autoInstall policy"
++GPU_OPERATOR_AUTOINSTALL="unknown"
++if command -v helm >/dev/null 2>&1; then
++  if helm get values -n gpu-operator gpu-operator -o yaml > "$ARTIFACTS_DIR/gpu_operator_values.yaml" 2>/dev/null; then
++    if command -v yq >/dev/null 2>&1; then
++      GPU_OPERATOR_AUTOINSTALL=$(yq e '.driver.autoInstall // "unknown"' "$ARTIFACTS_DIR/gpu_operator_values.yaml")
++    else
++      # fallback: grep
++      GPU_OPERATOR_AUTOINSTALL=$(grep -E 'autoInstall:' "$ARTIFACTS_DIR/gpu_operator_values.yaml" | tail -n1 | awk '{print $2}' || echo "unknown")
++    fi
++    echo "GPU operator autoInstall = $GPU_OPERATOR_AUTOINSTALL (expected=$EXPECTED_GPU_OPERATOR_AUTOINSTALL)" > "$ARTIFACTS_DIR/gpu_operator_auto_install.txt"
++  else
++    echo "helm get values failed; GPU Operator may not be installed or not named 'gpu-operator' in namespace gpu-operator."
++  fi
++else
++  echo "helm not installed; cannot query GPU Operator values."
++fi
++
++echo "6) Ensure DGX nodes are labeled"
++mapfile -t DGX_NODES < <(kubectl get nodes -o jsonpath='{range .items[?(@.metadata.labels["node.kubernetes.io/dgx"]=="true")]}{.metadata.name}{"\n"}{end}')
++if [[ ${#DGX_NODES[@]} -eq 0 ]]; then
++  echo "No nodes found with label node.kubernetes.io/dgx=true"
++  echo "Listing nodes for operator to inspect:"
++  kubectl get nodes -o wide > "$ARTIFACTS_DIR/nodes.txt"
++  cat "$ARTIFACTS_DIR/nodes.txt"
++  # Do not exit; allow manual labeling afterward
++else
++  echo "Found DGX-labeled nodes:"
++  printf '%s\n' "${DGX_NODES[@]}" > "$ARTIFACTS_DIR/dgx_nodes.txt"
++  cat "$ARTIFACTS_DIR/dgx_nodes.txt"
++fi
++
++echo "7) Run NCCL tuning to gather topology info"
++NCCl_OUT_DIR="$ARTIFACTS_DIR/nccl"
++mkdir -p "$NCCl_OUT_DIR"
++if [[ -x "./scripts/dgx/nccl_tuning.sh" ]]; then
++  ./scripts/dgx/nccl_tuning.sh --nodes 1 --gpus-per-node 8 --out "$NCCl_OUT_DIR" || true
++else
++  echo "nccl_tuning.sh not present; skipping NCCL tuning"
++fi
++
++echo "8) Generate suggested NCCL env variables"
++ENV_SUGGEST="$ARTIFACTS_DIR/nccl_env_suggest.sh"
++if [[ -x "./scripts/dgx/generate_nccl_env_suggest.sh" && -f "$NCCl_OUT_DIR/all_reduce_perf.txt" ]]; then
++  ./scripts/dgx/generate_nccl_env_suggest.sh --nccl-output "$NCCl_OUT_DIR/all_reduce_perf.txt" --out "$ENV_SUGGEST" || true
++fi
++if [[ -f "$ENV_SUGGEST" ]]; then
++  echo "Suggested NCCL env script saved to $ENV_SUGGEST"
++  source "$ENV_SUGGEST" || true
++fi
++
++echo "9) Prepare tuned k8s Job manifest from template"
++TUNED_JOB_MANIFEST="$ARTIFACTS_DIR/deepspeed_tuned_job.yaml"
++if [[ ! -f "$JOB_TEMPLATE" ]]; then
++  echo "Job template not found: $JOB_TEMPLATE"
++  exit 3
++fi
++
++cp "$JOB_TEMPLATE" "$TUNED_JOB_MANIFEST"
++
++# Insert suggested NCCL envs into manifest if present (simple sed-based replacement for placeholders)
++if grep -q "__NCCL_ENV_PLACEHOLDER__" "$TUNED_JOB_MANIFEST"; then
++  NCCL_EXPORTS="$(env | grep NCCL | sed 's/"/\\"/g' | awk '{print "          - name: " $1 " \n            value: \"" substr($0, index($0,$2)) "\""}' ORS='\n')"
++  # fallback if above awk fails
++  if [[ -z "$NCCL_EXPORTS" ]]; then
++    NCCL_EXPORTS=$(cat "$ENV_SUGGEST" 2>/dev/null | sed -n 's/export //p' | awk -F= '{print "          - name: "$1"\\n            value: \""$2"\""}' ORS='\n') || true
++  fi
++  # naive replacement: look for a block marker in template
++  sed -E "/__NCCL_ENV_PLACEHOLDER__/{
++    r /dev/stdin
++    d
++  }" "$TUNED_JOB_MANIFEST" > "$TUNED_JOB_MANIFEST.tmp" <<EOF
++$NCCL_EXPORTS
++EOF
++  mv "$TUNED_JOB_MANIFEST.tmp" "$TUNED_JOB_MANIFEST" || true
++fi
++
++echo "Applying tuned job manifest to namespace $NAMESPACE"
++kubectl create ns "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - || true
++kubectl apply -f "$TUNED_JOB_MANIFEST" || true
++
++echo "10) Wait for job pod to start and collect logs"
++JOB_LABEL=$(yq e '.metadata.labels.app' "$TUNED_JOB_MANIFEST" 2>/dev/null || echo "deepspeed-dgx")
++echo "Looking for job pods with label app=$JOB_LABEL"
++set +e
++kubectl wait --for=condition=ready pod -l app="$JOB_LABEL" -n "$NAMESPACE" --timeout ${TIMEOUT_SECONDS}s > "$ARTIFACTS_DIR/job_wait.txt" 2>&1
++set -e
++POD_NAME=$(kubectl -n "$NAMESPACE" get pod -l app="$JOB_LABEL" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
++if [[ -n "$POD_NAME" ]]; then
++  echo "Found pod: $POD_NAME"
++  kubectl -n "$NAMESPACE" logs -f "$POD_NAME" > "$ARTIFACTS_DIR/${POD_NAME}.log" 2>&1 || true
++  kubectl -n "$NAMESPACE" get pod "$POD_NAME" -o yaml > "$ARTIFACTS_DIR/${POD_NAME}.yaml" 2>&1 || true
++else
++  echo "No pod started for job; check job status"
++  kubectl -n "$NAMESPACE" get job -l app="$JOB_LABEL" -o wide > "$ARTIFACTS_DIR/job_status.txt" 2>&1 || true
++fi
++
++echo "11) Collect artifacts (nvidia-smi from nodes via kubectl exec if possible)"
++if [[ -n "$POD_NAME" ]]; then
++  kubectl -n "$NAMESPACE" exec "$POD_NAME" -- nvidia-smi -q > "$ARTIFACTS_DIR/nvidia-smi-from-pod.txt" 2>/dev/null || true
++fi
++
++echo "12) Create provenance record"
++PROV_FILE="$ARTIFACTS_DIR/provenance.json"
++jq -n --arg image "$IMAGE_FULL" --arg digest "$IMAGE_DIGEST" --arg cosign "$COSIGN_VERIFY_RESULT" \
++  --arg sbom "$SBOM_FILE" --arg trivy "$TRIVY_RESULT" --arg job_logs "$ARTIFACTS_DIR/${POD_NAME}.log" \
++  '{image:$image, digest:$digest, cosign:$cosign, sbom:$sbom, trivy:$trivy, job_logs:$job_logs, artifacts_dir:$ARTIFACTS_DIR}' \
++  > "$PROV_FILE"
++echo "Provenance written to $PROV_FILE"
++
++if [[ -n "$DECISION_LOG_URL" ]]; then
++  echo "Posting provenance to decision_log endpoint: $DECISION_LOG_URL"
++  if command -v curl >/dev/null 2>&1; then
++    curl -s -X POST -H "Content-Type: application/json" --data @"$PROV_FILE" "$DECISION_LOG_URL" > "$ARTIFACTS_DIR/decision_log_post.txt" 2>&1 || true
++  else
++    echo "curl not available; skipping post"
++  fi
++fi
++
++echo "Validation run complete. Collected artifacts under $ARTIFACTS_DIR"
++echo "Review provenance.json and the logs to confirm multi-node scaling behavior and any NCCL warnings/errors."
++exit 0
++
+diff --git a/k8s/manifests/dgx/deepspeed-dgx-job.template.yaml b/k8s/manifests/dgx/deepspeed-dgx-job.template.yaml
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/k8s/manifests/dgx/deepspeed-dgx-job.template.yaml
+@@ -0,0 +1,200 @@
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: deepspeed-dgx-prod-validate
++  namespace: aegis-ml
++  labels:
++    app: deepspeed-dgx-prod-validate
++spec:
++  template:
++    metadata:
++      labels:
++        app: deepspeed-dgx-prod-validate
++    spec:
++      restartPolicy: Never
++      nodeSelector:
++        "node.kubernetes.io/dgx": "true"
++      tolerations:
++        - key: "nvidia.com/gpu"
++          operator: "Exists"
++          effect: "NoSchedule"
++      containers:
++        - name: deepspeed-runner
++          image: __IMAGE_FULL__   # this will be replaced by prod_validate script if desired
++          imagePullPolicy: IfNotPresent
++          env:
++            # NCCL envs will be programmatically injected by prod_validate script;
++            # placeholder block used by the script to find insertion point:
++            __NCCL_ENV_PLACEHOLDER__
++            - name: PYTHONUNBUFFERED
++              value: "1"
++            - name: TORCH_DISTRIBUTED_DEBUG
++              value: "INFO"
++          command: ["/bin/bash", "-c"]
++          args:
++            - |
++              set -euo pipefail
++              echo "Running small DeepSpeed multi-GPU smoke test"
++              export NCCL_DEBUG=INFO
++              # Note: the container must include deepspeed and a small train script at examples/deepspeed_smoke/train.py
++              deepspeed --num_gpus 8 examples/deepspeed_smoke/train.py --epochs 1 --batch-size 8 || { rc=$?; echo "Deepspeed failed: $rc"; exit $rc; }
++          resources:
++            limits:
++              nvidia.com/gpu: 8
++            requests:
++              cpu: "8"
++              memory: "32Gi"
++      volumes:
++        - name: checkpoints
++          emptyDir: {}
++  backoffLimit: 1
++
++# Notes:
++# - Replace __IMAGE_FULL__ in the manifest copy with actual image (script will copy template and can replace).
++# - Ensure the image contains a minimal DeepSpeed training example at examples/deepspeed_smoke/train.py.
++# - Tune num_gpus and resources for your DGX topology.
++
+diff --git a/k8s/manifests/monitoring/dgx-prometheus-rules.yaml b/k8s/manifests/monitoring/dgx-prometheus-rules.yaml
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/k8s/manifests/monitoring/dgx-prometheus-rules.yaml
+@@ -0,0 +1,220 @@
++apiVersion: monitoring.coreos.com/v1
++kind: PrometheusRule
++metadata:
++  name: dgx-critical-rules
++  namespace: monitoring
++spec:
++  groups:
++    - name: dgx.rules
++      rules:
++        - alert: DGX_GPU_ECC_Error
++          expr: dcgm_gpu_ecc_volatile_errors_total > 0
++          for: 5m
++          labels:
++            severity: critical
++          annotations:
++            summary: "DGX node experiencing ECC errors"
++            description: "One or more ECC volatile errors on DGX GPUs. Investigate hardware faults."
++
++        - alert: DGX_NVLINK_Errors
++          expr: dcgm_nvlink_error_total > 0
++          for: 5m
++          labels:
++            severity: warning
++          annotations:
++            summary: "NVLink/NVSwitch errors observed"
++            description: "NVLink errors detected on DGX nodes. Check NVSwitch and cabling."
++
++        - alert: DGX_Low_GPU_Utilization
++          expr: avg by (instance) (rate(dcgm_gpu_utilization{job="dcgm-exporter"}[5m])) < 10
++          for: 30m
++          labels:
++            severity: warning
++          annotations:
++            summary: "Low GPU utilization on DGX node"
++            description: "GPU utilization below 10% for 30 minutes; investigate scheduling or IO bottlenecks."
++
++        - alert: DGX_NCCL_Timeouts
++          expr: increase(nccl_errors_total[5m]) > 0
++          for: 5m
++          labels:
++            severity: critical
++          annotations:
++            summary: "NCCL errors detected"
++            description: "NCCL errors observed; check IB/NIC, NCCL tuning and driver versions."
++
++        - alert: DGX_Checkpoint_PVC_Filling
++          expr: kubelet_volume_stats_available_bytes{persistentvolumeclaim="dgx-checkpoints-pvc"} / kubelet_volume_stats_capacity_bytes{persistentvolumeclaim="dgx-checkpoints-pvc"} < 0.1
++          for: 15m
++          labels:
++            severity: warning
++          annotations:
++            summary: "DGX checkpoint PVC near capacity"
++            description: "The PVC used for checkpoints is nearly full; ensure checkpoint retention and S3 offload are configured."
++
+diff --git a/.github/workflows/dgx_production_validation.yml b/.github/workflows/dgx_production_validation.yml
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/.github/workflows/dgx_production_validation.yml
+@@ -0,0 +1,220 @@
++name: DGX Production Validation (nightly & manual)
++
++on:
++  schedule:
++    - cron: '0 4 * * *'   # daily 04:00 UTC
++  workflow_dispatch:
++    inputs:
++      image:
++        description: "Image tag to validate (e.g., aegis-deepspeed:h100-cuda12.1-pytorch2.2)"
++        required: true
++        default: "aegis-deepspeed:h100-cuda12.1-pytorch2.2"
++
++jobs:
++  dgx-prod-validate:
++    runs-on: self-hosted
++    if: runner.labels contains 'dgx'
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Set up tooling
++        run: |
++          python -m pip install --upgrade pip
++          pip install yq jq || true
++
++      - name: Restore KUBECONFIG
++        env:
++          KUBECONFIG_DGX: ${{ secrets.KUBECONFIG_DGX }}
++        run: |
++          if [ -z "$KUBECONFIG_DGX" ]; then echo "KUBECONFIG_DGX not set"; exit 1; fi
++          echo "$KUBECONFIG_DGX" > "$HOME/.kube/config_dgx"
++          export KUBECONFIG="$HOME/.kube/config_dgx"
++          kubectl version --short
++
++      - name: Run production validation script
++        env:
++          REGISTRY: ${{ secrets.DGX_IMAGE_REGISTRY }}
++          IMAGE_TAG: ${{ github.event.inputs.image }}
++          DECISION_LOG_URL: ${{ secrets.DECISION_LOG_URL }}
++        run: |
++          chmod +x scripts/dgx/prod_validate_and_run.sh
++          ./scripts/dgx/prod_validate_and_run.sh
++
++      - name: Upload artifacts
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: dgx-prod-artifacts
++          path: artifacts || .
++
++      - name: Cleanup kubeconfig
++        if: always()
++        run: rm -f "$HOME/.kube/config_dgx" || true
++
+diff --git a/docs/runbooks/dgx_production_runbook.md b/docs/runbooks/dgx_production_runbook.md
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/docs/runbooks/dgx_production_runbook.md
+@@ -0,0 +1,240 @@
++# DGX Production Runbook — Validation & Go/No-Go Steps
++
++This runbook describes the manual and automated steps to validate DGX readiness for production DeepSpeed jobs using Aegis tooling.
++
++Prereqs
++- Kubeconfig for DGX cluster (set as GitHub secret KUBECONFIG_DGX for CI runners).  
++- Registry credentials and image registry host (set DGX_IMAGE_REGISTRY secret).  
++- cosign credentials if key-based signing is used (COSIGN_KEY or keyless OIDC flow configured).
++- Tools available on runner: kubectl, helm, syft, trivy, cosign, docker/skopeo, yq, jq.
++
++Steps
++1) Build & publish validated images:
++   - Use docker/Dockerfile.deepspeed.h100 or docker/Dockerfile.deepspeed.a100 and run scripts/dgx/publish_and_sign_images.sh.
++   - Confirm SBOM and cosign signature are produced and uploaded to artifacts store.
++
++2) Decide driver strategy:
++   - If DGX Cloud manages drivers, use the no-driver GPU Operator values: k8s/manifests/dgx/gpu-operator-values-no-driver.yaml
++   - Otherwise use the default gpu-operator-values.yaml (autoInstall=true).
++   - Deploy/update GPU Operator: helm upgrade --install --namespace gpu-operator gpu-operator nvidia/gpu-operator -f <values-file>
++
++3) Label nodes:
++   - kubectl label nodes <node> node.kubernetes.io/dgx=true
++
++4) Run validation:
++   - Manually: run ./scripts/dgx/prod_validate_and_run.sh with environment variables REGISTRY and IMAGE_TAG set.
++   - Via CI: trigger .github/workflows/dgx_production_validation.yml via workflow_dispatch.
++
++5) Review artifacts:
++   - Inspect artifacts/provenance.json, SBOM, trivy output, and job logs.
++   - Check Prometheus alerts (DGX_GPU_ECC_Error, DGX_NCCL_Timeouts, etc.)
++
++6) Chaos & nightly:
++   - Ensure .github/workflows/dgx_production_validation.yml is scheduled and runs successfully on self-hosted DGX runners.
++   - Address any failures, tune NCCL env vars, and re-run validation until green.
++
++7) Go/No-Go:
++   - Green criteria: cosign verification OR acceptable keyless signin, no HIGH/CRITICAL CVEs, job runs successfully with expected GPU utilization and no NCCL errors, SBOM recorded.
++   - If green, record validated image in docs/dgx/IMAGE_MATRIX.md and proceed to allow production promotions with that image digest.
++
++Troubleshooting
++- NCCL errors: run scripts/dgx/nccl_tuning.sh and inspect outputs; adjust NCCL_SOCKET_IFNAME/NCCL_IB_HCA.  
++- Driver mismatch: verify GPU Operator autoInstall setting and node driver versions via nvidia-smi.  
++- Storage issues: ensure fast PV exists (check dgx-checkpoints-pvc).
++
++Contact
++- Platform SRE: platform-team@example.com
++- Security: security@example.com
++
+diff --git a/scripts/dgx/post_provenance_to_decision_log.py b/scripts/dgx/post_provenance_to_decision_log.py
+new file mode 100644
+index 0000000..6666666
+--- /dev/null
++++ b/scripts/dgx/post_provenance_to_decision_log.py
+@@ -0,0 +1,160 @@
++#!/usr/bin/env python3
++"""
++Post provenance JSON to Aegis decision_log endpoint.
++Usage:
++  DECISION_LOG_URL=https://aegis-decision-log.local/api/provenance \
++  python3 scripts/dgx/post_provenance_to_decision_log.py artifacts/dgx_prod_validate/provenance.json
++"""
++import sys
++import os
++import json
++import requests
++
++def main():
++    if len(sys.argv) < 2:
++        print("Usage: post_provenance_to_decision_log.py <provenance.json>")
++        sys.exit(2)
++    prov_path = sys.argv[1]
++    if not os.path.exists(prov_path):
++        print("File not found:", prov_path); sys.exit(3)
++    url = os.environ.get("DECISION_LOG_URL")
++    if not url:
++        print("DECISION_LOG_URL not set; aborting")
++        sys.exit(4)
++    with open(prov_path, "r") as f:
++        payload = json.load(f)
++    headers = {"Content-Type": "application/json"}
++    resp = requests.post(url, json=payload, headers=headers, timeout=30)
++    print("POST", url, "->", resp.status_code)
++    print(resp.text)
++    resp.raise_for_status()
++
++if __name__ == "__main__":
++    main()
++

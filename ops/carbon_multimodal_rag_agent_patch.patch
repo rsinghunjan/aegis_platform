@@ -1,0 +1,415 @@
+*** Begin Patch
+*** Add File:ops/carbon/gpu_telemetry_exporter.py
++#!/usr/bin/env python3
++"""
++Telemetry exporter that captures GPU telemetry (via nvidia-smi) and computes
++per-job carbon estimates.
++
++Writes Prometheus metrics and JSONL per-job records to TELEMETRY_DIR.
++Usage: run as a cron or daemon on training nodes or as a sidecar.
++"""
++import os
++import time
++import json
++import subprocess
++from typing import Optional
++
++try:
++    from prometheus_client import start_http_server, Gauge
++except Exception:
++    start_http_server = None
++    Gauge = None
++
++TELEMETRY_DIR = os.environ.get("TELEMETRY_DIR", "/var/lib/aegis/telemetry")
++PROM_PORT = int(os.environ.get("CARBON_PROM_PORT", "9110"))
++# Emissions factor kgCO2e per kWh (default global average ~0.475)
++EMISSIONS_FACTOR = float(os.environ.get("EMISSIONS_FACTOR_KGCO2_PER_KWH", "0.475"))
++
++GPU_POWER_W_GAUGE = Gauge("aegis_gpu_power_watts", "GPU power draw (W)", ["gpu_index"]) if Gauge else None
++JOB_CARBON_KG = Gauge("aegis_job_carbon_kg", "Estimated kg CO2e per job", ["job_id"]) if Gauge else None
++
++def run_nvidia_smi():
++    try:
++        out = subprocess.check_output(["nvidia-smi", "--query-gpu=index,power.draw,utilization.gpu", "--format=csv,noheader,nounits"], text=True)
++        lines = [l.strip() for l in out.splitlines() if l.strip()]
++        res = []
++        for line in lines:
++            parts = [p.strip() for p in line.split(",")]
++            if len(parts) >= 3:
++                idx = parts[0]
++                power = float(parts[1]) if parts[1] not in ("N/A","") else 0.0
++                util = float(parts[2]) if parts[2] not in ("N/A","") else 0.0
++                res.append({"index": idx, "power_w": power, "util_pct": util})
++        return res
++    except Exception:
++        return []
++
++def estimate_job_carbon(job_power_w: float, duration_s: float) -> float:
++    # energy (kWh) = power(W) * time(h) / 1000
++    energy_kwh = (job_power_w * (duration_s/3600.0)) / 1000.0
++    return energy_kwh * EMISSIONS_FACTOR
++
++def write_event(event: dict):
++    os.makedirs(TELEMETRY_DIR, exist_ok=True)
++    fname = os.path.join(TELEMETRY_DIR, f"gpu_telemetry_{int(time.time())}.jsonl")
++    with open(fname, "a") as fh:
++        fh.write(json.dumps(event) + "\n")
++
++def main(poll_s: int = 30):
++    if start_http_server and PROM_PORT:
++        start_http_server(PROM_PORT)
++    # A simple loop: collect GPU-level telemetry and attribute to active Argo job via env or label.
++    # In production, integrate with job supervisor to map GPU usage -> job_id.
++    while True:
++        samples = run_nvidia_smi()
++        ts = int(time.time())
++        total_power = sum(s["power_w"] for s in samples)
++        # naive job attribution: assume single job per node; read JOB_ID env or file
++        job_id = os.environ.get("CURRENT_JOB_ID", "")
++        job_start = float(os.environ.get("CURRENT_JOB_START_TS", ts))
++        duration = max(1.0, ts - job_start)
++        carbon = estimate_job_carbon(total_power, duration)
++        event = {"ts": ts, "gpus": samples, "total_power_w": total_power, "job_id": job_id, "duration_s": duration, "carbon_kg": carbon}
++        write_event(event)
++        if GPU_POWER_W_GAUGE:
++            for s in samples:
++                GPU_POWER_W_GAUGE.labels(gpu_index=str(s["index"])).set(s["power_w"])
++        if JOB_CARBON_KG and job_id:
++            JOB_CARBON_KG.labels(job_id=job_id).set(carbon)
++        time.sleep(poll_s)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/grafana/carbon_dashboard.json
++{
++  "annotations": { "list": [] },
++  "panels": [
++    {
++      "type": "graph",
++      "title": "Node GPU Total Power (W)",
++      "targets": [
++        { "expr": "sum(aegis_gpu_power_watts) by (gpu_index)", "legendFormat": "{{gpu_index}}" }
++      ],
++      "id": 1
++    },
++    {
++      "type": "graph",
++      "title": "Job Estimated Carbon (kgCO2e)",
++      "targets": [
++        { "expr": "sum(aegis_job_carbon_kg) by (job_id)", "legendFormat": "{{job_id}}" }
++      ],
++      "id": 2
++    }
++  ],
++  "title": "Aegis Carbon Metrics",
++  "schemaVersion": 16,
++  "version": 1
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/argo/placement_policy_extension.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: WorkflowTemplate
++metadata:
++  name: aegis-placement-policy
++spec:
++  templates:
++    - name: carbon-aware-train
++      metadata:
++        annotations:
++          aegis/placement: "carbon-aware"
++      container:
++        image: REPLACE_WITH_TRAINING_IMAGE
++        command: [sh, -c]
++        args: ["echo running carbon-aware training..."]
++      nodeSelector:
++        # Example: operator labels node pools with carbon_score=low/medium/high
++        # Workflows annotated with aegis/placement=carbon-aware will be routed to nodes with carbon_score=low
++        aegis.carbon_score: "low"
++      tolerations:
++        - key: "spot"
++          operator: "Exists"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/multimodal/ingest_lidar.py
++#!/usr/bin/env python3
++"""
++Simple LiDAR ingest adapter:
++ - reads .pcd or .bin point cloud files from a directory
++ - writes per-file metadata and a Parquet manifest for the featurestore
++ - compresses/archives raw blobs to S3 if configured
++"""
++import os
++import json
++from pathlib import Path
++import pyarrow as pa
++import pyarrow.parquet as pq
++
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++INPUT_DIR = os.environ.get("LIDAR_INPUT_DIR", "/data/lidar")
++OUT_DIR = os.environ.get("FEATURESTORE_ROOT", "/var/lib/aegis/featurestore")
++S3_BUCKET = os.environ.get("FEATURESTORE_S3", "")
++
++def ingest(batch_limit=100):
++    Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
++    entries = []
++    files = sorted([f for f in os.listdir(INPUT_DIR) if f.endswith(('.pcd','.bin'))])[:batch_limit]
++    for f in files:
++        path = os.path.join(INPUT_DIR, f)
++        meta = {"filename": f, "size": os.path.getsize(path), "ts": int(os.path.getmtime(path))}
++        # optionally upload blob
++        s3_key = ""
++        if boto3 and S3_BUCKET:
++            s3 = boto3.client("s3")
++            key = f"lidar/{f}"
++            s3.upload_file(path, S3_BUCKET, key)
++            s3_key = f"s3://{S3_BUCKET}/{key}"
++        entries.append({"file": f, "meta": meta, "s3": s3_key})
++    if entries:
++        table = pa.Table.from_pylist(entries)
++        outp = os.path.join(OUT_DIR, "lidar_manifest.parquet")
++        pq.write_table(table, outp)
++        print("wrote manifest", outp)
++
++if __name__ == "__main__":
++    ingest()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/multimodal/ingest_audio.py
++#!/usr/bin/env python3
++"""
++Audio ingest adapter:
++ - finds WAV files, extracts basic metadata (duration via soundfile if available)
++ - writes manifest Parquet and optionally uploads to S3
++"""
++import os
++from pathlib import Path
++import pyarrow as pa
++import pyarrow.parquet as pq
++
++try:
++    import soundfile as sf
++except Exception:
++    sf = None
++
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++INPUT_DIR = os.environ.get("AUDIO_INPUT_DIR", "/data/audio")
++OUT_DIR = os.environ.get("FEATURESTORE_ROOT", "/var/lib/aegis/featurestore")
++S3_BUCKET = os.environ.get("FEATURESTORE_S3", "")
++
++def ingest(batch_limit=200):
++    Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
++    entries = []
++    files = sorted([f for f in os.listdir(INPUT_DIR) if f.endswith('.wav')])[:batch_limit]
++    for f in files:
++        path = os.path.join(INPUT_DIR, f)
++        duration = None
++        try:
++            if sf:
++                info = sf.info(path)
++                duration = info.duration
++        except Exception:
++            duration = None
++        s3_key = ""
++        if boto3 and S3_BUCKET:
++            s3 = boto3.client("s3")
++            key = f"audio/{f}"
++            s3.upload_file(path, S3_BUCKET, key)
++            s3_key = f"s3://{S3_BUCKET}/{key}"
++        entries.append({"file": f, "duration": duration, "s3": s3_key, "ts": int(os.path.getmtime(path))})
++    if entries:
++        table = pa.Table.from_pylist(entries)
++        outp = os.path.join(OUT_DIR, "audio_manifest.parquet")
++        pq.write_table(table, outp)
++        print("wrote manifest", outp)
++
++if __name__ == "__main__":
++    ingest()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/multimodal/featurestore_schema.py
++#!/usr/bin/env python3
++"""
++Featurestore schema helpers for multimodal manifests.
++Provides helpers to read/write Parquet manifests consistently.
++"""
++import pyarrow as pa
++import pyarrow.parquet as pq
++from typing import List, Dict
++
++def write_manifest(path: str, rows: List[Dict]):
++    table = pa.Table.from_pylist(rows)
++    pq.write_table(table, path)
++
++def read_manifest(path: str):
++    return pq.read_table(path).to_pylist()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/vector/indexer.py
++#!/usr/bin/env python3
++"""
++Simple FAISS-based vector indexer for document embeddings.
++ - Build index from numpy vectors and metadata (parquet/json)
++ - Persist index to disk and provide basic search API (k-NN)
++Requires faiss-cpu or faiss-gpu installed in the environment.
++"""
++import os
++import numpy as np
++import json
++try:
++    import faiss
++except Exception:
++    faiss = None
++
++INDEX_DIR = os.environ.get("VECTOR_INDEX_DIR", "/var/lib/aegis/vector_index")
++
++def build_index(vectors: np.ndarray, metas: list, index_name: str = "default"):
++    os.makedirs(INDEX_DIR, exist_ok=True)
++    d = vectors.shape[1]
++    if faiss is None:
++        raise RuntimeError("faiss not installed")
++    index = faiss.IndexFlatIP(d)
++    faiss.normalize_L2(vectors)
++    index.add(vectors)
++    faiss.write_index(index, os.path.join(INDEX_DIR, f"{index_name}.index"))
++    with open(os.path.join(INDEX_DIR, f"{index_name}.meta.json"), "w") as fh:
++        json.dump(metas, fh)
++    print("index built:", index_name)
++
++def search(index_name: str, qvec: np.ndarray, k: int = 5):
++    if faiss is None:
++        raise RuntimeError("faiss not installed")
++    idx = faiss.read_index(os.path.join(INDEX_DIR, f"{index_name}.index"))
++    faiss.normalize_L2(qvec)
++    D, I = idx.search(qvec, k)
++    with open(os.path.join(INDEX_DIR, f"{index_name}.meta.json")) as fh:
++        metas = json.load(fh)
++    results = []
++    for i, scores in enumerate(D):
++        results.append([{"score": float(score), "meta": metas[int(idx)]} for score, idx in zip(scores, I[i])])
++    return results
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/vector/retriever_service.py
++#!/usr/bin/env python3
++"""
++Lightweight FastAPI retriever service that loads a FAISS index and returns top-k docs for a query.
++Expects an embedding service (ops/embeddings/service.py) available to compute query embeddings.
++"""
++from fastapi import FastAPI
++from pydantic import BaseModel
++import os
++import numpy as np
++import requests
++
++EMB_URL = os.environ.get("EMBEDDING_URL", "http://embeddings:8086/embed")
++INDEX_NAME = os.environ.get("VECTOR_INDEX_NAME", "default")
++
++app = FastAPI()
++
++class QueryRequest(BaseModel):
++    texts: list
++    k: int = 5
++
++def embed_texts(texts):
++    r = requests.post(EMB_URL, json={"texts": texts}, timeout=30)
++    r.raise_for_status()
++    return np.array(r.json().get("embeddings"))
++
++@app.post("/retrieve")
++def retrieve(req: QueryRequest):
++    qvecs = embed_texts(req.texts)
++    import numpy as np
++    from ops.vector.indexer import search
++    qvecs = np.array(qvecs).astype(np.float32)
++    results = search(INDEX_NAME, qvecs, k=req.k)
++    return {"results": results}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/generative/rag/index_documents.py
++#!/usr/bin/env python3
++"""
++Index plain text documents into vector index (embeddings + FAISS).
++Produces metadata json and writes vectors as npy for indexing.
++"""
++import os
++import json
++import numpy as np
++from typing import List
++import requests
++
++EMB_URL = os.environ.get("EMBEDDING_URL", "http://embeddings:8086/embed")
++OUT_DIR = os.environ.get("RAG_OUT_DIR", "/var/lib/aegis/rag")
++INDEX_NAME = os.environ.get("VECTOR_INDEX_NAME", "default")
++
++def embed(texts: List[str]):
++    r = requests.post(EMB_URL, json={"texts": texts}, timeout=30)
++    r.raise_for_status()
++    return np.array(r.json().get("embeddings")).astype(np.float32)
++
++def index_docs(docs: List[dict]):
++    os.makedirs(OUT_DIR, exist_ok=True)
++    texts = [d["text"] for d in docs]
++    metas = [{"id": d.get("id"), "source": d.get("source")} for d in docs]
++    vecs = embed(texts)
++    np.save(os.path.join(OUT_DIR, "vectors.npy"), vecs)
++    with open(os.path.join(OUT_DIR, "metas.json"), "w") as fh:
++        json.dump(metas, fh)
++    # build faiss index
++    try:
++        from ops.vector.indexer import build_index
++        build_index(vecs, metas, index_name=INDEX_NAME)
++    except Exception as e:
++        print("index build failed:", e)
++
++if __name__ == "__main__":
++    # example usage: index sample docs
++    docs = [{"id":"d1","text":"Aegis is a secure AI platform.","source":"internal"}]
++    index_docs(docs)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/generative/rag/retrieval_service.py
++#!/usr/bin/env python3
++"""
++Retrieval-augmented generation wrapper:
++ - calls retriever service for top-k docs
++ - calls an LLM inference endpoint (mocked) with context
++ - applies DLP pre/post checks via existing ops/dlp/inference_middleware.py patterns
++"""
++from fastapi import FastAPI
++from pydantic import BaseModel
++import requests
++import os
++from typing import List
++
++RETRIEVER_URL = os.environ.get("RETRIEVER_URL", "http://localhost:8000/retrieve")
++LLM_URL = os.environ.get("LLM_URL", "http://localhost:8080/generate")
++DLP_URL = os.environ.get("DLP_URL", "http://localhost:8085/scan")
++
++app = FastAPI()
++
++class RAGRequest(BaseModel):
++    query: str
++    k: int = 5
++
++
+

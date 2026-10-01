@@ -1,0 +1,440 @@
+*** Begin Patch
+*** Add File:services/moderation/moderation_service.py
++#!/usr/bin/env python3
++"""
++NSFW Moderation microservice (text + image heuristics).
++ - POST /moderate_text  {"text": "..."}
++ - POST /moderate_image {"image_b64": "..."}  (very basic heuristics here)
++
++Expose Prometheus metrics:
++ - aegis_moderation_requests_total{type="text|image"}
++ - aegis_moderation_blocked_total{type="text|image"}
++"""
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
++from fastapi.responses import Response
++import os, re, base64, hashlib
++
++app = FastAPI(title="Aegis Moderation Service")
++
++# Simple heuristics: banned tokens (extend in production)
++BANNED_WORDS = set(w.strip().lower() for w in os.environ.get("MOD_BANNED_WORDS", "porn,sex,nude,xxx").split(","))
++
++REQ_COUNTER = Counter("aegis_moderation_requests_total", "Moderation requests", ["type"])
++BLOCK_COUNTER = Counter("aegis_moderation_blocked_total", "Moderation blocked", ["type"])
++
++class TextReq(BaseModel):
++    text: str
++
++class ImageReq(BaseModel):
++    image_b64: str
++
++@app.get("/metrics")
++def metrics():
++    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
++
++def text_is_nsfw(text: str) -> (bool, list):
++    lowered = text.lower()
++    hits = [w for w in BANNED_WORDS if w and w in lowered]
++    return (len(hits) > 0, hits)
++
++@app.post("/moderate_text")
++def moderate_text(req: TextReq):
++    REQ_COUNTER.labels(type="text").inc()
++    nsfw, hits = text_is_nsfw(req.text)
++    if nsfw:
++        BLOCK_COUNTER.labels(type="text").inc()
++    return {"nsfw": nsfw, "hits": hits}
++
++@app.post("/moderate_image")
++def moderate_image(req: ImageReq):
++    REQ_COUNTER.labels(type="image").inc()
++    # Very basic heuristic: check image size and simple base64 signature to detect likely obscene small payloads.
++    try:
++        b = base64.b64decode(req.image_b64)
++        if len(b) < 512:
++            # too small -> likely invalid or thumbnail; treat as not flagged
++            return {"nsfw": False, "reason": "small_image"}
++        # heuristic: if filename-like bytes contain "porn" etc (not reliable)
++        if any(x.encode("utf-8") in b.lower() for x in BANNED_WORDS):
++            BLOCK_COUNTER.labels(type="image").inc()
++            return {"nsfw": True, "reason": "heuristic_bytes_hit"}
++        # default: not flagged
++        return {"nsfw": False}
++    except Exception as e:
++        raise HTTPException(status_code=400, detail="invalid base64")
++
+*** End File
+*** Add File:services/pii/pii_service.py
++#!/usr/bin/env python3
++"""
++PII detection and redaction service (text-focused).
++ - POST /scan_text {"text":"..."} -> {"pii": [{"type":"email","match":"..."}], "count":N}
++ - POST /redact_text {"text":"..."} -> {"redacted": "...", "pii": [...]}
++
++This is a starter; integrate Microsoft Presidio or Google DLP for production.
++Exposes Prometheus counters.
++"""
++from fastapi import FastAPI
++from pydantic import BaseModel
++import re, hashlib, os
++from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
++from fastapi.responses import Response
++
++app = FastAPI(title="Aegis PII Service")
++
++PII_COUNTER = Counter("aegis_pii_scan_total", "PII scans", ["type"])
++PII_REDACT_COUNTER = Counter("aegis_pii_redact_total", "PII redactions", ["type"])
++
++EMAIL_RE = re.compile(r"([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)")
++PHONE_RE = re.compile(r"(\+?\d[\d\-\s]{7,}\d)")
++SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
++
++class TextReq(BaseModel):
++    text: str
++
++@app.get("/metrics")
++def metrics():
++    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
++
++@app.post("/scan_text")
++def scan_text(req: TextReq):
++    PII_COUNTER.labels(type="text").inc()
++    text = req.text
++    findings = []
++    for m in EMAIL_RE.findall(text):
++        findings.append({"type": "email", "match": m})
++    for m in PHONE_RE.findall(text):
++        findings.append({"type": "phone", "match": m})
++    for m in SSN_RE.findall(text):
++        findings.append({"type": "ssn", "match": m})
++    return {"count": len(findings), "pii": findings}
++
++def _hash_token(s: str):
++    # stable but non-reversible by using salted hash (salt from env)
++    salt = os.environ.get("PII_SALT", "aegis-default-salt")
++    h = hashlib.sha256((salt + s).encode("utf-8")).hexdigest()
++    return h[:12]
++
++@app.post("/redact_text")
++def redact_text(req: TextReq):
++    PII_REDACT_COUNTER.labels(type="text").inc()
++    text = req.text
++    findings = []
++    def repl_email(m):
++        tok = m.group(0)
++        h = _hash_token(tok)
++        findings.append({"type":"email","orig":tok,"token":h})
++        return f"[REDACTED:email:{h}]"
++    text = EMAIL_RE.sub(repl_email, text)
++    def repl_phone(m):
++        tok = m.group(0)
++        h = _hash_token(tok)
++        findings.append({"type":"phone","orig":tok,"token":h})
++        return f"[REDACTED:phone:{h}]"
++    text = PHONE_RE.sub(repl_phone, text)
++    text = SSN_RE.sub(lambda m: "[REDACTED:ssn]", text)
++    return {"redacted": text, "pii": findings}
++
+*** End File
+*** Add File:langchain_runtime/a2a_client.py
++"""
++Small helper to create A2A approval requests from services.
++"""
++import os, requests, uuid, time
++
++A2A_API = os.environ.get("A2A_API", "http://approver:8085")
++
++def request_approval(model_id: str, artifact_uri: str, reason: str, metadata: dict = None):
++    payload = {
++        "id": str(uuid.uuid4()),
++        "type": "approval_request",
++        "model_id": model_id,
++        "artifact_uri": artifact_uri,
++        "reason": reason,
++        "metadata": metadata or {},
++        "ts": int(time.time())
++    }
++    try:
++        r = requests.post(f"{A2A_API.rstrip('/')}/request", json=payload, timeout=5.0)
++        r.raise_for_status()
++        return payload["id"]
++    except Exception:
++        # best-effort: return request id (untracked) even on failure
++        return payload["id"]
++
+*** End File
+*** Update File:langchain_runtime/preflight.py
+@@
+-"""
+-Preflight helpers: call OPA policy server (or local bundle) to evaluate
+-whether a chain run should proceed. Also provides a hook to run Evidently drift checks.
+-"""
+-import os, requests, json
+-
+-OPA_URL = os.environ.get("OPA_URL", "http://opa:8181/v1/data/aegis/preflight")
+-EVIDENTLY_ENABLED = os.environ.get("EVIDENTLY_ENABLED", "false").lower() == "true"
+-EVIDENTLY_BASELINE = os.environ.get("EVIDENTLY_BASELINE_S3", "")
+-EVIDENTLY_BATCH = os.environ.get("EVIDENTLY_BATCH_S3", "")
+-
+-def run_opa(model_id, input_text, options):
+-    payload = {"input": {"model_id": model_id, "input": input_text, "options": options or {}}}
+-    try:
+-        r = requests.post(OPA_URL, json=payload, timeout=5.0)
+-        r.raise_for_status()
+-        data = r.json()
+-        # expects {"result": {"allow": true, "reason": ""}}
+-        return data.get("result", {"allow": True, "reason": "opa missing result"})
+-    except Exception as e:
+-        return {"allow": True, "reason": f"opa error: {e}"}
+-
+-def run_preflight(model_id, model_version, input_text, options):
+-    # first, OPA policy
+-    opa_res = run_opa(model_id, input_text, options)
+-    if not opa_res.get("allow", False):
+-        return {"allow": False, "reason": opa_res.get("reason", "denied by opa")}
+-    # optionally run an Evidently quick-check (if configured)
+-    if EVIDENTLY_ENABLED and EVIDENTLY_BASELINE and EVIDENTLY_BATCH:
+-        # invoke the evidently runner as an external job (assumes job configured)
+-        # For now, return allow; operator should schedule Evidently in cron
+-        pass
+-    return {"allow": True, "reason": "preflight passed"}
++"""
++Enhanced preflight: runs moderation (NSFW), hallucination verifier, PII scan/redaction,
++OPA policy check and optionally creates A2A approval requests when human signoff is required.
++
++This file implements:
++ - run_preflight(...) which accepts model_id, model_version, input_text, generated_output, retrieved_docs, options
++ - returns dict {allow: bool, reason: str, output: <possibly redacted output>, pending: bool, approval_id: str}
++"""
++import os, requests, json, logging
++from prometheus_client import Counter
++
++LOG = logging.getLogger("aegis.preflight")
++
++OPA_URL = os.environ.get("OPA_URL", "http://opa:8181/v1/data/aegis/preflight")
++MODERATION_SVC = os.environ.get("MODERATION_SVC", "http://moderation:8080")
++PII_SVC = os.environ.get("PII_SVC", "http://pii:8080")
++VERIFIER_SVC = os.environ.get("VERIFIER_SVC", "http://verifier:8080")
++AEGIS_MCP_API = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++
++# metrics
++PRE_FLIGHT_COUNTER = Counter("aegis_preflight_requests_total", "preflight requests", ["result"])
++MOD_BLOCKED_COUNTER = Counter("aegis_preflight_mod_blocked_total", "preflight moderation blocked", ["stage"])
++VERIFIER_FAIL_COUNTER = Counter("aegis_preflight_verifier_fail_total", "preflight verifier failures")
++PII_REDACT_COUNTER = Counter("aegis_preflight_pii_redact_total", "PII redactions performed")
++
++from .a2a_client import request_approval
++
++def run_opa_check(model_id, text, options):
++    payload = {"input": {"model_id": model_id, "input": text, "options": options or {}}}
++    try:
++        r = requests.post(OPA_URL, json=payload, timeout=5.0)
++        r.raise_for_status()
++        return r.json().get("result", {"allow": True, "reason": "opa missing result"})
++    except Exception as e:
++        LOG.warning("OPA check failed: %s", e)
++        return {"allow": True, "reason": f"opa error: {e}"}
++
++def call_moderation(text=None, image_b64=None):
++    try:
++        if text is not None:
++            r = requests.post(f"{MODERATION_SVC.rstrip('/')}/moderate_text", json={"text": text}, timeout=3.0)
++            r.raise_for_status()
++            return r.json()
++        if image_b64 is not None:
++            r = requests.post(f"{MODERATION_SVC.rstrip('/')}/moderate_image", json={"image_b64": image_b64}, timeout=3.0)
++            r.raise_for_status()
++            return r.json()
++    except Exception as e:
++        LOG.warning("moderation call failed: %s", e)
++        return {"nsfw": False, "reason": "moderation_error"}
++
++def call_verifier(output_text, retrieved_docs):
++    try:
++        r = requests.post(f"{VERIFIER_SVC.rstrip('/')}/verify", json={"text": output_text, "retrieved_docs": retrieved_docs}, timeout=5.0)
++        r.raise_for_status()
++        return r.json()
++    except Exception as e:
++        LOG.warning("verifier call failed: %s", e)
++        # default to allow (fail-open) but mark reason
++        return {"allow": True, "score": 1.0, "reasons": ["verifier_unavailable"]}
++
++def call_pii_scan(text):
++    try:
++        r = requests.post(f"{PII_SVC.rstrip('/')}/scan_text", json={"text": text}, timeout=3.0)
++        r.raise_for_status()
++        return r.json()
++    except Exception as e:
++        LOG.warning("pii scan failed: %s", e)
++        return {"count": 0, "pii": []}
++
++def call_pii_redact(text):
++    try:
++        r = requests.post(f"{PII_SVC.rstrip('/')}/redact_text", json={"text": text}, timeout=5.0)
++        r.raise_for_status()
++        return r.json()
++    except Exception as e:
++        LOG.warning("pii redact failed: %s", e)
++        return {"redacted": text, "pii": []}
++
++def attach_mcp_evidence(model_id, run_id, artifact_uri, meta):
++    try:
++        rec = {"model_id": model_id, "version": "", "artifacts": [{"uri": artifact_uri}], "evaluation": {"run_id": run_id, "meta": meta}, "approvals": []}
++        requests.post(f"{AEGIS_MCP_API.rstrip('/')}/models/{model_id}/context", json=rec, timeout=5.0)
++    except Exception:
++        LOG.warning("failed attaching MCP evidence")
++
++def run_preflight(model_id, model_version, input_text, generated_output, retrieved_docs, options=None):
++    """
++    Perform moderation, verification and PII redaction for a generated output.
++    Returns:
++      {"allow": bool, "reason": str, "output": <possibly redacted output>, "pending": bool, "approval_id": str}
++    """
++    options = options or {}
++    PRE_FLIGHT_COUNTER.labels(result="started").inc()
++
++    # 1) Input moderation (block early)
++    mod_in = call_moderation(text=input_text)
++    if mod_in.get("nsfw", False):
++        MOD_BLOCKED_COUNTER.labels(stage="input").inc()
++        PRE_FLIGHT_COUNTER.labels(result="blocked_input").inc()
++        # Create an evidence + approval for human review
++        approval_id = request_approval(model_id, "", "input contains NSFW", {"stage": "input", "hits": mod_in.get("hits")})
++        return {"allow": False, "reason": "input_nsfw", "pending": True, "approval_id": approval_id}
++
++    # 2) Verifier: check generated output against retrieved docs
++    verifier_res = call_verifier(generated_output, retrieved_docs or [])
++    if not verifier_res.get("allow", True) or verifier_res.get("score", 1.0) < float(os.environ.get("VERIFIER_MIN_SCORE", "0.2")):
++        VERIFIER_FAIL_COUNTER.inc()
++        PRE_FLIGHT_COUNTER.labels(result="verifier_failed").inc()
++        approval_id = request_approval(model_id, "", "verifier_reject", {"score": verifier_res.get("score"), "reasons": verifier_res.get("reasons")})
++        return {"allow": False, "reason": "verifier_reject", "pending": True, "approval_id": approval_id}
++
++    # 3) PII scan and redact if needed
++    pii_scan = call_pii_scan(generated_output)
++    if pii_scan.get("count", 0) > 0:
++        PII_REDACT_COUNTER.inc()
++        redact_res = call_pii_redact(generated_output)
++        redacted_output = redact_res.get("redacted", generated_output)
++        PRE_FLIGHT_COUNTER.labels(result="pii_redacted").inc()
++    else:
++        redacted_output = generated_output
++
++    # 4) Output moderation on redacted output
++    mod_out = call_moderation(text=redacted_output)
++    if mod_out.get("nsfw", False):
++        MOD_BLOCKED_COUNTER.labels(stage="output").inc()
++        PRE_FLIGHT_COUNTER.labels(result="blocked_output").inc()
++        approval_id = request_approval(model_id, "", "output contains NSFW", {"stage": "output", "hits": mod_out.get("hits")})
++        return {"allow": False, "reason": "output_nsfw", "pending": True, "approval_id": approval_id}
++
++    # 5) OPA policy check (optional reinforcement)
++    opa_res = run_opa_check(model_id, redacted_output, options)
++    if not opa_res.get("allow", True):
++        PRE_FLIGHT_COUNTER.labels(result="opa_denied").inc()
++        approval_id = request_approval(model_id, "", "OPA denied output", {"reason": opa_res.get("reason")})
++        return {"allow": False, "reason": "opa_denied", "pending": True, "approval_id": approval_id}
++
++    PRE_FLIGHT_COUNTER.labels(result="allow").inc()
++    return {"allow": True, "reason": "preflight_passed", "output": redacted_output, "pending": False}
+*** End File
+*** Add File:services/verifier/hallucination_verifier.py
++#!/usr/bin/env python3
++"""
++Simple hallucination verifier already present as a stub in repo; ensure service runs with /verify.
++We slightly extend to add Prometheus metrics and accept an optional confidence threshold param.
++"""
++from fastapi import FastAPI
++from pydantic import BaseModel
++from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
++from fastapi.responses import Response
++import difflib
++
++app = FastAPI(title="Aegis Hallucination Verifier")
++
++VERIFY_COUNTER = Counter("aegis_verifier_requests_total", "Verifier requests")
++VERIFY_FAIL_COUNTER = Counter("aegis_verifier_fail_total", "Verifier failures")
++
++class VerifyReq(BaseModel):
++    text: str
++    retrieved_docs: list
++
++@app.get("/metrics")
++def metrics():
++    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
++
++@app.post("/verify")
++def verify(req: VerifyReq):
++    VERIFY_COUNTER.inc()
++    doc_text = " ".join([d.get("text","") for d in req.retrieved_docs])
++    if not doc_text:
++        VERIFY_FAIL_COUNTER.inc()
++        return {"allow": False, "score": 0.0, "reasons": ["no supporting docs"]}
++    matcher = difflib.SequenceMatcher(None, req.text, doc_text)
++    score = matcher.ratio()
++    allow = score >= float(0.15)
++    if not allow:
++        VERIFY_FAIL_COUNTER.inc()
++    return {"allow": allow, "score": score, "reasons": []}
++
+*** End File
+*** Add File:monitoring/prometheus/rules/moderation_hallucination_rules.yaml
++apiVersion: monitoring.coreos.com/v1
++kind: PrometheusRule
++metadata:
++  name: moderation-and-hallucination-rules
++  namespace: monitoring
++spec:
++  groups:
++  - name: moderation.rules
++    rules:
++    - alert: HighModerationBlockRate
++      expr: increase(aegis_moderation_blocked_total[5m]) > 10
++      for: 5m
++      labels:
++        severity: page
++      annotations:
++        summary: "High moderation block rate"
++        description: "More than 10 blocked moderation events in 5m"
++  - name: verifier.rules
++    rules:
++    - alert: HighVerifierFailRate
++      expr: increase(aegis_verifier_fail_total[5m]) > 5
++      for: 5m
++      labels:
++        severity: page
++      annotations:
++        summary: "High verifier failure rate"
++        description: "Verifier is failing frequently; check retrieval quality and models"
++
+*** End File
+*** Add File:langchain_runtime/integration_example.md
++Integration notes: wire preflight into LangChain runtime
++
++1) Ensure services are deployed:
++   - moderation service -> MODERATION_SVC (default http://moderation:8080)
++   - verifier service   -> VERIFIER_SVC (default http://verifier:8080)
++   - pii service        -> PII_SVC (default http://pii:8080)
++
++2) The chain run flow should:
++   - perform retrieval (use langchain_runtime/rag_retriever)
++   - generate output using LLM
++   - call run_preflight(model_id, model_version, input_text, generated_output, retrieved_docs, options)
++   - if preflight returns allow==True, return preflight.output (may be redacted)
++   - if preflight returns pending==True, return a pending response and log approval_id to client
++
++Example pseudo-call (inside your chain runner):
++
++from .preflight import run_preflight
++docs = retrieve(query)
++output = llm_generate(query, docs)
++pf = run_preflight(model_id, model_version, query, output, docs)
++if pf.get("allow"):
++    return pf.get("output")
++if pf.get("pending"):
++    return {"status":"pending","approval_id":pf.get("approval_id"), "reason":pf.get("reason")}
++
+*** End File
+*** End Patch

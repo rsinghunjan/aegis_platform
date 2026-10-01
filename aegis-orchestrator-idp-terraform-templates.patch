@@ -1,0 +1,316 @@
+*** Begin Patch
+*** Add File:ops/orchestrator/one_click_orchestrator.sh
++#!/usr/bin/env bash
++#
++# One-Click Orchestrator for Aegis Level‑4 Staging Drill and Hardening
++# Safe-by-default: starts in dry-run mode. Requires operator confirmation
++# before any destructive action (terraform apply, alias flips, helm upgrades).
++#
++# Prereqs:
++# - gh (GitHub CLI) authenticated
++# - kubectl configured for target cluster or KUBE_CONFIG_DATA provided
++# - helm, terraform, aws, docker (optional for local builds)
++# - cosign (optional), rekor-cli (optional)
++#
++# Usage:
++#   ./ops/orchestrator/one_click_orchestrator.sh --dry-run                  # default
++#   ./ops/orchestrator/one_click_orchestrator.sh --apply --tfvars ./terraform/evidence/terraform.tfvars
++#
++set -euo pipefail
++
++DRY_RUN=true
++TFVARS=""
++FORCE=false
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --dry-run) DRY_RUN=true; shift ;;
++    --apply) DRY_RUN=false; shift ;;
++    --tfvars) TFVARS="$2"; shift 2 ;;
++    --force) FORCE=true; shift ;;
++    -h|--help) echo "Usage: $0 [--dry-run|--apply] [--tfvars path]"; exit 0 ;;
++    *) echo "Unknown arg: $1"; exit 2 ;;
++  esac
++done
++
++info(){ echo "[INFO] $*"; }
++warn(){ echo "[WARN] $*"; }
++err(){ echo "[ERR] $*" >&2; exit 1; }
++
++check_tool(){
++  if ! command -v "$1" >/dev/null 2>&1; then
++    err "Required tool missing: $1"
++  fi
++}
++
++preflight(){
++  info "Running preflight checks..."
++  check_tool gh
++  check_tool kubectl
++  check_tool helm
++  check_tool aws
++  check_tool jq
++  # optional
++  if ! command -v cosign >/dev/null 2>&1; then warn "cosign not found (recommended)"; fi
++  if ! command -v rekor-cli >/dev/null 2>&1; then warn "rekor-cli not found (recommended)"; fi
++  info "Preflight OK"
++}
++
++confirm(){
++  if [ "$FORCE" = true ]; then return 0; fi
++  if [ "$DRY_RUN" = true ]; then
++    read -p "Dry-run mode. Continue? [y/N] " yn
++  else
++    read -p "About to perform live changes. Type 'CONFIRM' to continue: " yn
++  fi
++  if [ "$yn" != "y" ] && [ "$yn" != "CONFIRM" ]; then
++    echo "Aborting per operator choice"
++    exit 0
++  fi
++}
++
++run_terraform(){
++  if [ -z "$TFVARS" ]; then
++    warn "No terraform.tfvars provided; skipping terraform"
++    return 0
++  fi
++  pushd terraform/evidence >/dev/null
++  terraform init -input=false
++  terraform plan -input=false -out plan.tfplan -var-file="$TFVARS"
++  if [ "$DRY_RUN" = true ]; then
++    info "Terraform plan created (dry-run). Review plan.tfplan in terraform/evidence"
++    terraform show -no-color plan.tfplan | sed -n '1,200p'
++  else
++    if [ "$FORCE" != true ]; then confirm; fi
++    terraform apply -input=false plan.tfplan
++    info "Terraform apply complete"
++  fi
++  popd >/dev/null
++}
++
++trigger_build_images(){
++  info "Triggering image build & push GH Action"
++  gh workflow run build_and_push_images.yml
++  info "Workflow triggered: build_and_push_images.yml"
++}
++
++bootstrap_argocd(){
++  info "Bootstrapping ArgoCD Application (if ArgoCD present)"
++  if [ "$DRY_RUN" = true ]; then
++    info "Dry-run: would apply argocd/application/aegis-app.yaml"
++  else
++    kubectl apply -f argocd/application/aegis-app.yaml || warn "Failed to apply ArgoCD app (check kubeconfig)"
++  fi
++}
++
++run_one_click_drill(){
++  info "Triggering Level-4 staging drill workflow"
++  gh workflow run level4_staging_drill.yml -f dataset_path="data/sample_dataset.csv" -f image_tag="latest"
++}
++
++pilot_mpc(){
++  info "Preparing MPC pilot (staging)"
++  if [ "$DRY_RUN" = true ]; then
++    info "Dry-run: would generate mTLS certs, create k8s secret, apply headless service + statefulset + RBAC, then run job"
++    return 0
++  fi
++  TMPDIR=$(mktemp -d)
++  ops/secure_agg/production_mpc/generate_mtls.sh "$TMPDIR"
++  kubectl -n aegis create secret generic crypten-mtls --from-file="$TMPDIR" || warn "Secret create might have failed"
++  kubectl apply -f ops/secure_agg/production_mpc/k8s/crypten-headless-service.yaml
++  kubectl apply -f ops/secure_agg/production_mpc/k8s/worker_statefulset.yaml
++  kubectl apply -f ops/secure_agg/production_mpc/k8s/crypten-rbac.yaml
++  info "MPC pilot manifests applied; waiting for pods..."
++  kubectl -n aegis wait --for=condition=Ready pods -l app=crypten-worker --timeout=300s || true
++  bash ops/secure_agg/production_mpc/launch_distributed.sh aegis crypten-worker || warn "Launch helper returned non-zero"
++  kubectl apply -f ops/secure_agg/production_mpc/tests/test_mpc_k8s_job.yaml || warn "Applying test job"
++}
++
++kms_dry_run(){
++  info "KMS rotation dry-run (create key & manifest but DO NOT update alias)"
++  if [ "$DRY_RUN" = true ]; then
++    info "Dry-run: would call aws kms create-key and produce manifest JSON"
++    return 0
++  fi
++  # create key
++  KMS_KEY_ID=$(aws kms create-key --description "Aegis rotation dry-run" --query KeyMetadata.KeyId --output text)
++  manifest="/tmp/kms_rotation_${KMS_KEY_ID}.json"
++  cat > "$manifest" <<EOF
++{
++  "timestamp": $(date +%s),
++  "note": "dry-run rotation (no alias swap performed)",
++  "new_key_id": "${KMS_KEY_ID}"
++}
++EOF
++  info "Created manifest $manifest"
++  if [ -n "${COSIGN_KMS_URI:-}" ]; then
++    cosign sign-blob --key "${COSIGN_KMS_URI}" "$manifest" || warn "cosign sign failed"
++  fi
++  if [ -n "${EVIDENCE_BUCKET:-}" ]; then
++    aws s3 cp "$manifest" "s3://${EVIDENCE_BUCKET%/}/kms-rotation/" || warn "s3 upload failed"
++  fi
++  info "KMS dry-run complete; alias not modified"
++}
++
++hardened_deploy_workflow(){
++  info "Trigger hardened deploy pipeline (verify -> approve -> deploy -> attest)"
++  read -p "Enter image tag to deploy (or 'latest'): " TAG
++  gh workflow run hardened_deploy_pipeline.yml -f image_tag="$TAG"
++  info "Triggered hardened_deploy_pipeline.yml for image_tag=$TAG"
++}
++
++generate_audit_packet(){
++  info "Generating audit packet locally"
++  python3 ops/evidence/audit_request_generator.py --out /tmp/aegis_audit_pack --note "orchestrator-run-$(date +%s)"
++  if [ -n "${EVIDENCE_BUCKET:-}" ]; then
++    aws s3 cp /tmp/aegis_audit_pack_*.tar.gz "s3://${EVIDENCE_BUCKET%/}/audit_packets/" || warn "upload failed"
++  fi
++}
++
++main(){
++  preflight
++  confirm
++  run_terraform
++  trigger_build_images
++  bootstrap_argocd
++  run_one_click_drill
++  pilot_mpc
++  kms_dry_run
++  hardened_deploy_workflow
++  generate_audit_packet
++  info "Orchestration complete (dry-run=$DRY_RUN)"
++}
++
++main
++
+*** End File
+*** Add File:terraform/evidence/terraform.tfvars.example
++region = "us-east-1"
++bucket_name = "aegis-evidence-<unique-suffix>"
++account_root_arn = "arn:aws:iam::<YOUR_ACCOUNT_ID>:root"
++ci_assume_principals = ["ec2.amazonaws.com"] # adjust for your CI provider (e.g., ["arn:aws:iam::ACCOUNT:role/GitHubActionsRole"])
++kms_deletion_window_days = 30
++tags = {
++  Environment = "staging"
++  Owner = "aegis-team"
++}
++
+*** End File
+*** Add File:idp/okta/okta_create_oidc_client.sh
++#!/usr/bin/env bash
++#
++# Create an OIDC app in Okta via Okta Management API (requires OKTA_DOMAIN and OKTA_API_TOKEN env vars)
++# This is a template: review and adapt scopes / redirectUris / settings to your org policy.
++#
++set -euo pipefail
++OKTA_DOMAIN="${OKTA_DOMAIN:-}"
++OKTA_TOKEN="${OKTA_API_TOKEN:-}"
++if [ -z "$OKTA_DOMAIN" ] || [ -z "$OKTA_TOKEN" ]; then
++  echo "Set OKTA_DOMAIN and OKTA_API_TOKEN env vars before running"
++  exit 2
++fi
++
++API="https://${OKTA_DOMAIN}/api/v1/apps"
++
++read -p "Enter app name (eg: aegis-mofn): " APPNAME
++cat > /tmp/okta_oidc.json <<JSON
++{
++  "name": "oidc_client",
++  "label": "${APPNAME}",
++  "signOnMode": "OPENID_CONNECT",
++  "credentials": { "oauthClient": { "autoKeyRotation": true } },
++  "settings": {
++    "oauthClient": {
++      "client_uri": "https://aegis.example",
++      "logo_uri": "https://aegis.example/logo.png",
++      "grant_types": ["client_credentials","authorization_code"],
++      "response_types": ["token","id_token","code"],
++      "redirect_uris": ["https://aegis.example/oauth2/callback"],
++      "application_type": "web"
++    }
++  }
++}
++JSON
++
++curl -sS -X POST "$API" \
++  -H "Authorization: SSWS ${OKTA_TOKEN}" \
++  -H "Content-Type: application/json" \
++  -d @/tmp/okta_oidc.json | jq .
++
++echo "Okta app creation response above. JWKS URL will be: https://${OKTA_DOMAIN}/oauth2/default/v1/keys (or check the created authorization server)."
++echo "Set OIDC_JWKS_URL and OIDC_AUDIENCE in Helm values / GitHub secrets accordingly."
++
+*** End File
+*** Add File:idp/azure/azure_ad_oidc_quickstart.md
++Azure AD quickstart (manual steps) — create app, get JWKS & audience
++
++1) Create app registration
++   az ad app create --display-name "aegis-mofn" --identifier-uris "api://aegis-mofn"
++   Note the appId (client id) returned.
++
++2) Create service principal and credential (client secret) if needed
++   az ad sp create --id <appId>
++   az ad sp credential reset --name <appId> --credential-description "aegis-mofn-secret" --years 1
++
++3) JWKS URL and metadata
++   The OpenID Connect metadata URL is:
++     https://login.microsoftonline.com/<TENANT_ID>/v2.0/.well-known/openid-configuration
++   The JWKS URL is value of "jwks_uri" in that document.
++   The audience (OIDC_AUDIENCE) is typically the application URI or client id: e.g., "api://<appId>" or the client id.
++
++4) Set Helm / GitHub secrets:
++   OIDC_JWKS_URL = https://login.microsoftonline.com/<TENANT_ID>/v2.0/.well-known/jwks
++   OIDC_AUDIENCE = "api://<appId>" (or the client id)
++
+*** End File
+*** Add File:idp/aws/cognito_oidc_quickstart.md
++AWS Cognito quickstart (user pool / app client)
++
++1) Create a user pool:
++   aws cognito-idp create-user-pool --pool-name aegis-pool
++
++2) Create a user pool client (app):
++   aws cognito-idp create-user-pool-client --user-pool-id <POOL_ID> --client-name aegis-client --generate-secret
++
++3) OIDC discovery & JWKS
++   OIDC discovery URL:
++     https://cognito-idp.<region>.amazonaws.com/<POOL_ID>/.well-known/openid-configuration
++   JWKS URL is the "jwks_uri" value in discovery document.
++   Audience is typically the app client id or the user pool id depending on your architecture.
++
++4) Set Helm / GitHub secrets:
++   OIDC_JWKS_URL = https://cognito-idp.<region>.amazonaws.com/<POOL_ID>/.well-known/jwks.json
++   OIDC_AUDIENCE = "<CLIENT_ID>" or pool id as appropriate
++
+*** End File
+*** Add File:docs/runbooks/orchestrator_usage.md
++# Orchestrator Usage & Safety Notes
++
++What the orchestrator does (safe-by-default)
++- Validates local tooling presence (gh/kubectl/helm/aws/cosign/jq)
++- Optionally runs terraform plan/apply for evidence infra (requires --tfvars)
++- Triggers build & push images workflow (GH Actions)
++- Bootstraps ArgoCD (if used) and triggers the one-click staging drill workflow
++- Runs MPC pilot manifests in staging cluster (creates mTLS certs and k8s secret)
++- Performs a KMS rotation dry-run (create key + manifest only; alias NOT swapped)
++- Triggers hardened_deploy_pipeline (verify image signatures, MOFN approval, DP check, deploy)
++- Generates an audit packet and uploads to evidence bucket
++
++Important safety constraints
++- Default mode is dry-run. Use --apply to perform live changes and --force if you want to skip interactive confirmations.
++- The orchestrator will never perform alias swaps in KMS; KMS rotation step is a dry-run that creates a new key and manifest. Alias swap must be done manually or via a separate, reviewed workflow after M-of-N approvals.
++- Ensure all repository and cluster secrets are set prior to running in apply mode.
++
++How to run
++- Dry-run:
++  ./ops/orchestrator/one_click_orchestrator.sh --dry-run
++- Apply:
++  ./ops/orchestrator/one_click_orchestrator.sh --apply --tfvars ./terraform/evidence/terraform.tfvars
++
++Operator checklist before apply
++- Confirm GitHub secrets: KUBE_CONFIG_DATA, EVIDENCE_BUCKET, COSIGN_KMS_URI, AWS_* creds, OIDC_JWKS_URL/AUDIENCE, REKOR_SERVER.
++- Confirm you can run kubectl against staging cluster.
++- Ensure cosign and rekor-cli installed on your environment if you need to verify signatures locally.
++
+*** End File
+*** End Patch

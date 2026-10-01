@@ -1,0 +1,607 @@
+*** Begin Patch
+*** Add File:cert-manager/cluster-issuer-selfsigned.yaml
++apiVersion: cert-manager.io/v1
++kind: ClusterIssuer
++metadata:
++  name: aegis-selfsigned-issuer
++spec:
++  selfSigned: {}
++
+*** End Patch
+*** Begin Patch
+*** Add File:cert-manager/aegis-carbon-cert.yaml
++apiVersion: cert-manager.io/v1
++kind: Certificate
++metadata:
++  name: aegis-carbon-webhook-cert
++  namespace: aegis
++spec:
++  secretName: aegis-carbon-webhook-tls
++  dnsNames:
++    - aegis-carbon-webhook.aegis.svc
++  issuerRef:
++    name: aegis-selfsigned-issuer
++    kind: ClusterIssuer
++  usages:
++    - digital signature
++    - key encipherment
++    - server auth
++
+*** End Patch
+*** Begin Patch
+*** Add File:cert-manager/patch_mutating_webhook_ca.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Wait for cert-manager to create secret aegis-carbon-webhook-tls in namespace aegis,
++# then extract CA and patch MutatingWebhookConfiguration's caBundle.
++NAMESPACE=${1:-aegis}
++WEBHOOK_NAME=${2:-aegis-carbon-webhook}
++
++echo "Waiting for TLS secret ${NAMESPACE}/aegis-carbon-webhook-tls..."
++for i in $(seq 1 60); do
++  if kubectl -n "${NAMESPACE}" get secret aegis-carbon-webhook-tls >/dev/null 2>&1; then
++    break
++  fi
++  sleep 2
++done
++
++if ! kubectl -n "${NAMESPACE}" get secret aegis-carbon-webhook-tls >/dev/null 2>&1; then
++  echo "Secret not found; cert-manager may not have issued cert yet."
++  exit 2
++fi
++
++CA=$(kubectl -n "${NAMESPACE}" get secret aegis-carbon-webhook-tls -o jsonpath='{.data.ca\.crt}')
++if [ -z "${CA}" ]; then
++  echo "CA not present in secret; ensure cert-manager produced CA bundle"
++  exit 2
++fi
++
++echo "Patching MutatingWebhookConfiguration ${WEBHOOK_NAME} with caBundle..."
++kubectl patch mutatingwebhookconfiguration "${WEBHOOK_NAME}" --type='json' -p="[{'op':'replace','path':'/webhooks/0/clientConfig/caBundle','value':'${CA}'}]" || true
++echo "Patched."
++
+*** End Patch
+*** Begin Patch
+*** Add File:webhook/aegis-carbon-webhook-deploy.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-carbon-webhook
++  namespace: aegis
++spec:
++  replicas: 3
++  selector:
++    matchLabels:
++      app: aegis-carbon-webhook
++  template:
++    metadata:
++      labels:
++        app: aegis-carbon-webhook
++    spec:
++      serviceAccountName: aegis-carbon-webhook-sa
++      containers:
++        - name: webhook
++          image: ghcr.io/yourorg/aegis-carbon-webhook:latest
++          args: ["--tls-crt=/tls/tls.crt","--tls-key=/tls/tls.key"]
++          env:
++            - name: REDIS_URL
++              value: "redis://aegis-redis.aegis.svc:6379/0"
++            - name: RUNTIME_PREDICTOR_URL
++              value: "http://runtime-predictor.aegis.svc:8080"
++            - name: TOKEN_BUDGET_URL
++              value: "http://token-budget.aegis.svc:9200"
++            - name: FEED_CACHE_TTL
++              value: "300"
++          ports:
++            - containerPort: 9443
++          volumeMounts:
++            - name: tls
++              mountPath: /tls
++              readOnly: true
++      volumes:
++        - name: tls
++          secret:
++            secretName: aegis-carbon-webhook-tls
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: aegis-carbon-webhook
++  namespace: aegis
++spec:
++  selector:
++    app: aegis-carbon-webhook
++  ports:
++    - port: 443
++      targetPort: 9443
++      protocol: TCP
++
+*** End Patch
+*** Begin Patch
+*** Add File:webhook/mutating_webhook_configuration.yaml
++apiVersion: admissionregistration.k8s.io/v1
++kind: MutatingWebhookConfiguration
++metadata:
++  name: aegis-carbon-webhook
++webhooks:
++  - name: carbon.aegis.example.com
++    admissionReviewVersions: ["v1"]
++    clientConfig:
++      service:
++        name: aegis-carbon-webhook
++        namespace: aegis
++        path: "/mutate"
++      caBundle: "REPLACE_WITH_CA_BUNDLE" # patched by cert-manager helper script
++    failurePolicy: Fail
++    sideEffects: None
++    timeoutSeconds: 10
++    rules:
++      - apiGroups: ["argoproj.io"]
++        apiVersions: ["v1alpha1"]
++        operations: ["CREATE"]
++        resources: ["workflows"]
++      - apiGroups: [""]
++        apiVersions: ["v1"]
++        operations: ["CREATE"]
++        resources: ["pods"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:webhook/webhook.py
++#!/usr/bin/env python3
++"""
++Aegis Carbon Mutating Webhook (AWS + cert-manager friendly)
++ - Validates and annotates incoming Argo Workflows and Pods with carbon estimates
++ - Queries runtime predictor service for expected runtime
++ - Checks token-budget for carbon budget enforcement
++ - Uses FeedAggregator (CO2Signal + AWS placeholder)
++
++Notes:
++ - Run behind cert-manager produced cert secret mounted at /tls
++ - Requires Redis for caching (env REDIS_URL) and token-budget endpoint (env TOKEN_BUDGET_URL)
++"""
++import os, json, base64, requests, redis, traceback
++from flask import Flask, request, jsonify
++from datetime import datetime, timedelta
++from scheduler.carbon.feed_aggregator_v2 import get_intensity
++from scheduler.carbon.estimator import estimate_emissions
++
++app = Flask("aegis-carbon-webhook")
++REDIS_URL = os.environ.get("REDIS_URL", "redis://aegis-redis.aegis.svc:6379/0")
++TOKEN_BUDGET_URL = os.environ.get("TOKEN_BUDGET_URL", "http://token-budget.aegis.svc:9200")
++RUNTIME_PREDICTOR = os.environ.get("RUNTIME_PREDICTOR_URL", "http://runtime-predictor.aegis.svc:8080")
++
++redis_cli = redis.Redis.from_url(REDIS_URL, decode_responses=True)
++
++def call_runtime_predictor(features):
++    try:
++        r = requests.post(f"{RUNTIME_PREDICTOR}/predict", json=features, timeout=5)
++        r.raise_for_status()
++        return int(r.json().get("predicted_seconds", 3600))
++    except Exception:
++        return None
++
++def check_token_budget(team, estimated_kg):
++    try:
++        r = requests.post(f"{TOKEN_BUDGET_URL}/check_carbon", json={"team": team, "kg": estimated_kg}, timeout=5)
++        r.raise_for_status()
++        return r.json().get("allowed", False)
++    except Exception:
++        return False
++
++def build_patch(obj, annotations):
++    patch = []
++    if not obj.get("metadata", {}).get("annotations"):
++        patch.append({"op":"add","path":"/metadata/annotations","value":annotations})
++    else:
++        for k,v in annotations.items():
++            path = "/metadata/annotations/" + k.replace("/","~1")
++            patch.append({"op":"add","path":path,"value":v})
++    return patch
++
++@app.route("/mutate", methods=["POST"])
++def mutate():
++    req = request.get_json(force=True)
++    try:
++        obj = req["request"]["object"]
++        meta = obj.get("metadata", {})
++        annotations = meta.get("annotations", {}) or {}
++        team = annotations.get("aegis.team","unknown")
++        node_type = annotations.get("aegis.node_type","default")
++        # Extract resource requests best-effort
++        reqs = {"cpu":1, "gpu":0, "mem_mb":0}
++        try:
++            # best-effort: inspect first container requests
++            if "spec" in obj:
++                tmpl = obj["spec"].get("template", obj["spec"])
++                containers = tmpl.get("containers") or []
++                if containers:
++                    c = containers[0]
++                    res = c.get("resources", {}).get("requests", {}) or c.get("resources", {}).get("limits", {})
++                    cpu = res.get("cpu")
++                    if cpu:
++                        if isinstance(cpu, str) and cpu.endswith("m"):
++                            reqs["cpu"] = float(cpu[:-1])/1000.0
++                        else:
++                            reqs["cpu"] = float(cpu)
++                    gpu = res.get("nvidia.com/gpu") or res.get("gpu")
++                    if gpu:
++                        reqs["gpu"] = int(gpu)
++        except Exception:
++            pass
++
++        # Call runtime predictor using available features (req_cpu, gpu, data_bytes)
++        data_bytes = int(annotations.get("aegis.input_data_bytes","0"))
++        features = {"req_cpu": reqs["cpu"], "gpu": reqs["gpu"], "data_bytes": data_bytes}
++        predicted_seconds = call_runtime_predictor(features) or float(annotations.get("aegis.expected_seconds", 3600))
++
++        intensity, source = get_intensity("US")
++        est = estimate_emissions(reqs, predicted_seconds, node_type, intensity)
++
++        # policy check via token-budget
++        allowed = check_token_budget(team, est["emissions_kg"])
++
++        # enforce team policy: if not allowed and policy requires low-carbon-only -> deny
++        policy = redis_cli.hgetall(f"policy:{team}") or {}
++        mode = policy.get("mode","best-effort")
++        threshold = int(policy.get("carbon_threshold", 400))
++
++        hint = {"action":"run","prefer_spot":False}
++        if intensity > threshold or not allowed:
++            if mode == "low-carbon-only":
++                # deny creation
++                admission = {"uid": req["request"]["uid"], "allowed": False, "status": {"message": "Job denied due to carbon policy"}}
++                return jsonify({"response": admission})
++            else:
++                # suggest defer (2 hours is default)
++                defer_until = (datetime.utcnow() + timedelta(hours=2)).isoformat() + "Z"
++                hint = {"action":"defer","defer_until":defer_until}
++
++        # decide prefer_spot via token-budget heuristic
++        if allowed and intensity < 200:
++            hint["prefer_spot"] = True
++
++        ann = {
++            "aegis.carbon.intensity": str(intensity),
++            "aegis.carbon.intensity_source": source,
++            "aegis.carbon.estimated_kg": f"{est['emissions_kg']:.6f}",
++            "aegis.carbon.energy_kwh": f"{est['energy_kwh']:.6f}",
++            "aegis.carbon.hint": json.dumps(hint),
++            "aegis.runtime.predicted_seconds": str(int(predicted_seconds))
++        }
++
++        patch = build_patch(obj, ann)
++        admission = {"uid": req["request"]["uid"], "allowed": True, "patch": base64.b64encode(json.dumps(patch).encode()).decode(), "patchType":"JSONPatch"}
++        return jsonify({"response": admission})
++    except Exception as e:
++        traceback.print_exc()
++        # Fail closed: reject creation on internal error
++        admission = {"uid": req.get("request",{}).get("uid",""), "allowed": False, "status": {"message": "internal webhook error"}}
++        return jsonify({"response": admission})
++
++@app.route("/healthz")
++def healthz():
++    return "ok"
++
++if __name__ == "__main__":
++    import ssl
++    tls_crt = os.environ.get("TLS_CRT", "/tls/tls.crt")
++    tls_key = os.environ.get("TLS_KEY", "/tls/tls.key")
++    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
++    context.load_cert_chain(tls_crt, tls_key)
++    app.run(host="0.0.0.0", port=9443, ssl_context=context)
++
+*** End Patch
+*** Begin Patch
+*** Add File:runtime_predictor/app.py
++#!/usr/bin/env python3
++"""
++Runtime predictor service:
++ - Loads a serialized scikit-learn model and exposes /predict to return predicted runtime seconds.
++ - Model can be trained offline and mounted via a ConfigMap, PVC or built into the container.
++"""
++import os, joblib, json
++from flask import Flask, request, jsonify
++
++MODEL_PATH = os.environ.get("RUNTIME_MODEL_PATH", "/models/runtime_model.pkl")
++app = Flask("runtime-predictor")
++
++model = None
++if os.path.exists(MODEL_PATH):
++    model = joblib.load(MODEL_PATH)
++else:
++    model = None
++
++@app.route("/predict", methods=["POST"])
++def predict():
++    payload = request.get_json(force=True)
++    req_cpu = float(payload.get("req_cpu", 1.0))
++    gpu = int(payload.get("gpu", 0))
++    data_bytes = float(payload.get("data_bytes", 0))
++    if model:
++        pred = model.predict([[req_cpu, gpu, data_bytes]])[0]
++        return jsonify({"predicted_seconds": int(pred)})
++    else:
++        # fallback heuristic: simple formula
++        base = 3600
++        scale = req_cpu * (1 + gpu * 4)
++        pred = int(base / max(0.5, scale))
++        return jsonify({"predicted_seconds": pred})
++
++@app.route("/healthz")
++def healthz():
++    return "ok"
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=8080)
++
+*** End Patch
+*** Begin Patch
+*** Add File:runtime_predictor/deploy.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: runtime-predictor
++  namespace: aegis
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: runtime-predictor
++  template:
++    metadata:
++      labels:
++        app: runtime-predictor
++    spec:
++      containers:
++        - name: runtime-predictor
++          image: ghcr.io/yourorg/runtime-predictor:latest
++          env:
++            - name: RUNTIME_MODEL_PATH
++              value: /models/runtime_model.pkl
++          volumeMounts:
++            - name: model
++              mountPath: /models
++      volumes:
++        - name: model
++          configMap:
++            name: runtime-model-cm
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: runtime-predictor
++  namespace: aegis
++spec:
++  selector:
++    app: runtime-predictor
++  ports:
++    - port: 8080
++      targetPort: 8080
++
+*** End Patch
+*** Begin Patch
+*** Add File:controller/carbon_resume_job_template.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: resume-workflow-PLACEHOLDER
++  namespace: aegis
++spec:
++  template:
++    spec:
++      restartPolicy: OnFailure
++      containers:
++        - name: resumer
++          image: bitnami/kubectl:latest
++          command:
++            - /bin/sh
++            - -c
++            - |
++              echo "Sleeping for SECONDS_PLACEHOLDER"
++              sleep SECONDS_PLACEHOLDER
++              echo "Resuming workflow NAMESPACE_PLACEHOLDER/WORKFLOW_PLACEHOLDER"
++              kubectl patch workflow WORKFLOW_PLACEHOLDER -n NAMESPACE_PLACEHOLDER --type merge -p '{"spec":{"suspend":false}}'
++
+*** End Patch
+*** Begin Patch
+*** Add File:controller/carbon_controller_resume.py
++#!/usr/bin/env python3
++"""
++Carbon scheduler controller (resume helper)
++ - Watches Workflows; when it sees aegis.carbon.hint with action=defer, it creates a Job that sleeps until the defer time
++   then patches the Workflow to resume.
++ - Requires RBAC allowing creation of Jobs and patching Workflows.
++"""
++import os, time, json, traceback
++from kubernetes import client, config, watch
++from datetime import datetime, timezone
++
++def iso_to_epoch(s):
++    return int(datetime.fromisoformat(s.replace("Z","+00:00")).timestamp())
++
++def create_resume_job(api_batch, workflow_name, workflow_ns, delay_seconds):
++    job_name = f"resume-{workflow_name[:50]}-{int(time.time())}"
++    body = {
++      "apiVersion": "batch/v1",
++      "kind": "Job",
++      "metadata": {"name": job_name, "namespace": workflow_ns},
++      "spec": {
++        "template": {
++          "spec": {
++            "restartPolicy": "OnFailure",
++            "containers": [{
++              "name": "resumer",
++              "image": "bitnami/kubectl:latest",
++              "command": ["/bin/sh", "-c"],
++              "args": [f"sleep {delay_seconds}; kubectl patch workflow {workflow_name} -n {workflow_ns} --type merge -p '{{\"spec\":{{\"suspend\":false}}}}'"]
++            }]
++          }
++        }
++      }
++    }
++    api_batch.create_namespaced_job(namespace=workflow_ns, body=body)
++    print("Created resume job", job_name)
++
++def main():
++    config.load_incluster_config()
++    crd = client.CustomObjectsApi()
++    batch = client.BatchV1Api()
++    w = watch.Watch()
++    print("Starting controller resume watcher...")
++    for ev in w.stream(crd.list_cluster_custom_object, group="argoproj.io", version="v1alpha1", plural="workflows", timeout_seconds=60):
++        try:
++            obj = ev["object"]
++            meta = obj.get("metadata", {})
++            ann = meta.get("annotations") or {}
++            hint_json = ann.get("aegis.carbon.hint")
++            if not hint_json:
++                continue
++            hint = json.loads(hint_json)
++            if hint.get("action") == "defer":
++                defer_until = hint.get("defer_until")
++                et = iso_to_epoch(defer_until)
++                now = int(datetime.now(timezone.utc).timestamp())
++                delay = max(0, et - now)
++                print("Scheduling resume for", meta.get("name"), "in", delay, "seconds")
++                create_resume_job(batch, meta.get("name"), meta.get("namespace","aegis"), delay)
++        except Exception:
++            traceback.print_exc()
++        time.sleep(1)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:spot/aws_nodegroup_provisioner.py
++#!/usr/bin/env python3
++"""
++AWS EKS Spot NodeGroup Provisioner (operator-run helper)
++ - Creates or updates an EKS managed nodegroup with capacityType=SPOT.
++ - Requires AWS credentials & IAM role for nodegroup; this is an operator helper for automation pipelines.
++"""
++import boto3, argparse, time
++
++eks = boto3.client("eks")
++
++def create_spot_nodegroup(cluster_name, nodegroup_name, subnets, node_role_arn, instance_types, min_size=1, max_size=4, desired_size=1):
++    print("Requesting nodegroup creation (spot)...")
++    resp = eks.create_nodegroup(
++        clusterName=cluster_name,
++        nodegroupName=nodegroup_name,
++        scalingConfig={"minSize": min_size, "maxSize": max_size, "desiredSize": desired_size},
++        diskSize=100,
++        subnets=subnets,
++        instanceTypes=instance_types,
++        nodeRole=node_role_arn,
++        capacityType="SPOT"
++    )
++    print("EKS create_nodegroup response:", resp)
++    return resp
++
++if __name__ == "__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--cluster", required=True)
++    p.add_argument("--name", required=True)
++    p.add_argument("--node-role-arn", required=True)
++    p.add_argument("--subnets", required=True, help="comma-separated subnet ids")
++    p.add_argument("--instance-types", required=True, help="comma-separated instance types")
++    args = p.parse_args()
++    create_spot_nodegroup(args.cluster, args.name, args.subnets.split(","), args.node_role_arn, args.instance_types.split(","))
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/feed_health_exporter.py
++#!/usr/bin/env python3
++"""
++Prometheus exporter for carbon feed health: exposes simple metrics about feed availability and latency.
++"""
++from prometheus_client import start_http_server, Gauge
++import time, requests, os
++
++g_co2_ok = Gauge("aegis_feed_co2signal_ok", "CO2Signal availability (1=ok)")
++g_grid_ok = Gauge("aegis_feed_grid_ok", "Grid operator feed availability (1=ok)")
++g_co2_latency = Gauge("aegis_feed_co2signal_latency_seconds", "CO2Signal latency")
++
++CO2_KEY = os.environ.get("CO2SIGNAL_API_KEY","")
++GRID_URL = os.environ.get("GRID_FEED_URL","")
++
++def check():
++    # co2signal
++    try:
++        t0 = time.time()
++        r = requests.get(f"https://api.co2signal.com/v1/latest?countryCode=US", headers={"auth-token":CO2_KEY}, timeout=5)
++        g_co2_ok.set(1 if r.status_code==200 else 0)
++        g_co2_latency.set(time.time()-t0)
++    except Exception:
++        g_co2_ok.set(0)
++    # grid
++    try:
++        r = requests.get(GRID_URL, timeout=3) if GRID_URL else None
++        g_grid_ok.set(1 if (r and r.status_code==200) else 0)
++    except Exception:
++        g_grid_ok.set(0)
++
++if __name__ == "__main__":
++    start_http_server(9611)
++    while True:
++        check()
++        time.sleep(30)
++
+*** End Patch
+*** Begin Patch
+*** Add File:policy/saas_policy_integration.md
++# Integrating Policies, Budgets & Appeals into Aegis
++
++This document describes how to wire team carbon policies into Aegis:
++
++1. Policy Storage: use Redis keys policy:<team> or central DB (policy_store.yaml for initial).
++2. Enforcement Points:
++   - Mutating webhook: can deny at admission for strict policies.
++   - Controller: can suspend/resume workflows if deferred.
++   - Token-budget: extended /check_carbon endpoint to accept per-team budgets and decrement.
++3. Appeals Workflow:
++   - When webhook denies, it returns a message and records a signed evidence entry in S3.
++   - Provide a web UI (policy_ui.py) to request an override; the override creates a one-time token stored in Redis for controller to accept.
++4. Billing / Accounting:
++   - Reconciliation reports (reconcile_job_postrun) are aggregated per-team and pushed to billing pipeline.
++   - Token-budget service should accept carbon credits and team budgets.
++
++Operators should integrate this doc into their SRE/FinOps practices.
++
+*** End Patch
+*** Begin Patch
+*** Add File:READMEs/carbon_aws_certmanager_NOTES.md
++# Notes for Operators: AWS + cert-manager Carbon Finalization
++
++1) Prereqs:
++   - cert-manager installed in cluster (cert-manager.io)
++   - Redis deployed and reachable
++   - Token-budget service endpoint reachable
++   - Runtime predictor model trained and available in ConfigMap runtime-model-cm
++   - AWS credentials available to provisioner (if using create_nodegroup)
++
++2) Deploy order (recommended):
++   - Deploy cert-manager ClusterIssuer (cert-manager/cluster-issuer-selfsigned.yaml)
++   - Deploy cert resource (cert-manager/aegis-carbon-cert.yaml)
++   - Deploy webhook deployment (webhook/aegis-carbon-webhook-deploy.yaml)
++   - Run cert-manager/patch_mutating_webhook_ca.sh to populate caBundle in MutatingWebhookConfiguration
++   - Deploy MutatingWebhookConfiguration (webhook/mutating_webhook_configuration.yaml)
++   - Deploy runtime predictor (runtime_predictor/deploy.yaml)
++   - Deploy controller (controller/carbon_controller_resume.py as deployment) and RBAC (rbac/carbon_controller_rbac.yaml)
++   - Deploy monitoring feed exporter (monitoring/feed_health_exporter.py) and Prometheus scrape
++
++3) Spot provisioning:
++   - Use spot/aws_nodegroup_provisioner.py via operator automation (Terraform recommended for production)
++   - Ensure nodegroup IAM & subnets are correct
++
++4) Security:
++   - Replace self-signed ClusterIssuer with corporate CA + cert-manager Issuer backed by your PKI for production
++   - Ensure webhook & controller service accounts have least privileges and audit logging enabled
++
+*** End Patch
+*** End Patch

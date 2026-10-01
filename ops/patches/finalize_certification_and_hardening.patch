@@ -1,0 +1,489 @@
+*** Begin Patch
+*** Add File:ops/hsm/auditor_finalizer.py
++#!/usr/bin/env python3
++"""
++Finalize CloudHSM auditor session lifecycle:
++ - Run live auditor session orchestrator (interactive/operator)
++ - Accept auditor written acceptance (PDF/URL) and attach to signoff ConfigMap
++ - Upload acceptance artifact to evidence bucket if configured
++ - Emit a concise signoff report for release_packager consumption
++"""
++import os
++import json
++import shutil
++import subprocess
++from datetime import datetime
++from kubernetes import client, config
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++SIGNOFF_CM = os.environ.get("AUDIT_SIGNOFF_CM", "aegis-auditor-signoffs")
++SIGNOFF_NS = os.environ.get("AUDIT_SIGNOFF_NS", "kube-system")
++
++def k8s_client():
++    try:
++        config.load_incluster_config()
++    except Exception:
++        config.load_kube_config()
++    return client.CoreV1Api()
++
++def run_live_session(sample_blob="ops/hsm/audit_sample.bin", kms_key_id=None, cluster_id=None, notes=""):
++    cmd = ["python", "ops/hsm/live_auditor_session_orchestrator.py", "--sample", sample_blob]
++    if kms_key_id:
++        cmd += ["--kms-key-id", kms_key_id]
++    if cluster_id:
++        cmd += ["--cluster-id", cluster_id]
++    if notes:
++        cmd += ["--notes", notes]
++    subprocess.check_call(cmd)
++    rpt = "/tmp/auditor_full_report.json"
++    if os.path.exists(rpt):
++        return json.load(open(rpt))
++    return {"error": "no_report"}
++
++def attach_acceptance(signoff_id, acceptance_path_or_url):
++    core = k8s_client()
++    cm = core.read_namespaced_config_map(SIGNOFF_CM, SIGNOFF_NS)
++    data = cm.data or {}
++    if signoff_id not in data:
++        raise RuntimeError("signoff id not found")
++    entry = json.loads(data[signoff_id])
++    # if local file, upload to evidence bucket if available
++    uploaded = None
++    if os.path.exists(acceptance_path_or_url) and EVIDENCE_BUCKET:
++        try:
++            import boto3
++            s3 = boto3.client("s3")
++            key = f"aegis/hsm_acceptances/{os.path.basename(acceptance_path_or_url)}"
++            s3.upload_file(acceptance_path_or_url, EVIDENCE_BUCKET, key)
++            uploaded = f"s3://{EVIDENCE_BUCKET}/{key}"
++        except Exception as e:
++            uploaded = {"error": str(e)}
++    entry["auditor_acceptance"] = {"source": acceptance_path_or_url, "uploaded": uploaded, "ts": datetime.utcnow().isoformat()+"Z"}
++    entry["state"] = "auditor_accepted"
++    data[signoff_id] = json.dumps(entry)
++    body = client.V1ConfigMap(metadata=client.V1ObjectMeta(name=SIGNOFF_CM), data=data)
++    core.replace_namespaced_config_map(SIGNOFF_CM, SIGNOFF_NS, body)
++    # produce small signoff report file for release_packager
++    out = {"signoff_id": signoff_id, "acceptance": entry["auditor_acceptance"], "ts": datetime.utcnow().isoformat()+"Z"}
++    outp = "/tmp/final_auditor_signoff_report.json"
++    with open(outp, "w") as fh:
++        json.dump(out, fh, indent=2)
++    return out
++
++if __name__=="__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--run", action="store_true")
++    p.add_argument("--sample", default="ops/hsm/audit_sample.bin")
++    p.add_argument("--kms")
++    p.add_argument("--cluster")
++    p.add_argument("--signoff-id")
++    p.add_argument("--acceptance", help="path or URL to auditor acceptance (PDF or URL)")
++    p.add_argument("--notes", default="")
++    args = p.parse_args()
++    if args.run:
++        print(run_live_session(args.sample, args.kms, args.cluster, args.notes))
++    if args.signoff_id and args.acceptance:
++        print(attach_acceptance(args.signoff_id, args.acceptance))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/validation/consecutive_validator_controller.py
++#!/usr/bin/env python3
++"""
++Controller to manage repeated full‑scale validation runs until N consecutive passes.
++ - Coordinates autoscaler tuning between runs
++ - Produces a final report and writes a lock marker/configmap for operations to pick up
++"""
++import os
++import json
++from datetime import datetime
++from ops.validation.repeat_fullscale_and_lock import run_until_consecutive
++from kubernetes import client, config
++
++LOCK_CM = os.environ.get("ASG_LOCK_CM", "aegis-asg-lock")
++LOCK_NS = os.environ.get("ASG_LOCK_NS", "kube-system")
++
++def k8s_client():
++    try:
++        config.load_incluster_config()
++    except Exception:
++        config.load_kube_config()
++    return client.CoreV1Api()
++
++def run_controller():
++    res = run_until_consecutive()
++    # if locked, persist a human readable ConfigMap for ops
++    core = k8s_client()
++    data = {"report": json.dumps(res)}
++    body = client.V1ConfigMap(metadata=client.V1ObjectMeta(name=LOCK_CM), data=data)
++    try:
++        core.replace_namespaced_config_map(LOCK_CM, LOCK_NS, body)
++    except Exception:
++        core.create_namespaced_config_map(LOCK_NS, body)
++    return res
++
++if __name__=="__main__":
++    print(run_controller())
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/providers/provider_sandbox_remediator.py
++#!/usr/bin/env python3
++"""
++Process provider sandbox live test reports and generate remediation tasks.
++ - Reads /tmp/provider_sandbox_live_report.json or report path provided
++ - Produces a remediation plan and optional PR/issue template to assign to infra/QE
++ - Updates provider_sandbox_registry.json with observed error codes for future classification
++"""
++import os
++import json
++from datetime import datetime
++
++REPORT_PATH = "/tmp/provider_sandbox_live_report.json"
++REG_PATH = "/tmp/provider_sandbox_registry.json"
++OUT_PLAN = "/tmp/provider_sandbox_remediation.json"
++PR_TEMPLATE = "/tmp/provider_sandbox_remediation_pr.md"
++
++def load_report(path=REPORT_PATH):
++    if not os.path.exists(path):
++        raise RuntimeError("report missing")
++    return json.load(open(path))
++
++def update_registry_from_report(report):
++    reg = {}
++    if os.path.exists(REG_PATH):
++        reg = json.load(open(REG_PATH))
++    for provider in ["braket","ibmq"]:
++        p = report.get(provider, {})
++        if not p:
++            continue
++        if not p.get("ok"):
++            errs = []
++            for k in ("transient","fatal","error"):
++                if k in p:
++                    errs.append(str(p[k]))
++            if errs:
++                rec = reg.get(provider, {"observed": []})
++                rec["observed"].extend(errs)
++                reg[provider] = rec
++    with open(REG_PATH, "w") as fh:
++        json.dump(reg, fh, indent=2)
++    return reg
++
++def generate_remediation_plan(report, registry):
++    plan = {"generated_at": datetime.utcnow().isoformat()+"Z", "items": []}
++    for provider in ["braket","ibmq"]:
++        p = report.get(provider)
++        if not p:
++            continue
++        if p.get("ok"):
++            continue
++        issue = {"provider": provider, "observed": p, "suggested_actions": []}
++        if "transient" in p:
++            issue["suggested_actions"].append("Investigate transient retry/backoff and add quota reservation.")
++        if "fatal" in p:
++            issue["suggested_actions"].append("Map fatal error codes to actionable remediation and add preflight validation.")
++        if "error" in p:
++            issue["suggested_actions"].append("Inspect exception, add unit/integration test to CI.")
++        plan["items"].append(issue)
++    with open(OUT_PLAN, "w") as fh:
++        json.dump(plan, fh, indent=2)
++    # PR template
++    with open(PR_TEMPLATE, "w") as fh:
++        fh.write("# Provider sandbox remediation\n\n")
++        fh.write("Observed issues and suggested fixes:\n\n")
++        for item in plan["items"]:
++            fh.write(f"## {item['provider']}\n\n")
++            fh.write(f"Observed: {json.dumps(item['observed'])}\n\n")
++            fh.write("Suggested actions:\n")
++            for a in item["suggested_actions"]:
++                fh.write(f"- {a}\n")
++            fh.write("\n\n")
++    return plan
++
++if __name__=="__main__":
++    rpt = load_report()
++    reg = update_registry_from_report(rpt)
++    plan = generate_remediation_plan(rpt, reg)
++    print("Remediation plan written to", OUT_PLAN)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/ota/device_calibration_runner.py
++#!/usr/bin/env python3
++"""
++Run calibration & mitigation tests on a set of real devices:
++ - Calls device agent /v1/benchmark endpoints for quantized model variants
++ - Collects p50/p95/p99, memory and thermal metrics, aggregates into a report
++ - Produces /tmp/device_calibration_report.json for release artifacts
++"""
++import os
++import json
++import requests
++from datetime import datetime
++
++DEVICES = os.environ.get("DEVICE_BENCH_DEVICES","").split(",")
++MODEL_VARIANTS = os.environ.get("DEVICE_MODEL_VARIANTS","model-small,model-int8").split(",")
++OUT = "/tmp/device_calibration_report.json"
++
++def call_device(device, model_variant):
++    try:
++        r = requests.post(device.rstrip("/") + "/v1/benchmark", json={"model": model_variant, "iters": 50}, timeout=30)
++        r.raise_for_status()
++        return r.json()
++    except Exception as e:
++        return {"error": str(e)}
++
++def run():
++    report = {"ts": datetime.utcnow().isoformat()+"Z", "devices": []}
++    for d in [x for x in DEVICES if x]:
++        drec = {"device": d, "variants": []}
++        for v in MODEL_VARIANTS:
++            res = call_device(d, v)
++            drec["variants"].append({"variant": v, "result": res})
++        report["devices"].append(drec)
++    with open(OUT, "w") as fh:
++        json.dump(report, fh, indent=2)
++    return OUT
++
++if __name__=="__main__":
++    print("Running device calibration; report:", run())
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/security/reproducible_build_check.py
++#!/usr/bin/env python3
++"""
++Heuristic reproducible build checker:
++ - Rebuilds a Docker image using fixed Dockerfile + build args and compares image manifest digests if registry is accessible.
++ - Outputs /tmp/repro_build_check.json with findings (pass/fail + diagnostics).
++Notes: This is a best-effort, not a formal reproducible-build verifier. Use build pipelines that support deterministic builds for stronger guarantees.
++"""
++import os
++import json
++import subprocess
++from datetime import datetime
++
++IMAGE_NAME = os.environ.get("CI_IMAGE_NAME", "aegis/release:ci")
++BUILD_CONTEXT = os.environ.get("CI_BUILD_CONTEXT", ".")
++OUT = "/tmp/repro_build_check.json"
++
++def build_image(temp_tag="aegis/repro:tmp"):
++    try:
++        subprocess.check_call(["docker","build","-t", temp_tag, BUILD_CONTEXT], timeout=600)
++        return temp_tag
++    except Exception as e:
++        return {"error": str(e)}
++
++def inspect_digest(tag):
++    try:
++        out = subprocess.check_output(["docker","inspect","--format='{{index .RepoDigests 0}}'", tag], timeout=30).decode().strip().strip("'")
++        return out
++    except Exception:
++        return None
++
++def run_check():
++    res = {"image": IMAGE_NAME, "ts": datetime.utcnow().isoformat()+"Z"}
++    built = build_image()
++    if isinstance(built, dict) and "error" in built:
++        res["build_error"] = built["error"]
++        with open(OUT,"w") as fh:
++            json.dump(res, fh, indent=2)
++        return res
++    # compare digests if possible
++    orig = inspect_digest(IMAGE_NAME)
++    new = inspect_digest(built)
++    res["original_digest"] = orig
++    res["rebuild_digest"] = new
++    res["match"] = (orig is not None and new is not None and orig == new)
++    with open(OUT,"w") as fh:
++        json.dump(res, fh, indent=2)
++    return res
++
++if __name__=="__main__":
++    print(run_check())
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/final_certification_pipeline.yml
++name: Final Certification Pipeline
++on:
++  workflow_dispatch:
++  workflow_call:
++
++jobs:
++  run-final-cert:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup kubectl & argo cli
++        run: |
++          sudo apt-get update && sudo apt-get install -y curl jq
++          curl -sSL -o /usr/local/bin/argo https://github.com/argoproj/argo-workflows/releases/download/v3.4.6/argo-linux-amd64
++          chmod +x /usr/local/bin/argo
++      - name: Trigger Argo final_certification_workflow
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG }}
++        run: |
++          # requires KUBECONFIG configured in secrets and argo CLI available
++          argo submit k8s/argo/final_certification_workflow.yaml --watch || true
++      - name: Run reproducible build check
++        run: |
++          python ops/security/reproducible_build_check.py || true
++      - name: Run SBOM & sign artifacts
++        run: |
++          python ops/security/ci_sign_artifacts.py || true
++      - name: Upload important reports
++        uses: actions/upload-artifact@v4
++        with:
++          name: final-cert-reports
++          path: |
++            /tmp/fullscale_final_report.json
++            /tmp/provider_sandbox_live_report.json
++            /tmp/device_canary_result.json
++            /tmp/final_auditor_signoff_report.json
++            /tmp/repro_build_check.json
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/nightly_formal_and_fuzz.yml
++name: Nightly Formal Proofs & Fuzz
++on:
++  schedule:
++    - cron: '0 2 * * *' # daily at 02:00 UTC
++
++jobs:
++  formal-fuzz:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python & Z3
++        run: |
++          python -m pip install --upgrade pip
++          pip install z3-solver
++      - name: Run SMT expansion + proof collection + fuzz (fast)
++        run: |
++          python ops/formal/expand_and_run_smt_suite.py || true
++      - name: Upload artifacts
++        uses: actions/upload-artifact@v4
++        with:
++          name: smt-fuzz-artifacts
++          path: |
++            /tmp/smt_suite/smt_suite_meta.json
++            /tmp/formal_fuzz_counterexamples.jsonl
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/process/readiness_dashboard_service.py
++#!/usr/bin/env python3
++"""
++Small readiness dashboard service:
++ - Serves JSON at /v1/readiness summarizing signoff_schedule.json and ConfigMap-based signoffs (if KUBECONFIG available)
++ - Intended for Grafana SimpleJson or direct polling
++"""
++from flask import Flask, jsonify
++import os
++import json
++
++SCHEDULE = "/tmp/signoff_schedule.json"
++SIGNOFF_CM = os.environ.get("AUDIT_SIGNOFF_CM", "aegis-auditor-signoffs")
++SIGNOFF_NS = os.environ.get("AUDIT_SIGNOFF_NS", "kube-system")
++
++app = Flask(__name__)
++
++def load_schedule():
++    if os.path.exists(SCHEDULE):
++        return json.load(open(SCHEDULE))
++    return {}
++
++def load_signoffs_local():
++    # best-effort read local file produced by operators (fallback if k8s not accessible)
++    cmfile = "/tmp/aegis_auditor_signoffs_dump.json"
++    if os.path.exists(cmfile):
++        return json.load(open(cmfile))
++    return {}
++
++@app.route("/v1/readiness")
++def readiness():
++    sched = load_schedule()
++    signoffs = load_signoffs_local()
++    return jsonify({"schedule": sched, "signoffs": signoffs, "ts": __import__("datetime").datetime.utcnow().isoformat()+"Z"})
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("READINESS_PORT","9376")))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/monitoring/grafana/readiness_dashboard.json
++{
++  "title": "Aegis Final Certification Readiness",
++  "panels": [
++    {
++      "title": "Signoff Schedule",
++      "type": "text",
++      "options": {
++        "content": "Displays required signoffs and owners. Source: /v1/readiness"
++      }
++    },
++    {
++      "title": "Signoffs (raw)",
++      "type": "table",
++      "targets": [
++        {
++          "refId": "A",
++          "expr": "up" 
++        }
++      ]
++    }
++  ],
++  "schemaVersion": 16,
++  "version": 1
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/runbooks/operator_cloudhsm_auditor_session.md
++# Operator runbook — CloudHSM key ceremony & auditor session (printable)
++
++Purpose
++-------
++Step‑by‑step instructions to run the external CloudHSM key ceremony with an auditor, collect evidence and record final acceptance.
++
++Preconditions
++- Ensure network access to CloudHSM cluster and HSM signer service.
++- Ensure EVIDENCE_BUCKET is configured for artifact uploads.
++- Place sample blob at: ops/hsm/audit_sample.bin
++- Create signoff schedule entry using ops/process/signoff_scheduler.py --init
++
++Steps
++1. Start evidence collection + pre-checks:
++   - Run: python ops/hsm/live_auditor_session_orchestrator.py --sample ops/hsm/audit_sample.bin
++   - Confirm pre‑ceremony live sign check passed (look in /tmp/auditor_full_report.json).
++
++2. Execute vendor CloudHSM key ceremony (manual):
++   - Follow vendor instructions; auditor observes.
++   - Record start/end timestamps and attendee names.
++
++3. Run post‑ceremony checks:
++   - Run: python ops/hsm/hsm_key_ceremony_automation.py --sample ops/hsm/audit_sample.bin
++   - This will collect events, produce an evidence bundle and (if configured) upload to EVIDENCE_BUCKET.
++
++4. Obtain auditor written acceptance (signed PDF or email confirmation).
++   - Save file locally (e.g., /tmp/auditor_acceptance.pdf) or get a URL.
++   - Attach to signoff: python ops/hsm/auditor_finalizer.py --signoff-id <SIGNOFF_ID> --acceptance /tmp/auditor_acceptance.pdf
++
++5. Verify signoff persisted:
++   - Use readiness dashboard or kubectl to inspect ConfigMap aegis-auditor-signoffs in kube-system namespace.
++
++Artifacts produced
++- /tmp/auditor_full_report.json
++- evidence bundle zip (local or s3://)
++- /tmp/final_auditor_signoff_report.json
++
++Contacts
++- Security/Infra owner: security@example.com
++- Auditor coordinator: compliance@example.com
++
+*** End Patch
+*** End Patch

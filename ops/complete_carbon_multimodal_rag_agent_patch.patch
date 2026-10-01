@@ -1,0 +1,795 @@
+*** Begin Patch
+*** Add File:ops/carbon/attrib.py
++#!/usr/bin/env python3
++"""
++Attribute GPU telemetry to Argo Workflows / Kubernetes jobs.
++- Reads GPU telemetry JSONL files (produced by gpu_telemetry_exporter.py)
++- Maps node -> pods -> argo workflow (via labels/ownerReferences)
++- Aggregates per-workflow power/time and writes per-workflow carbon JSONL
++
++Requirements: kubernetes python client (pip install kubernetes)
++"""
++import os
++import json
++import time
++from collections import defaultdict
++from typing import Dict, Any, List
++
++TELEMETRY_DIR = os.environ.get("TELEMETRY_DIR", "/var/lib/aegis/telemetry")
++OUT_DIR = os.environ.get("CARBON_ATTR_OUT", "/var/lib/aegis/carbon_by_workflow")
++EMISSIONS_FACTOR = float(os.environ.get("EMISSIONS_FACTOR_KGCO2_PER_KWH", "0.475"))
++
++try:
++    from kubernetes import client, config
++    config.load_incluster_config()
++    k8s_core = client.CoreV1Api()
++except Exception:
++    k8s_core = None
++
++def read_telemetry_files(limit=50) -> List[Dict[str,Any]]:
++    files = sorted([os.path.join(TELEMETRY_DIR,f) for f in os.listdir(TELEMETRY_DIR) if f.startswith("gpu_telemetry_")])[-limit:]
++    events=[]
++    for f in files:
++        try:
++            with open(f) as fh:
++                for line in fh:
++                    events.append(json.loads(line))
++        except Exception:
++            continue
++    return events
++
++def get_pods_on_node(node_name: str):
++    if k8s_core is None:
++        return []
++    try:
++        pods = k8s_core.list_pod_for_all_namespaces(field_selector=f"spec.nodeName={node_name}").items
++        res=[]
++        for p in pods:
++            res.append({
++                "name": p.metadata.name,
++                "namespace": p.metadata.namespace,
++                "labels": p.metadata.labels or {},
++                "ownerReferences": [o.to_dict() for o in (p.metadata.owner_references or [])]
++            })
++        return res
++    except Exception:
++        return []
++
++def find_workflow_for_pod(pod: Dict[str,Any]) -> str:
++    # Argo workflow pods usually have label "workflows.argoproj.io/workflow"
++    labels = pod.get("labels", {})
++    wf = labels.get("workflows.argoproj.io/workflow") or labels.get("workflow")
++    if wf:
++        return wf
++    # fallback: inspect ownerReferences for Workflow
++    for owner in pod.get("ownerReferences", []):
++        if owner.get("kind","").lower()=="workflow":
++            return owner.get("name")
++    return ""
++
++def aggregate(events: List[Dict[str,Any]]):
++    # events contain node-level snapshots with "gpus":[{"index","power_w"...}]
++    per_workflow = defaultdict(lambda: {"power_w_s": 0.0, "samples": 0, "duration_s": 0.0})
++    for ev in events:
++        node = ev.get("node") or ev.get("hostname") or ""
++        total_power = ev.get("total_power_w", 0.0)
++        ts = ev.get("ts", int(time.time()))
++        duration = ev.get("duration_s", 1.0)
++        pods = get_pods_on_node(node)
++        if not pods:
++            # attribute to node-unknown bucket
++            per_workflow["<unattributed>"]["power_w_s"] += total_power
++            per_workflow["<unattributed>"]["samples"] += 1
++            per_workflow["<unattributed>"]["duration_s"] += duration
++            continue
++        # simple attribution: split equally among GPU-using pods
++        wf_counts = defaultdict(float)
++        for p in pods:
++            wf = find_workflow_for_pod(p)
++            if wf:
++                wf_counts[wf] += 1.0
++        if wf_counts:
++            total = sum(wf_counts.values())
++            for wf, cnt in wf_counts.items():
++                share = (cnt/total) * total_power
++                per_workflow[wf]["power_w_s"] += share
++                per_workflow[wf]["samples"] += 1
++                per_workflow[wf]["duration_s"] += duration * (cnt/total)
++        else:
++            per_workflow["<unattributed>"]["power_w_s"] += total_power
++            per_workflow["<unattributed>"]["samples"] += 1
++            per_workflow["<unattributed>"]["duration_s"] += duration
++    return per_workflow
++
++def compute_carbon(per_workflow):
++    out=[]
++    for wf, v in per_workflow.items():
++        # average power_w = power_w_s / samples
++        samples = max(1, v["samples"])
++        avg_power = v["power_w_s"] / samples
++        duration = v.get("duration_s", 0.0)
++        energy_kwh = (avg_power * (duration/3600.0)) / 1000.0
++        carbon_kg = energy_kwh * EMISSIONS_FACTOR
++        out.append({"workflow": wf, "avg_power_w": avg_power, "duration_s": duration, "carbon_kg": carbon_kg})
++    return out
++
++def write_out(records):
++    os.makedirs(OUT_DIR, exist_ok=True)
++    fname = os.path.join(OUT_DIR, f"carbon_by_workflow_{int(time.time())}.jsonl")
++    with open(fname, "w") as fh:
++        for r in records:
++            fh.write(json.dumps(r) + "\n")
++
++def main():
++    ev = read_telemetry_files(limit=100)
++    agg = aggregate(ev)
++    recs = compute_carbon(agg)
++    write_out(recs)
++    print("wrote", len(recs), "workflow carbon records")
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/provider_carbon.py
++#!/usr/bin/env python3
++"""
++Provider carbon helper:
++ - Provide per-region emissions coefficient (kgCO2e/kWh)
++ - Optionally call cloud provider APIs for more precise estimates (stubs)
++"""
++import os
++REGION_COEFF = {
++    # sample coefficients (kg CO2e/kWh)
++    "us-east-1": 0.4,
++    "us-west-2": 0.35,
++    "eu-west-1": 0.2,
++    "asia-east1": 0.6
++}
++
++def get_coefficient_for_region(region: str) -> float:
++    return float(os.environ.get("EMISSIONS_FACTOR_KGCO2_PER_KWH", REGION_COEFF.get(region, 0.475)))
++
++def aws_customer_carbon_estimate(account_id: str):
++    """
++    Placeholder: Integrate with AWS Customer Carbon Footprint APIs or Cost Explorer to compute real usage.
++    For now return None to indicate unsupported in environment.
++    """
++    return None
++
++def gcp_carbon_insights(project_id: str):
++    """
++    Placeholder: integrate with GCP Carbon Insights if available.
++    """
++    return None
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/meta_scheduler.py
++#!/usr/bin/env python3
++"""
++Carbon-aware scheduler meta-controller:
++ - Periodically reads workflow queue (Argo) and pending workflows
++ - Computes carbon vs SLA tradeoff and patches WorkflowTemplates/Workflows nodeSelector
++ - Enforces per-namespace or per-user carbon budgets (simple quota)
++
++This is intentionally conservative: it annotates workflows for placement rather than force-migrating running pods.
++Requires: kubernetes client + access to Argo CRDs (or uses kubectl commands)
++"""
++import os
++import time
++import math
++from kubernetes import client, config
++from typing import Dict
++try:
++    config.load_incluster_config()
++except Exception:
++    try:
++        config.load_kube_config()
++    except Exception:
++        pass
++api = client.CustomObjectsApi()
++core = client.CoreV1Api()
++
++ARGO_GROUP = "argoproj.io"
++ARGO_VERSION = "v1alpha1"
++ARGO_PLURAL = "workflows"
++NAMESPACE = os.environ.get("ARGO_NS", "argo")
++CARBON_BUDGET_KG = float(os.environ.get("CARBON_BUDGET_KG", "10.0"))
++POLL_S = int(os.environ.get("CARBON_SCHED_POLL_S", "60"))
++
++def list_pending_workflows() -> list:
++    try:
++        res = api.list_namespaced_custom_object(group=ARGO_GROUP, version=ARGO_VERSION, namespace=NAMESPACE, plural=ARGO_PLURAL)
++        return [w for w in res.get("items", []) if w.get("status",{}).get("phase") in ("Pending","Running","Running") ]
++    except Exception:
++        return []
++
++def score_workflow_for_carbon(wf) -> float:
++    # Placeholder scoring: lower priority if annotation "aegis.priority" low and workflow has annotation aegis/placement=carbon-aware
++    ann = wf.get("metadata", {}).get("annotations", {}) or {}
++    priority = ann.get("aegis.priority", "normal")
++    base = {"low":0.5, "normal":1.0, "high":2.0}.get(priority, 1.0)
++    # SLA hint
++    sla = float(ann.get("aegis.sla_seconds", 3600))
++    # compute desired carbon sensitivity: larger sla -> more willingness to pick low-carbon nodes
++    sensitivity = min(2.0, max(0.5, sla/3600.0))
++    return base * sensitivity
++
++def annotate_for_low_carbon(wf_name:str):
++    # patch workflow to add nodeSelector (aegis.carbon_score=low)
++    try:
++        body = {"metadata": {"annotations": {"aegis.placement":"carbon-aware"}, "labels": {"aegis.carbon_placement":"low"}}}
++        api.patch_namespaced_custom_object(group=ARGO_GROUP, version=ARGO_VERSION, namespace=NAMESPACE, plural=ARGO_PLURAL, name=wf_name, body=body)
++        print("patched", wf_name, "for low-carbon placement")
++    except Exception as e:
++        print("patch failed", e)
++
++def get_consumed_carbon_last_window() -> float:
++    # read from carbon_by_workflow directory (produced by attrib.py), aggregate recent values
++    path = os.environ.get("CARBON_ATTR_OUT", "/var/lib/aegis/carbon_by_workflow")
++    import glob, json
++    tot = 0.0
++    for f in glob.glob(os.path.join(path, "carbon_by_workflow_*.jsonl"))[-10:]:
++        try:
++            with open(f) as fh:
++                for line in fh:
++                    rec = json.loads(line)
++                    tot += float(rec.get("carbon_kg", 0.0))
++        except Exception:
++            continue
++    return tot
++
++def main_loop():
++    while True:
++        try:
++            pending = list_pending_workflows()
++            consumed = get_consumed_carbon_last_window()
++            remaining = max(0.0, CARBON_BUDGET_KG - consumed)
++            print(f"[carbon-sched] consumed={consumed:.3f}kg remaining={remaining:.3f}kg pending={len(pending)}")
++            # sort workflows by score (higher -> more urgent)
++            scored = sorted([(score_workflow_for_carbon(w), w) for w in pending], key=lambda x: -x[0])
++            # for low-scoring workflows (less urgent), annotate them to prefer low-carbon nodes
++            for score, wf in scored:
++                name = wf.get("metadata",{}).get("name")
++                ann = wf.get("metadata",{}).get("annotations",{}) or {}
++                if "aegis.placement" in ann:
++                    continue
++                # If remaining budget low and score small, annotate
++                if remaining < (CARBON_BUDGET_KG * 0.2) or score < 1.0:
++                    annotate_for_low_carbon(name)
++            time.sleep(POLL_S)
++        except Exception as e:
++            print("meta scheduler error", e)
++            time.sleep(POLL_S)
++
++if __name__ == "__main__":
++    main_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/multimodal/sync_manifest.py
++#!/usr/bin/env python3
++"""
++Synchronize multimodal manifests:
++ - Read camera frame manifests, lidar manifests and audio manifests
++ - Align by timestamp window and write unified Parquet manifest partitioned by date/model
++"""
++import os
++import glob
++import json
++from datetime import datetime
++from pathlib import Path
++import pyarrow as pa
++import pyarrow.parquet as pq
++
++CAMERA_MANIFEST = os.environ.get("CAMERA_MANIFEST", "/var/lib/aegis/featurestore/camera_manifest.parquet")
++LIDAR_MANIFEST = os.environ.get("LIDAR_MANIFEST", "/var/lib/aegis/featurestore/lidar_manifest.parquet")
++AUDIO_MANIFEST = os.environ.get("AUDIO_MANIFEST", "/var/lib/aegis/featurestore/audio_manifest.parquet")
++OUT_DIR = os.environ.get("MULTIMODAL_OUT", "/var/lib/aegis/featurestore/multimodal")
++TIME_WINDOW_S = int(os.environ.get("SYNC_WINDOW_S", "1"))
++
++def read_parquet(path):
++    if not os.path.exists(path):
++        return []
++    try:
++        tbl = pq.read_table(path)
++        return tbl.to_pylist()
++    except Exception:
++        return []
++
++def key_by_time(entries, key_ts="ts"):
++    d = {}
++    for e in entries:
++        ts = int(e.get(key_ts, 0))
++        d.setdefault(ts, []).append(e)
++    return d
++
++def align_and_write():
++    cam = read_parquet(CAMERA_MANIFEST)
++    lidar = read_parquet(LIDAR_MANIFEST)
++    audio = read_parquet(AUDIO_MANIFEST)
++    cam_map = key_by_time(cam, "ts")
++    lidar_map = key_by_time(lidar, "ts")
++    audio_map = key_by_time(audio, "ts")
++    out_rows=[]
++    # collect unique timestamps
++    ts_set = set(list(cam_map.keys()) + list(lidar_map.keys()) + list(audio_map.keys()))
++    for ts in sorted(ts_set):
++        window = range(ts - TIME_WINDOW_S, ts + TIME_WINDOW_S + 1)
++        cams = [v for t in window for v in cam_map.get(t,[])]
++        lids = [v for t in window for v in lidar_map.get(t,[])]
++        auds = [v for t in window for v in audio_map.get(t,[])]
++        row = {"ts": ts, "camera": cams, "lidar": lids, "audio": auds}
++        out_rows.append(row)
++    if out_rows:
++        Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
++        outp = os.path.join(OUT_DIR, f"multimodal_manifest_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.parquet")
++        pq.write_table(pa.Table.from_pylist(out_rows), outp)
++        print("wrote multimodal manifest", outp)
++
++if __name__ == "__main__":
++    align_and_write()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/multimodal/stream_ingest.py
++#!/usr/bin/env python3
++"""
++Streaming ingestion for video and PCD preprocessing:
++ - Extract frames from video, downsample to configured fps, write image shards and manifest
++ - Simple voxel downsample for PCD (binary .bin files assumed Nx4 floats)
++"""
++import os
++import cv2
++import numpy as np
++from pathlib import Path
++import argparse
++import json
++import pyarrow as pa
++import pyarrow.parquet as pq
++
++OUT_DIR = os.environ.get("FEATURESTORE_ROOT", "/var/lib/aegis/featurestore")
++
++def extract_frames(video_path, out_prefix, fps=1):
++    cap = cv2.VideoCapture(video_path)
++    if not cap.isOpened():
++        raise RuntimeError("can't open video")
++    orig_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
++    step = max(1, int(orig_fps / fps))
++    idx = 0
++    frame_id = 0
++    frames_meta=[]
++    while True:
++        ret, frame = cap.read()
++        if not ret:
++            break
++        if (idx % step) == 0:
++            fname = f"{out_prefix}-frame-{frame_id:06d}.jpg"
++            cv2.imwrite(fname, frame)
++            frames_meta.append({"file": fname, "frame_id": frame_id, "ts": int(cap.get(cv2.CAP_PROP_POS_MSEC))})
++            frame_id += 1
++        idx += 1
++    cap.release()
++    return frames_meta
++
++def voxel_downsample_bin(bin_path, voxel_size=0.2):
++    # assume Nx4 float32: x,y,z,intensity
++    pts = np.fromfile(bin_path, dtype=np.float32).reshape(-1,4)
++    coords = np.floor(pts[:,:3] / voxel_size).astype(np.int64)
++    unique, idx = np.unique(coords, axis=0, return_index=True)
++    down = pts[idx]
++    out_path = bin_path + f".voxel{int(voxel_size*100)}.npy"
++    np.save(out_path, down)
++    return out_path, down.shape[0]
++
++def write_manifest(rows, out_name):
++    Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
++    outp = os.path.join(OUT_DIR, out_name)
++    pq.write_table(pa.Table.from_pylist(rows), outp)
++    return outp
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--video", help="video path", required=False)
++    parser.add_argument("--pcd", help="pcd bin file", required=False)
++    parser.add_argument("--fps", type=int, default=1)
++    args = parser.parse_args()
++    rows=[]
++    if args.video:
++        prefix = os.path.join("/tmp", Path(args.video).stem)
++        meta = extract_frames(args.video, prefix, fps=args.fps)
++        rows.extend([{"type":"video_frame","meta":m} for m in meta])
++    if args.pcd:
++        out, count = voxel_downsample_bin(args.pcd)
++        rows.append({"type":"pcd_voxel","file": out, "count": count})
++    if rows:
++        outp = write_manifest(rows, f"stream_manifest_{int(time.time())}.parquet")
++        print("manifest written", outp)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/vector/milvus_connector.py
++#!/usr/bin/env python3
++"""
++Milvus connector to replace FAISS local index in production.
++Requires pymilvus: pip install pymilvus
++"""
++import os
++import numpy as np
++from pymilvus import connections, FieldSchema, CollectionSchema, DataType, Collection, utility
++
++MILVUS_HOST = os.environ.get("MILVUS_HOST", "127.0.0.1")
++MILVUS_PORT = os.environ.get("MILVUS_PORT", "19530")
++COLLECTION_NAME = os.environ.get("MILVUS_COLLECTION", "aegis_vectors")
++
++def connect():
++    connections.connect(host=MILVUS_HOST, port=MILVUS_PORT)
++
++def ensure_collection(dim: int = 384):
++    if utility.has_collection(COLLECTION_NAME):
++        return Collection(COLLECTION_NAME)
++    fields = [
++        FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
++        FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=dim),
++        FieldSchema(name="meta", dtype=DataType.VARCHAR, max_length=65535)
++    ]
++    schema = CollectionSchema(fields, description="Aegis vector collection")
++    collection = Collection(COLLECTION_NAME, schema)
++    collection.create_index(field_name="embedding", index_params={"index_type":"IVF_FLAT", "metric_type":"IP", "params":{"nlist":1024}})
++    collection.load()
++    return collection
++
++def insert_vectors(vecs: np.ndarray, metas: list):
++    connect()
++    col = ensure_collection(vecs.shape[1])
++    data = [vecs.tolist(), [json.dumps(m) for m in metas]]
++    # pymilvus expects list of fields; since id is auto, pass None for id field
++    col.insert([None, vecs.tolist(), [json.dumps(m) for m in metas]])
++    col.flush()
++    return True
++
++def search(vec: np.ndarray, k=5):
++    connect()
++    col = Collection(COLLECTION_NAME)
++    res = col.search([vec.tolist()], "embedding", param={"metric_type":"IP","params":{"nprobe":10}}, limit=k, output_fields=["meta"])
++    out=[]
++    for hits in res:
++        out.append([{"score": h.score, "meta": h.entity.get("meta")} for h in hits])
++    return out
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/generative/llm_client.py
++#!/usr/bin/env python3
++"""
++LLM client abstraction:
++ - Supports OpenAI, local HTTP LLM endpoints or other providers via simple adapter
++ - Provides sync generate() and stream_generate() interfaces
++ - Emits token-level logs to file for auditing
++"""
++import os
++import time
++import requests
++from typing import Iterable
++
++LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "local_http")
++LLM_URL = os.environ.get("LLM_URL", "http://localhost:8080/generate")
++STREAM_URL = os.environ.get("LLM_STREAM_URL", "http://localhost:8080/stream")
++TOKEN_LOG_DIR = os.environ.get("LLM_TOKEN_LOG_DIR", "/var/lib/aegis/llm_tokens")
++os.makedirs(TOKEN_LOG_DIR, exist_ok=True)
++
++def generate(prompt: str, params: dict = None) -> str:
++    params = params or {}
++    if LLM_PROVIDER == "openai":
++        # placeholder: operator should set OPENAI_API_KEY and use openai client
++        return "openai-output-placeholder"
++    # default: call local HTTP
++    r = requests.post(LLM_URL, json={"prompt": prompt, "params": params}, timeout=60)
++    r.raise_for_status()
++    text = r.text
++    # log tokens (rough split)
++    fname = os.path.join(TOKEN_LOG_DIR, f"tokens_{int(time.time())}.jsonl")
++    with open(fname, "a") as fh:
++        fh.write(json.dumps({"prompt": prompt, "output": text, "ts": int(time.time())}) + "\n")
++    return text
++
++def stream_generate(prompt: str, params: dict = None) -> Iterable[str]:
++    params = params or {}
++    with requests.post(STREAM_URL, json={"prompt": prompt, "params": params}, stream=True) as r:
++        r.raise_for_status()
++        for chunk in r.iter_content(chunk_size=None):
++            if not chunk:
++                continue
++            s = chunk.decode(errors="ignore")
++            # crude token-level emit (operators should integrate with real tokenizer)
++            fname = os.path.join(TOKEN_LOG_DIR, f"tokens_stream_{int(time.time())}.jsonl")
++            with open(fname, "a") as fh:
++                fh.write(json.dumps({"partial": s, "ts": int(time.time())}) + "\n")
++            yield s
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/generative/streaming_token_logger.py
++#!/usr/bin/env python3
++"""
++Streaming adapter that wraps llm_client.stream_generate and applies token-level DLP checks.
++If DLP flags any token chunk, stream redaction and log the event.
++"""
++import os
++from ops.generative.llm_client import stream_generate
++import requests
++DLP_URL = os.environ.get("DLP_URL", "http://localhost:8085/scan")
++
++def dlp_scan(text: str):
++    try:
++        r = requests.post(DLP_URL, json={"text": text}, timeout=3)
++        r.raise_for_status()
++        return r.json().get("findings", [])
++    except Exception:
++        return [{"error":"dlp-unavailable"}]
++
++def stream_with_dlp(prompt: str):
++    for chunk in stream_generate(prompt):
++        findings = dlp_scan(chunk)
++        if findings and len(findings)>0:
++            yield "[REDACTED_DUE_TO_DLP]"
++            break
++        yield chunk
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/generative/retriever_cache.py
++#!/usr/bin/env python3
++"""
++Simple in-memory LRU cache wrapper for retriever results to reduce latency.
++"""
++from functools import lru_cache
++import json
++import hashlib
++import numpy as np
++from typing import List
++from ops.vector.retriever_service import retrieve as retrieve_api  # assumes service function available
++
++@lru_cache(maxsize=1024)
++def retrieve_cached(query: str, k: int = 5):
++    # use retriever service HTTP or direct function; here call local function if available
++    try:
++        res = retrieve_api.__wrapped__(query=query, k=k)  # if FastAPI function, __wrapped__ gives original
++        return res
++    except Exception:
++        # fallback to HTTP
++        import requests, os
++        url = os.environ.get("RETRIEVER_URL", "http://localhost:8000/retrieve")
++        r = requests.post(url, json={"texts":[query], "k": k}, timeout=5)
++        r.raise_for_status()
++        return r.json()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/generative/eval_metrics.py
++#!/usr/bin/env python3
++"""
++RAG evaluation helpers and simple hallucination detector (placeholder).
++ - relevance: average cosine similarity between query embedding and doc embeddings
++ - hallucination: basic entailment check using embedding similarity threshold
++"""
++import numpy as np
++from typing import List, Dict
++
++def relevance_score(query_emb: np.ndarray, doc_embs: np.ndarray) -> float:
++    # cosine similarities mean
++    q = query_emb / (np.linalg.norm(query_emb) + 1e-9)
++    d = doc_embs / (np.linalg.norm(doc_embs, axis=1)[:,None] + 1e-9)
++    sims = d.dot(q)
++    return float(np.mean(sims))
++
++def hallucination_flag(generated_text: str, retrieved_docs: List[Dict], threshold: float = 0.2) -> bool:
++    """
++    Placeholder: flag hallucination if retrieved docs have low lexical overlap or low semantic similarity.
++    Real implementation should use entailment / QA verification models.
++    """
++    # naive check: if no docs or docs empty, flag
++    if not retrieved_docs or all((not d) for d in retrieved_docs):
++        return True
++    return False
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/generative/rlhf/train_rlhf.py
++#!/usr/bin/env python3
++"""
++Skeleton RLHF pipeline:
++ - Collect human preference pairs into a dataset
++ - Train a reward model (placeholder)
++ - Produce a checkpoint to be used by policy trainer
++"""
++import os
++import json
++
++PREF_DIR = os.environ.get("RLHF_PREF_DIR", "/var/lib/aegis/rlhf/prefs")
++OUT_DIR = os.environ.get("RLHF_OUT", "/var/lib/aegis/rlhf/out")
++
++def collect_preferences():
++    prefs=[]
++    if not os.path.exists(PREF_DIR):
++        return prefs
++    for f in os.listdir(PREF_DIR):
++        if f.endswith(".jsonl"):
++            with open(os.path.join(PREF_DIR,f)) as fh:
++                for line in fh:
++                    prefs.append(json.loads(line))
++    return prefs
++
++def train_reward_model(prefs):
++    # Placeholder: implement proper training with transformers
++    if not prefs:
++        print("no prefs")
++        return None
++    os.makedirs(OUT_DIR, exist_ok=True)
++    ckpt = os.path.join(OUT_DIR, "reward_model.mock")
++    with open(ckpt, "w") as fh:
++        fh.write("mock reward model")
++    print("wrote mock reward model", ckpt)
++    return ckpt
++
++if __name__ == "__main__":
++    prefs = collect_preferences()
++    train_reward_model(prefs)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/agentic/sim_harness.py
++#!/usr/bin/env python3
++"""
++Simulation harness interface:
++ - Run CARLA scenarios or other simulators programmatically and collect episodes
++ - Episodes written as JSONL to RL log dir for offline RL
++"""
++import os
++import json
++from datetime import datetime
++
++RL_LOG_DIR = os.environ.get("RL_LOG_DIR", "/var/lib/aegis/rl_logs")
++os.makedirs(RL_LOG_DIR, exist_ok=True)
++
++def log_episode(ep: dict):
++    fname = os.path.join(RL_LOG_DIR, f"episode-{int(datetime.utcnow().timestamp())}.jsonl")
++    with open(fname, "a") as fh:
++        fh.write(json.dumps(ep) + "\n")
++
++def simulate_dummy_episode():
++    # Placeholder: demo episode with state, action, reward
++    ep = {"state": {"x":0}, "action":"noop", "reward":0.0, "done": True, "meta": {"scenario": "dummy"}}
++    log_episode(ep)
++    print("logged dummy episode")
++
++if __name__ == "__main__":
++    simulate_dummy_episode()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/agentic/offline_rl_pipeline.py
++#!/usr/bin/env python3
++"""
++Offline RL training pipeline (skeleton):
++ - Loads episodes from RL_LOG_DIR
++ - Trains a simple frequency-based policy (placeholder) or exports dataset for RLlib/Ray training
++"""
++import os
++import json
++from collections import Counter
++
++RL_LOG_DIR = os.environ.get("RL_LOG_DIR", "/var/lib/aegis/rl_logs")
++OUT_POLICY = os.environ.get("RL_POLICY_OUT", "/var/lib/aegis/rl_policy.json")
++
++def load_episodes():
++    eps=[]
++    if not os.path.exists(RL_LOG_DIR):
++        return eps
++    for f in os.listdir(RL_LOG_DIR):
++        if f.endswith(".jsonl"):
++            with open(os.path.join(RL_LOG_DIR,f)) as fh:
++                for line in fh:
++                    eps.append(json.loads(line))
++    return eps
++
++def train_simple_policy(eps):
++    counts = Counter()
++    for e in eps:
++        a = e.get("action")
++        counts[a]+=1
++    total = sum(counts.values()) or 1
++    policy = {a: counts[a]/total for a in counts}
++    with open(OUT_POLICY, "w") as fh:
++        json.dump(policy, fh)
++    print("wrote simple policy", OUT_POLICY)
++    return OUT_POLICY
++
++if __name__ == "__main__":
++    eps = load_episodes()
++    train_simple_policy(eps)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/agentic/plan_verifier.py
++#!/usr/bin/env python3
++"""
++Plan verifier:
++ - Validate preconditions (resource existence, read-only checks)
++ - Validate postcondition feasibility checks (dry-run kubectl, cost estimate)
++ - Produce a verification score used by multi_signal_verifier
++"""
++import subprocess
++import json
++
++def check_kubectl_dryrun(cmd: str) -> bool:
++    try:
++        # run kubectl with --dry-run=client
++        dry = f"{cmd} --dry-run=client"
++        subprocess.check_call(dry, shell=True)
++        return True
++    except Exception:
++        return False
++
++def estimate_cost_for_action(action: dict) -> float:
++    # Placeholder cost model (user should implement real cloud pricing)
++    tool = action.get("tool","")
++    if tool == "kubectl":
++        return 0.1
++    return 0.0
++
++def verify_plan(plan: list) -> dict:
++    total_cost = 0.0
++    ok = True
++    reasons=[]
++    for step in plan:
++        tool = step.get("tool")
++        params = step.get("params",{})
++        if tool == "kubectl":
++            cmd = params.get("cmd")
++            if cmd and not check_kubectl_dryrun(cmd):
++                ok = False
++                reasons.append(f"kubectl dry-run failed for {cmd}")
++        cost = estimate_cost_for_action(step)
++        total_cost += cost
++    score = 0.9 if ok else 0.2
++    return {"ok": ok, "score": score, "cost": total_cost, "reasons": reasons}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/automation/enforcer.py
++#!/usr/bin/env python3
++"""
++Autonomy policy enforcer:
++ - Reads autonomy policy (docs/governance/autonomy_policy_full.yaml)
++ - Decides whether an action requires approval and enforces SLAs
++ - Integrates with multi_signal_verifier for final decision
++"""
++import yaml
++import os
++from ops.automation.multi_signal_verifier_integration import decide_auto_execute
++
++POLICY_FILE = os.environ.get("AUTONOMY_POLICY_FILE", "docs/governance/autonomy_policy_full.yaml")
++
++def load_policy():
++    with open(POLICY_FILE) as fh:
++        return yaml.safe_load(fh)
++
++def enforce(plan_score: float, risk_level: str, plan_confidence: float, rule_checks: bool, hist_success: float, cost_est: float, approval_id: str = None):
++    policy = load_policy()
++    levels = policy.get("spec", {}).get("riskLevels", {})
++    level = levels.get(risk_level, {})
++    allow_auto = level.get("allowAuto", False)
++    if not allow_auto:
++        return {"allow": False, "reason": "policy_disallow_auto", "required": level}
++    # consult multi-signal verifier
++    res = decide_auto_execute(plan_confidence, rule_checks, hist_success, cost_est, risk_level, approval_id)
++    return res
++
+*** End Patch
+*** End Patch

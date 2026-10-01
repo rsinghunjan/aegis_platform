@@ -1,0 +1,608 @@
+*** Begin Patch
+*** Add File:aiops/drift/data_quality_checks.py
++#!/usr/bin/env python3
++"""
++Data quality & distribution drift checks.
++ - Computes basic schema drift, missingness and population stability index (PSI) between baseline and candidate CSVs.
++ - Emits JSON report and can post to Alertmanager webhook if thresholds exceeded.
++
++Usage:
++  python3 data_quality_checks.py --baseline baseline.csv --candidate candidate.csv --out report.json --alert-url http://alertmanager:9093/api/v1/alerts
++"""
++import argparse, pandas as pd, numpy as np, json, requests, os
++
++def psi(expected, actual, buckets=10):
++    """Population Stability Index for a single numeric series."""
++    try:
++        expected_perc, _ = np.histogram(expected, bins=buckets)
++        actual_perc, _ = np.histogram(actual, bins=buckets)
++        # avoid zeros
++        expected_perc = expected_perc.astype(float)
++        actual_perc = actual_perc.astype(float)
++        expected_perc = np.where(expected_perc == 0, 0.0001, expected_perc)
++        actual_perc = np.where(actual_perc == 0, 0.0001, actual_perc)
++        expected_perc /= expected_perc.sum()
++        actual_perc /= actual_perc.sum()
++        return np.sum((expected_perc - actual_perc) * np.log(expected_perc / actual_perc))
++    except Exception:
++        return None
++
++def schema_drift(baseline, candidate):
++    bcols = set(baseline.columns)
++    ccols = set(candidate.columns)
++    added = list(ccols - bcols)
++    removed = list(bcols - ccols)
++    common = list(bcols & ccols)
++    return {"added": added, "removed": removed, "common": common}
++
++def missingness(df):
++    return df.isnull().mean().to_dict()
++
++def numeric_psi_report(baseline, candidate, common_numeric):
++    out = {}
++    for col in common_numeric:
++        try:
++            out[col] = psi(baseline[col].dropna().values, candidate[col].dropna().values, buckets=10)
++        except Exception:
++            out[col] = None
++    return out
++
++def run_checks(baseline_csv, candidate_csv, outpath=None, alert_url=None, psi_threshold=0.2):
++    base = pd.read_csv(baseline_csv)
++    cand = pd.read_csv(candidate_csv)
++    schema = schema_drift(base, cand)
++    miss_base = missingness(base)
++    miss_cand = missingness(cand)
++    numeric_cols = [c for c in schema["common"] if pd.api.types.is_numeric_dtype(base[c])]
++    psi_report = numeric_psi_report(base, cand, numeric_cols)
++
++    findings = {"schema": schema, "missingness": {"baseline": miss_base, "candidate": miss_cand}, "psi": psi_report}
++    if outpath:
++        with open(outpath, "w") as f:
++            json.dump(findings, f, indent=2)
++    # simple alerting if any psi > threshold
++    alerts = []
++    for col, val in psi_report.items():
++        if val is not None and val > psi_threshold:
++            alerts.append({"labels": {"alertname": "DataDrift", "column": col}, "annotations": {"psi": val}})
++    if alert_url and alerts:
++        try:
++            # Alertmanager expects array of alerts
++            requests.post(alert_url, json=alerts, timeout=10)
++        except Exception:
++            pass
++    return findings
++
++if __name__ == "__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--baseline", required=True)
++    p.add_argument("--candidate", required=True)
++    p.add_argument("--out", default="/tmp/data_quality_report.json")
++    p.add_argument("--alert-url", default=os.environ.get("ALERTMANAGER_URL"))
++    p.add_argument("--psi-threshold", type=float, default=0.2)
++    args = p.parse_args()
++    r = run_checks(args.baseline, args.candidate, args.out, args.alert_url, args.psi_threshold)
++    print("Report written to", args.out)
++    print(r)
++
+*** End Patch
+*** Begin Patch
+*** Add File:aiops/k8s/data_drift_cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: aegis-data-drift
++  namespace: aegis
++spec:
++  schedule: "0 */6 * * *"  # every 6 hours
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          serviceAccountName: aegis-agent
++          containers:
++            - name: data-drift
++              image: python:3.10-slim
++              command: ["bash", "-lc"]
++              args:
++                - pip install pandas numpy requests && \
++                  python3 /opt/aiops/data_quality_checks.py --baseline /data/baseline/latest.csv --candidate /data/candidates/latest.csv --out /tmp/aiops_data_drift.json --alert-url ${ALERTMANAGER_URL} && \
++                  cp /tmp/aiops_data_drift.json /workspace/aiops_reports/aiops_data_drift_$(date +%s).json
++              env:
++                - name: ALERTMANAGER_URL
++                  value: "http://alertmanager.aegis:9093/api/v1/alerts"
++              volumeMounts:
++                - name: data
++                  mountPath: /data
++                - name: reports
++                  mountPath: /workspace/aiops_reports
++          restartPolicy: OnFailure
++          volumes:
++            - name: data
++              persistentVolumeClaim:
++                claimName: feast-batch-pvc
++            - name: reports
++              persistentVolumeClaim:
++                claimName: aiops-reports-pvc
++
+*** End Patch
+*** Begin Patch
+*** Add File:aiops/model_monitor/model_metrics_collector.py
++#!/usr/bin/env python3
++"""
++Per-inference model metrics collector:
++ - Instruments a small HTTP endpoint to receive inference telemetry from model servers.
++ - Persists to Prometheus (push gateway or exposition) and optionally logs summary to MLflow.
++
++Usage: run as a service and have model inference code POST telemetry to /telemetry
++"""
++from flask import Flask, request, jsonify
++import time, os, json
++from prometheus_client import Counter, Histogram, start_http_server
++import mlflow
++
++app = Flask(__name__)
++
++INFER_COUNT = Counter("aegis_inference_count", "Number of inferences", ['model_id','model_version'])
++INFER_LATENCY = Histogram("aegis_inference_latency_seconds", "Inference latency seconds", ['model_id','model_version'])
++
++MLFLOW_URL = os.environ.get("MLFLOW_URL")
++PUSHGATEWAY = os.environ.get("PUSHGATEWAY")
++
++def start_prometheus():
++    start_http_server(int(os.environ.get("PROM_PORT", "8002")))
++
++@app.route("/telemetry", methods=["POST"])
++def telemetry():
++    payload = request.json or {}
++    mid = payload.get("model_id","unknown")
++    ver = payload.get("model_version","v0")
++    latency = float(payload.get("latency",0.0))
++    label = {"model_id": mid, "model_version": ver}
++    INFER_COUNT.labels(mid, ver).inc()
++    INFER_LATENCY.labels(mid, ver).observe(latency)
++    # optional MLflow logging: aggregated periodically by external job
++    return jsonify({"status":"ok"})
++
++@app.route("/bulk", methods=["POST"])
++def bulk():
++    data = request.json or []
++    # Accept list of telemetry events for efficiency
++    for ev in data:
++        INFER_COUNT.labels(ev.get("model_id","unknown"), ev.get("model_version","v0")).inc()
++        INFER_LATENCY.labels(ev.get("model_id","unknown"), ev.get("model_version","v0")).observe(float(ev.get("latency",0.0)))
++    return jsonify({"status":"ok"})
++
++if __name__ == "__main__":
++    import threading
++    threading.Thread(target=start_prometheus, daemon=True).start()
++    app.run(host="0.0.0.0", port=int(os.environ.get("METRIC_API_PORT", "8085")))
++
+*** End Patch
+*** Begin Patch
+*** Add File:aiops/anomaly/time_series_detector.py
++#!/usr/bin/env python3
++"""
++Simple time-series anomaly detector using rolling z-score on metric series.
++ - Reads Prometheus-range output JSON (or CSV) of a metric, computes moving average & std, flags anomalies.
++ - Posts alerts to Alertmanager webhook when anomaly windows detected.
++
++Usage:
++  python3 time_series_detector.py --metric cpu_usage --prom-query 'avg(node_cpu_seconds_total)' --alert-url http://alertmanager:9093/api/v1/alerts
++"""
++import argparse, requests, time, numpy as np
++
++def fetch_prometheus_range(prom_url, query, start, end, step="15s"):
++    params = {"query": query, "start": start, "end": end, "step": step}
++    resp = requests.get(prom_url + "/api/v1/query_range", params=params, timeout=20)
++    resp.raise_for_status()
++    return resp.json()
++
++def analyze(values, window=20, z_thresh=4.0):
++    arr = np.array(values, dtype=float)
++    anomalies = []
++    for i in range(window, len(arr)):
++        w = arr[i-window:i]
++        mu = w.mean()
++        sd = w.std() if w.std() > 0 else 1e-6
++        z = (arr[i] - mu) / sd
++        if abs(z) > z_thresh:
++            anomalies.append({"index": i, "value": float(arr[i]), "z": float(z)})
++    return anomalies
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--prom-url", required=True)
++    p.add_argument("--query", required=True)
++    p.add_argument("--alert-url", required=False)
++    p.add_argument("--lookback", type=int, default=3600)
++    args = p.parse_args()
++    end = int(time.time())
++    start = end - args.lookback
++    data = fetch_prometheus_range(args.prom_url, args.query, start, end)
++    # This assumes a single timeseries result and extracts values
++    try:
++        series = data["data"]["result"][0]["values"]
++        values = [float(v[1]) for v in series]
++    except Exception:
++        values = []
++    anomalies = analyze(values, window=20, z_thresh=4.0)
++    if anomalies and args.alert_url:
++        alerts = []
++        for a in anomalies:
++            alerts.append({"labels": {"alertname": "TimeSeriesAnomaly"}, "annotations": {"index": a["index"], "value": a["value"], "z": a["z"]}})
++        try:
++            requests.post(args.alert_url, json=alerts, timeout=5)
++        except Exception:
++            pass
++    print("anomalies:", anomalies)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:aiops/incident/incident_bundler.py
++#!/usr/bin/env python3
++"""
++Automated RCA / incident bundler:
++ - Collects Kubernetes logs for a deployment, MLflow run artifacts, Rekor entries (if available), HSM S3 audit logs and packages into a tar.gz.
++ - Uploads bundle to a configured S3 bucket for engineers/auditors.
++
++Usage:
++  python3 incident_bundler.py --deployment aegis-quantum-broker --mlflow-run <run_id> --out /tmp/incident123.tar.gz --s3-bucket my-evidence-bucket
++"""
++import argparse, os, subprocess, tempfile, shutil, boto3, json
++
++def collect_k8s_logs(deployment, outdir):
++    try:
++        logs_file = os.path.join(outdir, "k8s_logs.txt")
++        subprocess.check_call(["kubectl","logs","-l","app="+deployment,"--all-containers=true","-n","aegis"], stdout=open(logs_file,"w"))
++    except Exception:
++        pass
++
++def collect_mlflow(run_id, outdir, mlflow_url=None):
++    if not mlflow_url or not run_id:
++        return
++    try:
++        import mlflow
++        mlflow.set_tracking_uri(mlflow_url)
++        client = mlflow.tracking.MlflowClient()
++        client.download_artifacts(run_id, "", os.path.join(outdir,"mlflow",run_id))
++    except Exception:
++        pass
++
++def collect_rekor_for_artifact(artifact_hash, outdir):
++    try:
++        out = subprocess.check_output(["rekor-cli","search","--hash","sha256:"+artifact_hash,"--output","json"])
++        with open(os.path.join(outdir,"rekor_"+artifact_hash+".json"), "wb") as f:
++            f.write(out)
++    except Exception:
++        pass
++
++def collect_hsm_audit(bucket, outdir, prefix="hsm-audit/"):
++    if not bucket:
++        return
++    s3 = boto3.client("s3")
++    resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=100)
++    for o in resp.get("Contents", []):
++        key = o["Key"]
++        local = os.path.join(outdir, os.path.basename(key))
++        try:
++            s3.download_file(bucket, key, local)
++        except Exception:
++            pass
++
++def package(outdir, outtar):
++    shutil.make_archive(outtar.replace(".tar.gz",""), 'gztar', root_dir=outdir)
++
++def upload_to_s3(localpath, bucket, key):
++    s3 = boto3.client("s3")
++    s3.upload_file(localpath, bucket, key)
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--deployment", required=False)
++    p.add_argument("--mlflow-run", required=False)
++    p.add_argument("--artifact-hash", required=False)
++    p.add_argument("--hsm-audit-bucket", required=False)
++    p.add_argument("--out", default="/tmp/incident_bundle.tar.gz")
++    p.add_argument("--s3-bucket", required=False)
++    p.add_argument("--mlflow-url", default=os.environ.get("MLFLOW_URL"))
++    args = p.parse_args()
++    tmp = tempfile.mkdtemp(prefix="incident_")
++    if args.deployment:
++        collect_k8s_logs(args.deployment, tmp)
++    if args.mlflow_run:
++        collect_mlflow(args.mlflow_run, tmp, args.mlflow_url)
++    if args.artifact_hash:
++        collect_rekor_for_artifact(args.artifact_hash, tmp)
++    if args.hsm_audit_bucket:
++        collect_hsm_audit(args.hsm_audit_bucket, tmp)
++    package(tmp, args.out)
++    if args.s3_bucket:
++        upload_to_s3(args.out, args.s3_bucket, os.path.basename(args.out))
++    print("Incident bundle prepared at", args.out)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:aiops/remediation/argo_remediation_workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: aegis-remediation-
++spec:
++  entrypoint: remediation-flow
++  templates:
++  - name: remediation-flow
++    steps:
++      - - name: gather-evidence
++          template: run-script
++          arguments:
++            parameters:
++              - name: script
++                value: "python3 aiops/incident/incident_bundler.py --deployment aegis-quantum-broker --mlflow-run {{workflow.parameters.mlflow_run}} --artifact-hash {{workflow.parameters.artifact_hash}} --hsm-audit-bucket {{workflow.parameters.hsm_audit_bucket}} --out /tmp/incident_{{workflow.parameters.incident_id}}.tar.gz --s3-bucket {{workflow.parameters.evidence_bucket}}"
++      - - name: approval
++          template: approval
++      - - name: rollback-model
++          template: run-script
++          arguments:
++            parameters:
++              - name: script
++                value: "python3 aiops/remediation/rollback_and_retrain.py --model {{workflow.parameters.model_name}} --namespace aegis --action rollback"
++      - - name: trigger-retrain
++          template: run-script
++          arguments:
++            parameters:
++              - name: script
++                value: "python3 aiops/retrain/retrain_trigger.py --model {{workflow.parameters.model_name}} --dataset {{workflow.parameters.dataset}}"
++
++  - name: run-script
++    inputs:
++      parameters:
++        - name: script
++    container:
++      image: python:3.10-slim
++      command: [sh, -c]
++      args: ["{{inputs.parameters.script}}"]
++
++  - name: approval
++    suspend: {}
++
++  arguments:
++    parameters:
++      - name: mlflow_run
++        value: ""
++      - name: artifact_hash
++        value: ""
++      - name: hsm_audit_bucket
++        value: ""
++      - name: evidence_bucket
++        value: ""
++      - name: incident_id
++        value: "manual"
++      - name: model_name
++        value: ""
++      - name: dataset
++        value: ""
++
+*** End Patch
+*** Begin Patch
+*** Add File:aiops/remediation/rollback_and_retrain.py
++#!/usr/bin/env python3
++"""
++Helper script to rollback a model deployment and optionally trigger retraining.
++ - Performs Helm / kubectl rollbacks for the model deployment.
++ - Optionally triggers a retrain via retrain_trigger.py
++"""
++import argparse, subprocess, sys
++
++def rollback_model(deployment, namespace="aegis"):
++    # naive: scale down and redeploy previous image (operator ensures previous image tag known in S3/DB)
++    try:
++        subprocess.check_call(["kubectl","-n",namespace,"rollout","undo","deployment/"+deployment])
++        return True
++    except Exception as e:
++        print("rollback failed:", e)
++        return False
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--model", required=True, dest="model")
++    p.add_argument("--namespace", default="aegis")
++    p.add_argument("--action", choices=["rollback","retrain","both"], default="rollback")
++    args = p.parse_args()
++    if args.action in ("rollback","both"):
++        ok = rollback_model(args.model, namespace=args.namespace)
++        if not ok:
++            sys.exit(2)
++    if args.action in ("retrain","both"):
++        subprocess.check_call(["python3","aiops/retrain/retrain_trigger.py","--model",args.model])
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:aiops/remediation/celery_tasks.py
++from celery import Celery
++import subprocess, os
++
++CELERY_BROKER = os.environ.get("CELERY_BROKER_URL", "redis://redis:6379/0")
++app = Celery("aiops", broker=CELERY_BROKER, backend=os.environ.get("CELERY_RESULT_BACKEND"))
++
++@app.task(bind=True, max_retries=2, default_retry_delay=10)
++def perform_rollback(self, deployment, namespace="aegis"):
++    try:
++        subprocess.check_call(["kubectl","-n",namespace,"rollout","undo","deployment/"+deployment])
++        return {"status":"rolled_back"}
++    except Exception as e:
++        raise self.retry(exc=e)
++
++@app.task(bind=True)
++def trigger_retrain(self, model, dataset=None):
++    try:
++        cmd = ["python3","aiops/retrain/retrain_trigger.py","--model",model]
++        if dataset:
++            cmd += ["--dataset",dataset]
++        subprocess.check_call(cmd)
++        return {"status":"retrain_started"}
++    except Exception as e:
++        raise self.retry(exc=e)
++
+*** End Patch
+*** Begin Patch
+*** Add File:aiops/retrain/retrain_trigger.py
++#!/usr/bin/env python3
++"""
++Trigger retrain pipeline:
++ - Option 1: submit Kubernetes Job to run training script
++ - Option 2: call an external CI/CD training pipeline endpoint (e.g., Argo, Airflow)
++
++Usage:
++  python3 retrain_trigger.py --model mymodel --dataset mydataset
++"""
++import argparse, subprocess, os, json
++
++def submit_k8s_job(model, dataset):
++    job_manifest = {
++        "apiVersion": "batch/v1",
++        "kind": "Job",
++        "metadata": {"name": f"retrain-{model}-{int(os.getpid())}"},
++        "spec": {
++            "template": {
++                "spec": {
++                    "containers": [{
++                        "name": "retrain",
++                        "image": os.environ.get("TRAINING_IMAGE","aegis/trainer:latest"),
++                        "env": [{"name":"MODEL","value":model},{"name":"DATASET","value":dataset or ""}],
++                        "command": ["python3","train.py","--model",model,"--dataset",dataset or ""]
++                    }],
++                    "restartPolicy":"Never"
++                }
++            },
++            "backoffLimit": 2
++        }
++    }
++    import tempfile, yaml
++    tf = tempfile.NamedTemporaryFile(delete=False, suffix=".yaml")
++    tf.write(yaml.safe_dump(job_manifest).encode())
++    tf.flush()
++    subprocess.check_call(["kubectl","apply","-f",tf.name])
++    print("Submitted k8s retrain job")
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--model", required=True)
++    p.add_argument("--dataset", required=False)
++    args = p.parse_args()
++    submit_k8s_job(args.model, args.dataset)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:aiops/prometheus/recording_and_alerts.yaml
++# Recording rules & alert rules for AIOps (snippet)
++groups:
++- name: aegis-aiops.rules
++  rules:
++  - record: job:inference_latency:avg
++    expr: avg_over_time(aegis_inference_latency_seconds_sum[5m]) / avg_over_time(aegis_inference_latency_seconds_count[5m])
++  - alert: ModelLatencyHigh
++    expr: job:inference_latency:avg > 1.0
++    for: 2m
++    labels:
++      severity: page
++    annotations:
++      summary: "High model latency detected (>1s)"
++  - alert: ModelErrorRateHigh
++    expr: rate(aegis_model_errors_total[5m]) > 0.01
++    for: 2m
++    labels:
++      severity: page
++    annotations:
++      summary: "Model error rate above threshold"
++  - alert: DataDriftDetected
++    expr: increase(aiops_data_drift_events_total[1h]) > 0
++    for: 0m
++    labels:
++      severity: warning
++    annotations:
++      summary: "Data drift events detected in last hour"
++
+*** End Patch
+*** Begin Patch
+*** Add File:aiops/security/approval_rbac.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: aiops-approver
++  namespace: aegis
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: aiops-approver-role
++  namespace: aegis
++rules:
++  - apiGroups: [""]
++    resources: ["pods","deployments"]
++    verbs: ["get","list"]
++  - apiGroups: ["argoproj.io"]
++    resources: ["workflows","workflowtemplates"]
++    verbs: ["get","list","watch","update","patch"]
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: aiops-approver-binding
++  namespace: aegis
++subjects:
++  - kind: ServiceAccount
++    name: aiops-approver
++    namespace: aegis
++roleRef:
++  kind: Role
++  name: aiops-approver-role
++  apiGroup: rbac.authorization.k8s.io
++
+*** End Patch
+*** Begin Patch
+*** Add File:aiops/docs/README_AIOPS.md
++# Aegis AIOps — Overview and Runbook
++
++This patch adds detection, diagnosis, remediation and retrain automation primitives to Aegis.
++
++Components added
++- Data / distribution drift checks: aiops/drift/data_quality_checks.py + CronJob (aiops/k8s/data_drift_cronjob.yaml)
++- Model performance telemetry collector: aiops/model_monitor/model_metrics_collector.py
++- Time-series anomaly detector: aiops/anomaly/time_series_detector.py
++- Incident bundler (RCA): aiops/incident/incident_bundler.py
++- Remediation workflow (Argo + scripts) + Celery tasks: aiops/remediation/*
++- Retrain trigger (K8s Job submitter): aiops/retrain/retrain_trigger.py
++- Prometheus recording rules & alerts snippet: aiops/prometheus/recording_and_alerts.yaml
++- RBAC for approvers: aiops/security/approval_rbac.yaml
++
++Quick start (staging)
++1. Deploy model metrics collector:
++   - kubectl -n aegis run aiops-metric-api --image=python:3.10-slim --port=8085 -- python3 aiops/model_monitor/model_metrics_collector.py
++2. Make your model servers POST telemetry to /telemetry (latency, model_id, model_version).
++3. Deploy data drift cronjob (aiops/k8s/data_drift_cronjob.yaml). Ensure baseline and candidate CSVs are available on PV.
++4. Deploy Argo remediation workflow (aiops/remediation/argo_remediation_workflow.yaml) and configure approver SA (aiops/security/approval_rbac.yaml).
++5. Wire Alertmanager to send webhook alerts to Argo or to invoke remediation workflows via CI.
++
++Notes & next steps
++- These components are intentionally simple and implementable without heavy infra. For production, replace:
++  - Single-node Redis/CRDs with durable stores
++  - Simple z-score detector with ML models (Numenta, Prophet, or custom)
++  - Plain MLflow artifact downloads with authenticated artifact fetches
++- Security: ensure RBAC, OIDC and SIEM integration are configured before enabling automated remediation.
++
+*** End Patch

@@ -1,0 +1,439 @@
+*** Begin Patch
+*** Add File:ops/carbon/submit_job_carbon_aware.py
++#!/usr/bin/env python3
++"""
++Carbon-aware job submitter.
++ - Decides whether to apply a Kubernetes job manifest immediately or defer / modify it based on grid intensity.
++ - Supports automatic optimistic optimizations (e.g., add MIXED_PRECISION env) prior to scheduling when allowed.
++ - Retries/defer loop with fallback policy.
++
++Usage:
++  python ops/carbon/submit_job_carbon_aware.py --manifest job.yaml --max-intensity 250 --defer-minutes 60 --auto-opt --force-fallback
++"""
++import os
++import time
++import subprocess
++import argparse
++import yaml
++from datetime import datetime, timedelta
++from ops.carbon.job_emissions_calculator import load_cfg, get_grid_intensity
++from ops.carbon.auto_optimizer import apply_suggestions_to_manifest
++
++def kubectl_apply(path):
++    subprocess.check_call(["kubectl", "apply", "-f", path])
++
++def kubectl_apply_manifest_obj(obj):
++    # write temp file and apply
++    import tempfile, json
++    fd, p = tempfile.mkstemp(suffix=".yaml")
++    os.close(fd)
++    with open(p, "w") as fh:
++        yaml.safe_dump(obj, fh)
++    kubectl_apply(p)
++    os.remove(p)
++
++def load_manifest(path):
++    with open(path) as fh:
++        return list(yaml.safe_load_all(fh))
++
++def save_manifest_objs(objs, path):
++    with open(path, "w") as fh:
++        yaml.safe_dump_all(objs, fh)
++
++def schedule_with_policy(manifest_path, max_intensity=300.0, defer_minutes=60, auto_opt=False, force_fallback=False, zone=None):
++    cfg = load_cfg()
++    if zone:
++        cfg["electricitymap_zone"] = zone
++    intensity, src = get_grid_intensity(cfg)
++    print("grid intensity:", intensity, "source:", src)
++    if intensity <= max_intensity:
++        print("Intensity below threshold; scheduling immediately.")
++        if auto_opt:
++            apply_suggestions_to_manifest(manifest_path)
++        kubectl_apply(manifest_path)
++        return {"action":"scheduled","intensity":intensity,"source":src}
++
++    # intensity too high: attempt to optimize then find green nodepool substitution
++    print("Intensity high; attempting optimizations and green placement.")
++    if auto_opt:
++        print("Applying automatic optimizations to manifest")
++        apply_suggestions_to_manifest(manifest_path, aggressive=False)
++
++    # try to patch manifest to prefer green nodeSelector label if present
++    objs = load_manifest(manifest_path)
++    patched = False
++    for o in objs:
++        kind = o.get("kind","")
++        if kind in ("Job","Deployment","CronJob"):
++            spec = o.setdefault("spec", {})
++            template = spec.setdefault("template", {})
++            meta = template.setdefault("metadata", {})
++            pod_spec = template.setdefault("spec", {})
++            # add nodeSelector green=true
++            node_selector = pod_spec.setdefault("nodeSelector", {})
++            node_selector.setdefault("green","true")
++            patched = True
++    if patched:
++        save_manifest_objs(objs, manifest_path + ".patched")
++        try:
++            kubectl_apply(manifest_path + ".patched")
++            return {"action":"scheduled_on_green","intensity":intensity,"source":src}
++        except Exception as e:
++            print("Failed to schedule on green nodes:", e)
++
++    # Defer loop
++    start = datetime.utcnow()
++    deadline = start + timedelta(minutes=defer_minutes)
++    while datetime.utcnow() < deadline:
++        print("Deferring scheduling. Will retry in 5 minutes until", deadline.isoformat())
++        time.sleep(300)
++        cfg = load_cfg()
++        if zone:
++            cfg["electricitymap_zone"] = zone
++        intensity, src = get_grid_intensity(cfg)
++        if intensity <= max_intensity:
++            print("Window cleared; scheduling now.")
++            if auto_opt:
++                apply_suggestions_to_manifest(manifest_path)
++            kubectl_apply(manifest_path)
++            return {"action":"scheduled_after_defer","intensity":intensity,"source":src, "deferred_until": datetime.utcnow().isoformat()+"Z"}
++
++    # Deadline reached; fallback policy
++    if force_fallback:
++        print("Deadline reached; force scheduling due to fallback policy.")
++        kubectl_apply(manifest_path)
++        return {"action":"forcibly_scheduled","intensity":intensity,"source":src}
++    else:
++        print("Deadline reached; not scheduling. Leaving job deferred.")
++        return {"action":"deferred","intensity":intensity,"source":src}
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--manifest", required=True)
++    p.add_argument("--max-intensity", type=float, default=300.0)
++    p.add_argument("--defer-minutes", type=int, default=60)
++    p.add_argument("--auto-opt", action="store_true")
++    p.add_argument("--force-fallback", action="store_true")
++    p.add_argument("--zone", default=None)
++    args = p.parse_args()
++    res = schedule_with_policy(args.manifest, args.max_intensity, args.defer_minutes, args.auto_opt, args.force_fallback, zone=args.zone)
++    print(res)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/push_metrics_for_job.py
++#!/usr/bin/env python3
++"""
++Push per-job carbon metrics to Prometheus Pushgateway for immediate scraping.
++ - Reads a carbon report JSON (job_emissions) and pushes metrics aegis_job_kwh_total and aegis_job_kgco2e_total.
++Usage:
++  python ops/carbon/push_metrics_for_job.py --report /tmp/carbon_report.json --pushgateway http://pushgw:9091
++"""
++import argparse
++import json
++import requests
++
++def push(pushgateway, job_id, kwh, kgco2, intensity):
++    payload = f"aegis_job_kwh_total{{job_id=\"{job_id}\"}} {kwh}\n"
++    payload += f"aegis_job_kgco2e_total{{job_id=\"{job_id}\"}} {kgco2}\n"
++    payload += f"aegis_grid_intensity_gco2_per_kwh{{job_id=\"{job_id}\"}} {intensity}\n"
++    url = pushgateway.rstrip("/") + f"/metrics/job/{job_id}"
++    r = requests.post(url, data=payload, timeout=10)
++    r.raise_for_status()
++    return True
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--report", required=True)
++    p.add_argument("--pushgateway", required=True)
++    args = p.parse_args()
++    j = json.load(open(args.report))
++    job_id = j.get("job_id","unknown")
++    kwh = j.get("kwh",{}).get("total_kwh",0.0)
++    kg = j.get("kgCO2e",0.0)
++    intensity = j.get("intensity_gCO2_per_kWh", j.get("intensity_gCO2_per_kWh",0.0))
++    push(args.pushgateway, job_id, kwh, kg, intensity)
++    print("Pushed metrics for", job_id)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/auto_optimizer.py
++#!/usr/bin/env python3
++"""
++Apply automated optimization suggestions to a Kubernetes job manifest.
++ - Light-weight: adds MIXED_PRECISION env var, reduces replica/parallelism or resource requests by a ratio.
++ - Intended as a best-effort pre-scheduling optimization to reduce carbon.
++"""
++import yaml
++import copy
++
++def apply_suggestions_to_manifest(manifest_path, aggressive=True):
++    objs = list(yaml.safe_load_all(open(manifest_path)))
++    modified = False
++    for o in objs:
++        kind = o.get("kind","")
++        if kind in ("Job","Deployment","CronJob"):
++            spec = o.setdefault("spec", {})
++            template = spec.setdefault("template", {})
++            pod_spec = template.setdefault("spec", {})
++            # apply env var MIXED_PRECISION=1 to containers
++            for c in pod_spec.get("containers", []):
++                env = c.setdefault("env", [])
++                # avoid duplicate
++                if not any(e.get("name")=="MIXED_PRECISION" for e in env):
++                    env.append({"name":"MIXED_PRECISION","value":"1"})
++                    modified = True
++                # reduce resource requests if present
++                res = c.get("resources", {})
++                if res.get("requests"):
++                    for k,v in list(res["requests"].items()):
++                        if k in ("cpu","memory"):
++                            # reduce by 20% or 40% if aggressive
++                            # Note: expects numeric strings like "100m" or "1"
++                            try:
++                                if k=="cpu":
++                                    if isinstance(v, str) and v.endswith("m"):
++                                        num = int(v[:-1])
++                                        num = int(num * (0.8 if aggressive else 0.9))
++                                        res["requests"][k] = f"{num}m"
++                                    else:
++                                        num = float(v)
++                                        num = num * (0.8 if aggressive else 0.9)
++                                        res["requests"][k] = str(num)
++                                if k=="memory":
++                                    # leave memory unchanged for safety
++                                    pass
++                                modified = True
++                            except Exception:
++                                pass
++    if modified:
++        with open(manifest_path + ".opt", "w") as fh:
++            yaml.safe_dump_all(objs, fh)
++        print("Wrote optimized manifest to", manifest_path + ".opt")
++        return manifest_path + ".opt"
++    return manifest_path
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--manifest", required=True)
++    p.add_argument("--aggressive", action="store_true")
++    args = p.parse_args()
++    print(apply_suggestions_to_manifest(args.manifest, aggressive=args.aggressive))
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/carbon_prometheus_rules.yaml
++apiVersion: monitoring.coreos.com/v1
++kind: PrometheusRule
++metadata:
++  name: aegis-carbon-rules
++  namespace: aegis-retriever
++spec:
++  groups:
++    - name: aegis-carbon-alerts
++      rules:
++        - alert: HighJobEmissions
++          expr: aegis_job_kgco2e_total > 5
++          for: 5m
++          labels:
++            severity: warning
++          annotations:
++            summary: "Job emitted >5kg CO2e"
++            description: "A job produced more than 5kg CO2e in the last sample"
++
++        - alert: TeamBudgetExceeded
++          expr: sum by(team) (aegis_team_monthly_kgco2e_total) > 1
++          for: 1m
++          labels:
++            severity: critical
++          annotations:
++            summary: "Team carbon budget exceeded"
++            description: "Team monthly carbon budget exceeded threshold"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/release_reporter.py
++#!/usr/bin/env python3
++"""
++Produce per-release carbon footprint reports by aggregating archived carbon reports and attaching to evidence bundle.
++ - Looks for carbon report files in CARBON_ARCHIVE (e.g., /tmp/carbon_reports_archive)
++ - Aggregates by release id (job_meta.release_id) and writes /tmp/release_carbon_{release}.json
++ - Optionally uploads to S3 when EVIDENCE_BUCKET is set
++"""
++import os
++import json
++from datetime import datetime
++import boto3
++
++ARCHIVE = os.environ.get("CARBON_ARCHIVE", "/tmp/carbon_reports_archive")
++OUT_DIR = os.environ.get("CARBON_RELEASE_REPORTS", "/tmp/release_reports")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++
++def run_for_release(release_id):
++    os.makedirs(OUT_DIR, exist_ok=True)
++    agg = {"release": release_id, "ts": datetime.utcnow().isoformat()+"Z", "total_kg": 0.0, "total_kwh": 0.0, "jobs": []}
++    for fn in os.listdir(ARCHIVE):
++        if not fn.endswith(".json"):
++            continue
++        r = json.load(open(os.path.join(ARCHIVE, fn)))
++        meta = r.get("job_meta", {})
++        if meta.get("release_id") == release_id:
++            agg["jobs"].append(r)
++            agg["total_kg"] += r.get("kgCO2e", 0.0)
++            agg["total_kwh"] += r.get("kwh",{}).get("total_kwh",0.0)
++    out = os.path.join(OUT_DIR, f"release_carbon_{release_id}.json")
++    with open(out, "w") as fh:
++        json.dump(agg, fh, indent=2)
++    if EVIDENCE_BUCKET:
++        s3 = boto3.client("s3")
++        key = f"carbon/release_carbon_{release_id}.json"
++        s3.upload_file(out, EVIDENCE_BUCKET, key)
++        agg["uploaded"] = f"s3://{EVIDENCE_BUCKET}/{key}"
++    print("Wrote release report", out)
++    return out
++
++if __name__ == "__main__":
++    import sys
++    if len(sys.argv) < 2:
++        print("usage: release_reporter.py <release_id>")
++    else:
++        run_for_release(sys.argv[1])
++
+*** End Patch
+*** Begin Patch
+*** Update File:ops/carbon/job_emissions_calculator_v2.py
+@@
+     report = {
+         "job_id": job_id,
+         "ts": datetime.utcnow().isoformat()+"Z",
+         "kwh": kwh,
+         "kgCO2e": kgco2,
+         "intensity_gCO2_per_kWh": intensity,
+         "intensity_source": src_i,
+-        "kwh_source": src,
++        "kwh_source": src,
++        # uncertainty/validation fields
++        "uncertainty_pct": None,
++        "kgCO2e_lower": None,
++        "kgCO2e_upper": None,
+         "job_meta": meta
+     }
++    # attach uncertainty estimate based on calibration DB
++    calib_path = os.environ.get("CARBON_CALIB_PATH", "/etc/aegis/carbon_calibration.json")
++    uncertainty = 0.10
++    try:
++        if os.path.exists(calib_path):
++            calib = json.load(open(calib_path))
++            # look for instance_type in job_meta
++            inst = meta.get("instance_type")
++            if inst and inst in calib:
++                samples = calib[inst].get("samples", 1)
++                # crude uncertainty: 10% for small sample, decrease with sqrt(samples)
++                uncertainty = max(0.03, 0.15 / (samples ** 0.5))
++    except Exception:
++        uncertainty = 0.10
++    report["uncertainty_pct"] = uncertainty
++    report["kgCO2e_lower"] = max(0.0, kgco2 * (1.0 - uncertainty))
++    report["kgCO2e_upper"] = kgco2 * (1.0 + uncertainty)
+*** End Patch
+*** Begin Patch
+*** Update File:ops/release/include_evidence_bundle.py
+@@
+-        # include carbon report if present
+-        carbon_path = os.environ.get("CARBON_REPORT_PATH", "/tmp/carbon_report.json")
+-        if os.path.exists(carbon_path):
+-            z.write(carbon_path, arcname=os.path.join("evidence", "carbon_report.json"))
++        # include carbon reports and archive if present
++        carbon_path = os.environ.get("CARBON_REPORT_PATH", "/tmp/carbon_report.json")
++        if os.path.exists(carbon_path):
++            z.write(carbon_path, arcname=os.path.join("evidence", "carbon_report.json"))
++        carbon_archive = os.environ.get("CARBON_ARCHIVE", "/tmp/carbon_reports_archive")
++        if os.path.exists(carbon_archive):
++            for root,_,files in os.walk(carbon_archive):
++                for f in files:
++                    full = os.path.join(root,f)
++                    arcname = os.path.join("evidence","carbon_archive", f)
++                    z.write(full, arcname=arcname)
+*** End Patch
+*** Begin Patch
+*** Add File:ops/ci/carbon_evidence_gate.py
++#!/usr/bin/env python3
++"""
++CI gate that ensures per-job carbon report exists and is within allowed uncertainty and budget before attaching evidence.
++ - Reads CARBON_REPORT_PATH and checks uncertainty and kgCO2e against per-team budget via budget_manager.
++ - Exits non-zero if report missing or budget exceeded unless FORCE_CARBON_GATES env var is set.
++"""
++import os
++import sys
++import json
++from ops.carbon.budget_manager import check_budget, record_consumption
++
++REPORT = os.environ.get("CARBON_REPORT_PATH", "/tmp/carbon_report.json")
++FORCE = os.environ.get("FORCE_CARBON_GATES", "false").lower() in ("1","true")
++
++def main():
++    if not os.path.exists(REPORT):
++        print("Carbon report missing at", REPORT)
++        if FORCE:
++            print("FORCE flag set; continuing.")
++            return 0
++        return 2
++    r = json.load(open(REPORT))
++    uncertainty = r.get("uncertainty_pct", 0.1)
++    if uncertainty > 0.25:
++        print("Uncertainty >25%:", uncertainty)
++        if FORCE:
++            print("FORCE set; continuing.")
++        else:
++            return 2
++    team = r.get("job_meta",{}).get("team","unknown")
++    kg = r.get("kgCO2e", 0.0)
++    ok, info = check_budget(team, kg)
++    if not ok:
++        print("Budget would be exceeded:", info)
++        if FORCE:
++            print("FORCE set; recording consumption and continuing.")
++            record_consumption(team, kg, r.get("job_id"))
++            return 0
++        return 2
++    # record consumption
++    record_consumption(team, kg, r.get("job_id"))
++    print("Carbon gate passed. Recorded consumption.")
++    return 0
++
++if __name__ == "__main__":
++    sys.exit(main())
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/ci/carbon_release_audit.py
++#!/usr/bin/env python3
++"""
++Assemble auditable carbon report for a release and push to evidence bucket.
++ - Aggregates release reports (ops/carbon/release_reporter.py) and attaches to evidence bundle
++"""
++import os
++import sys
++import json
++from ops.carbon.release_reporter import run_for_release
++
++def main(release_id):
++    out = run_for_release(release_id)
++    print("Release carbon audit written to", out)
++    return out
++
++if __name__ == "__main__":
++    if len(sys.argv) < 2:
++        print("usage: carbon_release_audit.py <release_id>")
++        sys.exit(2)
++    main(sys.argv[1])
++
+*** End Patch
+*** End Patch

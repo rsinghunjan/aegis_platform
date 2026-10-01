@@ -1,0 +1,426 @@
+*** Begin Patch
+*** Add File:services/excel/backend_proxy.py
++"""Aegis Excel Backend Proxy
++
++Responsibilities:
++- Validate incoming MSAL / OIDC bearer tokens from the Excel Add-in (config via OIDC_ISSUER and CLIENT_ID)
++- Proxy inference requests to internal Aegis RAG service using SERVICE_API_KEY
++- Provide reports endpoint for Power Query (CSV/JSON) protected by same auth
++- Expose an enqueue endpoint that forwards "request review" calls to human_queue service
++
++Configure via environment variables:
++ - OIDC_ISSUER (e.g. https://login.microsoftonline.com/{tenant}/v2.0)
++ - CLIENT_ID (Azure app client id used by Add-in)
++ - AEGIS_RAG_URL (internal RAG endpoint, e.g. http://rag-service.svc:8080/infer)
++ - AEGIS_REPORTS_URL (internal reporting endpoint returning JSON/CSV)
++ - SERVICE_API_KEY (secret allowing this proxy to call internal Aegis services)
++ - HUMAN_QUEUE_URL (http endpoint for human_queue.enqueue)
++ - LOG_PATH (optional)
++"""
++import os
++import time
++import json
++from typing import Dict, Any
++import requests
++from fastapi import FastAPI, Header, HTTPException, Request
++from pydantic import BaseModel
++from jose import jwt
++from jose.exceptions import JWTError
++from cachetools import TTLCache
++
++OIDC_ISSUER = os.environ.get("OIDC_ISSUER", "")
++CLIENT_ID = os.environ.get("CLIENT_ID", "")
++AEGIS_RAG_URL = os.environ.get("AEGIS_RAG_URL", "http://rag-service.svc:8080/infer")
++AEGIS_REPORTS_URL = os.environ.get("AEGIS_REPORTS_URL", "http://aegis-reports.svc:8080")
++SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY", "")
++HUMAN_QUEUE_URL = os.environ.get("HUMAN_QUEUE_URL", "http://human-queue.safety.svc:80/enqueue")
++LOG_PATH = os.environ.get("LOG_PATH", "/tmp/aegis_excel_proxy.log")
++
++app = FastAPI(title="Aegis Excel Proxy")
++
++# JWKS caching
++JWKS_CACHE = TTLCache(maxsize=1, ttl=3600)
++
++def fetch_jwks():
++    if "jwks" in JWKS_CACHE:
++        return JWKS_CACHE["jwks"]
++    if not OIDC_ISSUER:
++        raise RuntimeError("OIDC_ISSUER not configured")
++    well_known = OIDC_ISSUER.rstrip("/") + "/.well-known/openid-configuration"
++    r = requests.get(well_known, timeout=5)
++    r.raise_for_status()
++    jwks_uri = r.json().get("jwks_uri")
++    if not jwks_uri:
++        raise RuntimeError("jwks_uri not found in OIDC configuration")
++    jwks = requests.get(jwks_uri, timeout=5).json()
++    JWKS_CACHE["jwks"] = jwks
++    return jwks
++
++def validate_bearer_token(token: str) -> Dict[str, Any]:
++    """Validate incoming OIDC token (minimal checks)."""
++    jwks = fetch_jwks()
++    try:
++        # note: algorithms could be retrieved from jwks; for MS use RS256
++        payload = jwt.decode(token, jwks, audience=CLIENT_ID, issuer=OIDC_ISSUER, algorithms=['RS256'])
++        return payload
++    except JWTError as e:
++        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
++
++def log_event(obj: Dict[str, Any]):
++    try:
++        with open(LOG_PATH, "a") as f:
++            f.write(json.dumps({"ts": int(time.time()), **obj}) + "\n")
++    except Exception:
++        pass
++
++class InferRequest(BaseModel):
++    prompt: str
++    mode: str = "evidence_required"
++    top_k: int = 5
++
++@app.post("/api/rag/infer")
++def rag_infer(req: InferRequest, authorization: str = Header(None)):
++    if not authorization or not authorization.startswith("Bearer "):
++        raise HTTPException(status_code=401, detail="Missing Authorization header")
++    token = authorization.split(" ", 1)[1]
++    user = validate_bearer_token(token)
++    # proxy to Aegis RAG
++    payload = {"prompt": req.prompt, "mode": req.mode, "top_k": req.top_k, "requester": user.get("upn") or user.get("preferred_username") or user.get("sub")}
++    headers = {"Authorization": f"Bearer {SERVICE_API_KEY}", "Content-Type": "application/json"}
++    r = requests.post(AEGIS_RAG_URL, json=payload, headers=headers, timeout=30)
++    if r.status_code != 200:
++        raise HTTPException(status_code=502, detail="Upstream RAG error")
++    resp = r.json()
++    # Log for audit / evidence store (also upstream Aegis should log)
++    log_event({"type":"excel_infer","user":user.get("sub"), "prompt": req.prompt, "verifier": resp.get("verifier"), "provenance": resp.get("provenance")})
++    return resp
++
++@app.get("/api/reports/predictions")
++def reports_predictions(model: str = "qa", format: str = "json", authorization: str = Header(None)):
++    """Power Query friendly endpoint: proxies to AEGIS_REPORTS_URL and enforces auth."""
++    if not authorization or not authorization.startswith("Bearer "):
++        raise HTTPException(status_code=401, detail="Missing Authorization header")
++    _ = validate_bearer_token(authorization.split(" ",1)[1])
++    target = f"{AEGIS_REPORTS_URL}/predictions?model={model}&format={format}"
++    headers = {"Authorization": f"Bearer {SERVICE_API_KEY}"}
++    r = requests.get(target, headers=headers, timeout=30, stream=True)
++    if r.status_code != 200:
++        raise HTTPException(status_code=502, detail="Upstream reports error")
++    # stream response (FastAPI supports StreamingResponse, but return raw content for simplicity)
++    if format.lower() == "csv":
++        return Response(content=r.content, media_type="text/csv")
++    return r.json()
++
++@app.post("/api/enqueue")
++def enqueue_for_review(body: Dict[str, Any], authorization: str = Header(None)):
++    """Forward a request to human_queue.enqueue. Body should include text, output, provenance, severity."""
++    if not authorization or not authorization.startswith("Bearer "):
++        raise HTTPException(status_code=401, detail="Missing Authorization header")
++    user = validate_bearer_token(authorization.split(" ",1)[1])
++    payload = dict(body)
++    payload["reported_by"] = user.get("upn") or user.get("preferred_username") or user.get("sub")
++    # forward to human queue
++    headers = {"Content-Type":"application/json"}
++    try:
++        r = requests.post(HUMAN_QUEUE_URL, json=payload, headers=headers, timeout=10)
++    except Exception as e:
++        raise HTTPException(status_code=502, detail=f"Failed to call human queue: {e}")
++    if r.status_code not in (200,201,202):
++        raise HTTPException(status_code=502, detail="Human queue error")
++    log_event({"type":"enqueue","user":payload["reported_by"], "severity": payload.get("severity")})
++    return r.json()
++
++@app.get("/.well-known/health")
++def health():
++    return {"status":"ok"}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/excel/addin/src/taskpane.html
++<!doctype html>
++<html>
++  <head>
++    <meta charset="utf-8" />
++    <title>Aegis Excel Add-in</title>
++    <script src="https://alcdn.msauth.net/browser/2.33.0/js/msal-browser.min.js"></script>
++    <script src="taskpane.js"></script>
++    <style>
++      body { font-family: Arial, Helvetica, sans-serif; padding: 12px; }
++      textarea { width: 100%; height: 100px; }
++    </style>
++  </head>
++  <body>
++    <h3>Aegis Evidence-backed Q&A</h3>
++    <div>
++      <label>Prompt:</label><br/>
++      <textarea id="prompt">What is the capital of France?</textarea>
++    </div>
++    <div style="margin-top:8px">
++      <button id="btnAsk">Ask Aegis</button>
++      <button id="btnInsert">Insert Answer into Sheet</button>
++      <button id="btnReview">Request Human Review</button>
++    </div>
++    <div style="margin-top:12px">
++      <strong>Answer:</strong>
++      <pre id="answer" style="background:#f8f8f8; padding:8px;"></pre>
++      <strong>Verifier:</strong> <span id="verifier"></span>
++      <div id="provenance"></div>
++    </div>
++  </body>
++</html>
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/excel/addin/src/taskpane.js
++// Minimal Office Add-in Taskpane using MSAL to get a user token and call backend proxy.
++// Configure below:
++const MSAL_CLIENT_ID = "<YOUR_AZURE_APP_CLIENT_ID>";
++const MSAL_TENANT = "<YOUR_TENANT_ID_OR_COMMON>";
++const BACKEND_BASE = "<https://aegis-proxy.example.com>"; // replace with deployed backend proxy URL
++
++const msalConfig = {
++  auth: {
++    clientId: MSAL_CLIENT_ID,
++    authority: `https://login.microsoftonline.com/${MSAL_TENANT}`
++  }
++};
++const msalInstance = new msal.PublicClientApplication(msalConfig);
++const loginRequest = { scopes: ["openid", "profile", "email"] };
++
++async function getAccessToken() {
++  // interactive login if no account
++  const accounts = msalInstance.getAllAccounts();
++  if (accounts.length === 0) {
++    await msalInstance.loginPopup(loginRequest);
++  }
++  try {
++    const resp = await msalInstance.acquireTokenSilent({ scopes: loginRequest.scopes, account: msalInstance.getAllAccounts()[0] });
++    return resp.accessToken;
++  } catch (e) {
++    const resp = await msalInstance.acquireTokenPopup(loginRequest);
++    return resp.accessToken;
++  }
++}
++
++document.addEventListener("DOMContentLoaded", function() {
++  document.getElementById("btnAsk").onclick = async () => {
++    const p = document.getElementById("prompt").value;
++    const token = await getAccessToken();
++    const r = await fetch(`${BACKEND_BASE}/api/rag/infer`, {
++      method: "POST",
++      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
++      body: JSON.stringify({ prompt: p, mode: "evidence_required", top_k: 5 })
++    });
++    const j = await r.json();
++    document.getElementById("answer").innerText = j.result?.answer || JSON.stringify(j);
++    document.getElementById("verifier").innerText = JSON.stringify(j.verifier || {});
++    document.getElementById("provenance").innerText = JSON.stringify(j.provenance || []);
++  };
++
++  document.getElementById("btnInsert").onclick = async () => {
++    const ans = document.getElementById("answer").innerText;
++    await Excel.run(async (context) => {
++      const range = context.workbook.getSelectedRange();
++      range.values = [[ans]];
++      await context.sync();
++    });
++  };
++
++  document.getElementById("btnReview").onclick = async () => {
++    const token = await getAccessToken();
++    const payload = {
++      text: document.getElementById("prompt").value,
++      output: document.getElementById("answer").innerText,
++      provenance: document.getElementById("provenance").innerText,
++      severity: "medium"
++    };
++    const r = await fetch(`${BACKEND_BASE}/api/enqueue`, {
++      method: "POST",
++      headers: { "Content-Type":"application/json", "Authorization": `Bearer ${token}` },
++      body: JSON.stringify(payload)
++    });
++    const j = await r.json();
++    alert("Enqueue response: " + JSON.stringify(j));
++  };
++});
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/excel/addin/manifest.xml
++<?xml version="1.0" encoding="UTF-8"?>
++<OfficeApp xmlns="http://schemas.microsoft.com/office/appforoffice/1.1"
++           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++           xsi:type="TaskPaneApp">
++  <Id>00000000-0000-0000-0000-000000000001</Id>
++  <Version>1.0.0.0</Version>
++  <ProviderName>Aegis</ProviderName>
++  <DefaultLocale>en-US</DefaultLocale>
++  <DisplayName>Aegis Evidence Q&A</DisplayName>
++  <Description>Ask Aegis with evidence and verifier scores from Excel</Description>
++  <Hosts>
++    <Host Name="Workbook" />
++  </Hosts>
++  <DefaultSettings>
++    <SourceLocation DefaultValue="https://aegis-proxy.example.com/addin/taskpane.html"/>
++  </DefaultSettings>
++</OfficeApp>
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/excel/powerquery/PowerQuerySnippet.txt
++/* Power Query (M) snippet to call the Aegis reports endpoint.
++   Replace <TOKEN> with a short-lived token obtained via secure means (or configure OAuth in Power Query).
++   Usage: In Excel -> Data -> Get Data -> From Other Sources -> Blank Query -> Advanced Editor -> paste.
++*/
++let
++    url = "https://aegis-proxy.example.com/api/reports/predictions?model=qa&format=json",
++    headers = [ Authorization = "Bearer " & "<TOKEN>" ],
++    raw = Web.Contents(url, [ Headers = headers ]),
++    json = Json.Document(raw),
++    table = Table.FromList(json, Splitter.SplitByNothing(), null, null, ExtraValues.Error)
++in
++    table
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/excel/k8s/backend-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-excel-proxy
++  namespace: safety
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: aegis-excel-proxy
++  template:
++    metadata:
++      labels:
++        app: aegis-excel-proxy
++    spec:
++      containers:
++        - name: proxy
++          image: us.gcr.io/aegis/excel-proxy:latest
++          ports:
++            - containerPort: 8000
++          env:
++            - name: OIDC_ISSUER
++              value: "https://login.microsoftonline.com/<tenant>/v2.0"
++            - name: CLIENT_ID
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-secrets
++                  key: azure_client_id
++            - name: SERVICE_API_KEY
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-secrets
++                  key: service_api_key
++            - name: AEGIS_RAG_URL
++              value: "http://rag-service.svc:8080/infer"
++            - name: HUMAN_QUEUE_URL
++              value: "http://human-queue.safety.svc:80/enqueue"
++      imagePullSecrets:
++        - name: regcred
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: aegis-excel-proxy
++  namespace: safety
++spec:
++  selector:
++    app: aegis-excel-proxy
++  ports:
++    - port: 443
++      targetPort: 8000
++      protocol: TCP
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/excel/k8s/addin-static-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-excel-addin
++  namespace: safety
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-excel-addin
++  template:
++    metadata:
++      labels:
++        app: aegis-excel-addin
++    spec:
++      containers:
++        - name: nginx
++          image: nginx:stable-alpine
++          volumeMounts:
++            - name: addin-static
++              mountPath: /usr/share/nginx/html
++      volumes:
++        - name: addin-static
++          configMap:
++            name: aegis-addin-static
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: aegis-excel-addin
++  namespace: safety
++spec:
++  selector:
++    app: aegis-excel-addin
++  ports:
++    - port: 80
++      targetPort: 80
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/excel/k8s/addin-configmap.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: aegis-addin-static
++  namespace: safety
++data:
++  taskpane.html: |
++    (paste the contents of services/excel/addin/src/taskpane.html here when deploying)
++  taskpane.js: |
++    (paste the contents of services/excel/addin/src/taskpane.js here when deploying)
++
++NOTE: For large deployments serve static files from a CDN or object storage instead of embedding in ConfigMap.
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/excel/README_EXCEL_INTEGRATION.md
++# Aegis Excel Integration - Overview
++
++This patch adds:
++- Backend proxy (services/excel/backend_proxy.py) — validates OIDC tokens and proxies requests to internal Aegis services.
++- Office Add-in scaffold (taskpane.html + taskpane.js + manifest.xml) — minimal evidence-backed Q&A UI with "Insert answer" and "Request Review".
++- Power Query snippet (services/excel/powerquery/PowerQuerySnippet.txt) to fetch reports into Excel.
++- Kubernetes manifests to deploy the backend proxy and host the Add-in static assets.
++
++Security & deployment notes:
++- Register an Azure AD app for the Add-in and set CLIENT_ID + OIDC_ISSUER in the proxy deployment.
++- Do NOT embed SERVICE_API_KEY in client code. The Add-in must obtain a user token via MSAL and call the backend proxy; backend uses SERVICE_API_KEY to call internal Aegis services.
++- For production host Add-in static content on HTTPS (cdn or ingress) and set SourceLocation in manifest to that URL.
++- Wire human_queue URL and Aegis internal endpoints via cluster DNS or service mesh.
++
++Quick deploy (operator):
++1. Build and push proxy image (from services/excel/backend_proxy.py).
++2. Create Kubernetes secrets: aegis-secrets (azure_client_id, service_api_key).
++3. Apply configmap (or host static add-in files in CDN) and deployments:
++   kubectl apply -f services/excel/k8s/addin-configmap.yaml
++   kubectl apply -f services/excel/k8s/addin-static-deployment.yaml
++   kubectl apply -f services/excel/k8s/backend-deployment.yaml
++4. Update manifest.xml SourceLocation to https://<addin-host>/taskpane.html and sideload or publish add-in via Office 365 admin center.
++
+*** End Patch
+*** End Patch

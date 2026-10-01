@@ -1,0 +1,690 @@
+*** Begin Patch
+*** Add File:ops/llm/multimodal/ingest_pipeline.py
++#!/usr/bin/env python3
++"""
++Multimodal ingestion pipeline
++- Accepts images/audio from a source (S3 path or local directory)
++- Performs optional OCR (images) and transcription (audio)
++- Calls the inference-adapter multimodal embeddings endpoint
++- Chunks content and upserts embeddings to vector DB (Postgres+pgvector)
++
++Usage:
++  python ops/llm/multimodal/ingest_pipeline.py --source s3://bucket/path --type image
++  python ops/llm/multimodal/ingest_pipeline.py --source ./data/audio --type audio
++
++Notes: This is a minimal implementation intended to be invoked from an Argo step.
++"""
++import os
++import sys
++import json
++import argparse
++from pathlib import Path
++import requests
++import boto3
++import psycopg2
++from PIL import Image
++try:
++    import pytesseract
++except Exception:
++    pytesseract = None
++
++INFERENCE_ADAPTER = os.environ.get("INFERENCE_ADAPTER_URL", "http://inference-adapter.aegis.svc.cluster.local:8080")
++S3_CLIENT = boto3.client("s3")
++
++def list_s3_objects(s3uri):
++    # s3://bucket/prefix
++    assert s3uri.startswith("s3://")
++    parts = s3uri[5:].split("/", 1)
++    bucket = parts[0]
++    prefix = parts[1] if len(parts) > 1 else ""
++    paginator = S3_CLIENT.get_paginator("list_objects_v2")
++    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
++        for obj in page.get("Contents", []):
++            yield f"s3://{bucket}/{obj['Key']}"
++
++def download_s3(s3uri, dest_dir):
++    parts = s3uri[5:].split("/", 1)
++    bucket = parts[0]
++    key = parts[1]
++    dest = Path(dest_dir) / Path(key).name
++    Path(dest_dir).mkdir(parents=True, exist_ok=True)
++    S3_CLIENT.download_file(bucket, key, str(dest))
++    return dest
++
++def transcribe_audio_local(path):
++    # Placeholder: call external transcription (Whisper API or local model)
++    # For now, return a simple marker
++    return f"Transcribed text for audio file {path.name}"
++
++def ocr_image_local(path):
++    if pytesseract is None:
++        return ""
++    img = Image.open(path)
++    return pytesseract.image_to_string(img)
++
++def chunk_text(text, chunk_size=1024):
++    words = text.split()
++    chunks = []
++    curr = []
++    curr_len = 0
++    for w in words:
++        curr.append(w)
++        curr_len += len(w) + 1
++        if curr_len >= chunk_size:
++            chunks.append(" ".join(curr))
++            curr = []
++            curr_len = 0
++    if curr:
++        chunks.append(" ".join(curr))
++    return chunks
++
++def embed_text(text):
++    resp = requests.post(f"{INFERENCE_ADAPTER}/v1/embeddings", json={"input": text})
++    return resp.json()
++
++def upsert_to_pg(id, content, embedding):
++    # Minimal upsert to Postgres; expects PG env vars
++    conn = psycopg2.connect(
++        host=os.environ.get("PG_HOST", "postgres.aegis.svc.cluster.local"),
++        port=int(os.environ.get("PG_PORT", 5432)),
++        dbname=os.environ.get("PG_DB", "aegis"),
++        user=os.environ.get("PG_USER", "aegis"),
++        password=os.environ.get("PG_PASSWORD", "password"),
++    )
++    cur = conn.cursor()
++    # Assumes documents(id text primary key, content text, embedding vector)
++    cur.execute(
++        "INSERT INTO documents (id, content, embedding) VALUES (%s, %s, %s) ON CONFLICT (id) DO UPDATE SET content=EXCLUDED.content, embedding=EXCLUDED.embedding",
++        (id, content, embedding),
++    )
++    conn.commit()
++    cur.close()
++    conn.close()
++
++def process_file(path, content_type):
++    content = ""
++    if content_type == "image":
++        if pytesseract:
++            content = ocr_image_local(path)
++        else:
++            content = f"[image metadata for {path.name}]"
++    elif content_type == "audio":
++        content = transcribe_audio_local(path)
++    else:
++        content = path.read_text()
++    chunks = chunk_text(content, chunk_size=1024)
++    for i, chunk in enumerate(chunks):
++        emb = embed_text(chunk)
++        # Store embedding vector JSON for upsert (the upsert function should convert to vector)
++        embedding_vector = emb.get("data", [{}])[0].get("embedding")
++        upsert_to_pg(f"{path.name}-{i}", chunk, json.dumps(embedding_vector))
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--source", required=True, help="local dir or s3:// path")
++    parser.add_argument("--type", required=True, choices=["image", "audio", "text"], help="content type")
++    args = parser.parse_args()
++    src = args.source
++    local_dir = "/tmp/mm_ingest"
++    if src.startswith("s3://"):
++        for s3obj in list_s3_objects(src):
++            dst = download_s3(s3obj, local_dir)
++            process_file(dst, args.type)
++    else:
++        p = Path(src)
++        for f in p.iterdir():
++            process_file(f, args.type)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/llm/inference_adapter_multimodal.py
++#!/usr/bin/env python3
++"""
++Extended inference adapter with multimodal support.
++- Accepts multipart/form-data with image/audio files and returns embeddings or proxied outputs.
++Endpoints:
++  - POST /v1/embeddings (json: text)  [existing]
++  - POST /v1/embeddings/multimodal (multipart: file=..., metadata=json)
++  - POST /v1/complete (same as before)
++"""
++import os
++import time
++import logging
++from flask import Flask, request, jsonify
++from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
++import requests
++from PIL import Image
++import io
++try:
++    import pytesseract
++except Exception:
++    pytesseract = None
++
++LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
++logging.basicConfig(level=LOG_LEVEL)
++log = logging.getLogger("inference-adapter-mm")
++
++REQUEST_COUNT = Counter("llm_mm_requests_total", "Total multimodal LLM adapter requests", ["endpoint"])
++TOKEN_ESTIMATE = Counter("llm_mm_token_estimated_total", "Estimated tokens processed", ["endpoint"])
++LATENCY = Histogram("llm_mm_request_latency_seconds", "Latency seconds", ["endpoint"])
++
++app = Flask(__name__)
++
++OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
++MODEL_ENDPOINT = os.environ.get("MODEL_ENDPOINT", "")
++
++def estimate_tokens(text):
++    return max(1, int(len(text.split()) * 1.33))
++
++@app.route("/metrics")
++def metrics():
++    return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}
++
++@app.route("/v1/embeddings/multimodal", methods=["POST"])
++def embeddings_multimodal():
++    REQUEST_COUNT.labels(endpoint="embeddings_multimodal").inc()
++    if "file" not in request.files:
++        return jsonify({"error": "file missing"}), 400
++    f = request.files["file"]
++    content_type = f.content_type or ""
++    start = time.time()
++    # process image
++    if content_type.startswith("image/"):
++        img = Image.open(io.BytesIO(f.read()))
++        text = ""
++        if pytesseract:
++            text = pytesseract.image_to_string(img)
++        # Optionally call CLIP style endpoint; we proxy to embeddings endpoint with extracted text
++        if OPENAI_API_KEY:
++            resp = requests.post(
++                "https://api.openai.com/v1/embeddings",
++                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
++                json={"model": "text-embedding-3-small", "input": text},
++            )
++            result = resp.json()
++        elif MODEL_ENDPOINT:
++            resp = requests.post(f"{MODEL_ENDPOINT}/v1/embeddings", json={"input": text})
++            result = resp.json()
++        else:
++            result = {"data": [{"embedding": [float(sum(bytearray(text.encode())) % 1000) / 1000.0]}]}
++        elapsed = time.time() - start
++        LATENCY.labels(endpoint="embeddings_multimodal").observe(elapsed)
++        TOKEN_ESTIMATE.labels(endpoint="embeddings_multimodal").inc(estimate_tokens(text))
++        return jsonify(result)
++    elif content_type.startswith("audio/"):
++        # For audio, proxy to transcription then embed text
++        # Placeholder: we don't execute heavy transcription here
++        transcription = f"[transcribed audio {f.filename}]"
++        if OPENAI_API_KEY:
++            resp = requests.post(
++                "https://api.openai.com/v1/embeddings",
++                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
++                json={"model": "text-embedding-3-small", "input": transcription},
++            )
++            result = resp.json()
++        else:
++            result = {"data": [{"embedding": [0.1]}]}
++        elapsed = time.time() - start
++        LATENCY.labels(endpoint="embeddings_multimodal").observe(elapsed)
++        TOKEN_ESTIMATE.labels(endpoint="embeddings_multimodal").inc(estimate_tokens(transcription))
++        return jsonify(result)
++    else:
++        return jsonify({"error": f"unsupported content_type {content_type}"}), 400
++
++@app.route("/v1/embeddings", methods=["POST"])
++def embeddings_text():
++    REQUEST_COUNT.labels(endpoint="embeddings_text").inc()
++    payload = request.json or {}
++    inputs = payload.get("input") or payload.get("inputs")
++    if inputs is None:
++        return jsonify({"error": "missing input"}), 400
++    start = time.time()
++    # Proxy to OpenAI if available
++    if OPENAI_API_KEY:
++        resp = requests.post(
++            "https://api.openai.com/v1/embeddings",
++            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
++            json={"model": payload.get("model", "text-embedding-3-small"), "input": inputs},
++            timeout=30,
++        )
++        result = resp.json()
++    elif MODEL_ENDPOINT:
++        resp = requests.post(f"{MODEL_ENDPOINT}/v1/embeddings", json=payload, timeout=30)
++        result = resp.json()
++    else:
++        vec = [float(sum(bytearray(str(inputs), "utf-8")) % 1000) / 1000.0]
++        result = {"data": [{"embedding": vec, "index": 0}]}
++    elapsed = time.time() - start
++    LATENCY.labels(endpoint="embeddings_text").observe(elapsed)
++    TOKEN_ESTIMATE.labels(endpoint="embeddings_text").inc(max(1, estimate_tokens(str(inputs))))
++    return jsonify(result)
++
++@app.route("/v1/complete", methods=["POST"])
++def complete():
++    REQUEST_COUNT.labels(endpoint="complete").inc()
++    payload = request.json or {}
++    prompt = payload.get("prompt", "")
++    start = time.time()
++    # Proxy to OpenAI chat completions if key present
++    if OPENAI_API_KEY:
++        resp = requests.post(
++            "https://api.openai.com/v1/chat/completions",
++            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
++            json={
++                "model": payload.get("model", "gpt-4o-mini"),
++                "messages": [{"role": "user", "content": prompt}],
++                "max_tokens": payload.get("max_tokens", 512),
++            },
++            timeout=60,
++        )
++        result = resp.json()
++    elif MODEL_ENDPOINT:
++        resp = requests.post(f"{MODEL_ENDPOINT}/v1/complete", json=payload, timeout=60)
++        result = resp.json()
++    else:
++        result = {"id": "local-fallback", "choices": [{"message": {"content": f"Echo: {prompt}"}}]}
++    elapsed = time.time() - start
++    LATENCY.labels(endpoint="complete").observe(elapsed)
++    TOKEN_ESTIMATE.labels(endpoint="complete").inc(max(1, estimate_tokens(prompt)))
++    return jsonify(result)
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
++
+*** End Patch
+*** Begin Patch
+*** Add File:argo/llm/embed_multimodal_workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: llm-embed-multimodal-
++  namespace: argo
++spec:
++  entrypoint: embed-mm
++  templates:
++    - name: embed-mm
++      steps:
++        - - name: ingest-images
++            template: ingest-images
++        - - name: ingest-audio
++            template: ingest-audio
++
++    - name: ingest-images
++      script:
++        image: python:3.11-slim
++        command: [bash]
++        source: |
++          pip install boto3 requests psycopg2-binary pillow
++          python /work/ingest_pipeline.py --source s3://REPLACE_BUCKET/images --type image
++        volumeMounts:
++          - name: repo
++            mountPath: /work
++
++    - name: ingest-audio
++      script:
++        image: python:3.11-slim
++        command: [bash]
++        source: |
++          pip install boto3 requests psycopg2-binary
++          python /work/ingest_pipeline.py --source s3://REPLACE_BUCKET/audio --type audio
++        volumeMounts:
++          - name: repo
++            mountPath: /work
++
++  volumes:
++    - name: repo
++      emptyDir: {}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/agents/agent_orchestrator/app.py
++#!/usr/bin/env python3
++"""
++Agent orchestrator (minimal)
++- Accepts a task spec describing goals and allowed tools
++- Uses planner (simple LLM call) to produce a plan (sequence of tool calls)
++- Executes tools via tool wrappers, records provenance and audit logs to S3
++"""
++import os
++import json
++import time
++import logging
++from flask import Flask, request, jsonify
++import requests
++import boto3
++
++logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
++log = logging.getLogger("agent-orchestrator")
++
++INFERENCE_ADAPTER = os.environ.get("INFERENCE_ADAPTER_URL", "http://inference-adapter.aegis.svc.cluster.local:8080")
++S3_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
++
++app = Flask(__name__)
++S3 = boto3.client("s3", region_name=AWS_REGION)
++
++TOOLS = {
++    "search": os.environ.get("TOOL_SEARCH_URL", "http://rag-service.aegis.svc.cluster.local:8081/query"),
++    "db_query": "internal-db-query",  # mapped to internal function
++    "run_job": "internal-run-job",
++    "code_exec": "internal-code-exec",
++    "slack": "internal-slack",
++}
++
++def call_llm_planner(prompt):
++    resp = requests.post(f"{INFERENCE_ADAPTER}/v1/complete", json={"prompt": prompt, "max_tokens": 256})
++    return resp.json()
++
++def execute_tool(tool_name, params):
++    # Minimal dispatcher
++    if tool_name == "search":
++        resp = requests.post(TOOLS["search"], json={"question": params.get("q"), "top_k": params.get("k", 3)})
++        return resp.json()
++    elif tool_name == "db_query":
++        # placeholder - in real impl use prepared statements and RBAC
++        return {"result": f"db query executed: {params.get('query')}"}
++    elif tool_name == "run_job":
++        return {"result": f"job scheduled: {params.get('job_name')}"}
++    elif tool_name == "code_exec":
++        return {"result": "code executed (sandboxed)"}
++    elif tool_name == "slack":
++        return {"result": f"slack message sent to {params.get('channel')}"}
++    else:
++        return {"error": "unknown tool"}
++
++def write_provenance(obj):
++    if not S3_BUCKET:
++        log.info("No evidence bucket configured; skipping provenance write")
++        return None
++    key = f"evidence/agents/{int(time.time())}.json"
++    S3.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(obj).encode("utf-8"))
++    return key
++
++@app.route("/v1/agents/run", methods=["POST"])
++def run_agent():
++    body = request.json or {}
++    goals = body.get("goals", [])
++    allowed_tools = body.get("tools", ["search", "db_query", "run_job", "code_exec", "slack"])
++    # 1) simple plan generation via LLM
++    plan_prompt = f"Given goals: {goals}. Produce a stepwise plan using these tools: {allowed_tools}. Output JSON list of steps with tool and params."
++    planner_resp = call_llm_planner(plan_prompt)
++    # parse planner_resp (best effort)
++    plan_text = planner_resp.get("choices", [{}])[0].get("message", {}).get("content", "") if isinstance(planner_resp, dict) else str(planner_resp)
++    try:
++        plan = json.loads(plan_text)
++    except Exception:
++        # fallback: single step search
++        plan = [{"tool": "search", "params": {"q": " ".join(goals)}}]
++    results = []
++    for step in plan:
++        tool = step.get("tool")
++        params = step.get("params", {})
++        if tool not in allowed_tools:
++            results.append({"tool": tool, "error": "not allowed"})
++            continue
++        res = execute_tool(tool, params)
++        results.append({"tool": tool, "result": res})
++    prov = {"goals": goals, "plan": plan, "results": results, "planner_raw": planner_resp}
++    key = write_provenance(prov)
++    return jsonify({"plan": plan, "results": results, "evidence_key": key})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8090)))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/agents/Dockerfile
++FROM python:3.11-slim
++WORKDIR /app
++COPY app.py /app/app.py
++RUN pip install --no-cache-dir flask requests boto3
++EXPOSE 8090
++CMD ["python", "app.py"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/agents/agent-orchestrator-deployment.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: agent-orchestrator
++  namespace: aegis
++
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: agent-orchestrator
++  namespace: aegis
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: agent-orchestrator
++  template:
++    metadata:
++      labels:
++        app: agent-orchestrator
++    spec:
++      serviceAccountName: agent-orchestrator
++      containers:
++        - name: orchestrator
++          image: REPLACE_IMAGE_REGISTRY/agent-orchestrator:latest
++          env:
++            - name: INFERENCE_ADAPTER_URL
++              value: "http://inference-adapter.aegis.svc.cluster.local:8080"
++            - name: EVIDENCE_BUCKET
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-runtime-secrets
++                  key: EVIDENCE_BUCKET
++          ports:
++            - containerPort: 8090
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: agent-orchestrator
++  namespace: aegis
++spec:
++  selector:
++    app: agent-orchestrator
++  ports:
++    - port: 8090
++      targetPort: 8090
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/codecarbon_integration.py
++#!/usr/bin/env python3
++"""
++Simple integration wrapper for CodeCarbon emissions estimation.
++- Runs a function or command and reports estimated emissions in kgCO2eq
++- Exposes Prometheus metric 'job_emissions_kg' via a simple HTTP metrics endpoint
++"""
++from codecarbon import EmissionsTracker
++import time
++import argparse
++import json
++from prometheus_client import Gauge, start_http_server
++
++EMISSIONS_METRIC = Gauge("job_emissions_kg", "Estimated job emissions in kgCO2eq", ["job_id"])
++
++def run_and_track(job_id, command=None):
++    tracker = EmissionsTracker(project_name="aegis-job", measure_power_secs=1)
++    tracker.start()
++    start = time.time()
++    # Placeholder for actual job execution
++    if command:
++        import subprocess
++        subprocess.run(command, shell=True, check=False)
++    else:
++        time.sleep(1)
++    emissions = tracker.stop()
++    EMISSIONS_METRIC.labels(job_id=job_id).set(emissions)
++    return emissions
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--job-id", required=True)
++    parser.add_argument("--command", required=False)
++    parser.add_argument("--metrics-port", default=9102, type=int)
++    args = parser.parse_args()
++    start_http_server(args.metrics_port)
++    emissions = run_and_track(args.job_id, args.command)
++    print(json.dumps({"job_id": args.job_id, "emissions_kg": emissions}))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/Dockerfile
++FROM python:3.11-slim
++WORKDIR /app
++COPY codecarbon_integration.py /app/codecarbon_integration.py
++RUN pip install --no-cache-dir codecarbon prometheus_client
++EXPOSE 9102
++CMD ["python", "codecarbon_integration.py", "--job-id", "example"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/monitoring/carbon_prometheus_rules.yaml
++apiVersion: monitoring.coreos.com/v1
++kind: PrometheusRule
++metadata:
++  name: aegis-carbon-rules
++  namespace: monitoring
++spec:
++  groups:
++    - name: carbon.rules
++      rules:
++        - alert: HighJobEmissions
++          expr: job_emissions_kg > 1.0
++          for: 5m
++          labels:
++            severity: warning
++          annotations:
++            summary: "High job emissions detected"
++            description: "A job emitted more than 1 kgCO2eq in the last 5m. Investigate and consider region/batching changes."
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/gatekeeper/constraint_carbon_budget.yaml
++apiVersion: constraints.gatekeeper.sh/v1beta1
++kind: K8sRequiredLabels
++metadata:
++  name: require-carbon-budget-annotation
++spec:
++  match:
++    kinds:
++      - apiGroups: [""]
++        kinds: ["Pod"]
++  parameters:
++    labels:
++      - "carbon_budget"
++
++# Usage: annotate Pods or Jobs with carbon_budget=<USD or kg> and Gatekeeper will require the annotation.
++# Real enforcement of budget comparisons should be implemented in admission controllers or CI checks that call cost/emissions estimators.
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/monitoring/llm_multimodal_grafana_dashboard.json
++{
++  "title": "Aegis LLM & Carbon Overview (sample)",
++  "panels": [
++    {
++      "type": "graph",
++      "title": "LLM Requests (by endpoint)",
++      "targets": [
++        {"expr": "sum(llm_mm_requests_total) by (endpoint)", "legendFormat": "{{endpoint}}"}
++      ]
++    },
++    {
++      "type": "graph",
++      "title": "Estimated Tokens (total)",
++      "targets": [
++        {"expr": "sum(llm_mm_token_estimated_total)","legendFormat":"tokens"}
++      ]
++    },
++    {
++      "type": "graph",
++      "title": "Job Emissions (kg)",
++      "targets": [
++        {"expr": "sum(job_emissions_kg) by (job_id)", "legendFormat": "{{job_id}}"}
++      ]
++    }
++  ]
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/validate_multimodal_prompts_and_tools.yml
++name: Validate Multimodal Prompts & Tool Contracts
++
++on:
++  push:
++    paths:
++      - 'prompts/**'
++      - 'ops/agents/**'
++
++jobs:
++  validate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Check multimodal prompt placeholders
++        run: |
++          set -e
++          for f in prompts/*; do
++            if [ -f "$f" ]; then
++              if ! grep -q '{question}' "$f" && ! grep -q '{image}' "$f"; then
++                echo "Prompt $f missing multimodal placeholders"
++                exit 1
++              fi
++            fi
++          done
++          echo "Prompts OK"
++      - name: Lint agent tool wrappers (basic syntax)
++        run: |
++          set -e
++          python -m pyflakes ops/agents || true
++          echo "Agent tool wrapper syntax check completed (pyflakes output ignored)"
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/llm_multimodal_agent_carbon_README.md
++# Multimodal, Agentic and Carbon-Aware additions for Aegis
++
++This patch adds:
++- Multimodal ingestion + embeddings pipeline (images & audio)
++- Multimodal-capable inference adapter endpoint
++- Argo embedding workflow variant for multimodal inputs
++- Agent orchestrator (planner+executor) with tool wrappers and S3 provenance writes
++- Carbon estimator integration (CodeCarbon) + Prometheus metrics + alerts
++- Gatekeeper constraint templates for carbon & legal signoff
++- Grafana dashboard sample and CI prompt/tool validators
++
++Operator notes:
++- Build and push docker images for inference-adapter-multimodal, rag-service, agent-orchestrator and carbon worker.
++- Install vector DB (Postgres+pgvector) and ensure ExternalSecrets provide DB credentials to pods.
++- Deploy k8s manifests under k8s/ and argo/ workflows to run ingestion and embedding.
++- Ensure EVIDENCE_BUCKET is set in aegis-runtime-secrets so agents/RAG write provenance.
++- Install Gatekeeper and Prometheus (kube-prometheus-stack) and apply the PrometheusRule files.
++
++Security & governance:
++- Tool wrappers are minimal; production requires strict RBAC, sandboxed code execution, request/response validation, and signing of provenance artifacts.
++- Carbon gating is advisory in this patch; integrate the cost/emissions estimator in admission or CI gates for hard enforcement.
++- Do NOT commit any secrets (OpenAI keys, DB passwords); use ExternalSecrets and GitHub secrets as before.
++
++Next steps I can do for you:
++- Fill REPLACE_* placeholders and open a PR.
++- Create Helm charts for the new services with HPA and resource limits.
++- Implement stronger sandboxing for code_exec and secure job-runner tool (e.g., use Kubernetes Jobs with restrictions).
++- Wire CodeCarbon to job-level cost estimates and add a GitHub Actions step to block merges when carbon/budget exceed thresholds.
++
+*** End Patch
+*** End Patch

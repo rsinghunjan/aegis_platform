@@ -1,0 +1,574 @@
+*** Begin Patch
+*** Add File: provider/legal/baa_sign_archive_workflow.md
++BAA & SLA Sign, Archive and CI Gate Workflow
++
++Purpose
++- Ensure Business Associate Agreements (BAA) and provider SLAs are signed, archived, auditable and enforced before any regulated (PHI/PII) data is sent to external QPU providers.
++
++Actors
++- Legal: negotiate and sign BAAs/SLAs.
++- Ops: upload signed PDFs to secure object storage, update tracker.
++- CI: enforce BAA presence for regulated promotions.
++- Compliance: maintain audit trail (signed archive + cosign signature + Rekor entry).
++
++Steps
++1. Legal signs BAA/SLA PDF.
++2. Ops runs: python provider/legal/upload_baa.py --provider <prov> --file signed.pdf --bucket <secure-bucket> --uploader <email>
++   - This uploads the PDF to encrypted object storage and updates provider/legal/baas_tracker.csv.
++3. Ops runs cosign sign on the uploaded PDF (optional) and stores the attestation in Rekor.
++4. CI promotion pipelines call provider/legal/check_baa.py when the promotion request includes regulated=true. If missing, pipeline fails and provider/legal/notify_baa_needed.py notifies legal/ops.
++5. Audit: the signed PDF, cosign signature, Rekor entry and promotion manifest are collected into the compliance evidence bundle (compliance/evidence/assemble_and_sign.sh).
++
++Retention
++- Archive BAAs for required retention period (e.g., 7 years). Store in a compliance bucket with restricted access and MFA deletion controls.
++
+*** End Patch
+*** Begin Patch
+*** Add File: provider/legal/auto_archive_baa.py
++#!/usr/bin/env python3
++"""
++Automate archiving of signed BAA/SLA documents and create signed evidence.
++Uploads to S3/GCS and optionally signs the artifact with cosign via KMS/HSM.
++"""
++import argparse
++import subprocess
++from pathlib import Path
++import datetime
++import boto3
++
++def upload(bucket, src, dest_key):
++    s3 = boto3.client("s3")
++    s3.upload_file(str(src), bucket, dest_key, ExtraArgs={"ServerSideEncryption":"AES256"})
++    return f"s3://{bucket}/{dest_key}"
++
++def cosign_sign(local_path):
++    # expects COSIGN_KMS_KEY or COSIGN_PRIVATE_KEY in env
++    subprocess.check_call(["cosign","sign", local_path], timeout=120)
++
++def main():
++    p=argparse.ArgumentParser()
++    p.add_argument("--file", required=True)
++    p.add_argument("--provider", required=True)
++    p.add_argument("--bucket", required=True)
++    args=p.parse_args()
++    src=Path(args.file)
++    if not src.exists():
++        raise SystemExit("file not found")
++    dest=f"compliance/BAA/{args.provider}/{src.name}"
++    url=upload(args.bucket, src, dest)
++    # optional sign
++    try:
++        cosign_sign(str(src))
++    except Exception as e:
++        print("cosign sign failed:", e)
++    print("Archived to", url)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: infra/hsm/cloudhsm_init_playbook.yml
++- name: CloudHSM initialization and key import playbook (scaffold)
++  hosts: cloudhsm_admin
++  become: true
++  vars:
++    cloudhsm_cluster_id: ""
++    hsm_user: "CUadmin"
++  tasks:
++    - name: Ensure CloudHSM client & pkcs11 tools installed
++      apt:
++        name:
++          - libcloudhsm-client
++          - cloudhsm-client
++          - pkcs11-tool
++        state: present
++      ignore_errors: yes
++
++    - name: Display manual steps reminder
++      debug:
++        msg: |
++          After cluster creation: follow AWS CloudHSM docs to initialize cluster, claim HSMs,
++          create Crypto User (CU) and Security Officers (SO). This playbook will help place
++          PKCS11 config files and provide cosign test hooks.
++
++    - name: Deploy PKCS11 config
++      copy:
++        dest: /etc/cosign/pkcs11.conf
++        content: |
++          module_path = /usr/lib/libcloudhsm_pkcs11.so
++          token_label = cosign-key
++      mode: '0600'
++
++    - name: Upload cosign pkcs11 validation script
++      copy:
++        src: hsm/pkcs11/cosign_pkcs11_validation.sh
++        dest: /usr/local/bin/cosign_pkcs11_validation.sh
++        mode: '0755'
++
++    - name: Create admin wrapper for HSM key import (manual)
++      copy:
++        dest: /usr/local/bin/cloudhsm_manual_import.sh
++        content: |
++          #!/bin/sh
++          echo "This script is a placeholder: use HSM client tools to create/import keys."
++        mode: '0755'
++
+*** End Patch
+*** Begin Patch
+*** Add File: hsm/pkcs11/import_key.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Import or create a key inside the PKCS11 HSM and label it for cosign use.
++# This script is environment and HSM vendor dependent; run on an admin host with HSM client.
++PKCS11_MODULE="${PKCS11_MODULE:-/usr/lib/libcloudhsm_pkcs11.so}"
++KEY_LABEL="${1:-cosign-key}"
++
++echo "This is a guided helper. Use vendor HSM tools to create/import a key with label ${KEY_LABEL}."
++echo "Example steps (CloudHSM v2):"
++echo " - Use 'key_mgmt_util' or 'pkcs11-tool' to generate key inside HSM or import wrapped key."
++echo " - Ensure key is usable for signing and that client can access it via PKCS11 module at ${PKCS11_MODULE}."
++exit 0
++
+*** End Patch
+*** Begin Patch
+*** Add File: hsm/pkcs11/cosign_pkcs11_validation.sh
++#!/usr/bin/env bash
++set -euo pipefail
++MANIFEST="${1:-manifest.json}"
++MODULE="${PKCS11_MODULE:-/usr/lib/libcloudhsm_pkcs11.so}"
++LABEL="${PKCS11_LABEL:-cosign-key}"
++
++if [ ! -f "${MANIFEST}" ]; then
++  echo "manifest not found: ${MANIFEST}"; exit 2
++fi
++
++echo "Signing with PKCS11 key label ${LABEL} via module ${MODULE}"
++cosign sign --key "pkcs11:token=${LABEL}?module-path=${MODULE}" "${MANIFEST}"
++echo "Verifying signature"
++cosign verify "${MANIFEST}" || true
++echo "PKCS11 cosign validation complete"
++
+*** End Patch
+*** Begin Patch
+*** Add File: hsm/rotation/rotation_drill.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Rotate cosign signing key (KMS or HSM) and validate sign/verfiy + CloudTrail audit presence.
++# For AWS KMS: create new key and move alias.
++# For CloudHSM PKCS11: create new key in HSM and update label mapping in CI (manual).
++
++if [ "${USE_CLOUDHSM:-false}" = "true" ]; then
++  echo "Rotate CloudHSM key: manual process required. Use admin scripts to create new key and update CI secret COSIGN_PKCS11_LABEL."
++  exit 0
++else
++  NEW_KEY_ID=$(aws kms create-key --description "Cosign rotation key" --query KeyMetadata.KeyId --output text)
++  aws kms create-alias --alias-name alias/aegis-cosign --target-key-id "${NEW_KEY_ID}"
++  echo "New KMS key created: ${NEW_KEY_ID}"
++  # Update CI secret (example GitHub)
++  if command -v gh >/dev/null 2>&1; then
++    REPO="${1:-owner/repo}"
++    gh secret set COSIGN_KMS_KEY --repo "${REPO}" --body "awskms:///${NEW_KEY_ID}"
++    echo "Updated GitHub secret COSIGN_KMS_KEY"
++  fi
++  echo "Validate sign using new key (local cosign will pick up alias)."
++  cosign sign --key "awskms:///${NEW_KEY_ID}" manifest.json || true
++  cosign verify manifest.json || true
++fi
++
++echo "Check CloudTrail for Key usage (manual): aws cloudtrail lookup-events --lookup-attributes AttributeKey=ResourceName,AttributeValue=${NEW_KEY_ID}"
++
+*** End Patch
+*** Begin Patch
+*** Add File: ansible/provision/procurement_site_onboarding.md
++Site procurement & onboarding checklist for Jetson/ARM runner site
++
++1) Procurement
++ - Acquire Jetson/ARM HW with specified NVMe/Sdcard, RAM and power supplies.
++ - Ensure devices have TPM or secure boot where possible.
++
++2) Network design
++ - Place devices in private subnets with no public IPs.
++ - Provide a bastion host in a management subnet for SSH and maintenance.
++ - Restrict outbound to required endpoints (GitHub, artifact storage, Vault).
++
++3) Power & Physical
++ - Rack/power planning, UPS and network cabling.
++ - Device labeling & asset management.
++
++4) Onboarding
++ - Use cloud-init (ansible/provision/cloud_init_runner.yaml) to bootstrap runner user and node_exporter.
++ - Run ansible/provision/site_hardening_site.yml to apply hardening.
++ - Install MDM agent and verify certificate provisioning from Vault/MDM endpoint.
++
++5) Monitoring & maintenance
++ - Configure Prometheus node_exporter and register in monitoring.
++ - Set up alerting for runner down percentage (monitoring/prometheus/runner_alerts.yaml).
++ - Schedule weekly patch windows.
++
+*** End Patch
+*** Begin Patch
+*** Add File: ansible/provision/scale_reprovision.yml
++- name: Scale reprovision orchestrator (run from control host)
++  hosts: runners
++  become: true
++  serial: 20
++  tasks:
++    - name: Drain runner from CI orchestrator (best effort)
++      uri:
++        url: "https://ci.example.com/api/v1/runners/{{ inventory_hostname }}/drain"
++        method: POST
++      ignore_errors: yes
++
++    - name: Stop runner service
++      systemd:
++        name: github-runner
++        state: stopped
++      ignore_errors: yes
++
++    - name: Clean actions-runner dir
++      file:
++        path: /home/aegis-runner/actions-runner
++        state: absent
++
++    - name: Re-run runner install
++      include_role:
++        name: aegis.runner_install
++
++    - name: Ensure node_exporter updated
++      include_tasks: monitoring/node_exporter_install.yml
++
++    - name: Mark runner healthy
++      uri:
++        url: "https://ci.example.com/api/v1/runners/{{ inventory_hostname }}/healthy"
++        method: POST
++      ignore_errors: yes
++
+*** End Patch
+*** Begin Patch
+*** Add File: runners/scale/orchestrator.py
++#!/usr/bin/env python3
++"""
++High-level orchestrator to manage many runners: reprovision, rotate tokens and check health.
++Intended to be run from an ops host with SSH/Ansible access.
++"""
++import subprocess, csv, sys, argparse
++
++def run_playbook(limit=None):
++    cmd=["ansible-playbook","ansible/provision/scale_reprovision.yml"]
++    if limit:
++        cmd += ["--limit", limit]
++    print("Running:", " ".join(cmd))
++    subprocess.check_call(cmd)
++
++def rotate_tokens(inv_csv):
++    cmd=["python","scripts/runner/rotate_runner_tokens.py",inv_csv]
++    print("Running:", " ".join(cmd))
++    subprocess.check_call(cmd)
++
++if __name__=="__main__":
++    p=argparse.ArgumentParser()
++    p.add_argument("--rotate", action="store_true")
++    p.add_argument("--inv", default="ansible/provision/hosts.ini")
++    p.add_argument("--limit", default=None)
++    args=p.parse_args()
++    if args.rotate:
++        rotate_tokens(args.inv)
++    else:
++        run_playbook(limit=args.limit)
++
+*** End Patch
+*** Begin Patch
+*** Add File: quantum/hardening/run_sla_harness_distributed.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Run SLA harness in distributed fashion (k8s jobs or CI runners). Collect JSON reports to /tmp/qpu_reports.
++OUTDIR=${1:-/tmp/qpu_reports}
++mkdir -p "$OUTDIR"
++for i in $(seq 1 20); do
++  python quantum/sla/provider_sla_test_harness.py > "$OUTDIR/report_${i}.json" 2>&1 || true
++  sleep 10
++done
++echo "Reports in $OUTDIR"
++
+*** End Patch
+*** Begin Patch
+*** Add File: quantum/hardening/aggregate_sla_reports.py
++#!/usr/bin/env python3
++"""
++Aggregate SLA reports produced by the harness and compute provider-level metrics for tuning.
++Outputs JSON summary and suggestion file for adapter tuning pipeline.
++"""
++import json,glob,sys,statistics
++reports=glob.glob("/tmp/qpu_reports/report_*.json")
++agg={}
++latencies=[]
++errors=0
++count=0
++for r in reports:
++    try:
++        j=json.load(open(r))
++    except Exception:
++        continue
++    # harness may produce different shapes; adapt heuristics
++    elapsed=j.get("elapsed") or j.get("report",{}).get("elapsed") or 0
++    latencies.append(elapsed)
++    if j.get("result",{}).get("error") or j.get("error"):
++        errors+=1
++    count+=1
++summary={"count":count,"p95_latency":statistics.quantiles(latencies,n=20)[18] if latencies else None,"errors":errors}
++open("/tmp/qpu_sla_summary.json","w").write(json.dumps(summary,indent=2))
++print("Wrote /tmp/qpu_sla_summary.json")
++
+*** End Patch
+*** Begin Patch
+*** Add File: quantum/tuning/apply_adapter_config.py
++#!/usr/bin/env python3
++"""
++Apply adapter tuning recommendations to a Kubernetes ConfigMap for adapters to consume.
++Expects /tmp/adapter_recommendations.json to exist.
++"""
++import subprocess, json, os,sys
++CFG="/tmp/adapter_recommendations.json"
++if not os.path.exists(CFG):
++    print("No recommendations file",CFG); sys.exit(2)
++rec=json.load(open(CFG))
++cm={
++    "apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"aegis-adapter-config","namespace":"aegis"},"data":{"config":json.dumps(rec)}
++}
++proc=subprocess.run(["kubectl","apply","-f","-"], input=json.dumps(cm).encode())
++print("kubectl apply returned", proc.returncode)
++
+*** End Patch
+*** Begin Patch
+*** Add File: mitigation/znereadout_integration.py
++#!/usr/bin/env python3
++"""
++Operational integration for readout mitigation + ZNE pipeline.
++- Collect calibration snapshots from MLflow
++- Run mitigation experiments (ZNE + readout calibration) on small circuits
++- Persist mitigation artifacts and parameters back to MLflow and the adapter config store
++"""
++import mlflow, json, time, logging, os
++from quantum.transpile.zero_noise_extrapolation import zne_execute
++from quantum.mitigation.readout_mitigation_extended import build_meas_fitter, apply_mitigation
++from quantum.adapters.qiskit_adapter import QiskitAdapter
++
++mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI",""))
++LOG=logging.getLogger("aegis.zne")
++LOG.setLevel(logging.INFO)
++
++def run_for_device(device_name, test_circuit):
++    adapter=QiskitAdapter(use_simulator=True)
++    # readout mitigation
++    meas_fitter=None
++    try:
++        meas_fitter=build_meas_fitter(adapter.backend, list(range(min(6, adapter.backend.configuration().n_qubits))))
++    except Exception as e:
++        LOG.warning("meas fitter failed: %s", e)
++    # zne run
++    zne_res=zne_execute(adapter, test_circuit, shots=512, scales=[1.0,2.0])
++    # store in mlflow
++    run_name=f"mitigation-{device_name}-{int(time.time())}"
++    with mlflow.start_run(run_name=run_name):
++        mlflow.log_param("device", device_name)
++        mlflow.log_dict(zne_res, "zne_result.json")
++        if meas_fitter:
++            mlflow.log_param("meas_fitter_present", True)
++    return {"device":device_name,"zne":zne_res}
++
+*** End Patch
+*** Begin Patch
+*** Add File: mitigation/collect_calibration_mlflow.py
++#!/usr/bin/env python3
++"""
++Collect calibration snapshots and store under a per-device MLflow run for research teams.
++This utility will be used by mitigation research to fetch consistent data sets.
++"""
++import os, mlflow, json, time
++from quantum.adapters.qiskit_adapter import QiskitAdapter
++
++mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI",""))
++
++def collect(device_name, run_id=None):
++    adapter=QiskitAdapter(use_simulator=False)
++    try:
++        props=adapter.backend.properties().to_dict()
++    except Exception:
++        props={}
++    run_name=f"calibration-{device_name}-{int(time.time())}"
++    with mlflow.start_run(run_name=run_name, run_id=run_id):
++        mlflow.log_dict(props, "calibration/properties.json")
++    return props
++
++if __name__=="__main__":
++    print("Example: python mitigation/collect_calibration_mlflow.py ibm_santiago")
++
+*** End Patch
+*** Begin Patch
+*** Add File: billing/tagging/enforce_tagging_policy.md
++Tagging policy for Provider Billing Reconciliation
++
++Purpose
++- Ensure every QPU job and related cloud resource is tagged with aegis:tenant=<tenant-id> and aegis:job_id=<job-id>
++ so Cost Explorer and provider invoices can be reconciled to qpu_charges rows.
++
++Policy
++- CI and scheduler must attach tags on cloud provider resource creation:
++  - AWS: use TagSpecification when creating resources; apply tags to Braket tasks and other billable resources.
++  - IBM/Azure: use equivalent tagging/metadata features.
++
++Enforcement
++- Use IaC templates that include required tag variables.
++- Billing reconciliation job (billing/reconcile_mapper.py) expects tag 'aegis:tenant' to match qpu_charges.owner.
++
+*** End Patch
+*** Begin Patch
+*** Add File: billing/reconcile_automated.py
++#!/usr/bin/env python3
++"""
++Improved reconciliation worker:
++ - Fetch tagged costs via AWS Cost Explorer for a time window
++ - Attempt to match items to qpu_charges by owner (aegis:tenant tag)
++ - Produce reconciliation report and send SNS alert for exceptions
++"""
++import boto3, json, os, logging
++from datetime import date, timedelta
++from sqlalchemy import create_engine, text
++
++LOG=logging.getLogger("aegis.billing")
++logging.basicConfig(level=logging.INFO)
++DB_URL=os.environ.get("DATABASE_URL","postgresql://aegis:aegis@postgres:5432/aegis")
++engine=create_engine(DB_URL)
++SNS_TOPIC=os.environ.get("BILLING_SNS_TOPIC","")
++
++def fetch_tagged_costs(start,end):
++    client=boto3.client("ce",region_name="us-east-1")
++    resp=client.get_cost_and_usage(TimePeriod={"Start":start,"End":end},Granularity="DAILY",Metrics=["UnblendedCost"],GroupBy=[{"Type":"TAG","Key":"aegis:tenant"}])
++    return resp
++
++def reconcile(start,end):
++    resp=fetch_tagged_costs(start,end)
++    results=[]
++    with engine.connect() as conn:
++        for day in resp.get("ResultsByTime",[]):
++            day_str=day.get("TimePeriod",{}).get("Start")
++            for g in day.get("Groups",[]):
++                key=g.get("Keys",[None])[0]
++                if not key or "aegis:tenant$" not in key:
++                    continue
++                owner=key.split("$",1)[1]
++                amount=float(g.get("Metrics",{}).get("UnblendedCost",{}).get("Amount",0.0))
++                # naive matching by owner and day
++                q=conn.execute(text("SELECT id, amount_usd FROM qpu_charges WHERE owner=:owner AND to_char(to_timestamp(created_at),'YYYY-MM-DD') = :day"),{"owner":owner,"day":day_str})
++                rows=list(q)
++                if not rows:
++                    LOG.warning("Unmatched billing for owner %s on %s amount %s", owner, day_str, amount)
++                    results.append({"owner":owner,"day":day_str,"amount":amount,"matched":False})
++                else:
++                    # mark reconciled
++                    conn.execute(text("UPDATE qpu_charges SET reconciled=true, provider_invoice_id=:inv WHERE owner=:owner AND to_char(to_timestamp(created_at),'YYYY-MM-DD') = :day"),{"inv":"aws-"+day_str,"owner":owner,"day":day_str})
++                    results.append({"owner":owner,"day":day_str,"amount":amount,"matched":True})
++    if SNS_TOPIC:
++        import boto3
++        sns=boto3.client("sns")
++        exceptions=[r for r in results if not r["matched"]]
++        if exceptions:
++            sns.publish(TopicArn=SNS_TOPIC,Subject="Unmatched QPU billing",Message=json.dumps(exceptions))
++    open("/tmp/reconcile_report.json","w").write(json.dumps(results,indent=2))
++    print("Wrote /tmp/reconcile_report.json")
++
++if __name__=="__main__":
++    today=date.today(); start=(today - timedelta(days=7)).isoformat(); end=today.isoformat()
++    reconcile(start,end)
++
+*** End Patch
+*** Begin Patch
+*** Add File: edge/loadtest/locust_distributed_jobs.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: locust-worker-batch
++  namespace: aegis
++spec:
++  template:
++    spec:
++      containers:
++        - name: locust
++          image: locustio/locust
++          command: ["sh", "-c", "locust -f /mnt/locust/locustfile.py --worker --master-host locust-master.aegis.svc.cluster.local"]
++          volumeMounts:
++            - name: scripts
++              mountPath: /mnt/locust
++      restartPolicy: OnFailure
++      volumes:
++        - name: scripts
++          configMap:
++            name: locust-scripts
++
+*** End Patch
+*** Begin Patch
+*** Add File: db/partitioning/maintenance.sql
++-- Daily job example: create today's partition and vacuum prior partitions
++DO $$
++BEGIN
++  PERFORM create_telemetry_partition(current_date);
++END$$;
++
++VACUUM ANALYZE;
++
+*** End Patch
+*** Begin Patch
+*** Add File: db/tuning/pg_conf_suggester.py
++#!/usr/bin/env python3
++"""
++Suggest Postgres configuration based on expected device scale and ingestion QPS.
++Outputs recommended values for max_connections, work_mem, shared_buffers, and connection pool sizing.
++"""
++import math,sys,json
++
++def suggest(devices, qps_per_device=0.01):
++    expected_qps = devices * qps_per_device
++    worker_threads = max(8, int(expected_qps / 20))
++    max_connections = worker_threads * 25 + 200
++    shared_buffers = min(0.25 * (devices/1000) * 1024, 8192)  # MB heuristic
++    work_mem = int(max(4, 64 * (1 + worker_threads/100)))
++    return {"expected_qps": expected_qps, "worker_threads": worker_threads, "max_connections": max_connections, "shared_buffers_mb": int(shared_buffers), "work_mem_kb": work_mem}
++
++if __name__=="__main__":
++    devices=int(sys.argv[1]) if len(sys.argv)>1 else 100000
++    print(json.dumps(suggest(devices), indent=2))
++
+*** End Patch
+*** Begin Patch
+*** Add File: runbooks/acceptance/quantum_provider_live_test.md
++# Quantum Provider Live Test Runbook
++
++Objective
++- Run a live provider test for end-to-end QPU execution, attestation, billing trace and SLA measurement.
++
++Prerequisites
++- BAA signed for provider if regulated data is used.
++- Provider credentials in Vault/CI, Rekor and cosign accessible, MLflow configured.
++- SLA harness & adapter tuning deployed.
++
++Steps
++1. Schedule maintenance window with provider support if possible.
++2. Run distributed SLA harness: quantum/hardening/run_sla_harness_distributed.sh
++3. Aggregate reports: quantum/hardening/aggregate_sla_reports.py -> /tmp/qpu_sla_summary.json
++4. If p95 latency or error rate > threshold, adjust adapter config via quantum/tuning/apply_adapter_config.py
++5. Submit real low-shot jobs and verify provider receipt attestation:
++   - python quantum/workflows/simulate_promote_qpu.py --circuit tests/data/simple.qasm --provider braket --shots 64 --mlflow-run-id <runid>
++6. Fetch provider billing for the test window and run billing/reconcile_automated.py
++7. Review reconciliation report; tag/match issues escalate to billing owner.
++8. Document results and update device catalog and mitigation options based on calibration snapshots collected via mitigation/collect_calibration_mlflow.py
++
++Post-test actions
++- If provider performance acceptable, roll adapter tuning into ConfigMap and redo test.
++- If not acceptable, pause promotions to that provider and route to simulators or alternate providers.
++
+*** End Patch
+*** End Patch

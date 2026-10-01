@@ -1,0 +1,733 @@
+*** Begin Patch
+*** Add File:agent/manager.py
++#!/usr/bin/env python3
++"""
++Agent Manager service (FastAPI)
++ - Accepts an agent task request, spins up an agent run (background)
++ - Integrates with Tool Registry, OPA policy checks, Tool Runner, Session Store, Audit logger, Cost accounting and Safety checks
++ - If LangChain is installed it will attempt to use a LangChain agent; otherwise falls back to a simple planner loop
++
++Endpoints:
++ - POST /agent/start  -> start an agent run
++ - GET  /agent/status/{run_id}
++ - POST /agent/approve/{run_id}/{action_id}  -> human approval
++ - POST /agent/pause/{run_id}, /resume/{run_id}, /kill/{run_id}
++
++This is a coordinator and deliberately keeps logic lightweight; tool execution is delegated to tool_runner.
++"""
++import os
++import uuid
++import time
++import asyncio
++import json
++from typing import Dict, Any, List
++from fastapi import FastAPI, BackgroundTasks, HTTPException
++
++from prometheus_client import Counter, Histogram, start_http_server
++
++from agent.session_store import SessionStore
++from agent.tool_registry import ToolRegistryClient
++from agent.tool_runner import ToolRunner
++from agent.policies.opa_client import OPAClient
++from agent.audit.audit_logger import AuditLogger
++from agent.cost.accounting import CostAccounting
++from agent.safety.safety_checks import safety_pre_check, safety_post_check
++
++APP_PORT = int(os.environ.get("AGENT_MANAGER_PORT", "8085"))
++start_http_server(int(os.environ.get("AGENT_METRICS_PORT", "9105")))
++
++AGENT_RUNS: Dict[str, Dict[str, Any]] = {}
++
++# Prometheus metrics
++AGENT_RUNS_TOTAL = Counter("aegis_agent_runs_total", "Total agent runs started")
++AGENT_ACTIONS = Counter("aegis_agent_actions_total", "Total actions executed", ["tool"])
++AGENT_ACTION_LATENCY = Histogram("aegis_agent_action_latency_seconds", "Per-action latency seconds")
++
++app = FastAPI(title="Aegis Agent Manager")
++
++# Clients (init)
++SESSION_STORE = SessionStore()
++TOOL_REGISTRY = ToolRegistryClient(os.environ.get("TOOL_REGISTRY_URL", "http://localhost:8090"))
++TOOL_RUNNER = ToolRunner()
++OPA = OPAClient(os.environ.get("OPA_URL", "http://opa:8181"))
++AUDIT = AuditLogger()
++COST = CostAccounting()
++
++async def agent_loop(run_id: str, task: Dict[str, Any], max_steps: int = 10):
++    """
++    Core agent loop (simple planner). Steps:
++     - Plan next action (very simple heuristic or delegate to LangChain if available)
++     - Pre-action OPA check
++     - Run tool via ToolRunner
++     - Post-action OPA + safety checks
++     - Append to session and audit each action
++    """
++    AGENT_RUNS[run_id]["status"] = "RUNNING"
++    tenant = task.get("tenant", "global")
++    prompt = task.get("prompt", "")
++    memory = SESSION_STORE.create_session(run_id, {"prompt": prompt, "tenant": tenant})
++
++    # Try to use LangChain if installed and TASK requests it
++    use_langchain = task.get("use_langchain", False)
++    langchain_used = False
++    if use_langchain:
++        try:
++            from langchain.agents import initialize_agent, Tool
++            from langchain.llms import OpenAI
++            # Create dynamic Tool wrappers that call out to tool registry/runner
++            tools = []
++            for t in TOOL_REGISTRY.list_tools():
++                name = t["name"]
++                def make_run(name):
++                    def run_fn(input_str: str):
++                        return TOOL_RUNNER.run_tool_sync(name, input_str, run_id)
++                    return run_fn
++                tools.append(Tool(name=name, func=make_run(name), description=t.get("description","")))
++            llm = OpenAI(temperature=0)  # requires credentials in environment
++            agent = initialize_agent(tools, llm, agent="zero-shot-react-description", verbose=False)
++            res = agent.run(prompt)
++            SESSION_STORE.append_action(run_id, {"tool":"langchain","input":prompt,"output":res,"ts":time.time()})
++            AUDIT.log_action(run_id, "langchain", prompt, {"output": res})
++            langchain_used = True
++        except Exception as e:
++            print("LangChain not available or failed:", e)
++
++    if not langchain_used:
++        # Simple heuristic planner: choose a tool whose keywords match the prompt
++        for step in range(max_steps):
++            if AGENT_RUNS[run_id].get("state","") == "KILLED":
++                AGENT_RUNS[run_id]["status"] = "KILLED"
++                return
++            # Determine candidate tools
++            candidate_tools = TOOL_REGISTRY.find_tools_for_prompt(prompt)
++            if not candidate_tools:
++                # nothing to do
++                AGENT_RUNS[run_id]["status"] = "COMPLETED"
++                return
++            tool = candidate_tools[0]
++
++            action_id = str(uuid.uuid4())
++            action_meta = {"id": action_id, "tool": tool["name"], "input": prompt, "ts": time.time()}
++
++            # Pre-action OPA check
++            opa_ok, opa_msg = OPA.evaluate_pre_action({"run_id": run_id, "action": action_meta})
++            if not opa_ok:
++                # require human approval if OPA denies but marks for approval
++                if opa_msg.get("requires_approval"):
++                    AGENT_RUNS[run_id]["status"] = "AWAITING_APPROVAL"
++                    SESSION_STORE.set_pending_approval(run_id, action_meta)
++                    AUDIT.log_action(run_id, "pre_action_blocked", tool["name"], {"reason": opa_msg})
++                    return
++                else:
++                    AUDIT.log_action(run_id, "pre_action_denied", tool["name"], {"reason": opa_msg})
++                    AGENT_RUNS[run_id]["status"] = "FAILED_PRE_ACTION"
++                    return
++
++            # Cost and quota check
++            if not COST.check_quota(tenant, tool.get("cost_estimate", 1.0)):
++                AGENT_RUNS[run_id]["status"] = "FAILED_QUOTA"
++                AUDIT.log_action(run_id, "quota_exceeded", tool["name"], {"tenant": tenant})
++                return
++
++            # Run the tool (async)
++            AGENT_ACTIONS.labels(tool=tool["name"]).inc()
++            start = time.time()
++            try:
++                result = await TOOL_RUNNER.run_tool(tool["name"], prompt, run_id)
++            except Exception as e:
++                result = {"error": str(e)}
++            latency = time.time() - start
++            AGENT_ACTION_LATENCY.observe(latency)
++
++            # Post-action OPA & safety
++            opa_ok_post, opa_msg_post = OPA.evaluate_post_action({"run_id": run_id, "action": action_meta, "result": result})
++            safe_ok, safe_msg = safety_post_check(result)
++            SESSION_STORE.append_action(run_id, {"action": action_meta, "result": result, "ts": time.time()})
++            AUDIT.log_action(run_id, tool["name"], action_meta["input"], {"result": result})
++            COST.record_usage(tenant, tool.get("cost_estimate", 1.0))
++
++            if not opa_ok_post or not safe_ok:
++                # if post-action fails, escalate to human or mark failure
++                AUDIT.log_action(run_id, "post_action_issue", tool["name"], {"opa": opa_msg_post, "safety": safe_msg})
++                AGENT_RUNS[run_id]["status"] = "AWAITING_APPROVAL"
++                SESSION_STORE.set_pending_approval(run_id, {"action": action_meta, "result": result})
++                return
++
++            # Decide to continue or finish (simple heuristic)
++            if "final" in result or "error" in result:
++                AGENT_RUNS[run_id]["status"] = "COMPLETED"
++                return
++            # else update prompt / loop
++            prompt = result.get("next_prompt", prompt)
++        AGENT_RUNS[run_id]["status"] = "MAX_STEPS_REACHED"
++
++@app.post("/agent/start")
++async def start_agent(task: Dict[str, Any], background: BackgroundTasks):
++    run_id = str(uuid.uuid4())
++    AGENT_RUNS_TOTAL.inc()
++    AGENT_RUNS[run_id] = {"status": "PENDING", "task": task, "created_at": time.time()}
++    # schedule background agent loop
++    background.add_task(agent_loop, run_id, task, task.get("max_steps", 10))
++    return {"run_id": run_id, "status": "PENDING"}
++
++@app.get("/agent/status/{run_id}")
++def status(run_id: str):
++    if run_id not in AGENT_RUNS:
++        raise HTTPException(status_code=404, detail="run not found")
++    return AGENT_RUNS[run_id]
++
++@app.post("/agent/approve/{run_id}/{action_id}")
++def approve_action(run_id: str, action_id: str):
++    # Perform approval: fetch pending approval and resume
++    pending = SESSION_STORE.pop_pending_approval(run_id)
++    if not pending or pending.get("action", {}).get("id") != action_id:
++        raise HTTPException(status_code=404, detail="pending approval not found")
++    # mark approved and resume loop (simple implementation: restart background loop)
++    AGENT_RUNS[run_id]["status"] = "RESUMING_AFTER_APPROVAL"
++    # resume asynchronously
++    asyncio.create_task(agent_loop(run_id, AGENT_RUNS[run_id]["task"], max_steps=10))
++    return {"status": "approved"}
++
++@app.post("/agent/pause/{run_id}")
++def pause_run(run_id: str):
++    if run_id in AGENT_RUNS:
++        AGENT_RUNS[run_id]["state"] = "PAUSED"
++        return {"status": "paused"}
++    raise HTTPException(status_code=404)
++
++@app.post("/agent/resume/{run_id}")
++def resume_run(run_id: str):
++    if run_id in AGENT_RUNS:
++        AGENT_RUNS[run_id]["state"] = ""
++        asyncio.create_task(agent_loop(run_id, AGENT_RUNS[run_id]["task"], max_steps=10))
++        return {"status": "resuming"}
++    raise HTTPException(status_code=404)
++
++@app.post("/agent/kill/{run_id}")
++def kill_run(run_id: str):
++    if run_id in AGENT_RUNS:
++        AGENT_RUNS[run_id]["state"] = "KILLED"
++        AGENT_RUNS[run_id]["status"] = "KILLED"
++        return {"status": "killed"}
++    raise HTTPException(status_code=404)
++
++if __name__ == "__main__":
++    import uvicorn
++    uvicorn.run(app, host="0.0.0.0", port=APP_PORT)
++
+*** End Patch
+*** Begin Patch
+*** Add File:agent/tool_registry.py
++#!/usr/bin/env python3
++"""
++Tool Registry service client + simple in-memory registry.
++ - Provides registration, listing and discovery heuristics
++ - Stores tool metadata: name, description, required_secrets, rbac, cost_estimate, sandbox_profile
++"""
++import os
++import requests
++from typing import List, Dict, Any
++
++REGISTRY_URL = os.environ.get("TOOL_REGISTRY_URL", "")
++
++class ToolRegistryClient:
++    def __init__(self, base_url: str = ""):
++        self.base_url = base_url or REGISTRY_URL
++        # simple in-memory registry as fallback
++        self._tools: List[Dict[str, Any]] = [
++            {"name":"s3_put", "description":"Upload artifact to S3", "required_secrets":["aws"], "cost_estimate":0.1, "sandbox_profile":"write-limited"},
++            {"name":"sql_execute", "description":"Execute SQL on DW", "required_secrets":["redshift"], "cost_estimate":0.5, "sandbox_profile":"db-lite"},
++            {"name":"http_request", "description":"Call external HTTP API", "required_secrets":["api_key"], "cost_estimate":0.05, "sandbox_profile":"http-outbound"},
++            {"name":"shell_exec", "description":"Run shell in sandbox (dangerous)", "required_secrets":[], "cost_estimate":0.2, "sandbox_profile":"restricted-shell", "risk":"high"}
++        ]
++
++    def list_tools(self) -> List[Dict[str, Any]]:
++        if self.base_url:
++            try:
++                r = requests.get(f"{self.base_url}/tools", timeout=5)
++                return r.json()
++            except Exception:
++                pass
++        return self._tools
++
++    def get_tool(self, name: str) -> Dict[str, Any]:
++        for t in self.list_tools():
++            if t["name"] == name:
++                return t
++        raise KeyError("tool not found")
++
++    def find_tools_for_prompt(self, prompt: str) -> List[Dict[str, Any]]:
++        # Very simple heuristic: keyword match
++        candidates = []
++        for t in self.list_tools():
++            keywords = t.get("keywords", "") or t["name"].split("_")
++            for k in keywords:
++                if k.lower() in prompt.lower():
++                    candidates.append(t)
++                    break
++        # fallback: return tools with lowest cost first
++        return sorted(candidates or self.list_tools(), key=lambda x: x.get("cost_estimate", 1.0))
++
++    def register_tool(self, metadata: Dict[str, Any]):
++        self._tools.append(metadata)
++        return metadata
++
+*** End Patch
+*** Begin Patch
+*** Add File:agent/tool_runner.py
++#!/usr/bin/env python3
++"""
++Tool Runner
++ - Runs tools in sandboxed Kubernetes Jobs (preferred) or locally in mock mode
++ - Uses the k8s API to create a Job from a template; requires kubeconfig in the runtime environment
++ - Exposes async run_tool(name, input, run_id) coroutine that returns a result dict
++"""
++import os
++import asyncio
++import json
++import tempfile
++import subprocess
++from typing import Dict, Any
++
++# Try to import kubernetes client; if not available, fall back to local execution
++try:
++    from kubernetes import client, config
++    K8S_AVAILABLE = True
++except Exception:
++    K8S_AVAILABLE = False
++
++TOOL_RUNNER_IMAGE = os.environ.get("TOOL_RUNNER_IMAGE", "ghcr.io/yourorg/aegis-tool-runner:latest")
++NAMESPACE = os.environ.get("AGENT_NAMESPACE", "aegis")
++MOCK_MODE = os.environ.get("AGENT_MOCK", "1") == "1"
++
++async def run_tool(name: str, input_text: str, run_id: str) -> Dict[str, Any]:
++    runner = ToolRunner()
++    return await runner.run_tool(name, input_text, run_id)
++
++class ToolRunner:
++    def __init__(self):
++        if K8S_AVAILABLE:
++            try:
++                config.load_incluster_config()
++            except Exception:
++                try:
++                    config.load_kube_config()
++                except Exception:
++                    pass
++        self.k8s_api = client.BatchV1Api() if K8S_AVAILABLE else None
++
++    async def run_tool(self, name: str, input_text: str, run_id: str) -> Dict[str, Any]:
++        if MOCK_MODE or not K8S_AVAILABLE:
++            # local mock execution: echo back input with tool name
++            await asyncio.sleep(0.5)
++            return {"tool": name, "output": f"mocked-run for {name}", "next_prompt": ""}
++        # create k8s job YAML from template and submit
++        job_name = f"tool-{name}-{run_id[:8]}"
++        job_manifest = self._build_job_manifest(job_name, name, input_text)
++        resp = self.k8s_api.create_namespaced_job(namespace=NAMESPACE, body=job_manifest)
++        # wait for completion (simplified)
++        core = client.CoreV1Api()
++        for _ in range(60):
++            pods = core.list_namespaced_pod(namespace=NAMESPACE, label_selector=f"job-name={job_name}").items
++            if pods:
++                pod = pods[0]
++                if pod.status.phase == "Succeeded":
++                    logs = core.read_namespaced_pod_log(pod.metadata.name, NAMESPACE)
++                    try:
++                        return json.loads(logs)
++                    except Exception:
++                        return {"tool": name, "output": logs}
++                elif pod.status.phase == "Failed":
++                    logs = core.read_namespaced_pod_log(pod.metadata.name, NAMESPACE)
++                    return {"tool": name, "error": "job failed", "logs": logs}
++            await asyncio.sleep(2)
++        return {"tool": name, "error": "timeout"}
++
++    def run_tool_sync(self, name: str, input_text: str, run_id: str) -> Dict[str, Any]:
++        return asyncio.get_event_loop().run_until_complete(self.run_tool(name, input_text, run_id))
++
++    def _build_job_manifest(self, job_name: str, tool_name: str, input_text: str) -> Dict[str, Any]:
++        # Minimal job manifest with securityContext and seccomp
++        return {
++            "apiVersion": "batch/v1",
++            "kind": "Job",
++            "metadata": {"name": job_name, "namespace": NAMESPACE},
++            "spec": {
++                "template": {
++                    "metadata": {"labels": {"job-name": job_name}},
++                    "spec": {
++                        "serviceAccountName": "agent-tool-runner-sa",
++                        "containers": [
++                            {
++                                "name": "tool",
++                                "image": TOOL_RUNNER_IMAGE,
++                                "env": [
++                                    {"name":"TOOL_NAME","value":tool_name},
++                                    {"name":"RUN_ID","value":run_id},
++                                    {"name":"INPUT_TEXT","value":input_text}
++                                ],
++                                "securityContext": {
++                                    "runAsNonRoot": True,
++                                    "allowPrivilegeEscalation": False,
++                                    "readOnlyRootFilesystem": True
++                                },
++                                "resources": {"limits":{"cpu":"1","memory":"1Gi"},"requests":{"cpu":"200m","memory":"256Mi"}}
++                            }
++                        ],
++                        "restartPolicy": "Never",
++                        # Pod-level seccomp profile (requires cluster support)
++                        "securityContext": {"seccompProfile": {"type": "RuntimeDefault"}}
++                    }
++                },
++                "backoffLimit": 0
++            }
++        }
++
+*** End Patch
+*** Begin Patch
+*** Add File:agent/policies/opa_client.py
++#!/usr/bin/env python3
++"""
++OPA client wrappers for pre-action and post-action evaluation.
++ - Expects an OPA server with policies loaded at configured paths.
++ - Simple API: evaluate_pre_action(input_dict) and evaluate_post_action(input_dict)
++"""
++import os
++import requests
++
++OPA_URL = os.environ.get("OPA_URL", "http://opa:8181")
++PRE_POLICY = os.environ.get("OPA_PRE_POLICY", "aegis/agent/pre")
++POST_POLICY = os.environ.get("OPA_POST_POLICY", "aegis/agent/post")
++
++class OPAClient:
++    def __init__(self, base_url: str = OPA_URL):
++        self.base = base_url
++
++    def _eval(self, policy: str, inp: dict):
++        url = f"{self.base}/v1/data/{policy}"
++        try:
++            r = requests.post(url, json={"input": inp}, timeout=5)
++            if r.status_code == 200:
++                return True, r.json().get("result", {})
++            return False, {"error": r.text}
++        except Exception as e:
++            return False, {"error": str(e)}
++
++    def evaluate_pre_action(self, inp: dict):
++        ok, res = self._eval(PRE_POLICY, inp)
++        # expected res to include allow:bool and optionally requires_approval
++        if ok:
++            if isinstance(res, dict) and res.get("allow", True):
++                return True, res
++            return False, res
++        return False, res
++
++    def evaluate_post_action(self, inp: dict):
++        ok, res = self._eval(POST_POLICY, inp)
++        if ok:
++            if isinstance(res, dict) and res.get("allow", True):
++                return True, res
++            return False, res
++        return False, res
++
+*** End Patch
+*** Begin Patch
+*** Add File:agent/session_store.py
++#!/usr/bin/env python3
++"""
++Session Store using Redis for ephemeral state and Milvus (or S3) for long-term memory.
++Provides:
++ - create_session(run_id, meta)
++ - append_action(run_id, action_record)
++ - get_history(run_id)
++ - set/get/ pop pending approval
++"""
++import os, json, time
++try:
++    import redis
++    REDIS_AVAILABLE = True
++except Exception:
++    REDIS_AVAILABLE = False
++try:
++    from pymilvus import connections, Collection
++    MILVUS_AVAILABLE = True
++except Exception:
++    MILVUS_AVAILABLE = False
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
++
++class SessionStore:
++    def __init__(self):
++        if REDIS_AVAILABLE:
++            self.r = redis.from_url(REDIS_URL)
++        else:
++            self.r = None
++
++    def create_session(self, run_id, meta):
++        key = f"agent:session:{run_id}"
++        payload = {"meta": meta, "created_at": time.time(), "actions": []}
++        if self.r:
++            self.r.set(key, json.dumps(payload))
++        return payload
++
++    def append_action(self, run_id, action_record):
++        key = f"agent:session:{run_id}"
++        if self.r:
++            raw = self.r.get(key)
++            if raw:
++                obj = json.loads(raw)
++                obj.setdefault("actions", []).append(action_record)
++                self.r.set(key, json.dumps(obj))
++                return obj
++        return None
++
++    def get_history(self, run_id):
++        key = f"agent:session:{run_id}"
++        if self.r:
++            raw = self.r.get(key)
++            return json.loads(raw) if raw else None
++        return None
++
++    def set_pending_approval(self, run_id, action_meta):
++        key = f"agent:pending:{run_id}"
++        if self.r:
++            self.r.set(key, json.dumps(action_meta))
++
++    def pop_pending_approval(self, run_id):
++        key = f"agent:pending:{run_id}"
++        if self.r:
++            raw = self.r.get(key)
++            self.r.delete(key)
++            return json.loads(raw) if raw else None
++        return None
++
+*** End Patch
+*** Begin Patch
+*** Add File:agent/audit/audit_logger.py
++#!/usr/bin/env python3
++"""
++Audit logger
++ - Writes per-action logs to S3 (evidence bucket)
++ - Attempts to sign artifacts (cosign via awskms) and post a Rekor entry if configured
++ - Best-effort; failures are non-blocking but logged
++"""
++import os, json, time, tempfile, subprocess
++import boto3
++import requests
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "REPLACE_WITH_EVIDENCE_BUCKET")
++AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
++COSIGN_KMS = os.environ.get("COSIGN_KMS_KEY_ARN", "")
++REKOR_URL = os.environ.get("REKOR_URL", "")
++
++s3 = boto3.client("s3", region_name=AWS_REGION)
++
++class AuditLogger:
++    def log_action(self, run_id: str, tool: str, input_data: dict, extra: dict):
++        ts = int(time.time())
++        key = f"agents/{run_id}/actions/{ts}_{tool}.json"
++        payload = {"run_id": run_id, "tool": tool, "input": input_data, "extra": extra, "ts": ts}
++        try:
++            s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(payload).encode())
++        except Exception as e:
++            print("Failed to upload audit log:", e)
++        # optionally sign the payload object (best-effort): download, sign local file and upload signature
++        try:
++            tmp = tempfile.mktemp(suffix=".json")
++            with open(tmp, "w") as f:
++                json.dump(payload, f)
++            if COSIGN_KMS:
++                subprocess.run(["cosign", "sign", "--key", f"awskms://{COSIGN_KMS}", tmp], check=True)
++                sig = tmp + ".sig"
++                s3.upload_file(sig, EVIDENCE_BUCKET, key + ".sig")
++            # Rekor entry (best-effort)
++            if REKOR_URL:
++                requests.post(f"{REKOR_URL}/api/v1/log/entries", json={"run_id": run_id, "tool": tool, "s3": f"s3://{EVIDENCE_BUCKET}/{key}"}, timeout=5)
++        except Exception as e:
++            print("Best-effort signing or rekor post failed:", e)
++
+*** End Patch
+*** Begin Patch
+*** Add File:agent/cost/accounting.py
++#!/usr/bin/env python3
++"""
++Simple cost accounting & quota control using Redis.
++ - check_quota(tenant, cost_estimate) returns False if budget would be exceeded
++ - record_usage(tenant, cost) increments counters
++"""
++import os
++try:
++    import redis
++except Exception:
++    redis = None
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
++DEFAULT_BUDGET = float(os.environ.get("AGENT_DEFAULT_BUDGET", "100.0"))  # arbitrary units
++
++class CostAccounting:
++    def __init__(self):
++        self.r = redis.from_url(REDIS_URL) if redis else None
++
++    def check_quota(self, tenant: str, cost_estimate: float) -> bool:
++        if not self.r:
++            return True
++        used = float(self.r.get(f"usage:{tenant}:cost") or 0.0)
++        budget = float(self.r.get(f"budget:{tenant}") or DEFAULT_BUDGET)
++        return (used + cost_estimate) <= budget
++
++    def record_usage(self, tenant: str, cost: float):
++        if not self.r:
++            return
++        self.r.incrbyfloat(f"usage:{tenant}:cost", cost)
++
+*** End Patch
+*** Begin Patch
+*** Add File:agent/safety/safety_checks.py
++#!/usr/bin/env python3
++"""
++Safety checks integration for agent outputs and actions.
++Uses basic filters and placeholder hallucination detectors.
++"""
++from agentic import None  # placeholder to show this module's location
++try:
++    from llm.ops.safety.safety_filters import scrub_pii, basic_harm_filter
++except Exception:
++    # simple fallbacks
++    def scrub_pii(x): return x
++    def basic_harm_filter(x): return True
++
++def safety_pre_check(action):
++    # Check inputs for PII or harmful patterns
++    inp = action.get("input","")
++    cleaned = scrub_pii(inp)
++    ok = basic_harm_filter(cleaned)
++    return ok, {"cleaned": cleaned}
++
++def safety_post_check(result):
++    # Basic post-check: ensure output not containing blocked content
++    out = result.get("output") if isinstance(result, dict) else str(result)
++    ok = basic_harm_filter(out or "")
++    return ok, {"reason": None if ok else "blocked content"}
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/tool_runner/tool_runner_job_template.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: REPLACE_JOB_NAME
++  namespace: REPLACE_NAMESPACE
++spec:
++  template:
++    spec:
++      serviceAccountName: agent-tool-runner-sa
++      containers:
++        - name: tool
++          image: ghcr.io/yourorg/aegis-tool-runner:latest
++          env:
++            - name: TOOL_NAME
++              value: "REPLACE_TOOL_NAME"
++            - name: RUN_ID
++              value: "REPLACE_RUN_ID"
++            - name: INPUT_TEXT
++              value: "REPLACE_INPUT"
++          securityContext:
++            runAsNonRoot: true
++            allowPrivilegeEscalation: false
++          resources:
++            requests:
++              cpu: "200m"
++              memory: "256Mi"
++            limits:
++              cpu: "1"
++              memory: "1Gi"
++      restartPolicy: Never
++  backoffLimit: 0
++
++# Important: attach PodSecurityPolicy / OPA/Gatekeeper constraints to ensure the Job respects network & syscalls restrictions
++
+*** End Patch
+*** Begin Patch
+*** Add File:devsecops/conftest/agent_policy.rego
++package k8svalidation.agent
++
++# Ensure tool-runner Job templates include securityContext and do not escalate privileges
++deny[msg] {
++  input.kind == "Job"
++  containers := input.spec.template.spec.containers
++  c := containers[_]
++  not c.securityContext
++  msg = sprintf("Job %v/%v missing securityContext", [input.metadata.namespace, input.metadata.name])
++}
++
++deny[msg] {
++  input.kind == "Job"
++  containers := input.spec.template.spec.containers
++  c := containers[_]
++  c.securityContext.allowPrivilegeEscalation == true
++  msg = sprintf("Job %v/%v allows privilege escalation", [input.metadata.namespace, input.metadata.name])
++}
++
++# Ensure Deployments for agent manager expose RATE_LIMIT env var
++deny[msg] {
++  input.kind == "Deployment"
++  input.metadata.name == "rag-flask"
++  not has_rate_limit(input)
++  msg = "RAG/flask deployments must include RATE_LIMIT env var"
++}
++
++has_rate_limit(depl) {
++  some i
++  decl := depl.spec.template.spec.containers[_]
++  decl.env[i].name == "RATE_LIMIT"
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/mock_agent_e2e.yml
++name: Mock Agent E2E (CI)
++
++on:
++  workflow_dispatch:
++
++jobs:
++  mock-agent:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.11'
++      - name: Install deps
++        run: |
++          pip install fastapi uvicorn requests redis pymilvus sentence-transformers
++      - name: Start mock Tool Registry (background)
++        run: |
++          python -c "from agent.tool_registry import ToolRegistryClient; print('ToolRegistry OK') &"
++      - name: Start Agent Manager (background)
++        run: |
++          nohup python agent/manager.py &>/tmp/agent_manager.log &
++          sleep 2
++      - name: Start a mock agent run
++        run: |
++          curl -X POST -H "Content-Type: application/json" -d '{"prompt":"upload report to s3", "tenant":"ci", "max_steps":2}' http://127.0.0.1:8085/agent/start
++      - name: Poll status (sleep)
++        run: sleep 5 && tail -n +1 /tmp/agent_manager.log || true
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/grafana_agent_dashboard.json
++{
++  "dashboard": {
++    "title": "Aegis Agent Operations",
++    "panels": [
++      { "title": "Agent Runs per minute", "type": "graph", "targets":[{"expr":"rate(aegis_agent_runs_total[1m])"}]},
++      { "title": "Agent Actions by Tool", "type": "table", "targets":[{"expr":"sum(rate(aegis_agent_actions_total[1m])) by (tool)"}]},
++      { "title": "Action Latency p95", "type": "graph", "targets":[{"expr":"histogram_quantile(0.95, sum(rate(aegis_agent_action_latency_seconds_bucket[5m])) by (le))"}]}
++    ]
++  }
++}
++
+*** End Patch
+*** End Patch

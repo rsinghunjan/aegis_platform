@@ -1,0 +1,761 @@
+diff --git a/scripts/iterative_scale_tuning.sh b/scripts/iterative_scale_tuning.sh
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/scripts/iterative_scale_tuning.sh
+@@ -0,0 +1,220 @@
++#!/usr/bin/env bash
++#
++# Iterative scale & NCCL/RDMA tuning driver
++# - Runs the deepspeed_vllm_stress_pipeline across multiple cluster topologies (node counts / placement)
++# - Applies NCCL tuning variants via configmap patching between runs
++# - Collects artifacts and runs nccl_log_analyzer to mark PASS/FAIL per run
++# - Produces a summary JSON for operator review
++#
++# Usage:
++#  ./scripts/iterative_scale_tuning.sh --topologies "4,8" --variants "default,NCCL_IB_DISABLE=0,NCCL_IB_DISABLE=1" --rounds 2 --artifact-dir ./artifacts --s3-bucket my-bucket
++
++set -euo pipefail
++
++TOPOLOGIES="${TOPOLOGIES:-4}"
++VARIANTS="${VARIANTS:-DEFAULT}"
++ROUNDS="${ROUNDS:-1}"
++ARTIFACT_DIR="${ARTIFACT_DIR:-./artifacts}"
++S3_BUCKET="${S3_BUCKET:-}"
++S3_PREFIX="${S3_PREFIX:-aegis/tuning}"
++NAMESPACE="${NAMESPACE:-aegis-ml}"
++STATEFULSET="${STATEFULSET:-deepspeed-trainer}"
++TRAIN_SECONDS="${TRAIN_SECONDS:-300}"
++GATEWAY="${GATEWAY:-http://aegis-inference-gateway.aegis-ml.svc.cluster.local/generate}"
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --topologies) TOPOLOGIES="$2"; shift 2;;
++    --variants) VARIANTS="$2"; shift 2;;
++    --rounds) ROUNDS="$2"; shift 2;;
++    --artifact-dir) ARTIFACT_DIR="$2"; shift 2;;
++    --s3-bucket) S3_BUCKET="$2"; shift 2;;
++    --s3-prefix) S3_PREFIX="$2"; shift 2;;
++    --namespace) NAMESPACE="$2"; shift 2;;
++    --statefulset) STATEFULSET="$2"; shift 2;;
++    *) echo "Unknown arg $1"; exit 1;;
++  esac
++done
++
++mkdir -p "$ARTIFACT_DIR"
++SUMMARY_FILE="$ARTIFACT_DIR/tuning_summary_$(date +%Y%m%d%H%M%S).json"
++echo "[]" > "$SUMMARY_FILE"
++
++IFS=',' read -r -a TOPS <<< "$TOPOLOGIES"
++IFS=',' read -r -a VARS <<< "$VARIANTS"
++
++for topo in "${TOPS[@]}"; do
++  for var in "${VARS[@]}"; do
++    for r in $(seq 1 "$ROUNDS"); do
++      run_dir="${ARTIFACT_DIR}/topo_${topo}/var_${var// /_}/round_${r}"
++      mkdir -p "$run_dir"
++      echo "=== Running topo=${topo} variant='${var}' round=${r} -> ${run_dir} ==="
++
++      # Apply NCCL variant: either remove tuning configmap (DEFAULT) or write variant key
++      if [[ "$var" == "DEFAULT" ]]; then
++        kubectl -n "$NAMESPACE" delete configmap aegis-deepspeed-tuning --ignore-not-found || true
++      else
++        # create simple configmap with one env to be read by pods on restart
++        echo "Applying tuning variant: $var"
++        kubectl -n "$NAMESPACE" create configmap aegis-deepspeed-tuning --from-literal=nccl_variant="$var" --dry-run=client -o yaml | kubectl apply -f -
++      fi
++
++      # restart statefulset to pick up config (operator pods should pick up)
++      echo "Restarting statefulset ${STATEFULSET}"
++      kubectl -n "$NAMESPACE" rollout restart statefulset "$STATEFULSET"
++      kubectl -n "$NAMESPACE" rollout status statefulset "$STATEFULSET" --timeout=15m || true
++
++      # run stress pipeline for given topology
++      ./scripts/deepspeed_vllm_stress_pipeline.sh --nodes "$topo" --rounds 1 --train-seconds "$TRAIN_SECONDS" --gateway "$GATEWAY" --artifact-dir "$run_dir" --s3-bucket "$S3_BUCKET" --s3-prefix "$S3_PREFIX" --simulate-preemption true
++
++      # analyze NCCL logs/artifacts
++      echo "Analyzing NCCL logs for ${run_dir}"
++      python3 tools/nccl_log_analyzer.py --dir "$run_dir" --out "$run_dir/nccl_analysis.json" || true
++
++      # append summary
++      python3 - <<PY
++import json,os
++run_dir="$run_dir"
++out="$SUMMARY_FILE"
++try:
++    analysis=json.load(open(os.path.join(run_dir,"nccl_analysis.json")))
++except Exception:
++    analysis={"errors_detected":None}
++entry={"topology": "$topo", "variant":"$var", "round": $r, "run_dir": run_dir, "analysis": analysis}
++arr=json.load(open(out))
++arr.append(entry)
++open(out,"w").write(json.dumps(arr,indent=2))
++print("Appended summary entry")
++PY
++
++    done
++  done
++done
++
++echo "Tuning summary written to $SUMMARY_FILE"
++if [[ -n "$S3_BUCKET" && -x "$(command -v aws)" ]]; then
++  KEY="${S3_PREFIX%/}/$(basename $SUMMARY_FILE)"
++  aws s3 cp "$SUMMARY_FILE" "s3://${S3_BUCKET}/${KEY}" || true
++  echo "Uploaded summary to s3://${S3_BUCKET}/${KEY}"
++fi
++
++echo "Done."
++exit 0
++
+diff --git a/tools/nccl_log_analyzer.py b/tools/nccl_log_analyzer.py
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/tools/nccl_log_analyzer.py
+@@ -0,0 +1,240 @@
++#!/usr/bin/env python3
++"""
++Simple NCCL/log error analyzer
++ - Walks a run directory, inspects logs/dmesg for common NCCL / InfiniBand / RDMA error patterns
++ - Produces a JSON summary with counts of suspicious patterns and a simple PASS/FAIL heuristic
++"""
++import argparse
++import os
++import re
++import json
++
++PATTERNS = {
++    "nccl_errors": [r"unhandled event", r"NCCL WARN", r"NCCL ERROR", r"rank .* failed", r"fatal error"],
++    "ib_errors": [r"mlx5_core", r"IB ERROR", r"rdma.*error", r"IB QP"],
++    "oom": [r"out of memory", r"OOM"],
++}
++
++def analyze_file(path):
++    counts = {k:0 for k in PATTERNS.keys()}
++    try:
++        with open(path, "r", errors="ignore") as fh:
++            text = fh.read()
++            for k, pats in PATTERNS.items():
++                for p in pats:
++                    cnt = len(re.findall(p, text, flags=re.IGNORECASE))
++                    counts[k] += cnt
++    except Exception:
++        pass
++    return counts
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--dir", required=True, help="Run artifacts dir")
++    p.add_argument("--out", required=True)
++    args = p.parse_args()
++
++    summary = {"nccl_errors":0, "ib_errors":0, "oom":0, "files_scanned":0, "per_file":{}}
++    for root,_,files in os.walk(args.dir):
++        for f in files:
++            if f.endswith(".logs.txt") or f.endswith(".dmesg.txt") or f.endswith(".nvidia.xml"):
++                path = os.path.join(root,f)
++                counts = analyze_file(path)
++                if sum(counts.values())>0:
++                    summary["per_file"][path]=counts
++                for k in ["nccl_errors","ib_errors","oom"]:
++                    summary[k]+=counts.get(k,0)
++                summary["files_scanned"]+=1
++
++    # Simple heuristic: fail if any NCCL/IB error or OOM found
++    summary["status"]="PASS"
++    if summary["nccl_errors"]>0 or summary["ib_errors"]>0 or summary["oom"]>0:
++        summary["status"]="FAIL"
++
++    with open(args.out,"w") as fh:
++        json.dump(summary, fh, indent=2)
++    print("Wrote analysis to", args.out)
++
++if __name__ == "__main__":
++    main()
++
+diff --git a/scripts/kms_rotation_with_signoff.py b/scripts/kms_rotation_with_signoff.py
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/scripts/kms_rotation_with_signoff.py
+@@ -0,0 +1,320 @@
++#!/usr/bin/env python3
++"""
++Vault rotation integrated with KMS + SRE signoff flow.
++ - Requests new key material from KMS/CA (or generates locally)
++ - Writes secret to Vault KV v2
++ - Notifies SRE via GitHub Issue and waits for a label "sre-approved" (polling)
++ - After signoff, verifies injector propagation across namespaces and deletes plaintext k8s secrets
++ - Writes audit entries to decision_log via tools.decisionlog_client.insert_decision
++
++Usage:
++  GITHUB_REPO=org/repo GITHUB_TOKEN=... VAULT_ADDR=... VAULT_TOKEN=... python3 scripts/kms_rotation_with_signoff.py --vault-path secret/data/aegis/app --k8s-secret app-plain --namespaces aegis-ml,ops --verify-files app.pem --kms-url https://kms.example.local
++
++NOTE: This script uses GitHub Issues for signoff. It creates an issue and waits until an approver adds label "sre-approved". Set a reasonable timeout.
++"""
++import os
++import argparse
++import requests
++import subprocess
++import time
++import json
++
++try:
++    from tools.decisionlog_client import insert_decision
++except Exception:
++    def insert_decision(agent, action, payload, evidence):
++        print("decision_log stub", agent, action, payload, evidence)
++        return None
++
++GITHUB_REPO = os.environ.get("GITHUB_REPO")
++GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
++VAULT_ADDR = os.environ.get("VAULT_ADDR")
++VAULT_TOKEN = os.environ.get("VAULT_TOKEN")
++
++def create_issue(repo, title, body):
++    url = f"https://api.github.com/repos/{repo}/issues"
++    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
++    r = requests.post(url, headers=headers, json={"title": title, "body": body})
++    r.raise_for_status()
++    return r.json()["number"]
++
++def check_issue_has_label(repo, number, label):
++    url = f"https://api.github.com/repos/{repo}/issues/{number}"
++    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
++    r = requests.get(url, headers=headers)
++    r.raise_for_status()
++    labels = [l["name"] for l in r.json().get("labels",[])]
++    return label in labels
++
++def request_key_from_kms(kms_url):
++    try:
++        r = requests.post(kms_url.rstrip("/") + "/generate_keypair", timeout=10)
++        r.raise_for_status()
++        data = r.json()
++        return data.get("private_key"), data.get("public_key")
++    except Exception:
++        return None, None
++
++def generate_local_keypair(bits=2048):
++    priv_path = "/tmp/aegis_priv.pem"
++    pub_path = "/tmp/aegis_pub.pem"
++    subprocess.check_call(["openssl","genrsa","-out",priv_path,str(bits)])
++    subprocess.check_call(["openssl","rsa","-in",priv_path,"-pubout","-out",pub_path])
++    with open(priv_path) as fh: priv=fh.read()
++    with open(pub_path) as fh: pub=fh.read()
++    os.unlink(priv_path); os.unlink(pub_path)
++    return priv, pub
++
++def vault_write(path, data):
++    url = f"{VAULT_ADDR}/v1/{path}"
++    headers = {"X-Vault-Token": VAULT_TOKEN}
++    r = requests.post(url, headers=headers, json={"data": data}, timeout=10)
++    r.raise_for_status()
++    return r.json()
++
++def verify_injection(namespaces, expected_files, timeout=180):
++    end=time.time()+timeout
++    while time.time()<end:
++        ok_all=True
++        for ns in namespaces:
++            pods=subprocess.check_output(["kubectl","-n",ns,"get","pods","-o","jsonpath={.items[*].metadata.name}"]).decode().strip().split()
++            for p in pods:
++                try:
++                    phase=subprocess.check_output(["kubectl","-n",ns,"get","pod",p,"-o","jsonpath={.status.phase}"]).decode().strip()
++                    if phase!="Running":
++                        ok_all=False; break
++                    if subprocess.call(["kubectl","-n",ns,"exec",p,"--","test","-d","/vault/secrets"])!=0:
++                        ok_all=False; break
++                    for f in expected_files:
++                        if subprocess.call(["kubectl","-n",ns,"exec",p,"--","test","-f",f"/vault/secrets/{f}"])!=0:
++                            ok_all=False; break
++                except Exception:
++                    ok_all=False; break
++            if not ok_all:
++                break
++        if ok_all:
++            return True
++        time.sleep(5)
++    return False
++
++def delete_plaintext_secret(namespace, name):
++    try:
++        subprocess.check_call(["kubectl","-n",namespace,"delete","secret",name])
++        return {"status":"deleted","secret":f"{namespace}/{name}"}
++    except Exception as e:
++        return {"status":"failed","error":str(e)}
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--vault-path", required=True)
++    p.add_argument("--k8s-secret", required=True)
++    p.add_argument("--namespaces", required=True)
++    p.add_argument("--verify-files", required=True)
++    p.add_argument("--kms-url", required=False)
++    p.add_argument("--dry-run", action="store_true")
++    p.add_argument("--signoff-timeout", type=int, default=3600)
++    args = p.parse_args()
++
++    if not (GITHUB_REPO and GITHUB_TOKEN and VAULT_ADDR and VAULT_TOKEN):
++        print("GITHUB_REPO, GITHUB_TOKEN, VAULT_ADDR, VAULT_TOKEN must be set in env"); return 2
++
++    # acquire key
++    priv, pub = (None, None)
++    if args.kms_url:
++        priv,pub = request_key_from_kms(args.kms_url)
++    if not priv:
++        priv,pub = generate_local_keypair()
++
++    payload={"private_key":priv,"public_key":pub,"rotated_at":int(time.time())}
++    title=f"[Aegis] Rotation request for {args.vault_path}"
++    body=f"Rotation dry-run={args.dry_run}. Please review and add label 'sre-approved' to approve rotation.\n\nVault path: {args.vault_path}\nNamespaces: {args.namespaces}\nVerify files: {args.verify_files}"
++    issue_num = create_issue(GITHUB_REPO, title, body)
++    insert_decision(agent="aegis-vault-rotation", action="create_signoff_issue", payload={"issue":issue_num}, evidence={})
++    print("Created signoff issue:", issue_num)
++
++    # wait for signoff label
++    deadline=time.time()+args.signoff_timeout
++    print("Waiting for label 'sre-approved' on issue", issue_num)
++    approved=False
++    while time.time()<deadline:
++        if check_issue_has_label(GITHUB_REPO, issue_num, "sre-approved"):
++            approved=True; break
++        time.sleep(15)
++    if not approved:
++        print("Signoff not received within timeout; aborting")
++        insert_decision(agent="aegis-vault-rotation", action="signoff_timeout", payload={"issue":issue_num}, evidence={})
++        return 3
++    print("Signoff received; proceeding")
++
++    if not args.dry_run:
++        vault_write(args.vault_path, payload)
++        insert_decision(agent="aegis-vault-rotation", action="write_vault", payload={"vault_path":args.vault_path}, evidence={})
++
++    namespaces=[n.strip() for n in args.namespaces.split(",")]
++    verify_files=[f.strip() for f in args.verify_files.split(",")]
++    ok = verify_injection(namespaces, verify_files)
++    insert_decision(agent="aegis-vault-rotation", action="verify", payload={"ok":ok}, evidence={})
++    if ok and not args.dry_run:
++        res = delete_plaintext_secret(namespaces[0], args.k8s_secret)
++        insert_decision(agent="aegis-vault-rotation", action="delete_plaintext_secret", payload={"result":res}, evidence={})
++        print("Deleted k8s secret result:", res)
++    else:
++        print("Verification failed or dry-run; no deletion performed.")
++
++    return 0
++
++if __name__ == "__main__":
++    import sys
++    sys.exit(main())
++
+diff --git a/.github/workflows/kms_rotation_signoff.yml b/.github/workflows/kms_rotation_signoff.yml
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/.github/workflows/kms_rotation_signoff.yml
+@@ -0,0 +1,200 @@
++name: KMS Rotation with SRE Signoff (dispatch)
++
++on:
++  workflow_dispatch:
++    inputs:
++      vault_path:
++        required: true
++      envs:
++        required: true
++      k8s_secret:
++        required: true
++      verify_files:
++        required: true
++      kms_url:
++        required: false
++
++jobs:
++  rotate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run rotation & create signoff issue (dry-run)
++        env:
++          GITHUB_REPO: ${{ secrets.GITHUB_REPO }}
++          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
++          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
++        run: |
++          python3 scripts/kms_rotation_with_signoff.py --vault-path "${{ github.event.inputs.vault_path }}" --k8s-secret "${{ github.event.inputs.k8s_secret }}" --namespaces "${{ github.event.inputs.envs }}" --verify-files "${{ github.event.inputs.verify_files }}" --kms-url "${{ github.event.inputs.kms_url }}" --dry-run
++
+diff --git a/scripts/apply_org_branch_protection.sh b/scripts/apply_org_branch_protection.sh
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/scripts/apply_org_branch_protection.sh
+@@ -0,0 +1,220 @@
++#!/usr/bin/env bash
++#
++# Apply branch protection requiring the given status check across a list of repos in an org.
++# Uses `gh` CLI; must be authenticated as an org admin.
++#
++# Usage:
++#   ./scripts/apply_org_branch_protection.sh --org my-org --repos repo1,repo2 --branch main --required-check policy-blocking-ci
++
++set -euo pipefail
++
++ORG=""
++REPOS=""
++BRANCH="main"
++REQUIRED_CHECK=""
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --org) ORG="$2"; shift 2;;
++    --repos) REPOS="$2"; shift 2;;
++    --branch) BRANCH="$2"; shift 2;;
++    --required-check) REQUIRED_CHECK="$2"; shift 2;;
++    *) echo "Unknown arg $1"; exit 1;;
++  esac
++done
++
++if [[ -z "$ORG" || -z "$REPOS" || -z "$REQUIRED_CHECK" ]]; then
++  echo "--org, --repos and --required-check required"
++  exit 2
++fi
++
++IFS=',' read -r -a REPO_LIST <<< "$REPOS"
++for r in "${REPO_LIST[@]}"; do
++  full="${ORG}/${r}"
++  echo "Applying protection on ${full}:${BRANCH} requiring ${REQUIRED_CHECK}"
++  gh api -X PUT "repos/${full}/branches/${BRANCH}/protection" -f required_status_checks='{"strict":true,"contexts":["'"$REQUIRED_CHECK"'"]}' || echo "Failed for ${full}"
++done
++
++echo "Branch protection requests submitted. Verify in GitHub UI."
++
+diff --git a/.github/workflows/policy_blocking_enforce.yml b/.github/workflows/policy_blocking_enforce.yml
+new file mode 100644
+index 0000000..6666666
+--- /dev/null
++++ b/.github/workflows/policy_blocking_enforce.yml
+@@ -0,0 +1,160 @@
++name: Policy Blocking Enforce
++
++on:
++  pull_request:
++    paths:
++      - 'policy/**'
++
++jobs:
++  opa-test:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run OPA tests (fail PR if tests fail)
++        run: |
++          docker run --rm -v "${{ github.workspace }}:/workspace" openpolicyagent/opa:latest test /workspace/policy -v
++      - name: Build OPA bundle
++        run: |
++          docker run --rm -v "${{ github.workspace }}:/workspace" openpolicyagent/opa:latest build /workspace/policy -o /workspace/policy/bundle.tar.gz
++      - name: Upload OPA bundle
++        uses: actions/upload-artifact@v4
++        with:
++          name: opa-bundle
++          path: policy/bundle.tar.gz
++
++  # Repos should include this workflow and the branch protection must require the "Policy Blocking Enforce / opa-test" check
++
+diff --git a/scripts/apply_budget_guard.sh b/scripts/apply_budget_guard.sh
+new file mode 100644
+index 0000000..7777777
+--- /dev/null
++++ b/scripts/apply_budget_guard.sh
+@@ -0,0 +1,160 @@
++#!/usr/bin/env bash
++#
++# Deploy/enable the budget_guard OPA policy bundle to an OPA cluster and optionally toggle enforcement label.
++#
++# Usage:
++#  ./scripts/apply_budget_guard.sh --bundle policy/bundle.tar.gz --namespace aegis-ml --deploy true
++
++set -euo pipefail
++
++BUNDLE="${BUNDLE:-policy/bundle.tar.gz}"
++NAMESPACE="${NAMESPACE:-aegis-ml}"
++DEPLOY="${DEPLOY:-true}"
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --bundle) BUNDLE="$2"; shift 2;;
++    --namespace) NAMESPACE="$2"; shift 2;;
++    --deploy) DEPLOY="$2"; shift 2;;
++    *) echo "Unknown arg $1"; exit 1;;
++  esac
++done
++
++if [[ "$DEPLOY" != "true" ]]; then
++  echo "DEPLOY=false; skipping actual cluster deploy. Build bundle locally with opa build."
++  exit 0
++fi
++
++if [[ ! -f "$BUNDLE" ]]; then
++  echo "Bundle not found: $BUNDLE"; exit 2
++fi
++
++echo "Creating configmap opa-budget-bundle in namespace $NAMESPACE"
++kubectl -n "$NAMESPACE" create configmap opa-budget-bundle --from-file=bundle.tar.gz="$BUNDLE" --dry-run=client -o yaml | kubectl apply -f -
++echo "Restarting opa deployment to pick up bundle (if using OPA server reading configmap)"
++kubectl -n "$NAMESPACE" rollout restart deployment/opa || true
++echo "Budget guard bundle deployed (or queued)."
++
+diff --git a/scripts/keda_tune_and_apply.py b/scripts/keda_tune_and_apply.py
+new file mode 100644
+index 0000000..8888888
+--- /dev/null
++++ b/scripts/keda_tune_and_apply.py
+@@ -0,0 +1,320 @@
++#!/usr/bin/env python3
++"""
++Analyze multiple vLLM benchmark CSVs, suggest KEDA thresholds and optionally patch KEDA ScaledObject manifest.
++
++Usage:
++  python3 scripts/keda_tune_and_apply.py --csvs artifacts/*/vllm_round_*.csv --slo-p95 1.0 --apply-manifest k8s/manifests/keda_tuned_scaledobject.yaml
++"""
++import argparse
++import glob
++import csv
++import statistics
++import yaml
++import subprocess
++import os
++
++def read_latencies(csvfile):
++    lat=[]
++    with open(csvfile) as fh:
++        rdr=csv.DictReader(fh)
++        for row in rdr:
++            try:
++                if (row.get("ok","").lower()=="true"):
++                    lat.append(float(row.get("latency") or 0.0))
++            except Exception:
++                pass
++    return lat
++
++def suggest_threshold_from_files(files, slo_p95=1.0):
++    all_lat=[]
++    for f in files:
++        all_lat+=read_latencies(f)
++    if not all_lat:
++        return None
++    p95 = sorted(all_lat)[int(len(all_lat)*0.95)]
++    # baseline strategy: if p95 <= slo, keep 70; if > slo, reduce target to force earlier scaling
++    base=70
++    if p95 <= slo_p95:
++        return base
++    factor = p95 / slo_p95
++    new=int(max(40, base / factor))
++    return new
++
++def patch_keda_manifest(manifest_path, new_threshold):
++    if not os.path.exists(manifest_path):
++        print("Manifest not found:", manifest_path); return False
++    with open(manifest_path) as fh:
++        doc = yaml.safe_load(fh)
++    # find triggers -> prometheus -> metadata -> threshold
++    modified=False
++    if "spec" in doc and "triggers" in doc["spec"]:
++        for t in doc["spec"]["triggers"]:
++            if t.get("type")=="prometheus":
++                meta=t.setdefault("metadata",{})
++                if "threshold" in meta:
++                    meta["threshold"]=str(new_threshold)
++                    modified=True
++    if modified:
++        with open(manifest_path,"w") as fh:
++            yaml.safe_dump(doc, fh)
++        print("Patched manifest", manifest_path)
++        # apply with kubectl
++        subprocess.check_call(["kubectl","apply","-f",manifest_path])
++        return True
++    else:
++        print("No applicable prometheus trigger found; no patch applied.")
++        return False
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--csvs", required=True, help="glob pattern for csvs")
++    p.add_argument("--slo-p95", type=float, default=1.0)
++    p.add_argument("--apply-manifest", help="path to keda manifest to patch/apply")
++    args = p.parse_args()
++    files = glob.glob(args.csvs)
++    thr = suggest_threshold_from_files(files, args.slo_p95)
++    if thr is None:
++        print("No latency samples found")
++        return 2
++    print(f"Suggested KEDA GPU utilization threshold: {thr}% (based on {len(files)} files)")
++    if args.apply_manifest:
++        patch_keda_manifest(args.apply_manifest, thr)
++
++if __name__ == "__main__":
++    main()
++
+diff --git a/scripts/metabase_finalize_onboard.py b/scripts/metabase_finalize_onboard.py
+new file mode 100644
+index 0000000..9999999
+--- /dev/null
++++ b/scripts/metabase_finalize_onboard.py
+@@ -0,0 +1,260 @@
++#!/usr/bin/env python3
++"""
++Finalize Metabase onboarding for auditors:
++ - creates Postgres datasource (decision_log)
++ - creates saved questions and dashboard
++ - creates a readonly "auditor" user if possible (depends on Metabase edition/API)
++ - documents retention policy link
++
++Usage:
++  METABASE_URL=... METABASE_ADMIN_USER=... METABASE_ADMIN_PASS=... python3 scripts/metabase_finalize_onboard.py
++"""
++import os
++import requests
++import json
++import time
++
++MB_URL = os.environ.get("METABASE_URL")
++MB_USER = os.environ.get("METABASE_ADMIN_USER")
++MB_PASS = os.environ.get("METABASE_ADMIN_PASS")
++PG_HOST = os.environ.get("MB_PG_HOST")
++PG_PORT = os.environ.get("MB_PG_PORT","5432")
++PG_DB = os.environ.get("MB_PG_DB")
++PG_USER = os.environ.get("MB_PG_USER")
++PG_PASS = os.environ.get("MB_PG_PASS")
++AUDITOR_USER = os.environ.get("AUDITOR_USER","auditor@example.com")
++AUDITOR_PWD = os.environ.get("AUDITOR_PWD","ChangeMe123!")
++
++def login():
++    resp = requests.post(f"{MB_URL}/api/session", json={"username":MB_USER,"password":MB_PASS})
++    resp.raise_for_status()
++    return resp.json()["id"]
++
++def create_datasource(session_token):
++    headers={"X-Metabase-Session":session_token}
++    payload={"name":"decision_log_postgres","engine":"postgres","details":{"host":PG_HOST,"port":int(PG_PORT),"dbname":PG_DB,"user":PG_USER,"password":PG_PASS}}
++    r = requests.post(f"{MB_URL}/api/databases", headers=headers, json=payload)
++    print("Create datasource:", r.status_code, r.text)
++
++def create_saved_questions(session_token):
++    headers={"X-Metabase-Session":session_token}
++    q = {
++        "name":"Auditor Recent decision_log",
++        "dataset_query":{"database":1,"type":"native","native":{"query":"SELECT id, created_at, agent, payload->>'action' as action, payload->>'model' as model, evidence->>'pr_url' as pr_url FROM decision_log ORDER BY created_at DESC LIMIT 200"}},
++        "display":"table"
++    }
++    r = requests.post(f"{MB_URL}/api/card", headers=headers, json=q)
++    print("Saved question:", r.status_code)
++
++def create_dashboard(session_token):
++    headers={"X-Metabase-Session":session_token}
++    dash={"name":"Aegis Auditor Dashboard","ordered_cards":[]}
++    r = requests.post(f"{MB_URL}/api/dashboard", headers=headers, json=dash)
++    print("Dashboard:", r.status_code)
++
++def create_auditor_user(session_token):
++    # Metabase API for users is internal and may require admin rights - best-effort
++    headers={"X-Metabase-Session":session_token}
++    payload={"username":AUDITOR_USER,"password":AUDITOR_PWD,"first_name":"Aegis","last_name":"Auditor","email":AUDITOR_USER}
++    r = requests.post(f"{MB_URL}/api/user", headers=headers, json=payload)
++    print("Create auditor user:", r.status_code, r.text)
++
++def main():
++    token = login()
++    print("Logged into Metabase, session:", token)
++    create_datasource(token)
++    time.sleep(2)
++    create_saved_questions(token)
++    create_dashboard(token)
++    try:
++        create_auditor_user(token)
++    except Exception as e:
++        print("Create user failed (may be unsupported):", e)
++    print("Metabase onboarding attempted. Provide auditor credentials and documentation for retention policies.")
++
++if __name__ == "__main__":
++    main()
++
+diff --git a/scripts/dr_rehearse.sh b/scripts/dr_rehearse.sh
+new file mode 100644
+index 0000000..aaaaaaaa
+--- /dev/null
++++ b/scripts/dr_rehearse.sh
+@@ -0,0 +1,200 @@
++#!/usr/bin/env bash
++#
++# DR rehearsal helper: runs sharded restore test and records result to decision_log.
++# Usage:
++#  ./scripts/dr_rehearse.sh --shards /workspace/checkpoints --s3-prefix s3://my-bucket/checkpoints
++
++set -euo pipefail
++
++SHARDS="${SHARDS:-/workspace/checkpoints}"
++S3_PREFIX="${S3_PREFIX:-}"
++NAMESPACE="${NAMESPACE:-aegis-ml}"
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --shards) SHARDS="$2"; shift 2;;
++    --s3-prefix) S3_PREFIX="$2"; shift 2;;
++    *) echo "Unknown arg $1"; exit 1;;
++  esac
++done
++
++echo "Starting DR rehearsal: shards=${SHARDS} s3_prefix=${S3_PREFIX}"
++if python3 scripts/sharded_restore_test.py --shards "$SHARDS" --upload --s3-prefix "$S3_PREFIX"; then
++  echo "DR rehearsal succeeded"
++  python3 tools/decisionlog_client.py --record "dr_rehearse_success" || true
++else
++  echo "DR rehearsal failed"
++  python3 tools/decisionlog_client.py --record "dr_rehearse_failed" || true
++  exit 2
++fi
++
++echo "Done"
++exit 0
++
+diff --git a/README_PROD_FINAL_ACTIONS.md b/README_PROD_FINAL_ACTIONS.md
+new file mode 100644
+index 0000000..bbbbbbbb
+--- /dev/null
++++ b/README_PROD_FINAL_ACTIONS.md
+@@ -0,0 +1,240 @@
++# Aegis — Final production validation & operational actions (scripts summary)
++
++This patch contains operator-focused scripts to:
++
++- Run iterative cluster topology and NCCL/RDMA tuning across topologies (scripts/iterative_scale_tuning.sh)
++- Analyze NCCL/IB logs for errors (tools/nccl_log_analyzer.py)
++- Perform Vault rotations that require SRE signoff via GitHub Issues (scripts/kms_rotation_with_signoff.py)
++- Apply branch protection org-wide to enforce policy_blocking_ci (scripts/apply_org_branch_protection.sh)
++- Deploy budget guard OPA bundle (scripts/apply_budget_guard.sh)
++- Analyze vLLM benchmark CSVs and patch KEDA manifest thresholds (scripts/keda_tune_and_apply.py)
++- Finalize Metabase auditor onboarding (scripts/metabase_finalize_onboard.py)
++- Run DR rehearsals and record results (scripts/dr_rehearse.sh)
++
++How to use (high level)
++1. Run iterative tuning:
++   ./scripts/iterative_scale_tuning.sh --topologies "4,8,16" --variants "DEFAULT,NCCL_IB_DISABLE=1" --rounds 2 --artifact-dir ./artifacts --s3-bucket my-bucket
++
++2. Request Vault rotation with SRE signoff:
++   GITHUB_REPO=org/repo GITHUB_TOKEN=... VAULT_ADDR=... VAULT_TOKEN=... python3 scripts/kms_rotation_with_signoff.py --vault-path secret/data/aegis/app --k8s-secret app-plain --namespaces aegis-ml --verify-files app.pem --kms-url https://kms.example
++
++3. Apply org branch protection:
++   gh auth login
++   ./scripts/apply_org_branch_protection.sh --org my-org --repos repo1,repo2 --branch main --required-check "Policy Blocking Enforce / opa-test"
++
++4. Tune KEDA:
++   python3 scripts/keda_tune_and_apply.py --csvs "artifacts/*/vllm_round_*.csv" --slo-p95 1.0 --apply-manifest k8s/manifests/keda_tuned_scaledobject.yaml
++
++5. Run DR rehearsal:
++   ./scripts/dr_rehearse.sh --shards /workspace/checkpoints --s3-prefix s3://my-bucket/checkpoints
++
++Operator notes & safety
++- Always run destructive steps (rotation non-dry-run, deletion) only after SRE/Sec signoff.
++- Use testing/staging clusters for topology experiments and tune NIC driver/kernel settings before production rollout.
++- Ensure decision_log auditing is enabled and accessible to auditors before performing deletions.
++
++End.

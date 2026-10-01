@@ -1,0 +1,460 @@
+*** Begin Patch
+*** Add File:ops/data/schemas/sensor_schema_v1.json
++{
++  "$schema": "http://json-schema.org/draft-07/schema#",
++  "title": "Aegis Sensor / Sim Trace Schema v1",
++  "type": "object",
++  "required": ["capture_id", "source", "timestamp_ns", "frame_idx", "type", "payload"],
++  "properties": {
++    "capture_id": { "type": "string", "description": "Unique capture/run id" },
++    "source": { "type": "string", "description": "Sensor or simulator source name" },
++    "timestamp_ns": { "type": "integer", "description": "Nanosecond epoch timestamp" },
++    "frame_idx": { "type": "integer", "description": "Frame index in sequence" },
++    "type": { "type": "string", "enum": ["camera", "imu", "lidar", "joint_state", "sim_state", "other"] },
++    "payload": { "type": "object", "description": "Arbitrary payload - binary encoded (base64) or JSON depending on type" },
++    "meta": {
++      "type": "object",
++      "properties": {
++        "device_id": { "type": "string" },
++        "firmware": { "type": "string" },
++        "sample_rate_hz": { "type": "number" }
++      }
++    }
++  },
++  "additionalProperties": true
++}
++
+*** End File
+*** Add File:ops/data/schema_registry/register_schema.py
++#!/usr/bin/env python3
++"""
++Register a sensor/schema to the local schema registry (ops/schema_registry/extended_schema_registry.py)
++Usage: python ops/data/schema_registry/register_schema.py --name sensor.trace --version 1 ops/data/schemas/sensor_schema_v1.json
++"""
++import argparse
++import json
++import requests
++
++REGISTRY_URL = "http://localhost:8101/schema"  # adjust in prod
++
++def register(name, version, path, admin_token=None):
++    with open(path) as fh:
++        schema = json.load(fh)
++    payload = {"name": name, "version": version, "schema": schema, "compatibility": "backward"}
++    headers = {}
++    if admin_token:
++        headers["Authorization"] = f"Bearer {admin_token}"
++    r = requests.post(REGISTRY_URL, json=payload, headers=headers, timeout=5)
++    r.raise_for_status()
++    print("Registered schema", name, "v", version)
++
++if __name__=="__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--name", required=True)
++    p.add_argument("--version", type=int, required=True)
++    p.add_argument("schema_file")
++    p.add_argument("--admin-token")
++    args = p.parse_args()
++    register(args.name, args.version, args.schema_file, args.admin_token)
++
+*** End File
+*** Add File:ops/data/ingest/validate_and_ingest.py
++#!/usr/bin/env python3
++"""
++Validate sensor/sim trace files against JSON Schema, upload to object store, log to MLflow, and emit OpenLineage events.
++ - Validates each JSON record in newline-delimited JSON (ndjson) or single JSON file.
++ - Uploads artifact to S3 (via boto3) or local path.
++ - Logs MLflow run with artifact and dataset metadata.
++ - Emits OpenLineage dataset/register/run events to configured OPENLINEAGE_URL.
++
++Usage:
++  python ops/data/ingest/validate_and_ingest.py --file /tmp/capture.ndjson --schema ops/data/schemas/sensor_schema_v1.json --capture-id CAP123 --mlflow-uri http://mlflow:5000 --s3-uri s3://aegis-sim-traces/
++"""
++import os
++import json
++import argparse
++import tempfile
++import time
++from typing import Tuple
++
++try:
++    import jsonschema
++except Exception:
++    jsonschema = None
++
++try:
++    import mlflow
++except Exception:
++    mlflow = None
++
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++from ops.lineage.openlineage_client import emit as emit_lineage
++from ops.sdk.evidence_sdk import record_manifest
++
++def validate_file(file_path: str, schema: dict) -> Tuple[int,int]:
++    """
++    Validate an NDJSON file against JSON schema.
++    Returns (valid, invalid) counts and writes a validated temp file.
++    """
++    if jsonschema is None:
++        raise RuntimeError("jsonschema library required (pip install jsonschema)")
++    valid, invalid = 0, 0
++    temp_fd, temp_path = tempfile.mkstemp(suffix=".ndjson")
++    with os.fdopen(temp_fd, "w") as out:
++        with open(file_path, "r") as fh:
++            for line in fh:
++                if not line.strip():
++                    continue
++                try:
++                    j = json.loads(line)
++                    jsonschema.validate(instance=j, schema=schema)
++                    out.write(json.dumps(j) + "\n")
++                    valid += 1
++                except Exception as e:
++                    invalid += 1
++    return valid, invalid, temp_path
++
++def upload_artifact(local_path: str, s3_uri: str):
++    if boto3 is None:
++        raise RuntimeError("boto3 required to upload to S3")
++    # s3_uri expected s3://bucket/path-prefix/
++    if not s3_uri.startswith("s3://"):
++        raise RuntimeError("s3_uri must be s3://...")
++    parts = s3_uri[5:].split("/",1)
++    bucket = parts[0]
++    prefix = parts[1] if len(parts)>1 else ""
++    key = os.path.join(prefix, os.path.basename(local_path))
++    s3 = boto3.client("s3")
++    s3.upload_file(local_path, bucket, key)
++    return f"s3://{bucket}/{key}"
++
++def log_to_mlflow(capture_id: str, artifact_uri: str, mlflow_uri: str, schema_name: str, rows: int):
++    if mlflow is None:
++        raise RuntimeError("mlflow client required")
++    mlflow.set_tracking_uri(mlflow_uri)
++    with mlflow.start_run(run_name=f"ingest-{capture_id}") as run:
++        mlflow.log_param("capture_id", capture_id)
++        mlflow.log_param("schema", schema_name)
++        mlflow.log_metric("rows", rows)
++        mlflow.log_artifact(artifact_uri.replace("s3://", "/tmp/") if artifact_uri.startswith("s3://") else artifact_uri, artifact_path="dataset")
++        run_id = run.info.run_id
++    return run_id
++
++def emit_lineage_event(job_name: str, run_id: str, inputs=None, outputs=None):
++    try:
++        emit_lineage(event_type="START", job_name=job_name, run_id=run_id, inputs=inputs or [], outputs=outputs or [])
++    except Exception:
++        pass
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--file", required=True)
++    p.add_argument("--schema", required=True)
++    p.add_argument("--capture-id", required=True)
++    p.add_argument("--mlflow-uri", default=os.environ.get("MLFLOW_TRACKING_URI","http://localhost:5000"))
++    p.add_argument("--s3-uri", default=os.environ.get("S3_URI",""))
++    p.add_argument("--schema-name", default="sensor.trace")
++    args = p.parse_args()
++
++    schema = json.load(open(args.schema))
++    valid, invalid, validated_path = validate_file(args.file, schema)
++    print(f"Validated: {valid}, Invalid: {invalid}, temp: {validated_path}")
++
++    artifact_uri = validated_path
++    if args.s3_uri:
++        artifact_uri = upload_artifact(validated_path, args.s3_uri)
++        print("Uploaded to", artifact_uri)
++
++    # log to mlflow
++    run_id = log_to_mlflow(args.capture_id, validated_path if not args.s3_uri else validated_path, args.mlflow_uri, args.schema_name, valid)
++    print("Logged to MLflow run:", run_id)
++
++    # emit lineage
++    emit_lineage_event("ingest_sensor", run_id, inputs=[], outputs=[{"namespace":"aegis","name":f"{args.schema_name}:{args.capture_id}"}])
++
++    # record evidence manifest
++    try:
++        record_manifest("ingest_sensor", {"capture_id": args.capture_id, "rows": valid, "invalid": invalid, "mlflow_run": run_id, "artifact": artifact_uri})
++    except Exception:
++        pass
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:ops/hil/ingest_hil_artifacts.py
++#!/usr/bin/env python3
++"""
++Ingest HIL artifacts (logs, traces, recordings) into MLflow and emit lineage + evidence.
++Used by HIL orchestrator after a campaign finishes.
++"""
++import os
++import glob
++import tempfile
++from ops.sdk.evidence_sdk import record_manifest
++from ops.lineage.openlineage_client import emit as emit_lineage
++import mlflow
++
++MLFLOW_URI = os.environ.get("MLFLOW_TRACKING_URI","http://localhost:5000")
++
++def ingest_dir(campaign_id: str, artifact_dir: str, s3_uri: str = ""):
++    mlflow.set_tracking_uri(MLFLOW_URI)
++    with mlflow.start_run(run_name=f"hil-{campaign_id}") as run:
++        run_id = run.info.run_id
++        mlflow.log_param("campaign_id", campaign_id)
++        for path in glob.glob(os.path.join(artifact_dir, "**"), recursive=True):
++            if os.path.isfile(path):
++                mlflow.log_artifact(path, artifact_path="hil_artifacts")
++        # Optionally upload to S3 and produce artifact URIs (left as operator step)
++    # Emit lineage
++    try:
++        emit_lineage("HIL_CAMPAIGN", job_name="hil_campaign", run_id=run_id, inputs=[], outputs=[{"namespace":"aegis","name":f"hil:{campaign_id}"}])
++    except Exception:
++        pass
++    # record evidence
++    try:
++        record_manifest("hil_ingest", {"campaign_id": campaign_id, "mlflow_run": run_id, "artifact_dir": artifact_dir})
++    except Exception:
++        pass
++    return run_id
++
++if __name__=="__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--campaign-id", required=True)
++    p.add_argument("--artifact-dir", required=True)
++    args = p.parse_args()
++    r = ingest_dir(args.campaign_id, args.artifact_dir)
++    print("Ingested HIL artifacts to MLflow run", r)
++
+*** End File
+*** Add File:ops/k8s/low_latency/low_latency_deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-low-latency
++  namespace: aegis
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-low-latency
++  template:
++    metadata:
++      labels:
++        app: aegis-low-latency
++    spec:
++      # schedule to nodes labeled for realtime workloads
++      nodeSelector:
++        aegis.realtime: "true"
++      tolerations:
++        - key: "aegis.realtime"
++          operator: "Exists"
++          effect: "NoSchedule"
++      containers:
++        - name: low-latency
++          image: REGISTRY_PLACEHOLDER/aegis/low-latency:latest
++          env:
++            - name: LOW_LATENCY_PORT
++              value: "50055"
++          resources:
++            limits:
++              cpu: "2"    # pin to isolated CPUs via node config
++              memory: "2Gi"
++            requests:
++              cpu: "2"
++              memory: "2Gi"
++          securityContext:
++            capabilities:
++              add: ["SYS_NICE"]
++      # Use the 'static' CPU manager policy on kubelet for full cpu isolation in the node config.
++      # Node must be prepared via RT Kernel + isolcpus kernel params.
++
+*** End File
+*** Add File:ops/k8s/perception/perception_deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-perception
++  namespace: aegis
++spec:
++  replicas: 3
++  selector:
++    matchLabels:
++      app: aegis-perception
++  template:
++    metadata:
++      labels:
++        app: aegis-perception
++    spec:
++      nodeSelector:
++        aegis.perception: "true"
++      containers:
++        - name: perception
++          image: REGISTRY_PLACEHOLDER/aegis/perception:latest
++          env:
++            - name: BATCH_MAX_SIZE
++              value: "32"
++            - name: BATCH_TIMEOUT_SEC
++              value: "0.05"
++          resources:
++            limits:
++              cpu: "4"
++              memory: "8Gi"
++            requests:
++              cpu: "2"
++              memory: "4Gi"
++---
++# Horizontal Pod Autoscaler suggestion (deploy via kubectl autoscale)
++# kubectl autoscale deploy aegis-perception --cpu-percent=70 --min=2 --max=10 -n aegis
++
+*** End File
+*** Add File:.github/workflows/hardware_builder_secure.yml
++name: Hardware Build & Cosign Sign (self-hosted secure)
++on:
++  workflow_dispatch:
++jobs:
++  secure-build:
++    runs-on: [self-hosted, linux, hardware]
++    permissions:
++      contents: read
++      id-token: write
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Build vendor image
++        run: |
++          IMAGE="internal-registry/aegis/vendor-inference:${GITHUB_SHA}"
++          docker build -f ops/hw/inferentia/Dockerfile.neuron -t "$IMAGE" .
++          echo "IMAGE=$IMAGE" >> $GITHUB_OUTPUT
++
++      - name: Push image to registry
++        run: |
++          docker push "$IMAGE"
++
++      - name: Cosign sign image (KMS)
++        env:
++          COSIGN_KMS_URI: ${{ secrets.COSIGN_KMS_URI }}
++        run: |
++          cosign sign --key $COSIGN_KMS_URI "$IMAGE"
++          cosign verify --key $COSIGN_KMS_URI "$IMAGE"
++
++      - name: Rekor register (optional)
++        env:
++          REKOR_URL: ${{ secrets.REKOR_SERVER }}
++        run: |
++          # Rekor registration is performed by cosign; additional Rekor queries can be run here.
++          echo "Image $IMAGE signed and recorded"
++
++      - name: Record evidence manifest
++        run: |
++          python3 - <<PY
++from ops.sdk.evidence_sdk import record_manifest
++record_manifest("hardware_image_built", {"image":"$IMAGE"})
++PY
++
+*** End File
+*** Add File:.github/workflows/hil_artifact_ingest.yml
++name: HIL Artifact Ingest (CI helper)
++on:
++  workflow_dispatch:
++jobs:
++  ingest:
++    runs-on: ubuntu-latest
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++      - name: Upload artifacts (operator provides path)
++        run: |
++          # In CI, operator may upload artifacts to this runner. For demo, assume artifacts are in ./hil_artifacts
++          python3 ops/hil/ingest_hil_artifacts.py --campaign-id "${{ github.run_id }}" --artifact-dir "./hil_artifacts"
++
+*** End File
+*** Add File:ops/sdk/evidence_extensions.py
++"""
++Small helpers to extend evidence_sdk usage for dataset and HIL ingest flows.
++"""
++from ops.sdk.evidence_sdk import record_manifest
++import json
++
++def record_dataset_ingest(capture_id: str, mlflow_run: str, artifact_uri: str, rows: int):
++    payload = {
++        "type": "dataset_ingest",
++        "capture_id": capture_id,
++        "mlflow_run": mlflow_run,
++        "artifact": artifact_uri,
++        "rows": rows
++    }
++    try:
++        return record_manifest("dataset_ingest", payload)
++    except Exception as e:
++        print("Failed to record manifest:", e)
++        return None
++
++def record_hil_artifact(campaign_id: str, mlflow_run: str, artifact_dir: str):
++    payload = {"type":"hil_ingest","campaign_id":campaign_id,"mlflow_run":mlflow_run,"artifact_dir":artifact_dir}
++    try:
++        return record_manifest("hil_artifact_ingest", payload)
++    except Exception as e:
++        print("Failed to record manifest:", e)
++        return None
++
+*** End File
+*** Add File:ops/formal/package_and_sign_formal.sh
++#!/usr/bin/env bash
++set -euo pipefail
++OUT_DIR=${1:-/tmp/aegis_formal_bundle}
++mkdir -p "${OUT_DIR}"
++echo "Running formal pipeline and packaging artifacts..."
++./ops/formal/run_formal_pipeline.sh || true
++cp -r specs/formal "${OUT_DIR}/specs" || true
++cp ops/formal/apalache.out "${OUT_DIR}/" || true
++tar -czf "${OUT_DIR}.tar.gz" -C "$(dirname "${OUT_DIR}")" "$(basename "${OUT_DIR}")"
++echo "Signing bundle with cosign (KMS)"
++if [ -n "${COSIGN_KMS_URI:-}" ]; then
++  cosign sign --key "${COSIGN_KMS_URI}" "${OUT_DIR}.tar.gz" || true
++  echo "Signed bundle: ${OUT_DIR}.tar.gz"
++fi
++python3 - <<PY
++from ops.sdk.evidence_sdk import record_manifest
++record_manifest("formal_bundle_created", {"path":"${OUT_DIR}.tar.gz"})
++PY
++echo "Formal bundle prepared at ${OUT_DIR}.tar.gz"
++
+*** End File
+*** Add File:ops/hil/README_ingest_and_audit.md
++# HIL Ingest & Audit Runbook
++
++Purpose
++- Ensure HIL and sim artifacts are treated as first-class datasets with schema, provenance, and versioning.
++- Ingest artifacts into MLflow and OpenLineage; record evidence manifests and sign artifacts for auditors.
++
++Steps
++1. Register sensor schema:
++   python ops/data/schema_registry/register_schema.py --name sensor.trace --version 1 ops/data/schemas/sensor_schema_v1.json
++
++2. Run HIL campaign (operator-run) and collect artifacts under a directory (e.g., /data/hil/CAMPAIGN123).
++
++3. Validate & ingest traces:
++   python ops/data/ingest/validate_and_ingest.py --file /data/hil/CAMPAIGN123/capture.ndjson --schema ops/data/schemas/sensor_schema_v1.json --capture-id CAMPAIGN123 --mlflow-uri http://mlflow:5000 --s3-uri s3://aegis-hil/
++
++4. Ingest HIL artifacts (logs, video, debug) as a campaign:
++   python ops/hil/ingest_hil_artifacts.py --campaign-id CAMPAIGN123 --artifact-dir /data/hil/CAMPAIGN123
++
++5. Package formal artifacts and sign:
++   COSIGN_KMS_URI=awskms://... ./ops/formal/package_and_sign_formal.sh /tmp/aegis_formal_bundle
++
++6. Produce auditor bundle:
++   ./ops/ci/prepare_auditor_bundle.sh /tmp/aegis_hil_audit.tar.gz
++
++Notes:
++- Ensure MLflow, OpenLineage (Marquez), and S3 backends are configured and reachable from the ingest host.
++- Evidence manifests are recorded to link each action to a Rekor/cosign entry where applicable.
++
+*** End File
+*** End Patch

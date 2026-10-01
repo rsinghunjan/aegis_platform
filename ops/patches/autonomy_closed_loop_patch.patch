@@ -1,0 +1,680 @@
+*** Begin Patch
+*** Add File:services/autonomy/drift_detector.py
++"""
++Drift detector service (embedding / output drift).
++ - Periodically samples a corpus (or uses incoming production embeddings) and computes statistical drift
++ - Emits Prometheus metrics and triggers a webhook / callback when drift exceeds threshold
++ - Configurable via environment variables
++
++Notes:
++ - This is a lightweight scaffold. For production you should replace the sample loader with streaming
++   observation pipelines and persist historical embedding distributions.
++"""
++import os
++import time
++import json
++import numpy as np
++from prometheus_client import Gauge, start_http_server
++from typing import List
++
++from services.retriever import embedding_client  # assumed existing retriever wrapper
++
++DRIFT_THRESHOLD = float(os.environ.get("DRIFT_THRESHOLD", "0.25"))
++POLL_SECS = int(os.environ.get("DRIFT_POLL_SECS", "300"))
++EXPORT_PORT = int(os.environ.get("DRIFT_METRICS_PORT", "9420"))
++ALERT_WEBHOOK = os.environ.get("DRIFT_ALERT_WEBHOOK", "")  # e.g., http://orchestrator/alert
++
++METRIC_DRIFT_SCORE = Gauge("aegis_embedding_drift_score", "Embedding drift score (KS-statistic or cosine-shift)")
++METRIC_DRIFT_ALERTS = Gauge("aegis_embedding_drift_alerts_total", "Drift alerts fired")
++
++BASELINE_PATH = os.environ.get("DRIFT_BASELINE_PATH", "/data/drift_baseline.npy")
++SAMPLE_IDS_PATH = os.environ.get("DRIFT_SAMPLE_IDS", "/data/drift_sample_ids.json")
++
++def load_baseline() -> np.ndarray:
++    if os.path.exists(BASELINE_PATH):
++        return np.load(BASELINE_PATH)
++    # else compute on initial corpus (placeholder)
++    return np.zeros((1, embedding_client.dim()))
++
++def sample_current_embeddings(sample_ids: List[str]) -> np.ndarray:
++    # placeholder: use embedding_client to get embeddings quickly
++    embs = []
++    for sid in sample_ids:
++        v = embedding_client.get_embedding(sid)  # returns np.array or None
++        if v is not None:
++            embs.append(v)
++    if not embs:
++        return np.zeros((1, embedding_client.dim()))
++    return np.vstack(embs)
++
++def drift_score(baseline: np.ndarray, current: np.ndarray) -> float:
++    # simple heuristic: compute mean cosine distance between baseline mean and current mean
++    bmean = np.mean(baseline, axis=0)
++    cmean = np.mean(current, axis=0)
++    num = np.dot(bmean, cmean)
++    den = (np.linalg.norm(bmean) * np.linalg.norm(cmean) + 1e-12)
++    cos = num / den
++    score = 1.0 - cos
++    return float(score)
++
++def fire_alert(score: float, meta: dict):
++    METRIC_DRIFT_ALERTS.inc()
++    if ALERT_WEBHOOK:
++        try:
++            import requests
++            requests.post(ALERT_WEBHOOK, json={"type":"drift","score": score, "meta": meta}, timeout=5)
++        except Exception:
++            pass
++
++def main_loop():
++    start_http_server(EXPORT_PORT)
++    baseline = load_baseline()
++    sample_ids = []
++    if os.path.exists(SAMPLE_IDS_PATH):
++        sample_ids = json.load(open(SAMPLE_IDS_PATH))
++    while True:
++        try:
++            cur = sample_current_embeddings(sample_ids)
++            score = drift_score(baseline, cur)
++            METRIC_DRIFT_SCORE.set(score)
++            if score >= DRIFT_THRESHOLD:
++                fire_alert(score, {"sample_count": cur.shape[0]})
++        except Exception as e:
++            print("drift error", e)
++        time.sleep(POLL_SECS)
++
++if __name__ == "__main__":
++    main_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/autonomy/sampler.py
++"""
++Sampler: chooses examples for labeling using uncertainty and impact heuristics.
++ - Pulls production logs or a sampling endpoint
++ - Scores examples by uncertainty (entropy), verifier disagreement, provenance absence and recency
++ - Enqueues selected items to human_queue with priority and budget controls
++"""
++import os
++import time
++import json
++import math
++from typing import List
++import requests
++from scipy.stats import entropy
++
++HUMAN_QUEUE_URL = os.environ.get("HUMAN_QUEUE_URL", "http://human-queue.safety.svc:80/enqueue")
++INFERENCE_LOG_PATH = os.environ.get("INFERENCE_LOG_PATH", "/var/log/aegis/inference_requests.jsonl")
++SAMPLE_BATCH = int(os.environ.get("SAMPLE_BATCH", "50"))
++BUDGET_PER_DAY = int(os.environ.get("AL_LABEL_BUDGET_PER_DAY", "100"))
++SLEEP_SECONDS = int(os.environ.get("SAMPLER_SLEEP", "60"))
++VERIFIER_URL = os.environ.get("VERIFIER_URL", "http://verifier.safety.svc:8080/verify")
++
++def compute_entropy(probs: List[float]) -> float:
++    # assume probs is softmax over tokens or classes
++    return float(entropy(probs))
++
++def score_example(example: dict) -> float:
++    # heuristics: higher entropy and lower verifier support => higher priority
++    probs = example.get("token_probs") or example.get("class_probs") or [0.5, 0.5]
++    ent = compute_entropy(probs)
++    # call verifier if evidence exists
++    ver_score = 0.0
++    try:
++        if example.get("evidence"):
++            r = requests.post(VERIFIER_URL, json={"claim": example.get("prompt") or example.get("text"), "evidence": example.get("evidence")}, timeout=3)
++            if r.status_code == 200:
++                ver_score = r.json().get("best", {}).get("score", 0.0)
++    except Exception:
++        ver_score = 0.0
++    # absence of provenance => upweight
++    prov_weight = 1.0 if not example.get("provenance") else 0.7
++    score = ent * (1.0 - ver_score) * prov_weight
++    return float(score)
++
++def enqueue_for_label(item: dict, severity: str = "medium"):
++    payload = {
++        "text": item.get("text") or item.get("prompt"),
++        "output": item.get("output"),
++        "provenance": item.get("provenance", []),
++        "severity": severity,
++        "metadata": {"auto_sampled": True, "reason": item.get("reason", "")}
++    }
++    try:
++        r = requests.post(HUMAN_QUEUE_URL, json=payload, timeout=5)
++        return r.status_code in (200,201,202)
++    except Exception:
++        return False
++
++def main_loop():
++    daily_budget_used = 0
++    while True:
++        try:
++            if not os.path.exists(INFERENCE_LOG_PATH):
++                time.sleep(SLEEP_SECONDS); continue
++            batch = []
++            with open(INFERENCE_LOG_PATH) as f:
++                for line in f:
++                    try:
++                        j = json.loads(line.strip())
++                        batch.append(j)
++                        if len(batch) >= SAMPLE_BATCH: break
++                    except Exception:
++                        continue
++            scored = []
++            for ex in batch:
++                s = score_example(ex)
++                scored.append((s, ex))
++            scored.sort(key=lambda x: x[0], reverse=True)
++            for s,ex in scored:
++                if daily_budget_used >= BUDGET_PER_DAY: break
++                ok = enqueue_for_label(ex)
++                if ok:
++                    daily_budget_used += 1
++        except Exception as e:
++            print("sampler error", e)
++        time.sleep(SLEEP_SECONDS)
++
++if __name__ == "__main__":
++    main_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/autonomy/active_learning.py
++"""
++Active learning coordinator:
++ - Collects labeled examples from human_queue (via its API or DB), validates label consistency, and writes training manifest
++ - Supports simple labeling budgets and automatic retrain triggers when label counts exceed thresholds
++ - Emits metrics for labeled_samples_total
++"""
++import os
++import time
++import json
++import requests
++from prometheus_client import Counter, start_http_server
++
++HUMAN_QUEUE_API = os.environ.get("HUMAN_QUEUE_API", "http://human-queue.safety.svc:80/tasks")
++TRAIN_MANIFEST_PATH = os.environ.get("TRAIN_MANIFEST_PATH", "/data/autolabel/train_manifest.jsonl")
++LABELS_TRIGGER = int(os.environ.get("LABELS_TRIGGER", "200"))
++METRICS_PORT = int(os.environ.get("AL_METRICS_PORT","9431"))
++RETRAIN_HOOK = os.environ.get("RETRAIN_HOOK", "http://trainer.orchestrator:8080/retrain_trigger")
++
++LABELED_SAMPLES = Counter("aegis_labeled_samples_total", "Total labeled samples collected")
++
++def fetch_recent_labels() -> list:
++    try:
++        r = requests.get(HUMAN_QUEUE_API, timeout=10)
++        r.raise_for_status()
++        return r.json()
++    except Exception:
++        return []
++
++def write_manifest(records: list):
++    os.makedirs(os.path.dirname(TRAIN_MANIFEST_PATH), exist_ok=True)
++    with open(TRAIN_MANIFEST_PATH, "a") as f:
++        for r in records:
++            f.write(json.dumps(r) + "\n")
++            LABELED_SAMPLES.inc()
++
++def main_loop():
++    start_http_server(METRICS_PORT)
++    while True:
++        try:
++            labels = fetch_recent_labels()
++            if labels:
++                # filter newly labeled and not-yet-exported items
++                new = [l for l in labels if l.get("status")=="resolved" and l.get("exported")!=True]
++                if new:
++                    # transform to training record (domain specific)
++                    records = []
++                    for n in new:
++                        rec = {"id": n["id"], "text": n.get("text"), "label": n.get("verdict") or n.get("label")}
++                        records.append(rec)
++                    write_manifest(records)
++                    # mark exported via human_queue API (if exists)
++                    for n in new:
++                        try:
++                            requests.post(f"{HUMAN_QUEUE_API}/{n['id']}/mark_exported", timeout=5)
++                        except Exception:
++                            pass
++            # trigger retrain if enough labels
++            # (simple count check; production should use dataset versioning)
++            count = 0
++            try:
++                with open(TRAIN_MANIFEST_PATH) as f:
++                    for _ in f: count += 1
++            except Exception:
++                count = 0
++            if count >= LABELS_TRIGGER:
++                try:
++                    requests.post(RETRAIN_HOOK, json={"reason":"active_learning_trigger","count":count}, timeout=5)
++                except Exception:
++                    pass
++        except Exception as e:
++            print("active learning error", e)
++        time.sleep(60)
++
++if __name__ == "__main__":
++    main_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/autonomy/automl_optuna.py
++"""
++AutoML (Optuna) wrapper for quick candidate generation.
++ - Runs a small hyperparameter search around finetune_verifier.py or a model training script
++ - Produces candidate artifacts in out/automl/<trial>
++ - This is a scaffold: adapt objective() to your training code and resource environment.
++"""
++import os
++import json
++import subprocess
++import tempfile
++import optuna
++
++MAX_TRIALS = int(os.environ.get("AUTOML_MAX_TRIALS", "10"))
++TRAIN_SCRIPT = os.environ.get("AUTOML_TRAIN_SCRIPT", "python services/factuality/finetune_verifier.py")
++OUT_ROOT = os.environ.get("AUTOML_OUT_ROOT", "out/automl")
++
++def objective(trial):
++    lr = trial.suggest_loguniform("lr", 1e-6, 1e-3)
++    bs = trial.suggest_categorical("batch_size", [8,16,32])
++    epochs = trial.suggest_int("epochs", 1, 3)
++    model_name = trial.suggest_categorical("model_name", ["facebook/bart-large", "t5-small"])
++    out_dir = os.path.join(OUT_ROOT, f"trial_{trial.number}")
++    os.makedirs(out_dir, exist_ok=True)
++    cmd = [ "python", "services/factuality/finetune_verifier.py",
++            "--data", "train.jsonl", "--out_dir", out_dir,
++            "--model_name", model_name, "--epochs", str(epochs),
++            "--learning_rate", str(lr), "--batch_size", str(bs) ]
++    # Note: finetune_verifier.py should accept these args; adapt as needed.
++    try:
++        subprocess.check_call(cmd, timeout=60*60)
++        # After training evaluate on validation set (placeholder: load metrics from out_dir/metrics.json)
++        metrics_path = os.path.join(out_dir, "metrics.json")
++        if os.path.exists(metrics_path):
++            metrics = json.load(open(metrics_path))
++            score = metrics.get("f1", metrics.get("accuracy", 0.0))
++        else:
++            score = 0.0
++    except subprocess.CalledProcessError:
++        score = 0.0
++    # Optuna maximizes objective by default; return negative loss style if needed
++    return score
++
++def run_study():
++    study = optuna.create_study(direction="maximize")
++    study.optimize(objective, n_trials=MAX_TRIALS)
++    print("Best trial:", study.best_trial.params)
++    with open(os.path.join(OUT_ROOT, "study_best.json"), "w") as f:
++        json.dump(study.best_trial.params, f, indent=2)
++
++if __name__ == "__main__":
++    run_study()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/autonomy/trainer_orchestrator.py
++"""
++Trainer orchestrator:
++ - Receives retrain triggers (Webhook / HTTP) from active learning or drift detector
++ - Runs AutoML or a fast finetune job, runs the validation battery, and if passing triggers a gated promotion
++ - Promotion process: publish artifacts to configmap/registry, kick canary deployment, run canary checks and promote to production
++
++This scaffold uses local subprocess calls and kubectl for simplicity. Replace with your pipeline orchestrator (Argo/Kubeflow) in prod.
++"""
++import os
++import subprocess
++import json
++import time
++from fastapi import FastAPI, Request
++import requests
++
++VERIFIER_GATE_URL = os.environ.get("VERIFIER_GATE_URL", "http://verifier-gate.ci:8080/run")
++KUBE_NAMESPACE = os.environ.get("KUBE_NAMESPACE", "safety")
++CANARY_DEPLOYMENT = os.environ.get("CANARY_DEPLOYMENT", "inference-canary")
++PROD_DEPLOYMENT = os.environ.get("PROD_DEPLOYMENT", "inference")
++TRAIN_MANIFEST = os.environ.get("TRAIN_MANIFEST_PATH", "/data/autolabel/train_manifest.jsonl")
++AUTOML_ENABLED = os.environ.get("AUTOML_ENABLED", "true").lower() == "true"
++
++app = FastAPI(title="Trainer Orchestrator")
++
++def run_autml():
++    if os.environ.get("AUTOML_ENABLED","true") == "true":
++        subprocess.check_call(["python", "services/autonomy/automl_optuna.py"])
++        return True
++    return False
++
++def run_finetune():
++    out_dir = f"out/verifier_{int(time.time())}"
++    os.makedirs(out_dir, exist_ok=True)
++    cmd = ["python", "services/factuality/finetune_verifier.py", "--data", TRAIN_MANIFEST, "--out_dir", out_dir, "--model_name", "facebook/bart-large", "--epochs", "2"]
++    subprocess.check_call(cmd)
++    return out_dir
++
++def validate_candidate(out_dir: str) -> bool:
++    # run verifier gate or validation suite
++    try:
++        # optional: upload artifact to configmap and call verifier gate
++        with open(os.path.join(out_dir, "thresholds.json"), "w") as f:
++            json.dump({"best_threshold": 0.35}, f)
++        # call gate
++        resp = requests.post(VERIFIER_GATE_URL, json={"artifact": out_dir}, timeout=60)
++        return resp.status_code == 200
++    except Exception:
++        return False
++
++def promote_candidate(out_dir: str):
++    # create configmap (example) and restart verifier deployment
++    subprocess.check_call(["kubectl", "-n", KUBE_NAMESPACE, "create", "configmap", "verifier-model", "--from-file="+out_dir, "--dry-run=client", "-o", "yaml"], stdout=subprocess.PIPE)
++    subprocess.check_call(["kubectl", "-n", KUBE_NAMESPACE, "apply", "-f", "-"])
++    subprocess.check_call(["kubectl", "-n", KUBE_NAMESPACE, "rollout", "restart", "deployment/verifier"])
++
++@app.post("/retrain_trigger")
++async def retrain_trigger(req: Request):
++    payload = await req.json()
++    reason = payload.get("reason", "manual")
++    # Run automl or finetune
++    try:
++        if AUTOML_ENABLED:
++            run_autml()
++        out_dir = run_finetune()
++        ok = validate_candidate(out_dir)
++        if ok:
++            promote_candidate(out_dir)
++            return {"status":"promoted","artifact": out_dir}
++        else:
++            # create review issue or notify
++            return {"status":"validation_failed","artifact": out_dir}
++    except Exception as e:
++        return {"status":"error","error": str(e)}
++
++@app.get("/health")
++def health():
++    return {"status":"ok"}
++
++if __name__=="__main__":
++    import uvicorn
++    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/autonomy/serving_decision_engine.py
++"""
++Serving decision engine:
++ - Exposes an endpoint that selects the best serving variant (student/teacher/quant/ternary) for a request
++ - Decision based on request meta, cost/latency budgets, model residency, and metrics fetched from Prometheus
++ - Scaffolding; adapt to your model registry and metric sources
++"""
++import os
++import requests
++from fastapi import FastAPI, Request
++import random
++
++PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://prometheus.monitoring:9090")
++MODEL_REGISTRY_API = os.environ.get("MODEL_REGISTRY", "http://model-registry:8080/models")
++DEFAULT_POLICY = os.environ.get("SERVING_SELECTION_POLICY", "cost_saving")  # options: cost_saving, latency_first, quality_first
++
++app = FastAPI(title="Serving Decision Engine")
++
++def get_model_profiles():
++    # placeholder: query model registry API
++    return [
++        {"name":"teacher","latency_ms":300,"cost_usd":0.020,"quality":0.95,"resident": True},
++        {"name":"student","latency_ms":80,"cost_usd":0.002,"quality":0.88,"resident": True},
++        {"name":"quant","latency_ms":120,"cost_usd":0.005,"quality":0.90,"resident": False}
++    ]
++
++@app.post("/choose")
++def choose(req: Request):
++    payload = req.json() if hasattr(req, "json") else {}
++    mode = DEFAULT_POLICY
++    profiles = get_model_profiles()
++    # Basic selection heuristics
++    if mode == "latency_first":
++        profiles.sort(key=lambda p: p["latency_ms"])
++    elif mode == "quality_first":
++        profiles.sort(key=lambda p: -p["quality"])
++    else:
++        # cost saving: balance cost and quality
++        profiles.sort(key=lambda p: (p["cost_usd"] / max(p["quality"], 1e-6)))
++    chosen = profiles[0]
++    # if not resident and policy requires residency, pick next
++    if not chosen["resident"] and os.environ.get("REQUIRE_RESIDENT","true").lower() == "true":
++        for p in profiles:
++            if p["resident"]:
++                chosen = p; break
++    return {"chosen": chosen}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/policy_engine/policy_engine.py
++"""
++Policy engine: evaluate declarative policies against inference outputs.
++ - Enforces rules like evidence_required, conservative generation, and quarantine actions
++ - Returns action: allow / enqueue_review / block / quarantine
++ - Policies are simple JSON rules for this scaffold; replace with a full policy language in production.
++"""
++import os, json
++from typing import Dict
++
++POLICY_PATH = os.environ.get("POLICY_PATH", "config/policies.json")
++
++def load_policies():
++    if os.path.exists(POLICY_PATH):
++        return json.load(open(POLICY_PATH))
++    # default policy
++    return {
++        "high_risk": {"evidence_required": True, "verifier_threshold": 0.4, "action_on_fail": "enqueue_review"},
++        "default": {"evidence_required": False, "verifier_threshold": 0.35, "action_on_fail": "allow_with_caveat"}
++    }
++
++POLICIES = load_policies()
++
++def evaluate(output: Dict) -> Dict:
++    """
++    Input output structure expected:
++    {"prompt":..., "answer":..., "provenance":[...], "verifier": {"best": {"score":0.3}}}
++    """
++    policy = POLICIES.get(output.get("risk_level","default"))
++    thresh = policy.get("verifier_threshold", 0.35)
++    evidence_required = policy.get("evidence_required", False)
++    best_score = output.get("verifier", {}).get("best", {}).get("score", 0.0)
++    has_provenance = bool(output.get("provenance"))
++    if evidence_required and not has_provenance:
++        return {"action":"enqueue_review", "reason":"missing_evidence"}
++    if best_score < thresh:
++        return {"action": policy.get("action_on_fail", "enqueue_review"), "reason":"verifier_low"}
++    return {"action":"allow", "reason":"passed"}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/explainability/auto_explain.py
++"""
++Explainability utilities used by the autonomous loops:
++ - compute token-level attributions (calls existing token attribution code)
++ - compute uncertainty metrics for outputs (entropy, ensemble variance)
++ - return a compact explanation object used to decide escalation
++"""
++import os
++from typing import Dict, List
++import numpy as np
++
++from services.explainability.token_attribution import integrated_gradients_attribution, attention_rollout_attribution
++
++def token_attributions(model, tokenizer, text, method="attention"):
++    if method == "integrated":
++        atts = integrated_gradients_attribution(model, tokenizer, text)
++    else:
++        atts = attention_rollout_attribution(model, tokenizer(text, return_tensors="pt")["input_ids"])
++    return atts
++
++def uncertainty_from_logits(logits_list: List[np.ndarray]) -> Dict:
++    # logits_list: list of (batch, vocab) arrays from ensemble
++    # compute mean entropy and variance across ensemble
++    entropies = []
++    for logits in logits_list:
++        p = np.exp(logits) / np.exp(logits).sum(axis=-1, keepdims=True)
++        entropies.append(- (p * np.log(p + 1e-12)).sum(axis=-1))
++    entropies = np.stack(entropies, axis=0)
++    mean_ent = float(entropies.mean())
++    var_ent = float(entropies.var())
++    return {"mean_entropy": mean_ent, "var_entropy": var_ent}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/autonomy/cost_scheduler.py
++"""
++Cost & sustainability scheduler:
++ - Decides when to run large batch jobs (training) based on carbon API & cost budgets
++ - Integrates with Trainer Orchestrator to delay/retry heavy jobs into low-carbon windows
++"""
++import os
++import requests
++import time
++
++CARBON_API = os.environ.get("CARBON_API_URL", "https://api.carbonintensity.org.uk/intensity")
++THRESH_KG_PER_KWH = float(os.environ.get("CARBON_SCHEDULE_THRESHOLD", "0.35"))
++CHECK_INTERVAL = int(os.environ.get("CARBON_CHECK_INTERVAL", "300"))
++
++def get_intensity():
++    try:
++        r = requests.get(CARBON_API, timeout=5); r.raise_for_status()
++        j = r.json()
++        if isinstance(j.get("data"), list):
++            v = j["data"][0].get("intensity", {}).get("actual", None)
++            if v is not None:
++                return float(v)/1000.0
++    except Exception:
++        pass
++    return None
++
++def wait_for_low_carbon(max_wait_secs=86400):
++    start = time.time()
++    while time.time() - start < max_wait_secs:
++        val = get_intensity()
++        if val is not None and val <= THRESH_KG_PER_KWH:
++            return True
++        time.sleep(CHECK_INTERVAL)
++    return False
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agents/orchestrator_agent.py
++"""
++Orchestrator agent:
++ - Listens for alerts (drift, verifier regressions, sustainability alarms)
++ - Runs remediation workflows (reindex, retrain, kernel_tune, scale up)
++ - Offers human-in-loop approval URL or triggers automated remediation based on policy
++
++This is a small stateful agent with pluggable actions. Use with caution: in production prefer tested operator frameworks.
++"""
++import os
++import time
++import requests
++import subprocess
++
++ALERT_POLL_URL = os.environ.get("ALERT_POLL_URL", "http://alert-queue.svc/alerts")
++KUBE_NS = os.environ.get("KUBE_NAMESPACE", "inference")
++HUMAN_APPROVAL_WEBHOOK = os.environ.get("HUMAN_APPROVAL_WEBHOOK", "")
++
++def reindex():
++    print("Running reindex...")
++    subprocess.call(["./ops/retriever/reindex_all.sh"])
++
++def trigger_retrain():
++    print("Triggering retrain via trainer orchestration")
++    try:
++        requests.post("http://trainer.orchestrator:8080/retrain_trigger", json={"reason":"auto_agent"}, timeout=10)
++    except Exception as e:
++        print("retrain error", e)
++
++def kernel_tune():
++    print("Running kernel tuner on local node")
++    subprocess.call(["python3", "services/triton/kernel_opt/opt_tuner.py"])
++
++def scale_up_raters(amount=3):
++    print("Scaling rater nodegroup or HPA")
++    subprocess.call(["kubectl", "scale", "deployment/human-queue", f"--replicas={amount}", "-n", "safety"])
++
++def handle_alert(alert):
++    typ = alert.get("type")
++    if typ == "drift":
++        # start sampling and retrain sequence
++        reindex()
++        trigger_retrain()
++    elif typ == "verifier_regression":
++        # scale rater pool for more labeling
++        scale_up_raters(5)
++        if HUMAN_APPROVAL_WEBHOOK:
++            requests.post(HUMAN_APPROVAL_WEBHOOK, json={"alert": alert}, timeout=5)
++    elif typ == "high_co2":
++        # delay heavy work
++        print("High CO2: delaying batch jobs")
++    else:
++        print("Unhandled alert:", alert)
++
++def main_loop():
++    while True:
++        try:
++            r = requests.get(ALERT_POLL_URL, timeout=10)
++            alerts = r.json() if r.status_code==200 else []
++            for a in alerts:
++                handle_alert(a)
++        except Exception as e:
++            print("agent poll error", e)
++        time.sleep(30)
++
++if __name__ == "__main__":
++    main_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:config/policies.json
++{
++  "high_risk": {
++    "evidence_required": true,
++    "verifier_threshold": 0.45,
++    "action_on_fail": "enqueue_review"
++  },
++  "default": {
++    "evidence_required": false,
++    "verifier_threshold": 0.35,
++    "action_on_fail": "allow_with_caveat"
++  }
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/autonomy/README_AUTONOMY.md
++Autonomy & Closed-Loop Scaffolds
++--------------------------------
++
++What this patch provides:
++ - Drift detector (services/autonomy/drift_detector.py)
++ - Sampler for active labeling (services/autonomy/sampler.py)
++ - Active learning coordinator that collects labels and triggers retrains (services/autonomy/active_learning.py)
++ - AutoML (Optuna) wrapper for candidate generation (services/autonomy/automl_optuna.py)
++ - Trainer orchestrator (services/autonomy/trainer_orchestrator.py) to run finetune -> validate -> promote
++ - Serving decision engine (services/autonomy/serving_decision_engine.py) to choose model variants
++ - Policy engine (services/policy_engine/policy_engine.py) to declaratively enforce rules
++ - Explainability utilities used by autonomous components (services/explainability/auto_explain.py)
++ - Cost scheduler to shift heavy work to low-carbon windows (services/autonomy/cost_scheduler.py)
++ - Orchestrator agent (services/agents/orchestrator_agent.py) that executes remediation workflows on alerts
++
++How it fits into Aegis:
++ - Drift detector produces alerts that the orchestrator agent consumes.
++ - Sampler selects uncertain or high-impact examples and enqueues them in human_queue.
++ - Active learning collects labels and triggers the trainer orchestrator (retrain pipeline).
++ - The trainer runs AutoML or a fast finetune, runs validation (verifier gate etc.) and promotes only on pass.
++ - Serving decision engine selects model variants based on SLOs and cost profiles for each request.
++ - Policy engine enforces safety rules at inference and in promotion workflows.
++ - The orchestrator agent coordinates auto-remediation (reindex, retrain, kernel_tune) and offers human approval hooks.
++
++Operational notes:
++ - All services are scaffolds and must be adapted to your infra (auth, service discovery, model registry).
++ - Replace subprocess kubectl calls with your orchestration system (Argo Workflow, Tekton, etc.) for production.
++ - Ensure appropriate secrets (K8s, storage, service tokens) are configured before wiring services together.
++
+*** End Patch
+*** End Patch

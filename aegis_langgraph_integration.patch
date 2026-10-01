@@ -1,0 +1,569 @@
+*** Begin Patch
+*** Add File:langgraph/runtime/deployment.yaml
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: langgraph
++
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: langgraph-config
++  namespace: langgraph
++data:
++  # Graph repository or manifest store location (can be s3, git, or configmap)
++  GRAPH_STORE: "configmap" 
++  # When GRAPH_STORE=configmap, the graph manifests are mounted from configmaps (see langgraph/config/graph-example.yaml)
++  HF_API_HOST: "https://api-inference.huggingface.co"
++  SAFETY_MONITOR_URL: "http://safety-monitor.aegis.svc:8080/evaluate"
++
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: langgraph-runtime
++  namespace: langgraph
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: langgraph-runtime
++  template:
++    metadata:
++      labels:
++        app: langgraph-runtime
++    spec:
++      serviceAccountName: langgraph-sa
++      containers:
++        - name: langgraph-runtime
++          image: registry.example.com/aegis/langgraph-runtime:latest
++          imagePullPolicy: IfNotPresent
++          env:
++            - name: GRAPH_STORE
++              valueFrom:
++                configMapKeyRef:
++                  name: langgraph-config
++                  key: GRAPH_STORE
++            - name: HF_API_HOST
++              valueFrom:
++                configMapKeyRef:
++                  name: langgraph-config
++                  key: HF_API_HOST
++            - name: SAFETY_MONITOR_URL
++              valueFrom:
++                configMapKeyRef:
++                  name: langgraph-config
++                  key: SAFETY_MONITOR_URL
++            - name: HF_API_KEY
++              valueFrom:
++                secretKeyRef:
++                  name: langgraph-secrets
++                  key: HF_API_KEY
++            - name: VAULT_ADDR
++              value: "https://vault.aegis.svc:8200"
++          ports:
++            - containerPort: 8080
++          volumeMounts:
++            - name: graphs
++              mountPath: /graphs
++      volumes:
++        - name: graphs
++          configMap:
++            name: langgraph-graphs
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: langgraph
++  namespace: langgraph
++spec:
++  selector:
++    app: langgraph-runtime
++  ports:
++    - port: 8080
++      targetPort: 8080
++
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: langgraph-sa
++  namespace: langgraph
++
+*** End Patch
+*** Begin Patch
+*** Add File:langgraph/config/graph-example.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: langgraph-graphs
++  namespace: langgraph
++data:
++  simple_graph.json: |
++    {
++      "name": "demo-simple-qa",
++      "version": "0.1",
++      "nodes": [
++        {
++          "id": "prompt-1",
++          "type": "llm",
++          "model": "hf/cust-bert-or-llm",
++          "input": {"prompt": "Q: {{input.question}} \\nA:"},
++          "outputs": ["answer"]
++        },
++        {
++          "id": "safety-check",
++          "type": "safety_check",
++          "input": {"answer": "{{nodes.prompt-1.answer}}"},
++          "outputs": ["allowed"]
++        }
++      ],
++      "edges": [
++        {"from": "prompt-1", "to": "safety-check"}
++      ],
++      "entrypoint": "prompt-1",
++      "metadata": {
++        "description": "Simple QA graph that queries HF LLM and runs a safety check."
++      }
++    }
++
+*** End Patch
+*** Begin Patch
+*** Add File:langgraph/runtime/app.py
++#!/usr/bin/env python3
++"""
++Minimal LangGraph-like runtime (demo) that:
++- Loads graph manifests from /graphs (ConfigMap)
++- Executes nodes in sequence (LLM node -> safety check node)
++- Calls Hugging Face Inference API for LLM nodes
++- Calls safety-monitor service for safety checks
++- Redacts traces, bundles evidence, and invokes evidence signing/upload
++
++This is a lightweight scaffold suitable for integration into Aegis.
++"""
++import os, json, time, requests, hashlib
++from flask import Flask, request, jsonify
++
++app = Flask("langgraph-runtime")
++
++GRAPH_DIR = "/graphs"
++HF_API_HOST = os.environ.get("HF_API_HOST", "https://api-inference.huggingface.co")
++HF_API_KEY = os.environ.get("HF_API_KEY", "")
++SAFETY_MONITOR = os.environ.get("SAFETY_MONITOR_URL", "http://safety-monitor.aegis.svc:8080/evaluate")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++COSIGN_KMS = os.environ.get("COSIGN_KMS_KEY_ARN", "")
++
++def load_graph(name):
++    path = os.path.join(GRAPH_DIR, name + ".json")
++    with open(path) as f:
++        return json.load(f)
++
++def call_hf(payload):
++    headers = {"Authorization": f"Bearer {HF_API_KEY}"} if HF_API_KEY else {}
++    model = payload.get("model")
++    prompt = payload.get("prompt")
++    url = f"{HF_API_HOST}/models/{model}"
++    r = requests.post(url, headers=headers, json={"inputs": prompt}, timeout=30)
++    r.raise_for_status()
++    # HF returns generative response as JSON; pick text if present
++    j = r.json()
++    text = ""
++    if isinstance(j, dict) and "generated_text" in j:
++        text = j["generated_text"]
++    elif isinstance(j, list) and j and "generated_text" in j[0]:
++        text = j[0]["generated_text"]
++    else:
++        text = str(j)
++    return text
++
++def redacted(obj):
++    s = json.dumps(obj)
++    # simple redaction: remove long strings (e.g., >200 chars) to avoid PII leaks; production should use robust redactors
++    def redact_val(v):
++        if isinstance(v, str) and len(v) > 200:
++            return v[:100] + "...[REDACTED]..."
++        return v
++    def walk(o):
++        if isinstance(o, dict):
++            return {k: walk(redact_val(v)) for k,v in o.items()}
++        if isinstance(o, list):
++            return [walk(redact_val(x)) for x in o]
++        return o
++    return walk(obj)
++
++def call_safety_monitor(ctx):
++    r = requests.post(SAFETY_MONITOR, json=ctx, timeout=5)
++    r.raise_for_status()
++    return r.json()
++
++def bundle_and_sign(run_id, graph, trace):
++    # write files to /tmp and call existing evidence bundling script if present
++    tmp_manifest = f"/tmp/langgraph-{run_id}-manifest.json"
++    tmp_trace = f"/tmp/langgraph-{run_id}-trace.json"
++    with open(tmp_manifest,"w") as f:
++        json.dump(graph, f)
++    with open(tmp_trace,"w") as f:
++        json.dump(trace, f)
++    # call attach_and_sign if available
++    script = "/usr/local/bin/langgraph_attach_and_sign.py"
++    if os.path.exists(script):
++        try:
++            os.system(f"python3 {script} --manifest {tmp_manifest} --trace {tmp_trace} --out /tmp/langgraph-{run_id}-evidence.tgz")
++        except Exception as e:
++            print("evidence bundling failed", e)
++    else:
++        print("No evidence script found; skipping attach/sign step")
++
++@app.route("/run/<graph_name>", methods=["POST"])
++def run_graph(graph_name):
++    # Expected JSON: {"input": {...}}
++    payload = request.get_json() or {}
++    graph = load_graph(graph_name)
++    run_id = f"{graph_name}-{int(time.time())}"
++    trace = {"run_id": run_id, "graph": graph.get("name"), "start": time.time(), "nodes": []}
++    context = {"input": payload.get("input", {})}
++    try:
++        # naive linear execution following entrypoint
++        entry = graph.get("entrypoint")
++        node_map = {n["id"]: n for n in graph.get("nodes", [])}
++        current = entry
++        while current:
++            node = node_map[current]
++            step = {"id": node["id"], "type": node["type"], "start": time.time()}
++            if node["type"] == "llm":
++                prompt_template = node["input"]["prompt"]
++                prompt = prompt_template.replace("{{input.question}}", context.get("input",{}).get("question",""))
++                # call HF
++                answer = call_hf({"model": node.get("model"), "prompt": prompt})
++                context.setdefault("nodes",{})[node["id"]] = {"answer": answer}
++                step["output"] = {"answer": "[REDACTED]" if len(answer)>200 else answer}
++            elif node["type"] == "safety_check":
++                # call safety monitor with redacted payload
++                ctx = {"actor_id":"langgraph-runtime","artifact_id":graph.get("name"), "action":"safety_check", "parameters": {"answer": context.get("nodes",{}).get(node.get("input",{}).get("answer_field","answer"))}}
++                sm = call_safety_monitor(ctx)
++                step["output"] = {"allowed": sm.get("allowed"), "reason": sm.get("reason")}
++                if not sm.get("allowed", False):
++                    trace["nodes"].append(step)
++                    trace["end"] = time.time()
++                    trace["status"] = "blocked_by_safety"
++                    bundle_and_sign(run_id, graph, redacted(trace))
++                    return jsonify({"status":"blocked_by_safety","reason":sm.get("reason")}), 403
++            else:
++                step["output"] = {"note":"unsupported node type - noop"}
++            step["end"] = time.time()
++            trace["nodes"].append(step)
++            # move to next edge if any
++            edges = graph.get("edges", [])
++            next_node = None
++            for e in edges:
++                if e.get("from") == current:
++                    next_node = e.get("to")
++                    break
++            current = next_node
++        trace["end"] = time.time()
++        trace["status"] = "success"
++        # redact and bundle evidence
++        bundle_and_sign(run_id, graph, redacted(trace))
++        return jsonify({"status":"success","run_id": run_id, "trace_summary": {"nodes": len(trace["nodes"])}})
++    except Exception as e:
++        trace["status"] = "error"
++        trace["error"] = str(e)
++        bundle_and_sign(run_id, graph, redacted(trace))
++        return jsonify({"status":"error","error":str(e)}), 500
++
++@app.route("/health", methods=["GET"])
++def health():
++    return jsonify({"status":"ok"})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=8080)
++
+*** End Patch
+*** Begin Patch
+*** Add File:langgraph/scripts/langgraph_attach_and_sign.py
++#!/usr/bin/env python3
++"""
++Attach LangGraph trace and manifest, redact, sign (cosign KMS) and upload to EVIDENCE_BUCKET.
++This complements the main evidence attach flow but specific to LangGraph.
++"""
++import argparse, json, os, subprocess, tempfile
++
++def bundle(manifest, trace, out):
++    tmp = tempfile.mkdtemp()
++    subprocess.run(["cp", manifest, os.path.join(tmp, "manifest.json")], check=False)
++    subprocess.run(["cp", trace, os.path.join(tmp, "trace.json")], check=False)
++    tar = out
++    subprocess.run(["tar","czf",tar,"-C",tmp,"."], check=True)
++    return tar
++
++def sign_and_upload(tar_path):
++    kms = os.environ.get("COSIGN_KMS_KEY_ARN")
++    eb = os.environ.get("EVIDENCE_BUCKET")
++    if kms:
++        subprocess.run(["cosign","sign","--key",f"awskms://{kms}",tar_path], check=False)
++    if eb:
++        subprocess.run(["aws","s3","cp",tar_path,f"s3://{eb}/langgraph/"], check=False)
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--manifest", required=True)
++    p.add_argument("--trace", required=True)
++    p.add_argument("--out", default="/tmp/langgraph-evidence.tgz")
++    args = p.parse_args()
++    tar = bundle(args.manifest, args.trace, args.out)
++    sign_and_upload(tar)
++    print("Wrote evidence", tar)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:langgraph/ci/ci_sign_and_test_graph.yml
++name: Sign & Test LangGraph manifest (CI)
++on:
++  workflow_dispatch:
++
++jobs:
++  sign_and_test:
++    runs-on: ubuntu-latest
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++      - name: Install tools
++        run: |
++          curl -sSfL https://raw.githubusercontent.com/sigstore/cosign/main/install.sh | sh -s -- -b /usr/local/bin || true
++      - name: Sign graph manifest (cosign KMS)
++        env:
++          COSIGN_KMS_KEY_ARN: ${{ secrets.COSIGN_KMS_KEY_ARN }}
++        run: |
++          if [ -z "${COSIGN_KMS_KEY_ARN}" ]; then echo "COSIGN_KMS_KEY_ARN missing; aborting"; exit 1; fi
++          # manifest is expected at langgraph/config/graph-example.json in repo root or passed as input
++          MANIFEST=langgraph/config/graph-example.json
++          if [ ! -f "$MANIFEST" ]; then echo "Manifest not found at $MANIFEST"; exit 1; fi
++          cosign sign --key "awskms://${COSIGN_KMS_KEY_ARN}" --rekor-url "${{ secrets.REKOR_URL }}" "$MANIFEST" || true
++      - name: Trigger Argo digital twin test workflow
++        env:
++          ARGO_SERVER: ${{ secrets.ARGO_SERVER }}
++          MANIFEST_S3: ${{ secrets.MANIFEST_S3 }}
++        run: |
++          # In this CI we assume manifest is uploaded to S3 and Argo server accepts a workflow creation
++          echo "Requesting Argo to run graph simulation (operator must configure ARGO_SERVER and MANIFEST_S3)"
++          # Example: call Argo server API to submit workflow (adjust to your Argo setup)
++          curl -s -X POST "${ARGO_SERVER}/api/v1/workflows/aegis" -H "Content-Type: application/json" -d '{"apiVersion":"argoproj.io/v1alpha1","kind":"Workflow","metadata":{"generateName":"langgraph-test-"},"spec":{"entrypoint":"dt-sim","arguments":{"parameters":[{"name":"scenarios","value":"10"}]}}}' || true
++
+*** End Patch
+*** Begin Patch
+*** Add File:langgraph/gatekeeper/constraint_require_signed_graphs.yaml
++apiVersion: templates.gatekeeper.sh/v1beta1
++kind: ConstraintTemplate
++metadata:
++  name: require_cosign_attestation_for_graph
++spec:
++  crd:
++    spec:
++      names:
++        kind: RequireCosignForGraph
++  targets:
++    - target: admission.k8s.gatekeeper.sh
++      rego: |
++        package require_cosign_for_graph
++
++        violation[{"msg": msg}] {
++          input.review.object.kind == "ConfigMap"
++          input.review.object.metadata.namespace == "langgraph"
++          # Only check configmaps that look like graphs (have simple_graph.json key or name contains 'langgraph-graph')
++          (input.review.object.metadata.name == "langgraph-graphs")
++          # Here we check annotation "cosign.sigstore.dev" presence on the configmap (attestation must set this)
++          not input.review.object.metadata.annotations["cosign.sigstore.dev"]
++          msg := "Graph manifests must be signed and have cosign annotations before deploy"
++        }
++
++---
++apiVersion: constraints.gatekeeper.sh/v1beta1
++kind: RequireCosignForGraph
++metadata:
++  name: require-signed-graphs
++spec:
++  enforcementAction: dryrun
++
++# NOTE: enforcementAction initially dryrun. Review audit events before switching to "deny".
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/langgraph_exporter/app.py
++#!/usr/bin/env python3
++"""
++Small exporter to expose LangGraph runtime metrics for Prometheus.
++It reads a simple /var/run/langgraph/metrics.json file written by the runtime (or uses MongoDB)
++Metrics include:
++- langgraph_runs_total
++- langgraph_runs_failed_total
++- langgraph_node_latency_seconds (summary)
++"""
++from prometheus_client import start_http_server, Counter, Summary
++import time, os, json
++
++RUNS = Counter("langgraph_runs_total", "Total LangGraph runs")
++FAILED = Counter("langgraph_runs_failed_total", "Total LangGraph failed runs")
++NODE_LATENCY = Summary("langgraph_node_latency_seconds", "Node-level latency seconds")
++
++METRICS_FILE = os.environ.get("LANGGRAPH_METRICS_FILE", "/var/run/langgraph/metrics.json")
++
++def poll():
++    if os.path.exists(METRICS_FILE):
++        try:
++            j = json.load(open(METRICS_FILE))
++            runs = j.get("runs",0)
++            fails = j.get("failed",0)
++            latencies = j.get("latencies",[])
++            # This exporter is idempotent approximate (prometheus_client Counters should be incremented)
++            for _ in range(runs):
++                RUNS.inc()
++            for _ in range(fails):
++                FAILED.inc()
++            for l in latencies:
++                NODE_LATENCY.observe(l)
++            # zero out file after reading to avoid double counting in this simple demo
++            open(METRICS_FILE,"w").write(json.dumps({"runs":0,"failed":0,"latencies":[]}))
++        except Exception as e:
++            print("metrics read error", e)
++
++def main():
++    port = int(os.environ.get("METRICS_PORT","9205"))
++    start_http_server(port)
++    print("LangGraph exporter listening on", port)
++    while True:
++        poll()
++        time.sleep(10)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/langgraph_exporter/deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: langgraph-exporter
++  namespace: monitoring
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: langgraph-exporter
++  template:
++    metadata:
++      labels:
++        app: langgraph-exporter
++    spec:
++      containers:
++        - name: exporter
++          image: registry.example.com/aegis/langgraph-exporter:latest
++          env:
++            - name: LANGGRAPH_METRICS_FILE
++              value: "/var/run/langgraph/metrics.json"
++          ports:
++            - containerPort: 9205
++
+*** End Patch
+*** Begin Patch
+*** Add File:dashboards/grafana/langgraph_panel.json
++{
++  "dashboard": {
++    "id": null,
++    "title": "LangGraph - Runtime Metrics",
++    "panels": [
++      {
++        "type": "graph",
++        "title": "LangGraph runs total",
++        "targets": [{"expr": "langgraph_runs_total"}],
++        "gridPos": {"x":0,"y":0,"w":12,"h":6}
++      },
++      {
++        "type": "graph",
++        "title": "Node latency (s)",
++        "targets": [{"expr": "langgraph_node_latency_seconds"}],
++        "gridPos": {"x":12,"y":0,"w":12,"h":6}
++      }
++    ]
++  }
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:argo/langgraph/test_graph_workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: langgraph-test-
++  namespace: aegis
++spec:
++  entrypoint: langgraph-test
++  templates:
++    - name: langgraph-test
++      inputs:
++        parameters:
++          - name: graph-name
++            value: "simple_graph"
++      steps:
++        - - name: run-graph
++            template: run-graph
++            arguments:
++              parameters:
++                - name: graph-name
++                  value: "{{inputs.parameters.graph-name}}"
++
++    - name: run-graph
++      inputs:
++        parameters:
++          - name: graph-name
++      container:
++        image: curlimages/curl:7.85.0
++        command: [sh, -c]
++        args:
++          - |
++            set -e
++            GRAPH="{{inputs.parameters.graph-name}}"
++            # call langgraph runtime (assumes service in langgraph namespace)
++            curl -sS -X POST "http://langgraph.langgraph.svc:8080/run/${GRAPH}" -H "Content-Type: application/json" -d '{"input":{"question":"What is Aegis?"}}' -o /tmp/lang_out.json || true
++            cat /tmp/lang_out.json || true
++      outputs:
++        artifacts:
++          - name: result
++            path: /tmp/lang_out.json
++
+*** End Patch
+*** Begin Patch
+*** Add File:langgraph/docs/INSTALL_AND_SECURITY.md
++# LangGraph Integration — Install & Security Notes (Aegis)
++
++Overview
++- The LangGraph runtime runs in-cluster (namespace: langgraph). Graph manifests are loaded from a ConfigMap (langgraph-graphs) in this scaffold.
++- The runtime calls Hugging Face hosted inference endpoints (HF_API_KEY stored in Kubernetes Secret langgraph-secrets).
++- All graph runs are safety-checked via the existing safety-monitor service.
++- Traces are redacted and bundled into evidence; evidence is signed (cosign KMS) and uploaded to EVIDENCE_BUCKET.
++
++Secrets
++- Create a Kubernetes secret with HF_API_KEY:
++  kubectl create secret generic langgraph-secrets --from-literal=HF_API_KEY="<your-hf-key>" -n langgraph
++- Prefer storing HF_API_KEY in Vault and use Vault Agent or CSI driver to inject into the pod at runtime.
++
++Signing & Attestation
++- Graph manifests must be signed before deployment. CI example provided uses cosign with KMS (see langgraph/ci/ci_sign_and_test_graph.yml).
++- Gatekeeper constraint is provided to detect unsigned graph manifests (dry-run by default).
++
++Evidence
++- Runtime uses langgraph/scripts/langgraph_attach_and_sign.py to bundle trace and manifest; configure COSIGN_KMS_KEY_ARN and EVIDENCE_BUCKET environment variables in the runtime ServiceAccount or via cluster secrets.
++
++Deployment
++- Apply manifests:
++  kubectl apply -f langgraph/runtime/deployment.yaml
++  kubectl apply -f langgraph/config/graph-example.yaml
++  kubectl -n aegis apply -f argo/langgraph/test_graph_workflow.yaml
++
+*** End Patch
+*** End Patch

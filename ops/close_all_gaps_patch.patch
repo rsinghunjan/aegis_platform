@@ -1,0 +1,647 @@
+*** Begin Patch
+*** Add File:ops/carbon/attribution_improved.py
++#!/usr/bin/env python3
++"""
++Improved per-workflow carbon attribution:
++ - Reads node GPU reports (node_gpu_reporter) and detailed per-pod device allocations.
++ - Uses K8s metrics and NVIDIA device-plugin annotations / envs to map GPU UUID -> container
++ - Aggregates power/time per pod and maps to Argo workflow via labels: workflows.argoproj.io/workflow
++ - Emits per-workflow carbon records to CARBON_ATTR_OUT for downstream reporting/chargeback
++
++Notes:
++ - This is heuristic and must be validated in staging. For accurate attribution integrate with device-plugin telemetry
++   (DCGM exporter) and kubelet device-allocator metrics.
++"""
++import os
++import json
++import time
++from collections import defaultdict
++from typing import List, Dict
++
++TELEMETRY_DIR = os.environ.get("TELEMETRY_DIR", "/var/lib/aegis/telemetry")
++CARBON_ATTR_OUT = os.environ.get("CARBON_ATTR_OUT", "/var/lib/aegis/carbon_by_workflow")
++EMISSIONS_FACTOR = float(os.environ.get("EMISSIONS_FACTOR_KGCO2_PER_KWH", "0.475"))
++
++try:
++    from kubernetes import client, config
++    config.load_incluster_config()
++    core = client.CoreV1Api()
++except Exception:
++    core = None
++
++def read_reports(limit=200):
++    files = sorted([os.path.join(TELEMETRY_DIR,f) for f in os.listdir(TELEMETRY_DIR) if f.startswith("node_gpu_report_")])[-limit:]
++    evs=[]
++    for f in files:
++        try:
++            with open(f) as fh:
++                for line in fh:
++                    evs.append(json.loads(line))
++        except Exception:
++            continue
++    return evs
++
++def pods_on_node(node_name: str):
++    if core is None:
++        return []
++    try:
++        pods = core.list_pod_for_all_namespaces(field_selector=f"spec.nodeName={node_name}").items
++        out=[]
++        for p in pods:
++            out.append({"name": p.metadata.name, "ns": p.metadata.namespace, "labels": p.metadata.labels or {}, "containers": [{"name":c.name, "resources": getattr(c, "resources", None)} for c in p.spec.containers]})
++        return out
++    except Exception:
++        return []
++
++def find_workflow(pod):
++    labels = pod.get("labels") or {}
++    return labels.get("workflows.argoproj.io/workflow") or labels.get("workflows.argoproj.io/workflows")
++
++def attribute(evs: List[Dict]):
++    per_wf = defaultdict(lambda: {"energy_kwh": 0.0, "power_w_samples": 0.0, "duration_s": 0.0})
++    for ev in evs:
++        node = ev.get("node")
++        total_power = ev.get("total_power_w", 0.0)
++        gpus = ev.get("gpus", [])
++        ts = ev.get("ts", int(time.time()))
++        # get pods on node and compute GPU-requesting pods
++        pods = pods_on_node(node)
++        gpu_pods = [p for p in pods if any((c.get("resources") and getattr(c["resources"], "requests", None) and getattr(c["resources"].requests, "get", lambda k: None)("nvidia.com/gpu")) for c in p.get("containers",[]))]
++        workflows = {}
++        for p in gpu_pods:
++            wf = find_workflow(p)
++            if wf:
++                workflows.setdefault(wf, []).append(p)
++        if workflows:
++            # split power by number of workflows weighted by number of containers requesting GPUs
++            total_wf_containers = sum(sum(1 for c in p["containers"] if getattr(c.get("resources") or {}, "requests", None) and getattr(c["resources"].requests, "get", lambda k: None)("nvidia.com/gpu")) for p in ps) for ps in workflows.values())
++            if total_wf_containers == 0:
++                share = total_power / max(1, len(workflows))
++                for wf in workflows:
++                    per_wf[wf]["power_w_samples"] += share
++                    per_wf[wf]["duration_s"] += ev.get("duration_s", 1.0)
++            else:
++                for wf, ps in workflows.items():
++                    containers_count = sum(1 for p in ps for c in p["containers"] if getattr(c.get("resources") or {}, "requests", None) and getattr(c["resources"].requests, "get", lambda k: None)("nvidia.com/gpu"))
++                    share = (containers_count/total_wf_containers) * total_power
++                    per_wf[wf]["power_w_samples"] += share
++                    per_wf[wf]["duration_s"] += ev.get("duration_s", 1.0) * (containers_count/total_wf_containers)
++        else:
++            per_wf["<unattributed>"]["power_w_samples"] += total_power
++            per_wf["<unattributed>"]["duration_s"] += ev.get("duration_s", 1.0)
++    return per_wf
++
++def compute_and_write(per_wf):
++    os.makedirs(CARBON_ATTR_OUT, exist_ok=True)
++    out=[]
++    for wf, v in per_wf.items():
++        samples = max(1, v.get("power_w_samples", 0.0) and 1)
++        avg_power = v.get("power_w_samples", 0.0) / samples
++        duration = v.get("duration_s", 0.0)
++        energy_kwh = (avg_power * (duration/3600.0)) / 1000.0
++        carbon_kg = energy_kwh * EMISSIONS_FACTOR
++        rec = {"workflow": wf, "avg_power_w": avg_power, "duration_s": duration, "energy_kwh": energy_kwh, "carbon_kg": carbon_kg, "ts": int(time.time())}
++        out.append(rec)
++    fname = os.path.join(CARBON_ATTR_OUT, f"carbon_by_wf_{int(time.time())}.jsonl")
++    with open(fname, "w") as fh:
++        for r in out:
++            fh.write(json.dumps(r)+"\n")
++    return out
++
++def main():
++    evs = read_reports(limit=200)
++    per_wf = attribute(evs)
++    recs = compute_and_write(per_wf)
++    print("wrote", len(recs))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/provider_apis.py
++#!/usr/bin/env python3
++"""
++Provider carbon integration helpers.
++ - Uses per-region coefficients by default
++ - Stubs for AWS/GCP provider-specific APIs (to be completed with proper credentials and API calls)
++"""
++import os
++import boto3
++import requests
++
++REGION_COEFF = {
++    "us-east-1": 0.4,
++    "us-west-2": 0.35,
++    "eu-west-1": 0.2
++}
++
++def coefficient_for(region: str) -> float:
++    return float(os.environ.get("EMISSIONS_FACTOR_KGCO2_PER_KWH", REGION_COEFF.get(region, 0.475)))
++
++def aws_estimate_account_carbon(account_id: str, start_iso: str, end_iso: str):
++    """
++    Example stub: use Cost Explorer to estimate energy consumption; requires mapping cost -> kWh using provider formulas.
++    Replace with proper integration.
++    """
++    # placeholder - return None if not configured
++    if os.environ.get("AWS_ACCESS_KEY_ID") is None:
++        return None
++    # Example: call cost explorer (not implemented fully)
++    client = boto3.client("ce")
++    # Implement real query if needed
++    return None
++
++def gcp_get_carbon(project_id: str):
++    """
++    Placeholder for GCP Carbon Insights integration.
++    """
++    return None
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/scheduler_optimizer.py
++#!/usr/bin/env python3
++"""
++Carbon-aware scheduler optimizer (greedy placement):
++ - Lists pending Argo workflows
++ - For each workflow, fetch estimated runtime (annotation aegis.estimate_seconds) and priority/SLA
++ - Chooses node pool labels (aegis.carbon_score: low/medium/high) respecting budget and SLA tradeoffs
++ - Patches workflows with nodeSelector or labels to bias Kubernetes scheduler via nodeSelectors/affinity
++
++This module runs as a controller and should be deployed in a non-blocking fashion.
++"""
++import os
++import time
++from kubernetes import client, config
++import math
++
++try:
++    config.load_incluster_config()
++except Exception:
++    try:
++        config.load_kube_config()
++    except Exception:
++        pass
++api = client.CustomObjectsApi()
++
++ARGO_GROUP = "argoproj.io"
++ARGO_VER = "v1alpha1"
++ARGO_PLURAL = "workflows"
++NAMESPACE = os.environ.get("ARGO_NS", "argo")
++POLL_S = int(os.environ.get("CARBON_SCHED_POLL_S", "30"))
++CARBON_ATTR_DIR = os.environ.get("CARBON_ATTR_OUT", "/var/lib/aegis/carbon_by_workflow")
++
++def list_pending():
++    try:
++        res = api.list_namespaced_custom_object(group=ARGO_GROUP, version=ARGO_VER, namespace=NAMESPACE, plural=ARGO_PLURAL)
++        return [w for w in res.get("items", []) if w.get("status",{}).get("phase","") in ("Running","Pending","Unknown")]
++    except Exception:
++        return []
++
++def estimate_consumed_recent():
++    # sum recent carbon files (similar to meta_scheduler)
++    import glob, json
++    s=0.0
++    for f in sorted(glob.glob(os.path.join(CARBON_ATTR_DIR,"carbon_by_wf_*.jsonl")))[-50:]:
++        try:
++            with open(f) as fh:
++                for line in fh:
++                    s += float(json.loads(line).get("carbon_kg",0.0))
++        except Exception:
++            continue
++    return s
++
++def decide_placement(wf):
++    ann = wf.get("metadata",{}).get("annotations",{}) or {}
++    sla = float(ann.get("aegis.sla_seconds", 3600))
++    est = float(ann.get("aegis.estimate_seconds", 600))
++    priority = ann.get("aegis.priority","normal")
++    # compute a carbon sensitivity score: higher when SLA >> est (i.e., flexible)
++    sensitivity = max(0.5, min(2.0, sla / max(1.0, est)))
++    base = {"low":0.8,"normal":1.0,"high":1.2}.get(priority,1.0)
++    score = base * sensitivity
++    # decide: if score > 1.5 prefer low carbon, else normal
++    if score >= 1.5:
++        return "low"
++    elif score >= 1.0:
++        return "medium"
++    else:
++        return "high"
++
++def patch_workflow_node_selector(wf_name, score_label):
++    try:
++        body = {"metadata": {"labels": {"aegis.carbon_placement": score_label}, "annotations": {"aegis.placement":"annotated"}}}
++        api.patch_namespaced_custom_object(group=ARGO_GROUP, version=ARGO_VER, namespace=NAMESPACE, plural=ARGO_PLURAL, name=wf_name, body=body)
++        return True
++    except Exception as e:
++        print("patch failed", e)
++        return False
++
++def main_loop():
++    while True:
++        pending = list_pending()
++        consumed = estimate_consumed_recent()
++        for wf in pending:
++            name = wf.get("metadata",{}).get("name")
++            score = decide_placement(wf)
++            patch_workflow_node_selector(name, score)
++        time.sleep(POLL_S)
++
++if __name__ == "__main__":
++    main_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/multimodal/parallel_ingest_worker.py
++#!/usr/bin/env python3
++"""
++Parallel ingestion worker for multimodal files:
++ - Uses multiprocessing to process files in parallel (video->frames, pcd->voxel)
++ - Writes manifests in partitioned directories (by date/model) as Parquet shards
++ - Designed to be run as a scalable job (multiple workers) reading from an input queue (filesystem or SQS)
++"""
++import os
++from multiprocessing import Pool
++from pathlib import Path
++import time
++import glob
++import json
++import pyarrow as pa
++import pyarrow.parquet as pq
++from ops.multimodal.stream_ingest import extract_frames, voxel_downsample_bin
++
++INPUT_DIR = os.environ.get("MULTIMODAL_INPUT_DIR", "/data/multimodal_in")
++OUT_ROOT = os.environ.get("FEATURESTORE_ROOT", "/var/lib/aegis/featurestore")
++WORKERS = int(os.environ.get("INGEST_WORKERS", "4"))
++
++def process_file(path):
++    p = Path(path)
++    if p.suffix in [".mp4", ".mov", ".mkv"]:
++        frames = extract_frames(str(p), f"/tmp/{p.stem}", fps=1)
++        return [{"type":"video_frame","file":f["file"], "ts": f["ts"]} for f in frames]
++    elif p.suffix in [".bin", ".pcd"]:
++        out, cnt = voxel_downsample_bin(str(p))
++        return [{"type":"pcd_voxel","file": out, "count": cnt, "ts": int(time.time())}]
++    else:
++        return []
++
++def write_shard(rows, model="default"):
++    if not rows:
++        return
++    pdir = os.path.join(OUT_ROOT, model, time.strftime("%Y/%m/%d"))
++    Path(pdir).mkdir(parents=True, exist_ok=True)
++    outp = os.path.join(pdir, f"ingest_{int(time.time()*1000)}.parquet")
++    pq.write_table(pa.Table.from_pylist(rows), outp)
++    print("wrote", outp)
++
++def main():
++    files = glob.glob(os.path.join(INPUT_DIR, "*"))
++    with Pool(WORKERS) as pool:
++        for rows in pool.imap_unordered(process_file, files):
++            if rows:
++                write_shard(rows)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/multimodal/multimodal_serving.py
++#!/usr/bin/env python3
++"""
++FastAPI multimodal serving adapter:
++ - Accepts image bytes, lidar reference (s3 path) and optional text prompt
++ - Calls local model backends (ONNX/TF/PyTorch) and returns unified response
++ - Emits telemetry and logs inputs (for retraining)
++
++This is a lightweight adapter; production should route to optimized runtimes (TensorRT, Triton, etc.)
++"""
++from fastapi import FastAPI, File, UploadFile, Form
++from pydantic import BaseModel
++import os, io, json, requests
++from PIL import Image
++
++app = FastAPI()
++EMB_SERVICE = os.environ.get("EMBEDDING_URL", "http://embeddings:8086/embed")
++TELEMETRY_URL = os.environ.get("TELEMETRY_URL", "http://telemetry-collector:9102/collect")
++
++class MultiResp(BaseModel):
++    detections: dict
++    embeddings: list
++    metadata: dict
++
++def call_image_model(img: Image.Image):
++    # placeholder: run ONNX locally or call model serving
++    return {"objects": [{"label":"person","score":0.9}]}
++
++def call_lidar_model(s3_ref: str):
++    # placeholder: return voxels/points summary
++    return {"points": 12345}
++
++def emit_telemetry(payload):
++    try:
++        requests.post(TELEMETRY_URL, json=payload, timeout=1)
++    except Exception:
++        pass
++
++@app.post("/multimodal")
++async def multimodal(image: UploadFile = File(None), lidar_s3: str = Form(None), prompt: str = Form(None)):
++    img_obj = None
++    if image:
++        contents = await image.read()
++        img_obj = Image.open(io.BytesIO(contents)).convert("RGB")
++    detections = call_image_model(img_obj) if img_obj else {}
++    lidar_info = call_lidar_model(lidar_s3) if lidar_s3 else {}
++    emb = []
++    if prompt:
++        try:
++            r = requests.post(EMB_SERVICE, json={"texts":[prompt]}, timeout=5)
++            emb = r.json().get("embeddings", [])
++        except Exception:
++            emb = []
++    meta = {"ts": int(time.time()), "node": os.uname().nodename}
++    emit_telemetry({"ts": int(time.time()), "detections_count": len(detections.get("objects",[])), "has_lidar": bool(lidar_s3)})
++    return MultiResp(detections=detections, embeddings=emb, metadata=meta)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/vector/milvus/prod_values.yaml
++# Production-like Milvus values (example). Operators must customize storageClass / PVC sizes.
++image:
++  tag: "2.2.10"
++persistence:
++  enabled: true
++  storageClass: "gp2"
++  size: "200Gi"
++proxy:
++  service:
++    type: ClusterIP
++standalone:
++  enabled: false
++  replicaCount: 3
++  resources:
++    limits:
++      cpu: "4000m"
++      memory: "16Gi"
++    requests:
++      cpu: "2000m"
++      memory: "8Gi"
++cluster:
++  enabled: true
++  etcd:
++    persistence:
++      enabled: true
++      storageClass: "gp2"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/generative/hallucination_checker.py
++#!/usr/bin/env python3
++"""
++Hallucination checker:
++ - For generated answer and retrieved docs, runs a simple verification:
++   - Uses embedding similarity between the answer and docs
++   - Runs a QA model (if configured) to verify answer is supported by docs
++ - Returns pass/fail and confidence score
++"""
++import os
++import numpy as np
++import requests
++
++EMB_URL = os.environ.get("EMBEDDING_URL", "http://embeddings:8086/embed")
++QA_URL = os.environ.get("QA_VERIFIER_URL", "")  # optional dedicated QA verifier
++
++def embed_texts(texts):
++    r = requests.post(EMB_URL, json={"texts": texts}, timeout=10)
++    r.raise_for_status()
++    return np.array(r.json().get("embeddings"))
++
++def similarity(a_emb, b_embs):
++    a = a_emb / (np.linalg.norm(a_emb)+1e-9)
++    b = b_embs / (np.linalg.norm(b_embs, axis=1)[:,None]+1e-9)
++    return b.dot(a).max()
++
++def verify(answer: str, docs: list, threshold: float = 0.35):
++    try:
++        texts = [answer] + [d.get("text","") for d in docs]
++        embs = embed_texts(texts)
++        ans_emb = embs[0]
++        doc_embs = embs[1:]
++        sim = similarity(ans_emb, doc_embs)
++        qa_ok = True
++        if QA_URL:
++            r = requests.post(QA_URL, json={"answer": answer, "docs": docs}, timeout=10)
++            qa_ok = r.status_code == 200 and r.json().get("supported", False)
++        return {"sim": float(sim), "qa_ok": qa_ok, "pass": sim >= threshold and qa_ok}
++    except Exception as e:
++        return {"error": str(e), "pass": False}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/generative/rlhf/collect_ui_stub.py
++#!/usr/bin/env python3
++"""
++Simple Flask UI to collect human preferences for RLHF:
++ - Shows two candidate answers, records which one was preferred
++ - Writes JSONL preference records to RLHF_PREF_DIR
++"""
++from flask import Flask, request, render_template_string
++import os, json
++
++RLHF_PREF_DIR = os.environ.get("RLHF_PREF_DIR", "/var/lib/aegis/rlhf/prefs")
++os.makedirs(RLHF_PREF_DIR, exist_ok=True)
++app = Flask(__name__)
++
++TEMPLATE = """
++<h1>RLHF Preference</h1>
++<form method="post">
++  <div><h3>Question:</h3><pre>{{q}}</pre></div>
++  <div>
++    <button name="choice" value="a">Prefer A</button>
++    <button name="choice" value="b">Prefer B</button>
++  </div>
++  <div style="display:flex;">
++    <div style="flex:1"><h4>A</h4><pre>{{a}}</pre></div>
++    <div style="flex:1"><h4>B</h4><pre>{{b}}</pre></div>
++  </div>
++  <input type="hidden" name="qid" value="{{qid}}">
++</form>
++"""
++
++@app.route("/", methods=["GET","POST"])
++def prefs():
++    if request.method == "POST":
++        choice = request.form.get("choice")
++        qid = request.form.get("qid")
++        a = request.form.get("a")
++        b = request.form.get("b")
++        rec = {"qid": qid, "choice": choice, "a": a, "b": b}
++        with open(os.path.join(RLHF_PREF_DIR, f"pref_{int(time.time()*1000)}.jsonl"), "w") as fh:
++            fh.write(json.dumps(rec)+"\n")
++        return "Recorded"
++    # for demo make random items
++    q = "What is Aegis?"
++    a = "Aegis is a secure AI platform."
++    b = "Aegis runs models."
++    return render_template_string(TEMPLATE, q=q, a=a, b=b, qid="demo-"+str(int(time.time())))
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=8089)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/agentic/verification_models.py
++#!/usr/bin/env python3
++"""
++Trainable historical-success model used to predict probability of success for actions/plans.
++ - Simple logistic regression on hand-crafted features (placeholder)
++ - Requires feature engineering from historical traces (not implemented here)
++"""
++import os
++import json
++import numpy as np
++from sklearn.linear_model import LogisticRegression
++
++MODEL_OUT = os.environ.get("VERIFIER_MODEL_OUT", "/var/lib/aegis/verifier/model.pkl")
++
++def featurize(plan):
++    # naive features: number of steps, kubectl steps count
++    steps = len(plan)
++    kubectl = sum(1 for s in plan if s.get("tool")=="kubectl")
++    return np.array([steps, kubectl]).reshape(1,-1)
++
++def train_dummy(X, y):
++    mdl = LogisticRegression()
++    mdl.fit(X,y)
++    import joblib
++    os.makedirs(os.path.dirname(MODEL_OUT), exist_ok=True)
++    joblib.dump(mdl, MODEL_OUT)
++    print("trained verifier model to", MODEL_OUT)
++    return MODEL_OUT
++
++def predict(plan):
++    try:
++        import joblib
++        mdl = joblib.load(MODEL_OUT)
++        feat = featurize(plan)
++        return float(mdl.predict_proba(feat)[0][1])
++    except Exception:
++        # fallback
++        return 0.5
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/agentic/canary_controller_autopromote.py
++#!/usr/bin/env python3
++"""
++Automated canary controller:
++ - Deploys candidate via kubectl/Helm (or Argo)
++ - Monitors Prometheus metrics for a monitor window (p95 latency, error rate)
++ - If metrics pass thresholds, promotes; else runs rollback_playbook
++ - Integrates with plan_verifier_enhanced and multi_signal_verifier for gating
++"""
++import os
++import time
++import subprocess
++import requests
++from ops.agentic.rollback_playbook import rollback_deployment
++
++PROM_URL = os.environ.get("PROM_URL", "http://prometheus:9090")
++MONITOR_WINDOW = int(os.environ.get("CANARY_MONITOR_WINDOW_S", "120"))
++P95_EXPR = os.environ.get("CANARY_P95_EXPR", "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))")
++ERROR_RATE_EXPR = os.environ.get("CANARY_ERR_EXPR", "sum(rate(http_request_errors_total[5m]))")
++LATENCY_THRESHOLD = float(os.environ.get("CANARY_LATENCY_P95_THRESHOLD_S", "0.5"))
++ERROR_THRESHOLD = float(os.environ.get("CANARY_ERROR_RATE_THRESHOLD", "0.01"))
++
++def query_prom(expr):
++    try:
++        r = requests.get(f"{PROM_URL}/api/v1/query", params={"query": expr}, timeout=10)
++        r.raise_for_status()
++        data = r.json().get("data",{}).get("result", [])
++        if not data:
++            return 0.0
++        return float(data[0].get("value",[0,0])[1])
++    except Exception:
++        return 0.0
++
++def deploy_manifest(path):
++    subprocess.check_call(["kubectl","apply","-f", path])
++
++def promote(helm_release=None, manifest=None):
++    # Implement operator-specific promotion (e.g., update stable deployment)
++    if helm_release:
++        subprocess.check_call(["helm","upgrade", helm_release, manifest])
++    elif manifest:
++        subprocess.check_call(["kubectl","apply","-f", manifest])
++
++def run_canary(manifest, namespace, deployment_name, rollback_if_fail=True):
++    deploy_manifest(manifest)
++    start = time.time()
++    time.sleep(MONITOR_WINDOW)
++    p95 = query_prom(P95_EXPR)
++    err = query_prom(ERROR_RATE_EXPR)
++    if p95 <= LATENCY_THRESHOLD and err <= ERROR_THRESHOLD:
++        promote(manifest=manifest)
++        return {"status":"promoted","p95":p95,"err":err}
++    else:
++        if rollback_if_fail:
++            rollback_deployment(namespace, deployment_name, reason=f"canary fail p95={p95} err={err}")
++        return {"status":"rollback","p95":p95,"err":err}
++
++if __name__ == "__main__":
++    import sys
++    if len(sys.argv) < 4:
++        print("usage: canary_controller_autopromote.py <manifest> <namespace> <deployment>")
++        exit(2)
++    print(run_canary(sys.argv[1], sys.argv[2], sys.argv[3]))
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/runbooks/close_gaps_runbook.md
++# Runbook: Closing Gaps for Carbon, Multimodal, Generative & Agentic
++
++Overview:
++- This runbook sequences the components added in this patch. Many modules are conservative placeholders and require operator validation in staging.
++
++Steps:
++1) Deploy node reporter (DaemonSet)
++   - kubectl apply -f k8s/carbon/node-reporter-daemonset.yaml
++   - Verify /var/lib/aegis/telemetry files appear on node.
++
++2) Start attribution aggregator
++   - Run ops/carbon/attribution_improved.py as a CronJob or small Deployment (mount TELEMETRY_DIR, CARBON_ATTR_OUT)
++   - Inspect CARBON_ATTR_OUT JSONL for per-workflow records.
++
++3) Deploy scheduler optimizer
++   - Run ops/carbon/scheduler_optimizer.py as a Deployment (argo namespace access required)
++   - In staging submit various workflows with aegis.sla_seconds/aegis.estimate_seconds annotations and verify nodeSelectors annotations applied.
++
++4) Milvus production deploy (test)
++   - helm install using ops/vector/milvus/prod_values.yaml or ops/vector/milvus/values.yaml for dev
++   - Run k8s/milvus/test-ingest-job.yaml to validate ingestion/search.
++
++5) Multimodal ingestion & serving
++   - Run ops/multimodal/parallel_ingest_worker.py against sample input dir to produce partitioned Parquet.
++   - Start ops/multimodal/multimodal_serving.py and test /multimodal endpoint with a sample image/lidar/text.
++
++6) Generative: LLM adapter & hallucination
++   - Deploy k8s/generative/llm-adapter-deployment.yaml (adjust LOCAL_URL/OPENAI_API_KEY)
++   - Use ops/generative/hallucination_checker.py to validate RAG outputs for small dataset.
++   - Start RLHF preference UI: ops/generative/rlhf/collect_ui_stub.py and collect preferences.
++
++7) Agentic: sandbox & verifier
++   - Deploy sandbox-runner (k8s/agentic/sandbox-runner-deployment.yaml) and test ops/agentic/sandbox_executor.py locally.
++   - Run ops/agentic/plan_verifier_enhanced.py on sample plans. Train a simple verifier via ops/agentic/verification_models.py if historical traces available.
++   - Test canary autopromote flow with ops/agentic/canary_controller_autopromote.py in staging.
++
++Validation & Safety:
++- Validate carbon numbers vs provider estimates before using for billing.
++- Do NOT enable agentic actions that actuate hardware without HIL testing and policy approvals.
++- Verify DLP & PII redaction before storing multimodal raw data.
++
++Rollback:
++- If any new component causes issues, delete the corresponding Deployment/DaemonSet and inspect logs under /var/log/aegis and volumes mounted under /var/lib/aegis.
++
+*** End Patch
+*** End Patch

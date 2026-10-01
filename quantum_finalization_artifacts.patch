@@ -1,0 +1,496 @@
+*** Begin Patch
+*** Add File:ops/argo_submitter_hardened.py
++#!/usr/bin/env python3
++"""
++Hardened Argo submitter for operator-run submissions.
++
++Features:
++- Enforces cost check via ops/qpu_cost_estimator.py
++- Verifies GitHub PR label 'qpu-approved' when PR metadata provided
++- Retries argo submit with exponential backoff
++- Uploads an audit record to EVIDENCE_BUCKET in S3 (audit JSON includes submit request, estimate and argo response)
++- Emits structured logs suitable for Fluent / CloudWatch ingestion
++
++Security notes:
++- Run this process in a secure operator namespace with a constrained ServiceAccount
++- Supply GitHub token via k8s secret (qpu-github-token)
++"""
++import os
++import sys
++import json
++import subprocess
++import time
++import logging
++import traceback
++from datetime import datetime
++from pathlib import Path
++
++import boto3
++import requests
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "REPLACE_EVIDENCE_BUCKET")
++GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
++MAX_RETRIES = int(os.environ.get("ARGO_SUBMIT_MAX_RETRIES", "3"))
++BACKOFF_BASE = float(os.environ.get("ARGO_SUBMIT_BACKOFF_BASE", "5"))  # seconds
++
++logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
++logger = logging.getLogger("qpu-argo-submitter")
++
++def s3_put_json(key, obj):
++    s3 = boto3.client("s3")
++    body = json.dumps(obj, default=str, indent=2)
++    s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=body.encode("utf-8"))
++    return f"s3://{EVIDENCE_BUCKET}/{key}"
++
++def check_github_approval(pr):
++    if not pr:
++        return True
++    if not GITHUB_TOKEN:
++        logger.error("GITHUB_TOKEN missing; cannot check PR approval")
++        return False
++    repo = pr.get("repo")
++    number = pr.get("number")
++    url = f"https://api.github.com/repos/{repo}/issues/{number}/labels"
++    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
++    r = requests.get(url, headers=headers, timeout=10)
++    if r.status_code != 200:
++        logger.error("Failed to fetch PR labels: %s %s", r.status_code, r.text)
++        return False
++    labels = [l["name"] for l in r.json()]
++    approved = "qpu-approved" in labels
++    if not approved:
++        logger.warning("PR %s#%s missing qpu-approved label", repo, number)
++    return approved
++
++def estimate_cost(provider, shots, device, complexity):
++    try:
++        out = subprocess.check_output(["python3","ops/qpu_cost_estimator.py","--provider",provider,"--shots",str(shots),"--device",device,"--circuit-complexity",str(complexity)])
++        return json.loads(out)
++    except Exception as e:
++        logger.exception("Cost estimator failed, defaulting to high safe estimate")
++        return {"estimated_usd": 9999.0, "provider": provider}
++
++def submit_argo(workflow_path, params, max_retries=MAX_RETRIES):
++    cmd = ["argo", "submit", "-n", "aegis", workflow_path]
++    for k,v in params.items():
++        cmd += ["-p", f"{k}={v}"]
++    attempt = 0
++    while True:
++        attempt += 1
++        try:
++            logger.info("Running argo submit (attempt %d): %s", attempt, " ".join(cmd))
++            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8")
++            logger.info("Argo submit succeeded: %s", out.strip().splitlines()[-1] if out else "OK")
++            return {"success": True, "output": out}
++        except subprocess.CalledProcessError as e:
++            logger.error("Argo submit failed (attempt %d): %s", attempt, e.output.decode() if e.output else str(e))
++            if attempt >= max_retries:
++                return {"success": False, "error": e.output.decode() if e.output else str(e)}
++            backoff = BACKOFF_BASE * (2 ** (attempt-1))
++            logger.info("Retrying in %.1f seconds...", backoff)
++            time.sleep(backoff)
++        except Exception as e:
++            logger.exception("Unexpected error when submitting argo")
++            return {"success": False, "error": str(e)}
++
++def main():
++    # request file is written by operator into /work/submit_request.json (mounted or copied)
++    req_file = os.environ.get("SUBMIT_REQUEST_FILE", "/work/submit_request.json")
++    if not Path(req_file).exists():
++        logger.error("Request file not present: %s", req_file)
++        sys.exit(2)
++    req = json.loads(Path(req_file).read_text())
++    provider = req.get("provider")
++    shots = req.get("shots", 1000)
++    device = req.get("device", "simulator")
++    complexity = req.get("circuit_complexity", 1.0)
++    budget = float(req.get("budget_usd", 100.0))
++    pr = req.get("pr")  # optional: {repo, number}
++    workflow = req.get("workflow")
++    params = req.get("params", {})
++    audit = {
++        "timestamp": datetime.utcnow().isoformat() + "Z",
++        "request": req,
++        "status": "started"
++    }
++    audit_key = f"quantum_submissions/{int(time.time())}_audit.json"
++    try:
++        # cost estimate
++        est = estimate_cost(provider, shots, device, complexity)
++        audit["estimate"] = est
++        if est.get("estimated_usd", 0.0) > budget:
++            audit["status"] = "aborted_cost"
++            s3uri = s3_put_json(audit_key, audit)
++            logger.warning("Estimate %s exceeds budget %s. Audit: %s", est, budget, s3uri)
++            sys.exit(3)
++        # approval check if PR provided
++        if pr and not check_github_approval(pr):
++            audit["status"] = "aborted_no_approval"
++            s3uri = s3_put_json(audit_key, audit)
++            logger.warning("PR not approved. Audit: %s", s3uri)
++            sys.exit(4)
++        # submit
++        res = submit_argo(workflow, params)
++        audit["submit_result"] = res
++        audit["status"] = "submitted" if res.get("success") else "failed_submit"
++        s3uri = s3_put_json(audit_key, audit)
++        logger.info("Audit record written: %s", s3uri)
++        if not res.get("success"):
++            sys.exit(5)
++        # move request file aside (so we don't re-run)
++        Path(req_file).rename(f"{req_file}.handled.{int(time.time())}")
++        logger.info("Submit completed successfully")
++        sys.exit(0)
++    except Exception as e:
++        audit["status"] = "error"
++        audit["error"] = str(e)
++        audit["trace"] = traceback.format_exc()
++        s3_put_json(audit_key, audit)
++        logger.exception("Fatal error in submitter")
++        sys.exit(6)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/provider_connectors/braket_pricing_enhanced.py
++#!/usr/bin/env python3
++"""
++Enhanced AWS Braket pricing connector.
++Attempts to query AWS Pricing API and derive a reasonable per-shot estimate for Braket devices.
++Because pricing SKUs are complicated, this script uses a combination of pricing query and heuristics.
++"""
++import boto3, json, argparse, logging
++from decimal import Decimal
++
++logging.basicConfig(level=logging.INFO)
++log = logging.getLogger("braket_pricing")
++
++def query_pricing_products():
++    pricing = boto3.client("pricing", region_name="us-east-1")
++    try:
++        paginator = pricing.get_paginator("get_products")
++        products = []
++        for page in paginator.paginate(ServiceCode="AmazonBraket", MaxResults=100):
++            products.extend(page.get("PriceList", []))
++        return products
++    except Exception as e:
++        log.warning("Pricing API unavailable: %s", e)
++        return []
++
++def heuristic_estimate(shots, device, complexity):
++    # Conservative heuristic baseline per-shot
++    if "simulator" in device:
++        per_shot = Decimal("0.0005")
++    else:
++        # physical QPU are more expensive; scale with complexity
++        per_shot = Decimal("0.005") * (Decimal(1) + Decimal(complexity) * Decimal(0.1))
++    est = float((per_shot * Decimal(shots)).quantize(Decimal("0.0001")))
++    return {"provider":"braket","estimated_usd":est,"shots":shots,"device":device}
++
++def estimate(shots, device, complexity):
++    prods = query_pricing_products()
++    if not prods:
++        return heuristic_estimate(shots, device, complexity)
++    # Try to find any item mentioning Braket and per-usage pricing; best-effort parsing.
++    # NOTE: AWS pricing responses are complex — this attempt is a fallback and must be reviewed per-account.
++    for p in prods:
++        try:
++            data = json.loads(p)
++            # simplistic heuristic: if item mentions "Braket", accept heuristic
++            if "Braket" in json.dumps(data.get("product", {})):
++                return heuristic_estimate(shots, device, complexity)
++        except Exception:
++            continue
++    return heuristic_estimate(shots, device, complexity)
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--shots", type=int, default=1000)
++    p.add_argument("--device", default="simulator")
++    p.add_argument("--complexity", type=float, default=1.0)
++    args = p.parse_args()
++    print(json.dumps(estimate(args.shots, args.device, args.complexity)))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/provider_connectors/ibm_connector_enhanced.py
++#!/usr/bin/env python3
++"""
++IBM billing connector - enhanced stub.
++If IBM billing API endpoint is provided via env IBM_BILLING_ENDPOINT and IBM_API_KEY, you can call it here.
++Otherwise fallback to heuristic.
++"""
++import os, json, argparse, requests, logging
++
++logging.basicConfig(level=logging.INFO)
++log = logging.getLogger("ibm_connector")
++
++def heuristic(shots, device, complexity):
++    per_shot = 0.001
++    est = per_shot * shots * (1.0 + complexity*0.1)
++    return {"provider":"ibm","estimated_usd":round(est,4),"shots":shots,"device":device}
++
++def query_billing(shots, device, complexity):
++    endpoint = os.environ.get("IBM_BILLING_ENDPOINT")
++    api_key = os.environ.get("IBM_API_KEY")
++    if not endpoint or not api_key:
++        return heuristic(shots, device, complexity)
++    try:
++        r = requests.get(endpoint, headers={"Authorization": f"Bearer {api_key}"}, timeout=10)
++        if r.status_code == 200:
++            # parse according to enterprise API - this is account-specific
++            # For now, fallback to heuristic
++            return heuristic(shots, device, complexity)
++        else:
++            log.warning("IBM billing API returned %s", r.status_code)
++            return heuristic(shots, device, complexity)
++    except Exception as e:
++        log.exception("IBM billing query failed")
++        return heuristic(shots, device, complexity)
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--shots", type=int, default=1000)
++    p.add_argument("--device", default="ibm")
++    p.add_argument("--complexity", type=float, default=1.0)
++    args = p.parse_args()
++    print(json.dumps(query_billing(args.shots, args.device, args.complexity)))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/provider_connectors/azure_connector_enhanced.py
++#!/usr/bin/env python3
++"""
++Azure billing connector enhanced stub.
++Uses AZURE_* env vars if present; otherwise falls back to heuristic.
++"""
++import os, json, argparse, logging
++
++logging.basicConfig(level=logging.INFO)
++log = logging.getLogger("azure_connector")
++
++def heuristic(shots, device, complexity):
++    per_shot = 0.0009
++    est = per_shot * shots * (1.0 + complexity*0.1)
++    return {"provider":"azure","estimated_usd":round(est,4),"shots":shots,"device":device}
++
++def query_azure_cost(shots, device, complexity):
++    # Implement Azure Cost Management Query here if needed.
++    if os.environ.get("AZURE_CLIENT_ID"):
++        # placeholder for real querying
++        return heuristic(shots, device, complexity)
++    return heuristic(shots, device, complexity)
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--shots", type=int, default=1000)
++    p.add_argument("--device", default="ionq")
++    p.add_argument("--complexity", type=float, default=1.0)
++    args = p.parse_args()
++    print(json.dumps(query_azure_cost(args.shots, args.device, args.complexity)))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/provider_connectors/rigetti_connector_enhanced.py
++#!/usr/bin/env python3
++"""
++Rigetti billing connector enhanced stub.
++Implement enterprise API integration as required by your Rigetti contract.
++"""
++import json, argparse
++
++def heuristic(shots, device, complexity):
++    per_shot = 0.0012
++    est = per_shot * shots * (1.0 + complexity*0.1)
++    return {"provider":"rigetti","estimated_usd":round(est,4),"shots":shots,"device":device}
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--shots", type=int, default=1000)
++    p.add_argument("--device", default="rigetti_qpu")
++    p.add_argument("--complexity", type=float, default=1.0)
++    args = p.parse_args()
++    print(json.dumps(heuristic(args.shots, args.device, args.complexity)))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:.githooks/pre-commit-placeholder-check.sh
++#!/usr/bin/env bash
++#
++# Pre-commit hook to ensure no REPLACE_* placeholders are being committed.
++#
++FILES="$(git diff --cached --name-only --diff-filter=ACM | tr '\n' ' ')"
++if [ -z "$FILES" ]; then
++  exit 0
++fi
++echo "Running placeholder scan on staged files..."
++for f in $FILES; do
++  if grep -q "REPLACE_" "$f"; then
++    echo "ERROR: Found REPLACE_ token in staged file: $f"
++    grep -n "REPLACE_" "$f"
++    echo "Please replace placeholders or remove the file from commit (git reset HEAD $f)"
++    exit 1
++  fi
++done
++echo "No placeholders found in staged files."
++exit 0
++
+*** End Patch
+*** Begin Patch
+*** Add File:.pre-commit-config.yaml
++repos:
++-   repo: local
++    hooks:
++    - id: placeholder-check
++      name: Placeholder check
++      entry: .githooks/pre-commit-placeholder-check.sh
++      language: script
++      files: '' # run on all staged files
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/pr_checks_with_mlflow.yml
++name: PR Checks — placeholders & MLflow QA
++
++on:
++  pull_request:
++    types: [opened, synchronize, reopened]
++
++jobs:
++  placeholder-check:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Validate placeholders not committed
++        run: ./ops/validate_no_placeholders.sh
++
++  mlflow-qa:
++    needs: placeholder-check
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.10'
++      - name: Install deps
++        run: pip install mlflow jsonschema boto3
++      - name: Run MLflow Quantum QA (short lookback)
++        env:
++          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
++        run: |
++          python3 tests/mlflow_quantum_qa.py --tracking-uri "${MLFLOW_TRACKING_URI}" --lookback-seconds 3600 || { echo "MLflow QA failed in last hour"; exit 1; }
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/operator_playbook_full_placeholders.md
++# Operator Playbook — Full (Placeholders) — Finalization Steps
++
++Overview
++- This playbook contains the exact sequence of steps operators must perform to replace placeholders, provision IRSA IAM roles, deploy the hardened submitter, wire provider connectors, enable CI checks and run staged experiments.
++- All commands include explicit references to files in the repo and use REPLACE_* placeholders which must be set prior to running commands.
++
++1) Scan repo for placeholders
++   ./ops/replace_placeholders.sh /tmp/placeholders.txt
++
++2) Replace placeholders in local-only files
++   cp terraform/irsa/placeholder.tfvars.example terraform/irsa/my.tfvars
++   # Edit terraform/irsa/my.tfvars and replace REPLACE_* tokens
++   DO NOT commit my.tfvars
++
++3) Terraform IRSA roles (apply)
++   cd terraform/irsa
++   terraform init
++   terraform plan -var-file=my.tfvars
++   terraform apply -var-file=my.tfvars
++
++4) (Alternative) eksctl quick create (if preferred)
++   ./ops/eksctl_commands.sh REPLACE_CLUSTER_NAME REPLACE_AWS_REGION aegis
++
++5) Create ExternalSecrets in cluster (if required)
++   kubectl apply -f k8s/externalsecrets/braket_secret.yaml
++   kubectl apply -f k8s/externalsecrets/ibm_secret.yaml
++   kubectl apply -f k8s/externalsecrets/azure_quantum_secret.yaml
++   kubectl apply -f k8s/externalsecrets/rigetti_secret.yaml
++
++6) Populate GitHub repo secrets (do not commit secrets)
++   - COSIGN_KMS_ARN = REPLACE_COSIGN_KMS_ARN
++   - REKOR_URL = REPLACE_REKOR_URL
++   - EVIDENCE_BUCKET = REPLACE_EVIDENCE_BUCKET
++   - MLFLOW_TRACKING_URI = REPLACE_MLFLOW_URI
++   - SANDBOX_QPU_BUDGET_USD = REPLACE_SANDBOX_BUDGET_USD
++   - SANDBOX_QPU_S3_PREFIX = s3://REPLACE_EVIDENCE_BUCKET/...
++
++7) Build & sign quantum image (via CI or locally)
++   # locally (operator):
++   docker build -t REPLACE_GHCR_ORG/aegis-quantum:REPLACE_IMAGE_TAG -f docker/quantum/Dockerfile .
++   docker push REPLACE_GHCR_ORG/aegis-quantum:REPLACE_IMAGE_TAG
++   cosign verify --rekor-server REPLACE_REKOR_URL REPLACE_GHCR_ORG/aegis-quantum:REPLACE_IMAGE_TAG
++
++8) Wire images into overlays and deploy staging
++   ./ops/wire_images_into_kustomize.sh --registry REPLACE_GHCR_ORG --tag REPLACE_IMAGE_TAG --overlay k8s/overlays/staging
++   ./ops/apply_kustomize_and_deploy.sh k8s/overlays/staging
++
++9) Deploy hardened submitter (operator namespace)
++   kubectl create ns aegis-operator || true
++   # Create secret for GitHub token
++   kubectl -n aegis-operator create secret generic qpu-github-token --from-literal=token="${GITHUB_TOKEN}"
++   kubectl apply -f k8s/argo/submitter_deployment.yaml
++
++10) Configure and run a staged submission
++    # prepare submit_request.json with placeholders replaced by actual values
++    cat > /tmp/submit_request.json <<EOF
++    {
++      "provider": "braket",
++      "shots": 1000,
++      "device": "arn:aws:braket:::device/quantum-simulator/amazon/sv1",
++      "circuit_complexity": 1.0,
++      "budget_usd": 10,
++      "pr": {"repo":"REPLACE_GITHUB_REPO","number":123},
++      "workflow": "argo/quantum_braket_workflow.yaml",
++      "params": {"circuit-file-s3":"s3://REPLACE_EVIDENCE_BUCKET/quantum/circuits/example.py"}
++    }
++    kubectl -n aegis-operator cp /tmp/submit_request.json deploy/qpu-argo-submitter:/work/submit_request.json
++    # submitter will pick up the request and run guarded submit
++
++11) Validate MLflow & artifacts
++    # After run completes, check MLflow and audit S3
++    python3 mlflow/validate_quantum_mlflow.py --run-id <RUN_ID> --tracking-uri REPLACE_MLFLOW_URI
++    aws s3 ls s3://REPLACE_EVIDENCE_BUCKET/quantum_results/
++
++12) Enable CI checks
++    - Add .pre-commit-config.yaml to repo and instruct developers to install pre-commit hooks:
++       pip install pre-commit; pre-commit install
++    - Ensure .github/workflows/pr_checks_with_mlflow.yml is active as a PR check
++
++13) Nightly sandbox
++    - Populate SANDBOX_* GitHub secrets
++    - Enable .github/workflows/nightly_qpu_sandbox.yml
++
++14) Final review & production cutover
++    - Obtain legal signoff and store it at s3://REPLACE_EVIDENCE_BUCKET/legal_signoff/
++    - Ramp from simulate -> sandbox -> limited production with owner approvals and monitoring turned on
++
++Support
++- If anything fails, collect:
++  - kubectl -n aegis describe pod <pod>
++  - kubectl -n aegis logs <pod>
++  - Check /var/log/submitter logs in qpu-argo-submitter pod
++  - MLflow run artifacts and audit S3 objects
++
+*** End Patch
+*** End Patch

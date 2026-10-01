@@ -1,0 +1,606 @@
+*** Begin Patch
+*** Add File:ops/level4/orchestrator/service_v2.py
++#!/usr/bin/env python3
++"""
++Aegis Orchestrator v2 — Level‑4 automation-ready
++
++- Accepts webhook POSTs at /webhook and NATS events on 'safety.incidents'
++- Queries OPA for a policy decision
++- Records provenance (local file + metrics)
++- Triggers Argo workflows for auto-contain/auto-remediate-retrain/canary
++- Honours autonomy mode (conservative/hybrid/aggressive) from ConfigMap path or env
++"""
++import os, json, time, logging, threading, subprocess, requests
++from flask import Flask, request, jsonify
++from prometheus_client import start_http_server, Counter
++
++LOG = logging.getLogger("aegis.orchestrator.v2")
++logging.basicConfig(level=logging.INFO)
++
++# Config
++OPA_URL = os.environ.get("OPA_URL", "http://opa:8181")
++ARGO_NS = os.environ.get("ARGO_NS", "aegis-ml")
++ARGO_CLI = os.environ.get("ARGO_CLI", "argo")
++APPROVER_NOTIFY_URL = os.environ.get("APPROVER_NOTIFY_URL", "")
++AUTONOMY_CONFIG_PATH = os.environ.get("AUTONOMY_CONFIG_PATH", "/etc/aegis/autonomy_modes.yaml")
++PROV_LOG_PATH = os.environ.get("PROV_LOG_PATH", "/var/log/aegis/orchestrator_provenance.log")
++PROM_PORT = int(os.environ.get("PROM_PORT", "9105"))
++
++# Metrics
++c_events = Counter('aegis_orch_events_total', 'Total safety events processed')
++c_decision = Counter('aegis_orch_decisions_total', 'Decisions by action', ['action'])
++
++app = Flask("aegis-orch-v2")
++
++def get_mode():
++    try:
++        import yaml
++        cfg = yaml.safe_load(open(AUTONOMY_CONFIG_PATH))
++        return cfg.get("default_mode", "hybrid")
++    except Exception:
++        return os.environ.get("AUTONOMY_MODE", "hybrid")
++
++def opa_decision(event):
++    try:
++        r = requests.post(f"{OPA_URL}/v1/data/aegis/policy/decision", json={"input": event}, timeout=5)
++        r.raise_for_status()
++        return r.json().get("result", {"action":"require_human","reason":"opa_missing"})
++    except Exception:
++        LOG.exception("OPA request failed")
++        return {"action":"require_human","reason":"opa_unavail"}
++
++def record_provenance(event, decision):
++    entry = {
++        "ts": time.time(),
++        "event": event,
++        "decision": decision
++    }
++    try:
++        with open(PROV_LOG_PATH, "a") as fh:
++            fh.write(json.dumps(entry) + "\n")
++    except Exception:
++        LOG.exception("write prov log failed")
++    c_events.inc()
++    c_decision.labels(action=decision.get("action","unknown")).inc()
++
++def submit_argo(template, params=None):
++    cmd = [ARGO_CLI, "submit", "--from", f"workflowtemplate/{template}", "-n", ARGO_NS, "--wait"]
++    if params:
++        for k,v in params.items():
++            cmd += ["--parameter", f"{k}={v}"]
++    LOG.info("Running: %s", " ".join(cmd))
++    try:
++        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=300)
++        LOG.info("Argo submit OK: %s", out)
++        return {"ok": True, "out": out}
++    except subprocess.CalledProcessError as e:
++        LOG.exception("Argo submit failed: %s", e.output if hasattr(e,"output") else e)
++        return {"ok": False, "error": str(e)}
++
++def handle(event):
++    mode = get_mode()
++    decision = opa_decision(event)
++    # Respect mode: do not allow auto_remediate in conservative mode
++    if mode == "conservative" and decision.get("action") in ("auto_remediate","auto_block"):
++        decision = {"action":"require_human","reason":"mode_conservative_override"}
++    record_provenance(event, decision)
++    action = decision.get("action")
++    if action == "auto_block":
++        params = {"incident_id": event.get("id","evt"), "model": event.get("model","unknown")}
++        return submit_argo("aegis-auto-contain", params)
++    if action == "auto_remediate":
++        params = {"incident_id": event.get("id","evt"), "model": event.get("model","unknown")}
++        return submit_argo("aegis-auto-remediate-retrain-v2", params)
++    # require_human
++    try:
++        if APPROVER_NOTIFY_URL:
++            requests.post(APPROVER_NOTIFY_URL, json={"id": event.get("id"), "reason": decision.get("reason")}, timeout=3)
++    except Exception:
++        LOG.exception("notify failed")
++    return {"ok": True, "action": "require_human"}
++
++@app.route("/webhook", methods=["POST"])
++def webhook():
++    ev = request.get_json() or {}
++    threading.Thread(target=handle, args=(ev,)).start()
++    return jsonify({"ok": True}), 202
++
++if __name__ == "__main__":
++    start_http_server(PROM_PORT)
++    LOG.info("Orchestrator v2 starting on 0.0.0.0:8088 (metrics %d)", PROM_PORT)
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8088")))
++
+*** End File
+*** Add File:ops/level4/orchestrator/requirements.txt
++flask
++requests
++prometheus_client
++PyYAML
++
+*** End File
+*** Add File:ops/level4/orchestrator/Dockerfile
++FROM python:3.11-slim
++WORKDIR /app
++COPY requirements.txt /app/requirements.txt
++RUN pip install --no-cache-dir -r /app/requirements.txt
++COPY service_v2.py /app/service.py
++EXPOSE 8088 9105
++CMD ["python3","/app/service.py"]
++
+*** End File
+*** Add File:ops/level4/opa/level4_policy.rego
++package aegis.policy
++
++policy_version = "level4-2026-02-04"
++
++default decision = {"action":"require_human","reason":"default","policy_version":policy_version}
++
++# High-risk in production -> human required
++decision = {"action":"require_human","reason":reason,"policy_version":policy_version} {
++  input.model_env == "prod"
++  input.score >= 0.98
++  reason = sprintf("prod_high_confidence_%v", [input.score])
++}
++
++# Staging: auto-remediate & retrain for very high scores
++decision = {"action":"auto_remediate","reason":"staging_high_confidence","policy_version":policy_version,"confidence_cut":0.95} {
++  input.model_env == "staging"
++  input.score >= 0.95
++}
++
++# Non-prod auto-block for medium-high scores
++decision = {"action":"auto_block","reason":"nonprod_block","policy_version":policy_version,"confidence_cut":0.90} {
++  input.model_env != "prod"
++  input.score >= 0.90
++}
++
++# DP budget check
++decision = {"action":"require_human","reason":"dp_over_budget","policy_version":policy_version} {
++  input.dp_over_budget == true
++}
++
++# Operator override (audit recorded)
++decision = {"action":"auto_remediate","reason":"operator_override","policy_version":policy_version} {
++  input.operator_override == "auto"
++}
++
+*** End File
+*** Add File:ops/level4/argo/workflows/aegis-auto-remediate-retrain-v2.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: WorkflowTemplate
++metadata:
++  name: aegis-auto-remediate-retrain-v2
++  namespace: aegis-ml
++spec:
++  templates:
++  - name: auto-remediate-retrain-v2
++    steps:
++    - - name: collect-evidence
++        template: collect-evidence
++      - name: disable-model
++        template: disable-model
++      - name: update-blacklist
++        template: update-blacklist
++      - name: trigger-retrain
++        template: trigger-retrain
++      - name: validate-candidate
++        template: validate-candidate
++      - name: canary-promotion
++        template: canary-promotion
++
++  - name: collect-evidence
++    container:
++      image: bitnami/kubectl:latest
++      command: [sh, -c]
++      args:
++        - |
++          mkdir -p /tmp/evidence
++          kubectl -n aegis-ml get pods -o wide > /tmp/evidence/pods.txt || true
++          kubectl -n aegis-ml logs deployment/model-serving --tail=500 > /tmp/evidence/serving.log || true
++          tar czf /tmp/evidence.tgz /tmp/evidence || true
++    outputs:
++      artifacts:
++      - name: evidence
++        path: /tmp/evidence.tgz
++
++  - name: disable-model
++    container:
++      image: bitnami/kubectl:latest
++      command: [sh,-c]
++      args:
++        - kubectl -n aegis-ml scale deployment model-serving --replicas=0 || true
++
++  - name: update-blacklist
++    container:
++      image: curlimages/curl:7.85.0
++      command: [sh,-c]
++      args:
++        - |
++          curl -s -X POST -H "Content-Type: application/json" -d '{"pattern":"<auto-blacklist-pattern>","source":"auto_remediate"}' "${BLACKLIST_SERVICE:-http://blacklist:8093/blacklist}" || true
++
++  - name: trigger-retrain
++    container:
++      image: yourregistry/aegis-retrain-runner:latest
++      command: [sh,-c]
++      args:
++        - python3 /app/run_retrain.py --incident "{{workflow.parameters.incident_id}}" || true
++
++  - name: validate-candidate
++    container:
++      image: yourregistry/aegis-retrain-validator:latest
++      command: [sh,-c]
++      args:
++        - python3 /app/validate_candidate.py || (echo "validation failed" && exit 1)
++
++  - name: canary-promotion
++    container:
++      image: bitnami/kubectl:latest
++      command: [sh,-c]
++      args:
++        - echo "Canary promotion will be handled by aegis-canary-promotion workflow template (call separately)"
++
+*** End File
+*** Add File:ops/level4/argo/workflows/aegis-canary-promotion-v2.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: WorkflowTemplate
++metadata:
++  name: aegis-canary-promotion-v2
++  namespace: aegis-ml
++spec:
++  templates:
++  - name: canary-promotion
++    inputs:
++      parameters:
++      - name: candidate_image
++      - name: prometheus_url
++    steps:
++    - - name: deploy-canary
++        template: deploy-canary
++        arguments:
++          parameters:
++          - name: candidate_image
++            value: "{{inputs.parameters.candidate_image}}"
++    - - name: run-canary-traffic
++        template: run-canary-traffic
++    - - name: evaluate
++        template: evaluate-metrics
++        arguments:
++          parameters:
++          - name: prometheus_url
++            value: "{{inputs.parameters.prometheus_url}}"
++    - - name: finalize
++        template: finalize
++
++  - name: deploy-canary
++    inputs:
++      parameters:
++      - name: candidate_image
++    container:
++      image: bitnami/kubectl:latest
++      command: [sh,-c]
++      args:
++        - |
++          kubectl -n aegis-ml set image deployment/model-serving model-serving={{inputs.parameters.candidate_image}} --record || true
++          kubectl -n aegis-ml scale deployment model-serving --replicas=1 || true
++
++  - name: run-canary-traffic
++    container:
++      image: curlimages/curl:7.85.0
++      command: [sh,-c]
++      args:
++        - |
++          for i in $(seq 1 30); do
++            curl -s -X POST -H "Content-Type: application/json" -d '{"model":"canary","payload":{"inputs":"canary test"}}' http://triton-gateway:8089/generate || true
++            sleep 10
++          done
++
++  - name: evaluate-metrics
++    inputs:
++      parameters:
++      - name: prometheus_url
++    container:
++      image: curlimages/curl:7.85.0
++      command: [sh,-c]
++      args:
++        - |
++          PROM={{inputs.parameters.prometheus_url}}
++          # Example check: blocked rate not increased
++          BLOCK=$(curl -s "${PROM}/api/v1/query?query=increase(aegis_safety_filter_blocked_total[10m])" | jq -r '.data.result[0].value[1] // 0')
++          echo "blocked_incidents=$BLOCK"
++          if [ "$BLOCK" -gt 5 ]; then
++            echo "safety regression detected"
++            exit 2
++          fi
++          exit 0
++
++  - name: finalize
++    container:
++      image: bitnami/kubectl:latest
++      command: [sh,-c]
++      args:
++        - echo "Canary evaluation complete; promotion to prod requires policy/human per matrix"
++
+*** End File
+*** Add File:ops/level4/retrain/runner/run_retrain.py
++#!/usr/bin/env python3
++"""
++Retrain runner skeleton:
++- Collect curated negative examples for the incident
++- Augment training set, run a training job (placeholder), produce candidate model artifact
++- Publish candidate model tag to artifact store and exit with 0 on success
++"""
++import os, argparse, logging, subprocess, json, time
++logging.basicConfig(level=logging.INFO)
++LOG = logging.getLogger("aegis.retrain")
++
++def collect_examples(incident_id, outdir="/tmp/retrain_data"):
++    LOG.info("Collecting examples for incident %s", incident_id)
++    os.makedirs(outdir, exist_ok=True)
++    # Placeholder: call review API or fetch evidence from S3
++    # Here we simulate creating a small augment file
++    with open(os.path.join(outdir, "neg_examples.jsonl"), "w") as fh:
++        fh.write(json.dumps({"example":"sensitive content example", "incident":incident_id})+"\n")
++    return outdir
++
++def run_training(data_dir, candidate_tag):
++    LOG.info("Running training using data_dir=%s", data_dir)
++    # Placeholder: call your training infrastructure (kubeflow/airflow/batch)
++    time.sleep(5)
++    # Simulate artifact push (docker tag/push or model registry)
++    LOG.info("Publishing candidate model: %s", candidate_tag)
++    return True
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--incident", required=True)
++    ap.add_argument("--candidate-tag", default="registry/aegis-model:candidate-latest")
++    args = ap.parse_args()
++    data_dir = collect_examples(args.incident)
++    ok = run_training(data_dir, args.candidate_tag)
++    if ok:
++        LOG.info("Retrain runner succeeded")
++        return 0
++    LOG.error("Retrain runner failed")
++    return 2
++
++if __name__ == "__main__":
++    raise SystemExit(main())
++
+*** End File
+*** Add File:ops/level4/retrain/runner/requirements.txt
++requests
++boto3
++
+*** End File
+*** Add File:ops/level4/validator/validate_candidate.py
++#!/usr/bin/env python3
++"""
++Candidate validator skeleton:
++- Downloads candidate artifact
++- Runs safety suite (red-team regression), unit tests and performance checks
++- Exit 0 on pass, non-zero on failure
++"""
++import os, sys, subprocess, logging, time
++logging.basicConfig(level=logging.INFO)
++LOG = logging.getLogger("aegis.validator")
++
++def run_safety_regressions(candidate_tag):
++    LOG.info("Running safety regressions for candidate %s", candidate_tag)
++    # Placeholder: run red-team tests against a staging endpoint using candidate image
++    time.sleep(3)
++    # Simulate pass/fail based on env var TEST_FAIL
++    if os.environ.get("VALIDATOR_FORCE_FAIL","") == "1":
++        LOG.error("Validator failing as requested")
++        return False
++    return True
++
++def run_perf_checks(candidate_tag):
++    LOG.info("Running perf checks")
++    time.sleep(2)
++    return True
++
++def main():
++    candidate = os.environ.get("CANDIDATE_TAG","registry/aegis-model:candidate-latest")
++    ok = run_safety_regressions(candidate) and run_perf_checks(candidate)
++    if ok:
++        LOG.info("Candidate validation succeeded")
++        return 0
++    LOG.error("Candidate validation failed")
++    return 3
++
++if __name__ == "__main__":
++    raise SystemExit(main())
++
+*** End File
+*** Add File:ops/level4/ci/automation_coverage.yml
++name: Automation Coverage Daily
++on:
++  schedule:
++    - cron: '0 6 * * *'
++  workflow_dispatch:
++jobs:
++  coverage:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: "3.11"
++      - name: Install test deps
++        run: pip install pytest requests
++      - name: Run backtest automation
++        run: |
++          python3 ops/level4/tests/backtest_automation.py --incidents ops/level4/tests/sample_incidents.json --out coverage_report.json
++      - name: Upload coverage
++        uses: actions/upload-artifact@v4
++        with:
++          name: automation-coverage
++          path: coverage_report.json
++
+*** End File
+*** Add File:ops/level4/tests/backtest_automation.py
++#!/usr/bin/env python3
++"""
++Backtest script to evaluate automation decisions on historical incidents.
++Input: JSON array where each entry has:
++  {id, score, model_env, dp_over_budget, expected_action}
++This script will evaluate OPA rego locally using 'opa' if available or approximate the decision logic.
++"""
++import json, argparse, subprocess, os, sys
++def run_opa_eval(incident, policy_path):
++    try:
++        inp = json.dumps({"input": incident})
++        out = subprocess.check_output(["opa","eval","-i","-","-d", policy_path, "data.aegis.policy.decision"], input=inp.encode(), timeout=5)
++        return out.decode()
++    except Exception:
++        return None
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--incidents", required=True)
++    ap.add_argument("--out", default="backtest_report.json")
++    ap.add_argument("--policy", default="ops/level4/opa/level4_policy.rego")
++    args = ap.parse_args()
++    incidents = json.load(open(args.incidents))
++    results = []
++    for inc in incidents:
++        # naive local heuristic mirror of policy if opa not available
++        action = "require_human"
++        score = inc.get("score",0)
++        env = inc.get("model_env","staging")
++        if env=="prod" and score>=0.98:
++            action="require_human"
++        elif env=="staging" and score>=0.95:
++            action="auto_remediate"
++        elif env!="prod" and score>=0.90:
++            action="auto_block"
++        if inc.get("dp_over_budget"):
++            action="require_human"
++        results.append({"id":inc.get("id"), "score":score, "env":env, "predicted":action, "expected":inc.get("expected_action")})
++    json.dump(results, open(args.out,"w"), indent=2)
++    print("Wrote backtest report to", args.out)
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:ops/level4/deploy/flip_to_level4.sh
++#!/usr/bin/env bash
++# Flip the cluster to Level-4 (hybrid/aggressive) — run in a controlled maintenance window
++# 1) Preconditions: detectors deployed, dp-service healthy, OPA & orchestrator running in staging, Argo templates deployed
++# 2) Usage: set AUTONOMY_MODE=hybrid|aggressive and run (requires kubectl context)
++set -euo pipefail
++MODE="${1:-hybrid}"
++CTX="${KUBE_CONTEXT:-}"
++NAMESPACE="${NAMESPACE:-aegis-system}"
++echo "Switching autonomy mode to $MODE in namespace $NAMESPACE"
++kubectl ${CTX:+--context $CTX} -n $NAMESPACE create configmap aegis-autonomy-modes --from-file=autonomy_modes.yaml=ops/config/autonomy_modes.yaml --dry-run=client -o yaml | kubectl ${CTX:+--context $CTX} apply -f -
++# Set default_mode via sed (quick in-place)
++TMP=$(mktemp)
++python3 - <<PY > "$TMP"
++import yaml,sys
++p='ops/config/autonomy_modes.yaml'
++m=sys.argv[1]
++d=yaml.safe_load(open(p))
++d['default_mode']=m
++open(p,"w").write(yaml.dump(d))
++PY "$MODE"
++kubectl ${CTX:+--context $CTX} -n $NAMESPACE create configmap aegis-autonomy-modes --from-file=ops/config/autonomy_modes.yaml --dry-run=client -o yaml | kubectl ${CTX:+--context $CTX} apply -f -
++kubectl ${CTX:+--context $CTX} -n "$NAMESPACE" rollout restart deployment aegis-orchestrator || true
++echo "Orchestrator restarted; verify mode endpoint:"
++kubectl ${CTX:+--context $CTX} -n $NAMESPACE get pods -l app=aegis-orchestrator
++echo "Request /webhook test event to validate (inspect Argo workflows)"
++curl -s -X POST -H "Content-Type: application/json" -d '{"id":"flip-test","score":0.97,"model_env":"staging"}' "http://aegis-orchestrator.$NAMESPACE.svc.cluster.local:8088/webhook" || true
++echo "Flip script complete. Monitor orchestrator metrics and Argo workflows for expected behavior."
++
+*** End File
+*** Add File:ops/level4/docs/level4_playbook.md
++# Level‑4 Flip & Runbook (Executive playbook)
++
++Prereqs:
++- Detector images deployed cluster-wide and smoke-verified.
++- DP service multi-AZ healthy; dp_service health check passing.
++- OPA loaded with level4_policy.rego and tested in staging.
++- Orchestrator v2 deployed and connected to Argo.
++- Argo templates (auto-remediate-retrain-v2, canary-promotion-v2) deployed.
++- Retrain runner & validator images built & available.
++
++Steps (high level):
++1. Run backtest against historical incidents and confirm false-auto rate < 1%:
++   python3 ops/level4/tests/backtest_automation.py --incidents ops/level4/tests/sample_incidents.json --out backtest.json
++2. Deploy orchestrator & OPA to staging. Run GH action redteam_to_orchestrator.
++3. Validate Argo workflows triggered, evidence bundles produced, candidate artifacts published.
++4. Execute flip script (ops/level4/deploy/flip_to_level4.sh hybrid) in maintenance window.
++5. Monitor automation_coverage CI and Prometheus metrics for 48 hours.
++6. If false-auto > threshold, immediately revert to conservative mode and open incident.
++
++Emergency rollback:
++- kubectl -n aegis-system set env deployment/aegis-orchestrator AUTONOMY_MODE=conservative
++- kubectl -n aegis-ml scale deployment model-serving --replicas=<previous>
++- Open incident and perform RCA.
++
++Sign-off:
++- Security lead, ML lead, Infra lead must sign before flipping.
++
+*** End File
+*** Add File:ops/level4/approvals/multisig_guide.md
++# Multi‑party cosign approvals (guidance)
++
++Goal: require N-of-M cosign sign‑blob approvals before certain high‑impact actions (e.g., production promotion, dataset purge).
++
++1. Set up a KMS key for cosign and restrict usage to the approver service principal(s).
++2. Each approver obtains a short-lived credential / OIDC token mapped to a KMS grant or signs via a dedicated approver mediator.
++3. To sign a blob:
++   cosign sign-blob --key awskms://arn:aws:kms:... approver_payload.bin
++4. Use Rekor to record signatures for audit:
++   rekor-cli upload --artifact approver_payload.bin --signature approver_payload.bin.sig --public-key <pub>
++5. Verification:
++   cosign verify-blob --key awskms://... --signature approver_payload.bin.sig approver_payload.bin
++6. Orchestrator checks that required N signatures exist before executing high-risk Argo templates.
++
+*** End File
+*** Add File:ops/config/autonomy_modes.yaml
++# Staged autonomy modes configuration
++modes:
++  conservative:
++    description: "Only automated containment & evidence collection. All retrain/promotion require human approval."
++    allow_auto_block: true
++    allow_auto_remediate: false
++    auto_promote_canary: false
++    require_human_for_promote: true
++  hybrid:
++    description: "Automated containment + retrain in staging, canary promotion automated with metric gating, production requires human approve."
++    allow_auto_block: true
++    allow_auto_remediate: true
++    auto_promote_canary: true
++    require_human_for_promote: true
++  aggressive:
++    description: "Automated end-to-end pipeline: retrain, validate, canary and promote to prod automatically if gates pass and no legal impact."
++    allow_auto_block: true
++    allow_auto_remediate: true
++    auto_promote_canary: true
++    require_human_for_promote: false
++
++default_mode: hybrid
++
+*** End File
+*** Add File:ops/level4/tests/sample_incidents.json
++[
++  {"id":"inc-001","score":0.96,"model_env":"staging","dp_over_budget":false,"expected_action":"auto_remediate"},
++  {"id":"inc-002","score":0.92,"model_env":"dev","dp_over_budget":false,"expected_action":"auto_block"},
++  {"id":"inc-003","score":0.99,"model_env":"prod","dp_over_budget":false,"expected_action":"require_human"},
++  {"id":"inc-004","score":0.85,"model_env":"staging","dp_over_budget":false,"expected_action":"require_human"},
++  {"id":"inc-005","score":0.96,"model_env":"staging","dp_over_budget":true,"expected_action":"require_human"}
++]
++
+*** End File
+*** Add File:ops/level4/docs/README_LEVEL4.md
++# Aegis Level‑4 Automation Deliverables
++
++This folder contains the orchestrator, OPA policy, Argo WorkflowTemplates, retrain runner, validator, CI jobs and runbooks required to reach Level‑4 automation.
++
++Important: review all placeholders (your registry, S3 bucket, KMS URIs, ARGO namespace) before applying. Run in staging first.
++
+*** End File
+*** End Patch

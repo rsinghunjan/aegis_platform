@@ -1,0 +1,690 @@
+diff --git a/argo/workflows/fine_tune_rlhf.yaml b/argo/workflows/fine_tune_rlhf.yaml
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/argo/workflows/fine_tune_rlhf.yaml
+@@ -0,0 +1,248 @@
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: aegis-finetune-rlhf-
++  namespace: aegis-ml
++spec:
++  entrypoint: finetune-rlhf
++  serviceAccountName: aegis-agent-sa
++  templates:
++    - name: finetune-rlhf
++      steps:
++        - - name: prepare-data
++            template: prepare-data
++        - - name: finetune-sharded
++            template: finetune-sharded
++        - - name: validate
++            template: validate
++        - - name: train-reward-model
++            template: train-reward-model
++        - - name: rlhf-ppo
++            template: rlhf-ppo
++        - - name: register-model
++            template: register-model
++
++    - name: prepare-data
++      container:
++        image: python:3.10-slim
++        command: ["bash", "-lc"]
++        args:
++          - |
++            set -euo pipefail
++            echo "Prepare data: tokenization, filtering, create train/val"
++            python3 /app/scripts/prepare_finetune_data.py --input-s3 ${INPUT_S3} --out /workspace/data
++      volumeMounts:
++        - name: workspace
++          mountPath: /workspace
++
++    - name: finetune-sharded
++      container:
++        image: <REGISTRY>/aegis-deepspeed-launcher:latest
++        command: ["bash", "-lc"]
++        args:
++          - |
++            set -euo pipefail
++            echo "Launching DeepSpeed sharded fine-tune job"
++            python3 /app/scripts/deepspeed_launcher.py --config /app/configs/deepspeed_config.json --data-dir /workspace/data --output-dir /workspace/checkpoints
++      env:
++        - name: NVIDIA_VISIBLE_DEVICES
++          value: "all"
++      volumeMounts:
++        - name: workspace
++          mountPath: /workspace
++        - name: deepspeed-config
++          mountPath: /app/configs
++
++    - name: validate
++      container:
++        image: <REGISTRY>/aegis-validate:latest
++        command: ["python3", "/app/validate.py", "--model-dir", "/workspace/checkpoints", "--threshold", "0.8"]
++      volumeMounts:
++        - name: workspace
++          mountPath: /workspace
++
++    - name: train-reward-model
++      container:
++        image: <REGISTRY>/aegis-reward-trainer:latest
++        command: ["python3", "/app/scripts/train_reward_model.py", "--data", "/workspace/reward_data", "--out", "/workspace/reward_model"]
++      volumeMounts:
++        - name: workspace
++          mountPath: /workspace
++
++    - name: rlhf-ppo
++      container:
++        image: <REGISTRY>/aegis-rlhf-runner:latest
++        command: ["python3", "/app/scripts/rlhf_trainer.py", "--policy-checkpoint", "/workspace/checkpoints", "--reward-model", "/workspace/reward_model", "--out", "/workspace/rlhf_model"]
++      volumeMounts:
++        - name: workspace
++          mountPath: /workspace
++
++    - name: register-model
++      container:
++        image: python:3.10-slim
++        command: ["bash", "-lc"]
++        args:
++          - |
++            set -euo pipefail
++            echo "Registering model to MLflow and creating approval PR"
++            python3 /app/scripts/register_model.py --model-dir /workspace/rlhf_model --model-name ${MODEL_NAME}
++      volumeMounts:
++        - name: workspace
++          mountPath: /workspace
++
++  volumes:
++    - name: workspace
++      emptyDir: {}
++    - name: deepspeed-config
++      configMap:
++        name: aegis-deepspeed-config
++
++  arguments:
++    parameters:
++      - name: INPUT_S3
++        value: ""
++      - name: MODEL_NAME
++        value: "aegis-rlhf-model"
++
++  ttlStrategy:
++    secondsAfterCompletion: 3600
++
++# Notes:
++# - This workflow assumes container images implement the scripts referenced in /app/scripts/.
++# - The register-model step will call MLflow and the approval gateway (orchestrator) to create a promotion PR.
++# - Tune resource requests/limits and backoff as needed for your infra.
++
+diff --git a/scripts/deepspeed_launcher.py b/scripts/deepspeed_launcher.py
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/scripts/deepspeed_launcher.py
+@@ -0,0 +1,200 @@
++#!/usr/bin/env python3
++"""
++Lightweight launcher wrapper that prepares DeepSpeed run environment and invokes the training script.
++This script is intended to run inside a container image that has deepspeed and torch installed.
++It accepts a Deepspeed JSON config and a training entrypoint script.
++"""
++import os
++import argparse
++import subprocess
++
++parser = argparse.ArgumentParser()
++parser.add_argument("--config", required=True)
++parser.add_argument("--data-dir", required=True)
++parser.add_argument("--output-dir", required=True)
++parser.add_argument("--num-nodes", type=int, default=1)
++parser.add_argument("--gpus-per-node", type=int, default=8)
++args = parser.parse_args()
++
++os.makedirs(args.output_dir, exist_ok=True)
++
++deepspeed_config = args.config
++train_script = "/app/train_finetune.py"
++
++# Construct deepspeed launch command (simple)
++cmd = [
++    "deepspeed",
++    "--num_nodes", str(args.num_nodes),
++    "--num_gpus", str(args.gpus_per_node),
++    "--module", train_script,
++    "--",
++    "--data_dir", args.data_dir,
++    "--output_dir", args.output_dir,
++    "--deepspeed_config", deepspeed_config
++]
++
++print("Launching DeepSpeed with command:", " ".join(cmd))
++subprocess.check_call(cmd)
++
+diff --git a/scripts/train_finetune.py b/scripts/train_finetune.py
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/scripts/train_finetune.py
+@@ -0,0 +1,260 @@
++#!/usr/bin/env python3
++"""
++Training entrypoint intended for DeepSpeed (module mode). This script uses Hugging Face Accelerate/Transformers
++and DeepSpeed ZeRO config passed via CLI. It's a simplified scaffold; operators must tune hyperparameters.
++"""
++import os
++import argparse
++import json
++import logging
++from pathlib import Path
++from datasets import load_dataset, Dataset
++from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments
++import torch
++
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger("aegis.finetune")
++
++parser = argparse.ArgumentParser()
++parser.add_argument("--data_dir", required=True)
++parser.add_argument("--output_dir", required=True)
++parser.add_argument("--deepspeed_config", required=True)
++parser.add_argument("--model_name", default=os.environ.get("HF_BASE_MODEL", "gpt2"))
++parser.add_argument("--epochs", type=int, default=1)
++parser.add_argument("--batch_size", type=int, default=4)
++parser.add_argument("--lr", type=float, default=5e-5)
++args = parser.parse_args()
++
++data_dir = args.data_dir
++output_dir = args.output_dir
++os.makedirs(output_dir, exist_ok=True)
++
++# In production you'd likely load from LakeFS or S3; here we assume a JSONL with "text" field
++train_path = os.path.join(data_dir, "train.jsonl")
++val_path = os.path.join(data_dir, "val.jsonl")
++
++def load_jsonl(path):
++    lines = []
++    with open(path, "r") as fh:
++        for l in fh:
++            try:
++                lines.append(json.loads(l))
++            except:
++                continue
++    return lines
++
++train_data = []
++val_data = []
++if os.path.exists(train_path):
++    train_data = load_jsonl(train_path)
++if os.path.exists(val_path):
++    val_data = load_jsonl(val_path)
++
++if not train_data:
++    logger.error("No training data found at %s", train_path)
++    exit(1)
++
++tokenizer = AutoTokenizer.from_pretrained(args.model_name)
++if tokenizer.pad_token is None:
++    tokenizer.add_special_tokens({"pad_token":"<|pad|>"})
++
++def tokenize_batch(examples):
++    return tokenizer(examples["text"], truncation=True, max_length=1024)
++
++train_dataset = Dataset.from_list(train_data)
++train_dataset = train_dataset.map(lambda ex: {"text": ex["text"]})
++train_dataset = train_dataset.map(lambda ex: tokenize_batch(ex), batched=True)
++
++val_dataset = None
++if val_data:
++    val_dataset = Dataset.from_list(val_data)
++    val_dataset = val_dataset.map(lambda ex: {"text": ex["text"]})
++    val_dataset = val_dataset.map(lambda ex: tokenize_batch(ex), batched=True)
++
++model = AutoModelForCausalLM.from_pretrained(args.model_name)
++model.resize_token_embeddings(len(tokenizer))
++
++training_args = TrainingArguments(
++    output_dir=output_dir,
++    overwrite_output_dir=True,
++    per_device_train_batch_size=args.batch_size,
++    per_device_eval_batch_size=args.batch_size,
++    num_train_epochs=args.epochs,
++    learning_rate=args.lr,
++    logging_steps=10,
++    save_total_limit=3,
++    deepspeed=args.deepspeed_config,
++)
++
++trainer = Trainer(
++    model=model,
++    args=training_args,
++    train_dataset=train_dataset,
++    eval_dataset=val_dataset if val_dataset else None,
++)
++
++trainer.train()
++trainer.save_model(output_dir)
++logger.info("Fine-tune complete. Model saved to %s", output_dir)
++
++# Optionally register to MLflow (if env set)
++try:
++    import mlflow
++    if os.environ.get("MLOPS_MLFLOW_TRACKING_URI"):
++        mlflow.set_tracking_uri(os.environ.get("MLOPS_MLFLOW_TRACKING_URI"))
++        with mlflow.start_run() as run:
++            mlflow.log_param("model_name", args.model_name)
++            mlflow.log_param("epochs", args.epochs)
++            mlflow.log_artifacts(output_dir, artifact_path="model")
++            print("Registered model to MLflow run", run.info.run_id)
++except Exception:
++    logger.warning("MLflow not configured or failed to log model")
++
+diff --git a/scripts/train_reward_model.py b/scripts/train_reward_model.py
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/scripts/train_reward_model.py
+@@ -0,0 +1,220 @@
++#!/usr/bin/env python3
++"""
++Train a small reward model from preference/reward dataset.
++Assumes dataset in JSONL with fields: prompt, completion, reward (or pairwise pref info).
++This is a minimal trainer using Hugging Face Transformers.
++"""
++import os
++import argparse
++import json
++import logging
++from datasets import load_dataset, Dataset
++from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer
++
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger("aegis.reward")
++
++parser = argparse.ArgumentParser()
++parser.add_argument("--data", required=True)
++parser.add_argument("--out", required=True)
++parser.add_argument("--model", default="distilbert-base-uncased")
++parser.add_argument("--epochs", type=int, default=3)
++parser.add_argument("--batch_size", type=int, default=16)
++args = parser.parse_args()
++
++os.makedirs(args.out, exist_ok=True)
++
++# Load JSONL as dataset
++ds = load_dataset("json", data_files=args.data)["train"]
++
++tokenizer = AutoTokenizer.from_pretrained(args.model)
++
++def prepare(example):
++    text = (example.get("prompt","") + "\n\n" + example.get("completion","")).strip()
++    toks = tokenizer(text, truncation=True, max_length=512)
++    toks["labels"] = int(example.get("reward", 1))
++    return toks
++
++ds = ds.map(prepare, remove_columns=ds.column_names, batched=False)
++ds.set_format(type="torch")
++
++model = AutoModelForSequenceClassification.from_pretrained(args.model, num_labels=2)
++
++training_args = TrainingArguments(
++    output_dir=args.out,
++    per_device_train_batch_size=args.batch_size,
++    num_train_epochs=args.epochs,
++    logging_steps=10,
++    save_total_limit=2,
++)
++
++trainer = Trainer(model=model, args=training_args, train_dataset=ds)
++trainer.train()
++trainer.save_model(args.out)
++logger.info("Reward model trained and saved to %s", args.out)
++
++# Emit minimal MLflow logging if configured
++try:
++    import mlflow
++    if os.environ.get("MLOPS_MLFLOW_TRACKING_URI"):
++        mlflow.set_tracking_uri(os.environ.get("MLOPS_MLFLOW_TRACKING_URI"))
++        with mlflow.start_run() as run:
++            mlflow.log_param("reward_model_base", args.model)
++            mlflow.log_artifacts(args.out, artifact_path="reward_model")
++except Exception:
++    logger.warning("MLflow not configured or failed to log reward model")
++
+diff --git a/scripts/rlhf_trainer.py b/scripts/rlhf_trainer.py
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/scripts/rlhf_trainer.py
+@@ -0,0 +1,300 @@
++#!/usr/bin/env python3
++"""
++Simplified RLHF trainer (PPO loop). This script is a scaffold showing:
++ - policy model (the fine-tuned model) used for rollouts
++ - reward model to score outputs
++ - PPO loop using trl or a simplified placeholder if trl not available
++
++In production, replace with a robust RL implementation (TRL or custom).
++"""
++import os
++import argparse
++import json
++import logging
++import random
++from pathlib import Path
++
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger("aegis.rlhf")
++
++parser = argparse.ArgumentParser()
++parser.add_argument("--policy-checkpoint", required=True)
++parser.add_argument("--reward-model", required=True)
++parser.add_argument("--out", required=True)
++parser.add_argument("--steps", type=int, default=100)
++parser.add_argument("--batch-size", type=int, default=8)
++args = parser.parse_args()
++
++os.makedirs(args.out, exist_ok=True)
++
++# Placeholder functions for model inference and reward scoring.
++def policy_generate(prompt, max_tokens=64):
++    # In production: call vLLM/Triton or use HF generation with the sharded checkpoint
++    # Here we produce a dummy completion
++    return prompt + " [generated completion]"
++
++def score_with_reward_model(prompt, completion):
++    # In production: load the reward model and compute scalar reward
++    # Placeholder: random small reward
++    return random.uniform(0, 1)
++
++def ppo_update(policy_batch, rewards):
++    # Placeholder for PPO update step. In production use trl.PPOTrainer or custom optimizer.
++    # Here we simulate a lightweight update by writing a "checkpoint" artifact.
++    summary = {
++        "updated_steps": len(policy_batch),
++        "mean_reward": sum(rewards) / len(rewards),
++    }
++    return summary
++
++# Load some prompts for rollouts; in production, use dataset of prompts / user queries
++prompts = [
++    "Summarize the following policy on model promotion.",
++    "Explain how to rotate keys in Vault.",
++    "Provide an example of a safe prompt for an assistant."
++]
++
++history = []
++
++for step in range(args.steps):
++    batch_prompts = random.choices(prompts, k=args.batch_size)
++    completions = []
++    rewards = []
++    for p in batch_prompts:
++        c = policy_generate(p)
++        r = score_with_reward_model(p, c)
++        completions.append((p, c))
++        rewards.append(r)
++    # perform PPO update (placeholder)
++    update_summary = ppo_update(completions, rewards)
++    logger.info("Step %d: update_summary=%s", step, update_summary)
++    history.append(update_summary)
++
++# Persist a minimal RLHF artifact
++with open(os.path.join(args.out, "rlhf_summary.json"), "w") as fh:
++    json.dump({"steps": args.steps, "history": history}, fh)
++
++# Optionally log to MLflow
++try:
++    import mlflow
++    if os.environ.get("MLOPS_MLFLOW_TRACKING_URI"):
++        mlflow.set_tracking_uri(os.environ.get("MLOPS_MLFLOW_TRACKING_URI"))
++        with mlflow.start_run() as run:
++            mlflow.log_param("policy_checkpoint", args.policy_checkpoint)
++            mlflow.log_artifacts(args.out, artifact_path="rlhf")
++except Exception:
++    logger.warning("MLflow not configured or failed to log RLHF artifacts")
++
++logger.info("RLHF (placeholder) complete. Artifacts in %s", args.out)
++
+diff --git a/scripts/register_model.py b/scripts/register_model.py
+new file mode 100644
+index 0000000..6666666
+--- /dev/null
++++ b/scripts/register_model.py
+@@ -0,0 +1,240 @@
++#!/usr/bin/env python3
++"""
++Register trained model into MLflow Model Registry and create an approval PR via the approval gateway.
++This script logs a decision to decision_log indicating a promotion interest and triggers the approval gateway.
++"""
++import os
++import argparse
++import json
++import requests
++
++from tools.decisionlog_client import insert_decision
++
++parser = argparse.ArgumentParser()
++parser.add_argument("--model-dir", required=True)
++parser.add_argument("--model-name", required=True)
++parser.add_argument("--mlflow-uri", default=os.environ.get("MLOPS_MLFLOW_TRACKING_URI"))
++parser.add_argument("--approval-gateway", default=os.environ.get("APPROVAL_GATEWAY_URL", "http://aegis-approval-gateway.aegis-ml.svc.cluster.local:8080/request-approval"))
++args = parser.parse_args()
++
++# Minimal MLflow registration (delegated to mlflow client if available)
++try:
++    import mlflow
++    if args.mlflow_uri:
++        mlflow.set_tracking_uri(args.mlflow_uri)
++    run_id = None
++    with mlflow.start_run() as run:
++        mlflow.log_artifacts(args.model_dir, artifact_path="model")
++        run_id = run.info.run_id
++    print("Logged model to MLflow run", run_id)
++except Exception:
++    print("MLflow not available; skipping registration")
++    run_id = None
++
++# Create a decision_log entry for "promotion_requested"
++payload = {"model_name": args.model_name, "mlflow_run": run_id}
++evidence = {"model_dir": args.model_dir}
++dec_id = insert_decision(agent="aegis-finetune-workflow", action="promotion_requested", payload=payload, evidence=evidence)
++print("Wrote decision_log id:", dec_id)
++
++# Call approval gateway to create PR for human review
++pr_payload = {
++    "model": args.model_name,
++    "reason": "Auto-request promotion after RLHF+validation",
++    "change_branch": f"aegis/auto-promote-{args.model_name}",
++    "diff": "Model registered; requires review & safety checks",
++    "decision_log_id": dec_id,
++}
++
++resp = requests.post(args.approval_gateway, json=pr_payload, timeout=10)
++if resp.status_code in (200,201):
++    print("Approval PR created:", resp.json())
++else:
++    print("Failed to create approval PR:", resp.status_code, resp.text)
++
+diff --git a/k8s/manifests/deepspeed-finetune-job.yaml b/k8s/manifests/deepspeed-finetune-job.yaml
+new file mode 100644
+index 0000000..7777777
+--- /dev/null
++++ b/k8s/manifests/deepspeed-finetune-job.yaml
+@@ -0,0 +1,220 @@
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: aegis-deepspeed-finetune
++  namespace: aegis-ml
++spec:
++  backoffLimit: 2
++  template:
++    spec:
++      serviceAccountName: aegis-agent-sa
++      containers:
++        - name: deepspeed-launcher
++          image: <REGISTRY>/aegis-deepspeed-launcher:latest
++          command: ["python3", "/app/deepspeed_launcher.py", "--config", "/app/configs/deepspeed_config.json", "--data-dir", "/workspace/data", "--output-dir", "/workspace/checkpoints"]
++          env:
++            - name: NVIDIA_VISIBLE_DEVICES
++              value: "all"
++          volumeMounts:
++            - name: workspace
++              mountPath: /workspace
++            - name: deepspeed-config
++              mountPath: /app/configs
++          resources:
++            limits:
++              nvidia.com/gpu: 8
++              memory: "120Gi"
++              cpu: "8000m"
++      restartPolicy: Never
++      nodeSelector:
++        aegis/instance-type: "gpu-on-demand"
++  volumes:
++    - name: workspace
++      emptyDir: {}
++    - name: deepspeed-config
++      configMap:
++        name: aegis-deepspeed-config
++
++# This Job is an example; for multi-node DeepSpeed you should use a scheduler that can coordinate Node allocation (or use a launcher that integrates with k8s MPI).
++
+diff --git a/k8s/manifests/reward-trainer-deployment.yaml b/k8s/manifests/reward-trainer-deployment.yaml
+new file mode 100644
+index 0000000..8888888
+--- /dev/null
++++ b/k8s/manifests/reward-trainer-deployment.yaml
+@@ -0,0 +1,160 @@
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-reward-trainer
++  namespace: aegis-ml
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-reward-trainer
++  template:
++    metadata:
++      labels:
++        app: aegis-reward-trainer
++    spec:
++      serviceAccountName: aegis-agent-sa
++      containers:
++        - name: reward-trainer
++          image: <REGISTRY>/aegis-reward-trainer:latest
++          command: ["python3", "/app/scripts/train_reward_model.py", "--data", "/data/reward.jsonl", "--out", "/output/reward_model"]
++          volumeMounts:
++            - name: reward-data
++              mountPath: /data
++            - name: reward-output
++              mountPath: /output
++          resources:
++            requests:
++              cpu: "1000m"
++              memory: "4Gi"
++      volumes:
++        - name: reward-data
++          persistentVolumeClaim:
++            claimName: aegis-reward-data-pvc
++        - name: reward-output
++          persistentVolumeClaim:
++            claimName: aegis-reward-output-pvc
++
+diff --git a/tools/mlflow_client.py b/tools/mlflow_client.py
+new file mode 100644
+index 0000000..9999999
+--- /dev/null
++++ b/tools/mlflow_client.py
+@@ -0,0 +1,220 @@
++#!/usr/bin/env python3
++"""
++Convenience wrapper for MLflow interactions: register model artifact and add tags/metadata.
++"""
++import os
++import logging
++import mlflow
++
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger("aegis.mlflow")
++
++MLFLOW_URI = os.environ.get("MLOPS_MLFLOW_TRACKING_URI")
++if MLFLOW_URI:
++    mlflow.set_tracking_uri(MLFLOW_URI)
++
++def register_model(model_dir: str, model_name: str, tags: dict = None):
++    tags = tags or {}
++    try:
++        with mlflow.start_run() as run:
++            mlflow.log_artifacts(model_dir, artifact_path="model")
++            run_id = run.info.run_id
++        # Register model (if model registry configured)
++        client = mlflow.tracking.MlflowClient()
++        artifact_uri = f"runs:/{run_id}/model"
++        model_version = None
++        try:
++            model_version = client.create_registered_model(model_name)
++        except Exception:
++            # may already exist
++            logger.debug("Model registry may already have model %s", model_name)
++        mv = client.create_model_version(name=model_name, source=artifact_uri, run_id=run_id)
++        client.set_model_version_tag(model_name, mv.version, "registered_by", "aegis-finetune-workflow")
++        for k, v in tags.items():
++            client.set_model_version_tag(model_name, mv.version, k, str(v))
++        logger.info("Registered model %s version %s", model_name, mv.version)
++        return {"run_id": run_id, "model_version": mv.version}
++    except Exception as e:
++        logger.exception("Failed to register model to MLflow: %s", e)
++        return None
++
+diff --git a/docs/RLHF_README.md b/docs/RLHF_README.md
+new file mode 100644
+index 0000000..aaaaaaaa
+--- /dev/null
++++ b/docs/RLHF_README.md
+@@ -0,0 +1,220 @@
++# Aegis Fine-tune & RLHF Pipeline (patch)
++
++This patch adds a minimal end-to-end pipeline for fine-tuning and RLHF using Argo Workflows and DeepSpeed sharded training. It includes:
++- Argo workflow: argo/workflows/fine_tune_rlhf.yaml
++- DeepSpeed launcher and training script: scripts/deepspeed_launcher.py, scripts/train_finetune.py
++- Reward model trainer: scripts/train_reward_model.py
++- RLHF placeholder trainer (PPO loop): scripts/rlhf_trainer.py
++- Model registerer: scripts/register_model.py (registers to MLflow and triggers approval gateway)
++- Kubernetes resources for running DeepSpeed job and reward trainer
++- MLflow helper: tools/mlflow_client.py
++
++Quick start (staging)
++1. Build container images for:
++   - deepspeed-launcher (has deepspeed, torch, transformers)
++   - aegis-reward-trainer (has transformers, datasets)
++   - aegis-rlhf-runner (has trl or placeholder)
++   - aegis-validate, aegis-promote images referenced by Argo workflow if used
++
++2. Ensure Argo Workflows is installed in cluster and aegis-ml namespace exists.
++
++3. Configure environment:
++   - Set MLOPS_MLFLOW_TRACKING_URI to your MLflow server
++   - Ensure POSTGRES_URL is set (decision_log writes)
++   - Provide INPUT_S3 parameter to the Argo workflow (S3 path to training corpora)
++
++4. Launch the workflow (example using `argo` CLI):
++   argo submit -n aegis-ml argo/workflows/fine_tune_rlhf.yaml -p INPUT_S3=s3://my-bucket/corpus -p MODEL_NAME=my-rlhf-model
++
++Notes & next steps
++- The RLHF training in scripts/rlhf_trainer.py is a placeholder demonstrating the loop. Replace with TRL (Hugging Face TRL) or a proper PPO implementation for production.
++- DeepSpeed multi-node orchestration requires careful infra integration (node allocation, RDMA, NCCL tuning). The deepspeed launcher shown is a simplified example.
++- Register_model triggers the approval gateway and writes a decision_log entry. The approval gateway must be deployed and reachable.
++- Add validation steps, unit tests, safety checks, and OPA policy gating in the Argo workflow for production readiness.
++
++If you want, I can:
++- Add a TRL-based PPO implementation and kubeflow/mpi job manifests for real multi-node DeepSpeed runs.
++- Create an Argo cron workflow to schedule periodic RLHF retraining and data collection.
++- Wire in monitoring dashboards (Prometheus/Grafana) for training/rlhf metrics.
++
++Safety: use a staging environment with restricted budgets and smaller subsets before scaling up to production.
++

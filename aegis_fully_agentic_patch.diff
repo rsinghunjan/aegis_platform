@@ -1,0 +1,132 @@
+diff --git a/agents/orchestrator/main.py b/agents/orchestrator/main.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/agents/orchestrator/main.py
+@@ -0,0 +1,340 @@
++#!/usr/bin/env python3
++"""
++Decision Orchestrator for Aegis (agentic control plane).
++
++Responsibilities:
++ - Receive events (Argo Events / webhook) and persist the raw event (optional)
++ - Query OPA policy engine to make an allow/deny decision for requested actions
++ - Enforce kill-switch, rate limits, budget guards and model-risk checks
++ - Record every decision in the durable decision_log (Postgres) via agents.common.decision_db
++ - Emit Prometheus metrics about decisions/actions
++ - Trigger safe executions (Argo workflow submission or GitHub PR creation) when allowed (or in dry-run mode)
++
++Configuration via environment variables:
++ - OPA_URL (default http://opa:8181/v1/data/aegis/policies/allow)
++ - ARGO_RETRAIN_TEMPLATE (path to a JSON Argo workflow template)
++ - ARGO_SERVER (Argo server base URL)
++ - DECISION_DB_* envs for Postgres (handled by agents.common.decision_db)
++ - KILL_SWITCH (if "true", no actions will be executed)
++ - DRY_RUN (if "true", no external side effects; decisions still logged)
++ - RATE_LIMIT_PER_MIN (integer)
++ - REDIS_URL (optional, for distributed rate limiter)
++ - BUDGET_LIMIT (optional numeric monthly budget cap)
++ - GITHUB_* handled by agents.common.utils for PR creation
++ - PROMETHEUS_METRICS_PORT default 9000
++
++Notes:
++ - This is intentionally conservative and small: it demonstrates the safety checks and audit logging
++ - In production you should add authentication on the webhook (e.g., X-AEGIS-TOKEN header) and run OPA + Gatekeeper
++   as part of your control plane.
++"""
++import os
++import time
++import json
++import threading
++import traceback
++from datetime import datetime, timedelta
++
++from flask import Flask, request, jsonify
++import requests
++
++from prometheus_client import Counter, Gauge, start_http_server
++
++try:
++    import redis
++except Exception:
++    redis = None
++
++try:
++    from agents.common import decision_db
++    from agents.common.utils import argo_submit_workflow, create_github_pr, record_decision as utils_record_decision
++except Exception:
++    # In case relative import path differs in tests, attempt absolute
++    from agents.common import decision_db  # type: ignore
++    from agents.common.utils import argo_submit_workflow, create_github_pr, record_decision as utils_record_decision  # type: ignore
++
++app = Flask(__name__)
++
++# Configuration
++OPA_URL = os.environ.get("OPA_URL", "http://opa:8181/v1/data/aegis/policies/allow")
++ARGO_RETRAIN_TEMPLATE = os.environ.get("ARGO_RETRAIN_TEMPLATE", "/workflows/retrain_workflow.json")
++KILL_SWITCH = os.environ.get("KILL_SWITCH", "false").lower() == "true"
++DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
++RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "10"))
++REDIS_URL = os.environ.get("REDIS_URL", "")
++BUDGET_LIMIT = float(os.environ.get("BUDGET_LIMIT", "0.0"))  # 0.0 reserved for 'no budget guard'
++PROM_PORT = int(os.environ.get("PROMETHEUS_METRICS_PORT", "9000"))
++
++# Prometheus metrics
++MET_DECISIONS = Counter("aegis_decisions_total", "Total decisions by orchestrator", ["agent", "action", "result"])
++MET_ACTIONS = Counter("aegis_actions_executed_total", "Actions executed by orchestrator", ["agent", "action", "target"])
++MET_DECISION_DURATION = Gauge("aegis_decision_latency_seconds", "Time taken to make decision")
++MET_RATE_LIMIT_REJECTS = Counter("aegis_rate_limit_rejects_total", "Rate limit rejects")
++MET_BUDGET_REJECTS = Counter("aegis_budget_rejects_total", "Budget guard rejects")
++
++# Simple in-memory rate limiter fallback
++class InMemoryRateLimiter:
++    def __init__(self, per_min):
++        self.per_min = per_min
++        self.lock = threading.Lock()
++        self.tokens = per_min
++        self.last = time.time()
++
++    def allow(self, key="global"):
++        with self.lock:
++            now = time.time()
++            elapsed = now - self.last
++            # Refill tokens
++            refill = elapsed * (self.per_min / 60.0)
++            self.tokens = min(self.per_min, self.tokens + refill)
++            self.last = now
++            if self.tokens >= 1:
++                self.tokens -= 1
++                return True
++            return False
++
++class RedisRateLimiter:
++    """
++    Very small Redis-based counter per minute using INCR with EXPIRE.
++    Key format: "aegis:rl:{key}:{YYYYMMDDHHMM}"
++    """
++    def __init__(self, redis_url, per_min):
++        self.per_min = per_min
++        self.client = redis.from_url(redis_url, decode_responses=True)
++
++    def allow(self, key="global"):
++        now = datetime.utcnow()
++        window = now.strftime("%Y%m%d%H%M")
++        rkey = f"aegis:rl:{key}:{window}"
++        cur = self.client.incr(rkey)
++        if cur == 1:
++            # set expire a bit longer than a minute
++            self.client.expire(rkey, 75)
++        if cur > self.per_min:
++            return False
++        return True
++
++# Initialize rate limiter
++if REDIS_URL and redis:
++    RATE_LIMITER = RedisRateLimiter(REDIS_URL, RATE_LIMIT_PER_MIN)
++else:
++    RATE_LIMITER = InMemoryRateLimiter(RATE_LIMIT_PER_MIN)
++
++def opa_check(input_obj):
++    """
++    Query OPA for the given input. Return dict with '*
+

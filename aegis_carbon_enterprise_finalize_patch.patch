@@ -1,0 +1,536 @@
+*** Begin Patch
+*** Add File:telemetry/job_runtime_collector.py
++#!/usr/bin/env python3
++"""
++Job runtime collector
++ - Collects completed Argo Workflow durations and basic features (cpu/gpu requests, input data size)
++ - Writes CSV for runtime predictor training.
++ - Can run as a CronJob to build up historical dataset.
++"""
++import os
++import csv
++import time
++from datetime import datetime
++from kubernetes import client, config
++
++OUT_DIR = os.environ.get("RUNTIME_TELEM_OUT", "/data/runtime")
++NAMESPACE = os.environ.get("WATCH_NAMESPACE", "")
++
++def ensure_dir(path):
++    os.makedirs(path, exist_ok=True)
++
++def extract_features_from_wf(wf):
++    meta = wf.get("metadata", {})
++    spec = wf.get("spec", {})
++    status = wf.get("status", {}) or {}
++    # duration
++    started = status.get("startedAt")
++    finished = status.get("finishedAt")
++    if not started or not finished:
++        return None
++    start_ts = datetime.fromisoformat(started.replace("Z","+00:00"))
++    end_ts = datetime.fromisoformat(finished.replace("Z","+00:00"))
++    duration_s = (end_ts - start_ts).total_seconds()
++    # approximate requested resources: pick the max requests from templates (best-effort)
++    req_cpu = 1.0
++    gpu = 0
++    data_bytes = 0
++    # try to inspect templates
++    templates = spec.get("templates", [])
++    for t in templates:
++        c = t.get("container", {})
++        if not c:
++            continue
++        resources = c.get("resources", {})
++        reqs = resources.get("requests", {}) or resources.get("limits", {})
++        cpu = reqs.get("cpu")
++        if cpu:
++            if isinstance(cpu, str) and cpu.endswith("m"):
++                req_cpu = max(req_cpu, float(cpu[:-1]) / 1000.0)
++            else:
++                try:
++                    req_cpu = max(req_cpu, float(cpu))
++                except Exception:
++                    pass
++        ng = reqs.get("nvidia.com/gpu") or reqs.get("gpu")
++        if ng:
++            try:
++                gpu = max(gpu, int(ng))
++            except Exception:
++                pass
++    # data size hint from annotations
++    ann = meta.get("annotations", {}) or {}
++    try:
++        data_bytes = int(ann.get("aegis.input_data_bytes", "0"))
++    except Exception:
++        data_bytes = 0
++
++    return {
++        "name": meta.get("name"),
++        "namespace": meta.get("namespace", NAMESPACE),
++        "duration_s": duration_s,
++        "req_cpu": req_cpu,
++        "gpu": gpu,
++        "data_bytes": data_bytes,
++        "ts": finished
++    }
++
++def write_rows(rows):
++    ensure_dir(OUT_DIR)
++    fname = os.path.join(OUT_DIR, f"runtime_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv")
++    with open(fname, "w", newline="") as f:
++        w = csv.DictWriter(f, fieldnames=["name","namespace","duration_s","req_cpu","gpu","data_bytes","ts"])
++        w.writeheader()
++        for r in rows:
++            w.writerow(r)
++    print("Wrote runtime telemetry:", fname)
++
++def main():
++    ensure_dir(OUT_DIR)
++    config.load_incluster_config()
++    crd = client.CustomObjectsApi()
++    # list workflows across cluster (best-effort)
++    try:
++        res = crd.list_cluster_custom_object(group="argoproj.io", version="v1alpha1", plural="workflows")
++        items = res.get("items", [])
++    except Exception as e:
++        print("Failed to list workflows:", e)
++        items = []
++    rows = []
++    for wf in items:
++        f = extract_features_from_wf(wf)
++        if f:
++            rows.append(f)
++    if rows:
++        write_rows(rows)
++    else:
++        print("No completed workflows found to record.")
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:runtime_predictor/train_model.py
++#!/usr/bin/env python3
++"""
++Train a simple runtime predictor (scikit-learn) from CSV telemetry.
++Produces a serialized model (job_runtime_model.pkl) for prediction at submission time.
++"""
++import glob, os, joblib
++import pandas as pd
++from sklearn.ensemble import RandomForestRegressor
++
++TELEM_DIR = os.environ.get("RUNTIME_TELEM_OUT", "/data/runtime")
++MODEL_OUT = os.environ.get("RUNTIME_MODEL_OUT", "/app/runtime_model.pkl")
++
++def load_data():
++    files = glob.glob(os.path.join(TELEM_DIR, "*.csv"))
++    if not files:
++        raise SystemExit("No telemetry CSVs found")
++    dfs = [pd.read_csv(f) for f in files]
++    df = pd.concat(dfs, ignore_index=True)
++    # features: req_cpu, gpu, data_bytes
++    df = df[['req_cpu','gpu','data_bytes','duration_s']].dropna()
++    return df
++
++def train():
++    df = load_data()
++    X = df[['req_cpu','gpu','data_bytes']].astype(float)
++    y = df['duration_s'].astype(float)
++    model = RandomForestRegressor(n_estimators=50, random_state=42)
++    model.fit(X, y)
++    joblib.dump(model, MODEL_OUT)
++    print("Trained runtime model saved to", MODEL_OUT)
++
++if __name__ == "__main__":
++    train()
++
+*** End Patch
+*** Begin Patch
+*** Add File:runtime_predictor/predict.py
++#!/usr/bin/env python3
++"""
++Load trained runtime model and predict runtime seconds from features provided on stdin or args.
++"""
++import joblib, sys, json
++MODEL_PATH = os.environ.get("RUNTIME_MODEL_OUT", "/app/runtime_model.pkl")
++
++def predict(features):
++    model = joblib.load(MODEL_PATH)
++    arr = [[float(features.get("req_cpu",1.0)), float(features.get("gpu",0)), float(features.get("data_bytes",0))]]
++    pred = model.predict(arr)[0]
++    return pred
++
++if __name__ == "__main__":
++    if len(sys.argv) > 1:
++        f = json.loads(sys.argv[1])
++    else:
++        f = json.load(sys.stdin)
++    print(int(predict(f)))
++
+*** End Patch
+*** Begin Patch
+*** Add File:scheduler/carbon/feed_aggregator_v2.py
++#!/usr/bin/env python3
++"""
++Enhanced Feed Aggregator with multiple providers and Redis caching & health checks.
++Providers: CO2Signal, AWS Emissions API placeholder, GCP placeholder, Grid operator CSV.
++"""
++import time, os, requests, json
++import redis
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://aegis-redis.aegis.svc:6379/0")
++CACHE_TTL = int(os.environ.get("FEED_CACHE_TTL", "300"))
++co2_key = os.environ.get("CO2SIGNAL_API_KEY")
++redis_cli = redis.Redis.from_url(REDIS_URL, decode_responses=True)
++
++def fetch_co2signal(country="US"):
++    if not co2_key:
++        return None
++    try:
++        r = requests.get(f"https://api.co2signal.com/v1/latest?countryCode={country}", headers={"auth-token":co2_key}, timeout=5)
++        r.raise_for_status()
++        return int(r.json().get("data",{}).get("carbonIntensity"))
++    except Exception:
++        return None
++
++def fetch_aws(region="us-west-2"):
++    # Placeholder: integrate with cloud provider APIs for region emission factors
++    return None
++
++def fetch_grid_operator(region_hint):
++    # Optional local operator feed (CSV/HTTP) configured via env
++    url = os.environ.get("GRID_FEED_URL")
++    if not url:
++        return None
++    try:
++        r = requests.get(url, timeout=3)
++        r.raise_for_status()
++        return int(r.json().get("intensity_gco2_per_kwh"))
++    except Exception:
++        return None
++
++def get_intensity(region="US"):
++    key = f"carbon:{region}"
++    cached = redis_cli.get(key)
++    if cached:
++        data = json.loads(cached)
++        if time.time() - data.get("ts",0) < CACHE_TTL:
++            return data["value"], data["source"]
++    # try providers in order
++    v = fetch_grid_operator(region) or fetch_co2signal(region) or fetch_aws(region)
++    source = "grid" if v == fetch_grid_operator(region) else ("co2signal" if v==fetch_co2signal(region) else "aws" if v==fetch_aws(region) else "fallback")
++    if v is None:
++        v = 999
++        source = "fallback"
++    payload = {"ts": time.time(), "value": int(v), "source": source}
++    redis_cli.set(key, json.dumps(payload), ex=CACHE_TTL)
++    return int(v), source
++
++def health_check():
++    # check each provider's return quality and latency
++    checks = {}
++    for name,fn in [("co2signal",fetch_co2signal), ("aws", fetch_aws), ("grid", fetch_grid_operator)]:
++        try:
++            t0 = time.time()
++            val = fn("US")
++            latency = time.time()-t0
++            checks[name] = {"ok": val is not None, "latency_s": latency, "value": val}
++        except Exception as e:
++            checks[name] = {"ok": False, "error": str(e)}
++    return checks
++
++if __name__ == "__main__":
++    print(get_intensity("US"))
++    print(health_check())
++
+*** End Patch
+*** Begin Patch
+*** Add File:scheduler/controller/carbon_scheduler_controller_v2.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: carbon-scheduler-controller
++  namespace: aegis
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: carbon-scheduler-controller
++  template:
++    metadata:
++      labels:
++        app: carbon-scheduler-controller
++    spec:
++      serviceAccountName: carbon-scheduler-controller-sa
++      containers:
++        - name: controller
++          image: ghcr.io/yourorg/aegis-carbon-controller:latest
++          env:
++            - name: WATCH_NAMESPACE
++              value: ""
++            - name: REDIS_URL
++              value: "redis://aegis-redis.aegis.svc:6379/0"
++          resources:
++            limits:
++              cpu: "500m"
++              memory: "512Mi"
++
+*** End Patch
+*** Begin Patch
+*** Add File:rbac/carbon_controller_rbac.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: carbon-scheduler-controller-sa
++  namespace: aegis
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRole
++metadata:
++  name: carbon-scheduler-controller-role
++rules:
++  - apiGroups: ["argoproj.io"]
++    resources: ["workflows"]
++    verbs: ["get","list","watch","patch"]
++  - apiGroups: [""]
++    resources: ["pods","jobs","cronjobs","namespaces"]
++    verbs: ["get","list","watch","create","patch"]
++  - apiGroups: [""]
++    resources: ["configmaps","secrets"]
++    verbs: ["get","list"]
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRoleBinding
++metadata:
++  name: carbon-scheduler-controller-binding
++subjects:
++  - kind: ServiceAccount
++    name: carbon-scheduler-controller-sa
++    namespace: aegis
++roleRef:
++  kind: ClusterRole
++  name: carbon-scheduler-controller-role
++  apiGroup: rbac.authorization.k8s.io
++
+*** End Patch
+*** Begin Patch
+*** Add File:scheduler/spot/spot_provisioner_cloud.py
++#!/usr/bin/env python3
++"""
++Spot pool provisioning helper (placeholder)
++ - For AWS, invoke ASG/NodeGroup APIs (via Terraform or boto3) to create spot node pools.
++ - This file contains a safe operator-run CLI that suggests actions; integrate with infra automation for full automation.
++"""
++import argparse, subprocess, os
++
++def ensure_spot_nodegroup(name, min_size, max_size, instance_type):
++    # Placeholder: in production use Terraform / cloud API
++    print(f"[placeholder] ensure spot nodegroup {name} size {min_size}-{max_size} type {instance_type}")
++    # Example: call a terraform workspace or bootstrap script
++    return True
++
++if __name__ == "__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--name", required=True)
++    p.add_argument("--min", type=int, default=1)
++    p.add_argument("--max", type=int, default=10)
++    p.add_argument("--type", default="p4d.24xlarge")
++    args = p.parse_args()
++    ensure_spot_nodegroup(args.name, args.min, args.max, args.type)
++
+*** End Patch
+*** Begin Patch
+*** Add File:policy/policy_ui.py
++#!/usr/bin/env python3
++"""
++Simple policy UI + API to read/update per-team carbon policies.
++ - Uses policy store file (policy_store_example.yaml) for persistence.
++"""
++from flask import Flask, request, jsonify, render_template_string
++import yaml, os
++
++POLICY_FILE = os.environ.get("POLICY_FILE", "/app/policy_store.yaml")
++app = Flask("policy-ui")
++
++TEMPLATE = """
++<html><body>
++<h1>Team Carbon Policies</h1>
++<pre id=policies>{{policies}}</pre>
++<form method=post action="/api/policy/update">
++Team: <input name=team /><br/>
++Mode: <select name=mode><option>low-carbon-only</option><option>best-effort</option></select><br/>
++Threshold: <input name=threshold value=200 /><br/>
++<button type=submit>Update</button>
++</form>
++</body></html>
++"""
++
++def load():
++    try:
++        return yaml.safe_load(open(POLICY_FILE)) or {"policies": {}}
++    except Exception:
++        return {"policies": {}}
++
++@app.route("/")
++def index():
++    return render_template_string(TEMPLATE, policies=yaml.dump(load()))
++
++@app.route("/api/policy/<team>", methods=["GET"])
++def get_policy(team):
++    return jsonify(load().get("policies", {}).get(team, {}))
++
++@app.route("/api/policy/update", methods=["POST"])
++def update():
++    team = request.form.get("team")
++    mode = request.form.get("mode")
++    threshold = int(request.form.get("threshold", "200"))
++    data = load()
++    data.setdefault("policies", {})[team] = {"mode": mode, "carbon_threshold": threshold}
++    with open(POLICY_FILE, "w") as f:
++        yaml.safe_dump(data, f)
++    return "OK", 200
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=8090)
++
+*** End Patch
+*** Begin Patch
+*** Add File:reconciliation/auto_calibrate.py
++#!/usr/bin/env python3
++"""
++Auto-calibration loop:
++ - Periodically analyze reconciliation reports (reconcile_job_postrun outputs)
++ - If consistent bias detected for a node_type, create a draft calibration change and notify ops (upload to evidence bucket).
++ - Requires manual approval to write power_profiles.yaml in production.
++"""
++import glob, json, os, statistics, boto3
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++S3 = boto3.client("s3") if EVIDENCE_BUCKET else None
++RECON_DIR = os.environ.get("RECON_DIR", "/data/reconciliations")
++PROFILE_PATH = os.environ.get("POWER_PROFILES_OUT", "/app/power_profiles.yaml")
++THRESHOLD_RATIO = float(os.environ.get("CALIBRATE_THRESHOLD", "0.1"))  # 10% bias
++
++def analyze():
++    files = glob.glob(os.path.join(RECON_DIR, "*.json"))
++    biases = {}
++    for f in files:
++        j = json.load(open(f))
++        est = j.get("estimate", {})
++        meas = j.get("measured", {})
++        # Best-effort attribute node_type via j or metadata (placeholder)
++        node_type = j.get("node_type", "default")
++        if est and meas:
++            bias = (meas.get("measured_emissions_kg", 0) - est.get("estimated_emissions_kg", 0)) / max(1e-6, meas.get("measured_emissions_kg", 1))
++            biases.setdefault(node_type, []).append(bias)
++    changes = {}
++    for nt, vals in biases.items():
++        med = statistics.median(vals)
++        if abs(med) > THRESHOLD_RATIO:
++            changes[nt] = med
++    return changes
++
++def publish_draft(changes):
++    draft = {"ts": __import__("datetime").datetime.utcnow().isoformat()+"Z", "changes": changes}
++    out = "/tmp/power_profiles_draft.json"
++    json.dump(draft, open(out, "w"), indent=2)
++    if S3:
++        key = f"calibration/draft_{os.path.basename(out)}"
++        S3.upload_file(out, EVIDENCE_BUCKET, key)
++        print("Uploaded draft calibration to s3://{}/{}".format(EVIDENCE_BUCKET, key))
++    else:
++        print("Draft calibration:", out)
++
++if __name__ == "__main__":
++    changes = analyze()
++    if changes:
++        publish_draft(changes)
++    else:
++        print("No significant biases detected.")
++
+*** End Patch
+*** Begin Patch
+*** Add File:token_budget/carbon_hook.py
++#!/usr/bin/env python3
++"""
++Token-budget carbon hook:
++ - Checks team carbon budget before allowing job to run (simple POST to token-budget service)
++ - Integrate this as part of admission/controller decision path.
++"""
++import os, requests
++TOKEN_BUDGET_URL = os.environ.get("TOKEN_BUDGET_URL", "http://token-budget.aegis.svc:9200")
++
++def check_carbon_budget(team, est_kg):
++    try:
++        r = requests.post(f"{TOKEN_BUDGET_URL}/check_carbon", json={"team": team, "kg": est_kg}, timeout=5)
++        r.raise_for_status()
++        return r.json().get("allowed", False)
++    except Exception:
++        return False
++
++if __name__ == "__main__":
++    import sys
++    team = sys.argv[1]
++    kg = float(sys.argv[2])
++    print(check_carbon_budget(team, kg))
++
+*** End Patch
+*** Begin Patch
+*** Add File:manifests/webhook_full_mutating.yaml
++apiVersion: admissionregistration.k8s.io/v1
++kind: MutatingWebhookConfiguration
++metadata:
++  name: aegis-carbon-webhook
++webhooks:
++  - name: carbon.aegis.example.com
++    admissionReviewVersions: ["v1"]
++    clientConfig:
++      service:
++        name: aegis-carbon-webhook
++        namespace: aegis
++        path: "/mutate"
++      caBundle: "REPLACE_WITH_CA_BUNDLE"
++    failurePolicy: Fail
++    sideEffects: None
++    timeoutSeconds: 10
++    rules:
++      - apiGroups: ["argoproj.io"]
++        apiVersions: ["v1alpha1"]
++        operations: ["CREATE"]
++        resources: ["workflows"]
++      - apiGroups: [""]
++        apiVersions: ["v1"]
++        operations: ["CREATE"]
++        resources: ["pods"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:READMEs/carbon_finalization_README.md
++# Final Carbon-Aware Operationalization Steps
++
++This patch supplies:
++- Historical runtime telemetry collector & runtime predictor (train + predict).
++- Enhanced redundant feed aggregator (v2) with Redis caching & health checks.
++- Controller deployment & RBAC for enforcing defer/resume and nodeSelector placement.
++- Spot provisioning helper and integration placeholders.
++- Policy UI, token-budget carbon hook, and reconciliation auto-calibration loop.
++
++Operator manual steps:
++1. Deploy telemetry collector and collect at least 1-2 weeks of runtime & power telemetry.
++2. Run runtime_predictor/train_model.py to produce a runtime model and place in image or shared path.
++3. Deploy webhook with production CA (use cert_manager.sh to create certs and populate caBundle).
++4. Deploy controller (carbon_scheduler_controller_v2) and ensure RBAC is applied.
++5. Configure token-budget to expose /check_carbon and wire TOKEN_BUDGET_URL.
++6. Deploy reconcile auto-calibrate to produce drafts and then review/accept changes to power_profiles.yaml.
++7. Wire Grafana + Prometheus to Prom exporter and review monitoring rules.
++
++Security & production cautions:
++- Use real cloud provider APIs for spot provisioning and proper infra pipelines (Terraform/Cluster API).
++- Do not rely on self-signed CA in production — use a corporate PKI.
++- Ensure least-privilege RBAC for controller and webhook and audit all decisions.
++
+*** End Patch
+*** End Patch

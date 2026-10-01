@@ -1,0 +1,633 @@
+*** Begin Patch
+*** Add File:ops/carbon/job_wrapper.py
++#!/usr/bin/env python3
++"""
++Job wrapper to instrument job lifecycle and emit precise per-job metrics for carbon attribution.
++
++Usage:
++  Wrap job execution with this script to record start/stop timestamps, resource labels, job metadata.
++  Example:
++    python ops/carbon/job_wrapper.py --job-id=bench-123 --team=rl --workload=train -- \
++      python train.py --epochs 10
++
++Outputs:
++ - Writes per-job metadata to /tmp/aegis_jobs/{job_id}.json
++ - Pushes Prometheus metrics (job_start_ts, job_end_ts) to Pushgateway if PUSHGATEWAY_URL set.
++ - Emits a compact annotation file consumed by job_emissions_calculator for exact PromQL scoping.
++"""
++import os
++import sys
++import json
++import time
++import argparse
++import subprocess
++from datetime import datetime
++
++OUT_DIR = os.environ.get("AEGIS_JOB_DIR", "/tmp/aegis_jobs")
++PUSHGATEWAY = os.environ.get("PUSHGATEWAY_URL", "")
++
++def push_metric(job_id, metric, value):
++    if not PUSHGATEWAY:
++        return
++    # simple push using curl to prometheus pushgateway
++    payload = f'# TYPE {metric} gauge\n{metric}{{job="{job_id}"}} {value}\n'
++    try:
++        subprocess.check_call(["curl", "-sS", "-X", "POST", "--data-binary", "@-", f"{PUSHGATEWAY}/metrics/job/{job_id}"], input=payload.encode(), stdout=subprocess.DEVNULL)
++    except Exception:
++        pass
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--job-id", required=True)
++    p.add_argument("--team", default="unknown")
++    p.add_argument("--workload", default="batch")
++    p.add_argument("--namespace", default="aegis-retriever")
++    p.add_argument("--", dest="sep", action="store_true")
++    p.add_argument("cmd", nargs=argparse.REMAINDER)
++    args = p.parse_args()
++    job_id = args.job_id
++    os.makedirs(OUT_DIR, exist_ok=True)
++    meta = {
++        "job_id": job_id,
++        "team": args.team,
++        "workload": args.workload,
++        "namespace": args.namespace,
++        "cmd": args.cmd,
++        "start_ts": datetime.utcnow().isoformat()+"Z"
++    }
++    path = os.path.join(OUT_DIR, f"{job_id}.json")
++    with open(path, "w") as fh:
++        json.dump(meta, fh)
++    # push start metric
++    push_metric(job_id, "aegis_job_start_ts", int(time.time()))
++
++    # Execute user command
++    try:
++        rc = subprocess.call(args.cmd)
++    except Exception as e:
++        rc = 1
++    meta["end_ts"] = datetime.utcnow().isoformat()+"Z"
++    meta["exit_code"] = rc
++    with open(path, "w") as fh:
++        json.dump(meta, fh)
++    # push end metric
++    push_metric(job_id, "aegis_job_end_ts", int(time.time()))
++    # Also write an annotation file consumed by emissions calculator to scope PromQL precisely
++    ann = {
++        "job_id": job_id,
++        "namespace": args.namespace,
++        "pod_label_selector": f'job="{job_id}"'  # best-effort; ensure job controller labels pods
++    }
++    ann_path = os.path.join(OUT_DIR, f"{job_id}.annot.json")
++    with open(ann_path, "w") as fh:
++        json.dump(ann, fh)
++    sys.exit(rc)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/node_power_exporter.py
++#!/usr/bin/env python3
++"""
++Node-level power telemetry helper.
++ - Best-effort collector that reads GPU power via nvidia-smi and host power via ipmi or mock.
++ - Outputs a JSON file /tmp/node_power_<node>.json with timestamped power samples.
++ - Intended to be run as a DaemonSet sidecar or a periodic cron job on nodes.
++"""
++import os
++import json
++import time
++import subprocess
++from datetime import datetime
++
++OUT_DIR = os.environ.get("NODE_POWER_DIR", "/tmp/node_power")
++SAMPLE_INTERVAL = int(os.environ.get("NODE_POWER_INTERVAL_S", "10"))
++
++def read_nvidia_power():
++    try:
++        out = subprocess.check_output(["nvidia-smi", "--query-gpu=power.draw", "--format=csv,noheader,nounits"]).decode().strip().splitlines()
++        vals = [float(x.strip()) for x in out if x.strip()]
++        return sum(vals)  # total GPU watts
++    except Exception:
++        return None
++
++def read_host_power_mock():
++    # best-effort fallback: read from /sys/class/powercap (platform dependent) - implement mock
++    try:
++        # if ipmitool available, could query sensors; for now use 100W base
++        return 100.0
++    except Exception:
++        return 100.0
++
++def run(node_name=None):
++    os.makedirs(OUT_DIR, exist_ok=True)
++    node = node_name or os.environ.get("NODE_NAME", "localnode")
++    path = os.path.join(OUT_DIR, f"node_power_{node}.jsonl")
++    while True:
++        sample = {"ts": datetime.utcnow().isoformat()+"Z", "node": node}
++        gpu = read_nvidia_power()
++        host = read_host_power_mock()
++        sample["gpu_watts"] = gpu
++        sample["host_watts"] = host
++        with open(path, "a") as fh:
++            fh.write(json.dumps(sample)+"\n")
++        time.sleep(SAMPLE_INTERVAL)
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--node", default=None)
++    args = p.parse_args()
++    run(args.node)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/calibration_runner.py
++#!/usr/bin/env python3
++"""
++Calibration harness to map instance types / GPU models to measured power draw under load.
++ - Must be run on representative instances (or via a DaemonSet) to gather real power vs load.
++ - Produces a calibration DB /etc/aegis/carbon_calibration.json (or configurable path).
++"""
++import os
++import json
++import subprocess
++import time
++from datetime import datetime
++
++OUT_PATH = os.environ.get("CARBON_CALIB_PATH", "/etc/aegis/carbon_calibration.json")
++SAMPLES = int(os.environ.get("CALIB_SAMPLES", "10"))
++
++def run_cpu_stress(duration=30):
++    # small CPU stress using sysbench if available fallback to busy loop
++    try:
++        subprocess.check_call(["sysbench", "--test=cpu", "--cpu-max-prime=20000", f"run"], timeout=duration)
++    except Exception:
++        # busy loop for duration
++        t0 = time.time()
++        while time.time() - t0 < duration:
++            pass
++
++def sample_power(node="local"):
++    # read latest sample from node_power_exporter output
++    pdir = os.environ.get("NODE_POWER_DIR", "/tmp/node_power")
++    f = os.path.join(pdir, f"node_power_{node}.jsonl")
++    if not os.path.exists(f):
++        return None
++    with open(f) as fh:
++        lines = fh.read().strip().splitlines()
++        if not lines:
++            return None
++        last = json.loads(lines[-1])
++        return last
++
++def main(instance_type="generic", node="local"):
++    samples = []
++    for i in range(SAMPLES):
++        # run small stress
++        run_cpu_stress(duration=10)
++        time.sleep(1)
++        s = sample_power(node)
++        if s:
++            samples.append(s)
++        time.sleep(1)
++    if not samples:
++        print("No power samples collected.")
++        return
++    # compute average watts
++    avg_host = sum(s.get("host_watts",0) for s in samples) / len(samples)
++    avg_gpu = sum((s.get("gpu_watts") or 0) for s in samples) / len(samples)
++    calib = {"instance_type": instance_type, "avg_host_watts": avg_host, "avg_gpu_watts": avg_gpu, "samples": len(samples), "ts": datetime.utcnow().isoformat()+"Z"}
++    os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
++    data = {}
++    if os.path.exists(OUT_PATH):
++        try:
++            data = json.load(open(OUT_PATH))
++        except Exception:
++            data = {}
++    data[instance_type] = calib
++    with open(OUT_PATH, "w") as fh:
++        json.dump(data, fh, indent=2)
++    print("Wrote calibration to", OUT_PATH)
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--instance", default="generic")
++    p.add_argument("--node", default="local")
++    args = p.parse_args()
++    main(args.instance, args.node)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/job_emissions_calculator.py
+*** End Patch
+*** Begin Patch
+*** Update File:ops/carbon/job_emissions_calculator.py
+@@
+-def load_cfg():
++def load_cfg():
+@@
+     return cfg
+*** End Patch
+*** Begin Patch
+*** Update File:ops/carbon/job_emissions_calculator.py
+@@
+ def query_resource_usage(prometheus_url, promql_filter, window):
+@@
+-    cpu_secs = 0.0
+-    gpu_count = 0.0
++    cpu_secs = 0.0
++    gpu_count = 0.0
+     try:
+         cpu_secs = prom_query(prometheus_url, cpu_query)
+     except Exception as e:
+         print("CPU Prometheus query failed:", e)
+     try:
+         # gpu_query returns instantaneous count (number of GPUs requested). Multiply by window seconds.
+         gpu_req = prom_query(prometheus_url, gpu_query)
+@@
+     return cpu_secs, gpu_count
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/job_emissions_calculator_v2.py
++#!/usr/bin/env python3
++"""
++Enhanced job emissions calculator (v2) that uses per-job annotations produced by job_wrapper.py
++and node-level telemetry (node_power_exporter outputs) when available to compute measured kWh.
++Fallbacks back to Prometheus-based estimates if direct telemetry not present.
++"""
++import os
++import json
++from datetime import datetime
++from .job_emissions_calculator import load_cfg, query_resource_usage, compute_kwh, get_grid_intensity
++
++JOB_DIR = os.environ.get("AEGIS_JOB_DIR", "/tmp/aegis_jobs")
++NODE_POWER_DIR = os.environ.get("NODE_POWER_DIR", "/tmp/node_power")
++
++def measured_kwh_from_node_samples(job_meta):
++    # Try to estimate kWh by reading node power samples overlapping job interval
++    start = job_meta.get("start_ts")
++    end = job_meta.get("end_ts")
++    if not start or not end:
++        return None
++    st = datetime.fromisoformat(start.replace("Z",""))
++    en = datetime.fromisoformat(end.replace("Z",""))
++    total_wh = 0.0
++    count = 0
++    for fn in os.listdir(NODE_POWER_DIR):
++        if not fn.endswith(".jsonl"):
++            continue
++        path = os.path.join(NODE_POWER_DIR, fn)
++        with open(path) as fh:
++            for line in fh:
++                try:
++                    s = json.loads(line)
++                    ts = datetime.fromisoformat(s["ts"].replace("Z",""))
++                    if st <= ts <= en:
++                        host = s.get("host_watts",0) or 0
++                        gpu = s.get("gpu_watts",0) or 0
++                        total_wh += host + gpu
++                        count += 1
++                except Exception:
++                    continue
++    if count == 0:
++        return None
++    # average W over samples -> Wh per sample interval; approximate kWh
++    avg_w = total_wh / count
++    duration_hours = (en - st).total_seconds() / 3600.0
++    return {"cpu_kwh": 0.0, "gpu_kwh": 0.0, "total_kwh": avg_w * duration_hours / 1000.0}
++
++def run_for_job(job_id, prom_window="1h"):
++    # Load job meta
++    meta_path = os.path.join(JOB_DIR, f"{job_id}.json")
++    if not os.path.exists(meta_path):
++        raise FileNotFoundError("job meta not found")
++    meta = json.load(open(meta_path))
++    cfg = load_cfg()
++    # prefer measured node-power samples
++    measured = measured_kwh_from_node_samples(meta)
++    if measured:
++        kwh = measured
++        src = "measured_node_samples"
++    else:
++        # fallback to Prometheus: use annotation to scope PromQL
++        ann = os.path.join(JOB_DIR, f"{job_id}.annot.json")
++        promql_filter = f'namespace="{meta.get("namespace","aegis-retriever")}"'
++        if os.path.exists(ann):
++            annj = json.load(open(ann))
++            # use pod_label_selector if present for more precise scope
++            if annj.get("pod_label_selector"):
++                promql_filter = annj["pod_label_selector"]
++        cpu_secs, gpu_secs = query_resource_usage(cfg["prometheus_url"], promql_filter, prom_window)
++        kwh = compute_kwh(cpu_secs, gpu_secs, cfg)
++        src = "prometheus_estimate"
++    intensity, src_i = get_grid_intensity(cfg)
++    kgco2 = kwh["total_kwh"] * intensity / 1000.0
++    report = {
++        "job_id": job_id,
++        "ts": datetime.utcnow().isoformat()+"Z",
++        "kwh": kwh,
++        "kgCO2e": kgco2,
++        "intensity_gCO2_per_kWh": intensity,
++        "intensity_source": src_i,
++        "kwh_source": src,
++        "job_meta": meta
++    }
++    out = os.environ.get("CARBON_REPORT_PATH", "/tmp/carbon_report.json")
++    with open(out, "w") as fh:
++        json.dump(report, fh, indent=2)
++    print("Wrote", out)
++    return report
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--job-id", required=True)
++    p.add_argument("--window", default="1h")
++    args = p.parse_args()
++    run_for_job(args.job_id, prom_window=args.window)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/budget_manager.py
++#!/usr/bin/env python3
++"""
++Simple carbon budget manager and billing stub.
++ - Stores per-team monthly budgets and records consumption.
++ - Provides check_budget(team, kgCO2e) -> bool and record_consumption(team, kgCO2e, job_id)
++ - Persists data in JSON for demo; replace with DB for production.
++"""
++import os
++import json
++from datetime import datetime
++
++DB = os.environ.get("CARBON_BUDGET_DB", "/var/aegis/carbon_budgets.json")
++
++def _load():
++    if os.path.exists(DB):
++        try:
++            return json.load(open(DB))
++        except Exception:
++            pass
++    # sample structure
++    return {"teams": {"rl": {"budget_kgCO2_per_month": 100.0, "consumed": []}}}
++
++def _save(d):
++    os.makedirs(os.path.dirname(DB), exist_ok=True)
++    with open(DB, "w") as fh:
++        json.dump(d, fh, indent=2)
++
++def check_budget(team, kg):
++    d = _load()
++    t = d["teams"].get(team)
++    if not t:
++        return False, "team_not_found"
++    # compute month consumed
++    now = datetime.utcnow()
++    month = now.strftime("%Y-%m")
++    consumed = sum(item["kg"] for item in t.get("consumed",[]) if item["month"]==month)
++    allowed = t.get("budget_kgCO2_per_month", 0.0)
++    return consumed + kg <= allowed, {"consumed": consumed, "allowed": allowed}
++
++def record_consumption(team, kg, job_id):
++    d = _load()
++    if team not in d["teams"]:
++        d["teams"][team] = {"budget_kgCO2_per_month": 0.0, "consumed": []}
++    now = datetime.utcnow()
++    month = now.strftime("%Y-%m")
++    d["teams"][team"]["consumed"].append({"job_id": job_id, "kg": kg, "ts": now.isoformat()+"Z", "month": month})
++    _save(d)
++    return True
++
++if __name__ == "__main__":
++    print("budget db at", DB)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/aggregator.py
++#!/usr/bin/env python3
++"""
++Aggregate historical carbon reports into per-team, per-project summaries.
++ - Scans a directory of carbon reports (default /tmp/carbon_reports_archive) and emits CSV/JSON summaries
++ - Produces /tmp/carbon_aggregate_summary.json
++"""
++import os
++import json
++from datetime import datetime
++
++REPORT_DIR = os.environ.get("CARBON_ARCHIVE", "/tmp/carbon_reports_archive")
++OUT = "/tmp/carbon_aggregate_summary.json"
++
++def run():
++    os.makedirs(REPORT_DIR, exist_ok=True)
++    agg = {}
++    for fn in os.listdir(REPORT_DIR):
++        if not fn.endswith(".json"):
++            continue
++        path = os.path.join(REPORT_DIR, fn)
++        try:
++            r = json.load(open(path))
++            team = r.get("job_meta",{}).get("team","unknown")
++            team_entry = agg.setdefault(team, {"kg":0.0, "kwh":0.0, "count":0})
++            team_entry["kg"] += r.get("kgCO2e",0.0)
++            team_entry["kwh"] += r.get("kwh",{}).get("total_kwh",0.0)
++            team_entry["count"] += 1
++        except Exception:
++            continue
++    with open(OUT, "w") as fh:
++        json.dump({"ts": datetime.utcnow().isoformat()+"Z", "teams": agg}, fh, indent=2)
++    print("Wrote", OUT)
++    return OUT
++
++if __name__ == "__main__":
++    run()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/optimizer.py
++#!/usr/bin/env python3
++"""
++Simple optimizer that provides suggestions to reduce emissions based on job metadata and carbon report.
++ - Suggestions: enable mixed precision, reduce batch size, shorten epochs, use green nodepool or spot instances.
++ - Produces suggestions.json next to the carbon report for human review.
++"""
++import os
++import json
++
++def suggest(report_path):
++    if not os.path.exists(report_path):
++        print("report not found")
++        return
++    r = json.load(open(report_path))
++    suggestions = []
++    kgh = r.get("kgCO2e", 0.0)
++    if kgh > 1.0:
++        suggestions.append({"suggestion": "consider_mixed_precision", "rationale": "High kgCO2e for job"})
++    meta = r.get("job_meta",{})
++    if meta.get("workload","") == "train":
++        suggestions.append({"suggestion": "reduce_epochs_or_dataset_shard", "rationale": "training workload"})
++    # make green node suggestion if intensity high
++    if r.get("intensity_gCO2_per_kWh",0) > 300:
++        suggestions.append({"suggestion": "defer_to_low_intensity_window", "rationale": "grid intensity high"})
++    out = os.path.splitext(report_path)[0] + ".suggestions.json"
++    json.dump({"job_id": r.get("job_id"), "suggestions": suggestions}, open(out, "w"), indent=2)
++    print("wrote suggestions to", out)
++    return out
++
++if __name__ == "__main__":
++    import sys
++    suggest(sys.argv[1] if len(sys.argv)>1 else "/tmp/carbon_report.json")
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/carbon/validation_runner.py
++#!/usr/bin/env python3
++"""
++Validation harness: compares estimated kWh (calculator) to measured kWh (node_power_exporter)
++ - Produces a simple error report and writes /tmp/carbon_validation.json
++ - Intended to run periodically to calibrate models and quantify error margins.
++"""
++import os
++import json
++from datetime import datetime
++from .job_emissions_calculator_v2 import run_for_job
++
++OUT = "/tmp/carbon_validation.json"
++
++def validate(job_id):
++    # run emissions calculator v2 which prefers measured node samples
++    est = run_for_job(job_id)
++    # if measured source used, we consider it ground truth; otherwise attempt to fetch node samples separately
++    measured_src = est.get("kwh_source") == "measured_node_samples"
++    # If estimator used prom, try to compute measured_kwh from node samples using helper (internal)
++    res = {"job_id": job_id, "ts": datetime.utcnow().isoformat()+"Z", "est_report": est, "validated": measured_src}
++    with open(OUT, "w") as fh:
++        json.dump(res, fh, indent=2)
++    print("Wrote validation to", OUT)
++    return res
++
++if __name__ == "__main__":
++    import sys
++    if len(sys.argv) < 2:
++        print("usage: validation_runner.py <job_id>")
++    else:
++        validate(sys.argv[1])
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/edge/device_power_collector.py
++#!/usr/bin/env python3
++"""
++Device power collector for edge devices.
++ - Collects per-device power via an agent endpoint or SSH. Expects device agent to expose /v1/power or accept an SSH command.
++ - Writes per-device /tmp/device_power_<id>.jsonl samples for later aggregation.
++"""
++import os
++import json
++import time
++import requests
++from datetime import datetime
++
++OUT = "/tmp/device_power"
++os.makedirs(OUT, exist_ok=True)
++
++def collect_from_agent(url, device_id):
++    try:
++        r = requests.get(url.rstrip("/") + "/v1/power", timeout=5)
++        r.raise_for_status()
++        j = r.json()
++        j["ts"] = datetime.utcnow().isoformat()+"Z"
++        with open(os.path.join(OUT, f"device_{device_id}.jsonl"), "a") as fh:
++            fh.write(json.dumps(j)+"\n")
++        return True
++    except Exception:
++        return False
++
++if __name__ == "__main__":
++    # simple CLI: list of device endpoints via env DEVICE_ENDPOINTS (csv of id|url)
++    eps = os.environ.get("DEVICE_ENDPOINTS", "")
++    for pair in (eps.split(",") if eps else []):
++        try:
++            device_id, url = pair.split("|",1)
++            collect_from_agent(url, device_id)
++        except Exception:
++            continue
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/carbon_methodology.md
++Carbon estimation methodology (Aegis)
++-----------------------------------
++
++This document describes how Aegis estimates job energy and CO2e:
++
++1. Instrumentation & attribution
++   - Jobs must be wrapped with ops/carbon/job_wrapper.py which records precise start/end timestamps, job_id, team, workload and writes an annotation file used for PromQL scoping.
++   - Node-level power samples are collected by node_power_exporter (preferably deployed as a DaemonSet) and stored centrally for per-job overlap queries.
++
++2. Estimation flow
++   - Prefer measured node samples overlapping a job window to compute kWh directly (measured power average * duration).
++   - If measured samples are unavailable, fall back to Prometheus-based estimation using container_cpu_usage_seconds_total (increase over window) and GPU request approximations.
++   - Convert CPU/GPU seconds to Wh using calibrated watts from ops/carbon/calibration_runner.py outputs and apply a PUE factor.
++   - Fetch grid carbon intensity from ElectricityMap (or fallback defaults) for the region and timestamp to compute kgCO2e.
++
++3. Validation & calibration
++   - Periodically run validation_runner to compare estimated vs measured and update calibration DB.
++   - Collect calibration data via calibration_runner on representative instance types.
++
++4. Reporting & budgets
++   - Carbon reports are attached to evidence bundles and archived.
++   - Budget manager enforces team monthly budgets and the nightly orchestrator checks budget caps before full runs.
++
++5. Uncertainty & limitations
++   - Estimates carry uncertainty due to sampling frequency, host-level mixing of workloads, and grid intensity granularity. Documented error margins should accompany reports.
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/carbon_calibration_and_validation.yml
++name: Carbon Calibration & Validation (scheduled)
++on:
++  schedule:
++    - cron: '0 5 * * 0'  # weekly calibration/validation
++  workflow_dispatch:
++
++jobs:
++  calibrate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run calibration (best-effort)
++        run: |
++          python ops/carbon/calibration_runner.py --instance nightly-calib --node local || true
++      - name: Upload calibration (if present)
++        uses: actions/upload-artifact@v4
++        with:
++          name: calibration
++          path: /etc/aegis/carbon_calibration.json
++
++  validate:
++    runs-on: ubuntu-latest
++    needs: calibrate
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run validation for a recent job (best-effort)
++        run: |
++          # pick a job id from /tmp/aegis_jobs if available
++          JOB=$(ls /tmp/aegis_jobs | head -n1 || true)
++          if [ -n "$JOB" ]; then
++            JID=$(basename $JOB .json)
++            python ops/carbon/validation_runner.py $JID || true
++          else
++            echo "No job meta found to validate."
++          fi
++      - name: Upload validation report
++        uses: actions/upload-artifact@v4
++        with:
++          name: carbon-validation
++          path: /tmp/carbon_validation.json
++
+*** End Patch
+*** End Patch

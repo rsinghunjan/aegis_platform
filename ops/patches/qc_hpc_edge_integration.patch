@@ -1,0 +1,643 @@
+*** Begin Patch
+*** Add File:services/quantum/qpu_queue_service.py
++#!/usr/bin/env python3
++"""
++QPU Job Queue Service (PoC)
++
++Provides:
++ - POST /submit : submit a QPU job (payload contains circuit metadata, provider choice, budget/timeout)
++ - GET  /status/{job_id} : check job status
++ - GET  /estimate : quick cost/latency estimate
++ - POST /cancel/{job_id} : cancel job
++
++Features:
++ - Basic quota check (per-client) and billing estimate
++ - Records provenance and uploads evidence to S3 (EVIDENCE_BUCKET)
++ - Integrates with Keycloak auth via services.common.keycloak_auth if available
++
++Notes:
++ - This is a PoC queue. In production you must persist jobs (DB), add retries, backpressure, and provenance storage.
++"""
++import os
++import time
++import uuid
++import json
++import logging
++from typing import Dict, Any
++
++from fastapi import FastAPI, HTTPException, Depends
++from pydantic import BaseModel
++
++try:
++    from services.common.keycloak_auth import validate_token, require_role
++except Exception:
++    def validate_token(x=None): return {"preferred_username": "dev"}
++    def require_role(r): return validate_token
++
++import requests
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++logger = logging.getLogger("qpu-queue")
++logging.basicConfig(level=logging.INFO)
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++S3 = boto3.client("s3") if boto3 and EVIDENCE_BUCKET else None
++
++app = FastAPI(title="QPU Queue Service (PoC)")
++
++JOBS: Dict[str, Dict[str, Any]] = {}
++QUOTAS = {"dev": 10}  # jobs in flight
++
++class QPUJobSubmit(BaseModel):
++    name: str
++    provider: str  # e.g., "local_sim", "ibm", "aws_braket"
++    payload: Dict[str, Any]  # circuit spec or reference to stored artifact
++    priority: int = 10
++    max_cost_usd: float = 10.0
++    timeout_s: int = 600
++
++def upload_evidence(key_prefix: str, payload: Dict[str, Any]):
++    ts = int(time.time())
++    key = f"{key_prefix}/{ts}-{uuid.uuid4().hex}.json"
++    if not S3:
++        path = f"/tmp/{key.replace('/','_')}"
++        os.makedirs(os.path.dirname(path), exist_ok=True)
++        with open(path, "w") as f:
++            json.dump(payload, f, indent=2)
++        return path
++    try:
++        S3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(payload).encode("utf-8"))
++        return f"s3://{EVIDENCE_BUCKET}/{key}"
++    except Exception as e:
++        logger.warning("s3 upload failed: %s", e)
++        return None
++
++@app.post("/submit")
++def submit(job: QPUJobSubmit, user=Depends(validate_token)):
++    client = user.get("preferred_username", "dev")
++    # simple in-memory quota check
++    in_flight = sum(1 for j in JOBS.values() if j["owner"] == client and j["state"] in ("queued","running"))
++    quota = QUOTAS.get(client, 2)
++    if in_flight >= quota:
++        raise HTTPException(status_code=429, detail="quota exceeded")
++    job_id = uuid.uuid4().hex
++    JOBS[job_id] = {"id": job_id, "owner": client, "job": job.dict(), "state": "queued", "submitted_at": int(time.time())}
++    upload_evidence("qpu/submissions", {"job_id": job_id, "owner": client, "job": job.dict(), "ts": int(time.time())})
++    # For PoC: immediately schedule local simulation or proxy to adapter
++    try:
++        from services.quantum.qiskit_adapter import run_job_sync
++        JOBS[job_id]["state"] = "running"
++        res = run_job_sync(job.dict(), job_id=job_id)
++        JOBS[job_id]["state"] = "done"
++        JOBS[job_id]["result"] = res
++        upload_evidence("qpu/results", {"job_id": job_id, "result": res})
++    except Exception as e:
++        JOBS[job_id]["state"] = "error"
++        JOBS[job_id]["error"] = str(e)
++        upload_evidence("qpu/errors", {"job_id": job_id, "error": str(e)})
++    return {"job_id": job_id}
++
++@app.get("/status/{job_id}")
++def status(job_id: str, user=Depends(validate_token)):
++    j = JOBS.get(job_id)
++    if not j:
++        raise HTTPException(status_code=404, detail="job not found")
++    return {"id": job_id, "state": j["state"], "owner": j["owner"], "submitted_at": j.get("submitted_at"), "result": j.get("result"), "error": j.get("error")}
++
++@app.get("/estimate")
++def estimate(provider: str = "local_sim", shots: int = 1000):
++    # PoC heuristics
++    per_shot_usd = {"local_sim": 0.0, "ibm": 0.0005, "aws_braket": 0.001}
++    latency_s = {"local_sim": 0.1, "ibm": 30, "aws_braket": 10}
++    return {"cost_usd": per_shot_usd.get(provider, 0.01) * shots, "latency_s": latency_s.get(provider, 30)}
++
++@app.post("/cancel/{job_id}")
++def cancel(job_id: str, user=Depends(validate_token)):
++    j = JOBS.get(job_id)
++    if not j:
++        raise HTTPException(status_code=404)
++    if j["state"] in ("done", "error"):
++        return {"ok": False, "reason": "already finished"}
++    j["state"] = "cancelled"
++    upload_evidence("qpu/cancel", {"job_id": job_id, "by": user.get("preferred_username"), "ts": int(time.time())})
++    return {"ok": True}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/quantum/qiskit_adapter.py
++#!/usr/bin/env python3
++"""
++Qiskit Adapter (PoC)
++
++Runs a simple circuit on Aer (local simulator) or forwards to cloud provider if credentials configured.
++Returns a dict result and writes minimal provenance metadata; real integration would handle provider SDKs.
++"""
++import os, json, time, logging
++from typing import Dict, Any, Optional
++
++logger = logging.getLogger("qiskit-adapter")
++logging.basicConfig(level=logging.INFO)
++
++try:
++    from qiskit import QuantumCircuit, Aer, execute
++except Exception:
++    QuantumCircuit = None
++    Aer = None
++    execute = None
++
++def run_job_sync(job_spec: Dict[str, Any], job_id: Optional[str] = None) -> Dict[str, Any]:
++    provider = job_spec.get("provider", "local_sim")
++    payload = job_spec.get("payload", {})
++    shots = int(payload.get("shots", 1024))
++    # For PoC: build a simple circuit or accept QASM in payload
++    if provider == "local_sim" or Aer is None:
++        # simulate a simple bell-state if no payload
++        from random import random
++        out = {"counts": {"00": int(shots*0.5), "11": int(shots*0.5)}}
++        return {"job_id": job_id, "provider": "local_sim", "result": out, "ts": int(time.time())}
++    # Otherwise use Aer
++    qc = QuantumCircuit(2,2)
++    qc.h(0); qc.cx(0,1); qc.measure([0,1],[0,1])
++    backend = Aer.get_backend('qasm_simulator')
++    job = execute(qc, backend=backend, shots=shots)
++    res = job.result().get_counts()
++    return {"job_id": job_id, "provider": "local_sim", "result": {"counts": res}, "ts": int(time.time())}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tekton/quantum-hybrid-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: hybrid-qpu-workflow
++  namespace: cicd
++spec:
++  params:
++    - name: model_name
++      type: string
++    - name: evidence_bucket
++      type: string
++  steps:
++    - name: train-classical
++      image: docker.io/library/python:3.10
++      script: |
++        set -euo pipefail
++        echo "Running classical preproc / short local training (placeholder)"
++        python -c "print('classical step for model $(params.model_name)')"
++        # write an artifact reference used by QPU call
++        echo '{"circuit":"bell","shots":1024}' > /workspace/output/qpu_payload.json
++    - name: call-qpu
++      image: curlimages/curl:8.2.1
++      script: |
++        set -euo pipefail
++        PAYLOAD=$(cat /workspace/output/qpu_payload.json)
++        echo "Submitting QPU job to queue"
++        curl -sS -X POST -H "Content-Type: application/json" --data "$PAYLOAD" http://qpu-queue.monitoring.svc:8085/submit || true
++    - name: gather-evidence
++      image: amazon/aws-cli:2.13.7
++      script: |
++        set -euo pipefail
++        echo "Collecting artifacts and uploading to s3://$(params.evidence_bucket)/hybrid/$(params.model_name)/$(date +%s).json"
++        aws s3 cp /workspace/output/qpu_payload.json s3://$(params.evidence_bucket)/hybrid/$(params.model_name)/$(date +%s).json
++  workspaces:
++    - name: workspace
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/quantum/simulator_runner.py
++#!/usr/bin/env python3
++"""
++Simulator runner to execute many noisy simulations in parallel for CI.
++Writes per-run evidence to EVIDENCE_BUCKET.
++"""
++import os, json, time, logging
++from concurrent.futures import ThreadPoolExecutor
++
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++logger = logging.getLogger("sim-runner")
++logging.basicConfig(level=logging.INFO)
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++S3 = boto3.client("s3") if boto3 and EVIDENCE_BUCKET else None
++
++def run_one(i):
++    # Simulate noise run (PoC)
++    res = {"run": i, "counts": {"00": 512, "11": 512}, "ts": int(time.time())}
++    key = f"simulations/run-{i}-{int(time.time())}.json"
++    if S3:
++        S3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(res).encode("utf-8"))
++        return f"s3://{EVIDENCE_BUCKET}/{key}"
++    else:
++        p = f"/tmp/{key.replace('/','_')}"
++        os.makedirs(os.path.dirname(p), exist_ok=True)
++        with open(p, "w") as f:
++            json.dump(res, f)
++        return p
++
++def run_many(n=100, workers=8):
++    with ThreadPoolExecutor(max_workers=workers) as ex:
++        futures = [ex.submit(run_one, i) for i in range(n)]
++        res = [f.result() for f in futures]
++    logger.info("Completed %d simulations", len(res))
++    return res
++
++if __name__ == "__main__":
++    import sys
++    n = int(sys.argv[1]) if len(sys.argv) > 1 else 200
++    run_many(n=n, workers=16)
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/hpc/slurm_submitter.py
++#!/usr/bin/env python3
++"""
++Submit jobs to Slurm from Tekton/CI or scripts.
++ - Submits job via sbatch over SSH to a SLURM headnode (PoC)
++ - Polls job status and streams accounting into Prometheus pushgateway (if present)
++ - Supports checkpoint preemption hook via scontrol/kill signal
++"""
++import os, subprocess, time, logging
++from typing import Optional
++
++logger = logging.getLogger("slurm-submit")
++logging.basicConfig(level=logging.INFO)
++
++SLURM_HEAD = os.environ.get("SLURM_HEAD", "slurm-head.example.internal")
++SSH_USER = os.environ.get("SLURM_SSH_USER", "aegis")
++PUSHGATEWAY = os.environ.get("PUSHGATEWAY", "")
++
++def ssh_run(cmd: str):
++    ssh = ["ssh", f"{SSH_USER}@{SLURM_HEAD}", cmd]
++    out = subprocess.check_output(ssh).decode("utf-8")
++    return out
++
++def submit_script(script_path: str) -> Optional[str]:
++    # copy script to head and run sbatch
++    remote_path = f"/tmp/{os.path.basename(script_path)}-{int(time.time())}"
++    subprocess.check_call(["scp", script_path, f"{SSH_USER}@{SLURM_HEAD}:{remote_path}"])
++    out = ssh_run(f"sbatch {remote_path}")
++    # parse job id
++    import re
++    m = re.search(r"Submitted batch job (\d+)", out)
++    if m:
++        return m.group(1)
++    return None
++
++def poll_job(job_id: str, interval=10):
++    while True:
++        out = ssh_run(f"sacct -j {job_id} --format=JobID,State,Elapsed -n")
++        logger.info("sacct: %s", out.strip())
++        if "COMPLETED" in out or "FAILED" in out or "CANCELLED" in out:
++            return out
++        time.sleep(interval)
++
++def trigger_checkpoint(job_id: str):
++    # best-effort: send USR1 to job's tasks so training job can checkpoint
++    ssh_run(f"scontrol signal jobid={job_id} USR1")
++
++if __name__ == "__main__":
++    import sys
++    script = sys.argv[1] if len(sys.argv) > 1 else "train.sh"
++    j = submit_script(script)
++    if j:
++        logger.info("Submitted job %s", j)
++        poll_job(j)
++
+*** End Patch
+*** Begin Patch
+*** Add File:tekton/tasks/slurm-submit-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: slurm-submit
++  namespace: cicd
++spec:
++  params:
++    - name: script
++      type: string
++  steps:
++    - name: submit
++      image: alpine/ssh
++      script: |
++        set -euo pipefail
++        echo "Copying and submitting script to SLURM head node (configure SSH via secret/known_hosts)"
++        scp $(params.script) $SLURM_SSH_USER@$SLURM_HEAD:/tmp/
++        ssh $SLURM_SSH_USER@$SLURM_HEAD "sbatch /tmp/$(basename $(params.script))"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/hpc/mpi_orchestrator.py
++#!/usr/bin/env python3
++"""
++MPI/Distributed training orchestrator helper (PoC)
++ - Generates a hostfile for mpirun/horovod
++ - Launches torchrun/horovodrun with provided command
++ - Handles checkpoint signals
++"""
++import os, subprocess, logging
++from typing import List
++
++logger = logging.getLogger("mpi-orch")
++logging.basicConfig(level=logging.INFO)
++
++def write_hostfile(hosts: List[str], path="/tmp/hostfile"):
++    with open(path, "w") as f:
++        for h in hosts:
++            f.write(h + "\n")
++    return path
++
++def launch_mpi(hostfile: str, cmd: List[str]):
++    mpi_cmd = ["mpirun", "-np", str(len(open(hostfile).read().strip().splitlines())), "-hostfile", hostfile] + cmd
++    logger.info("Launching MPI: %s", " ".join(mpi_cmd))
++    subprocess.check_call(mpi_cmd)
++
++if __name__ == "__main__":
++    hosts = os.environ.get("MPI_HOSTS", "node1,node2").split(",")
++    hf = write_hostfile(hosts)
++    launch_mpi(hf, ["python", "train_distributed.py"])
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/scripts/checkpoint_on_preempt.sh
++#!/usr/bin/env bash
++#
++# Called by Slurm preemption handler or spot interruption hook to checkpoint training job
++# Expects TRAIN_PID or training process to respond to USR1/USR2 to trigger checkpoint
++PID=${1:-}
++if [ -z "$PID" ]; then
++  echo "Usage: $0 <training-pid>"
++  exit 2
++fi
++echo "Sending USR1 to PID $PID to trigger checkpoint"
++kill -USR1 "$PID"
++sleep 2
++echo "Checkpoint signaled"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/edge/device_registry.py
++#!/usr/bin/env python3
++"""
++Device Registry & Provisioning Service (PoC)
++ - POST /enroll  : device sends CSR or public key and receives a provisioning token
++ - GET  /device/{id} : query registry metadata
++ - POST /claim/{id} : claim device (associate tenant)
++
++Notes:
++ - In production integrate with Keycloak -> issue short-lived device tokens via a secure flow and store device certs in a secure DB.
++ - This PoC stores registry in-memory or in a simple file.
++"""
++import os, json, time, uuid, logging
++from typing import Dict, Any
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++
++logger = logging.getLogger("device-registry")
++logging.basicConfig(level=logging.INFO)
++
++REG_FILE = os.environ.get("DEVICE_REG_FILE", "/data/device_registry.json")
++
++try:
++    with open(REG_FILE) as f:
++        DEVICES = json.load(f)
++except Exception:
++    DEVICES = {}
++
++app = FastAPI(title="Device Registry (PoC)")
++
++class EnrollReq(BaseModel):
++    device_id: str = None
++    public_key: str = None
++    metadata: Dict[str, Any] = {}
++
++def save():
++    try:
++        os.makedirs(os.path.dirname(REG_FILE), exist_ok=True)
++        with open(REG_FILE, "w") as f:
++            json.dump(DEVICES, f, indent=2)
++    except Exception:
++        pass
++
++@app.post("/enroll")
++def enroll(req: EnrollReq):
++    did = req.device_id or uuid.uuid4().hex
++    DEVICES[did] = {"id": did, "public_key": req.public_key, "metadata": req.metadata, "provisioned_at": int(time.time())}
++    save()
++    # produce a simple provisioning token (PoC) - in prod, return signed device cert or JWT issued by IdP
++    token = uuid.uuid4().hex
++    DEVICES[did]["provision_token"] = token
++    save()
++    return {"device_id": did, "token": token}
++
++@app.get("/device/{device_id}")
++def get_device(device_id: str):
++    d = DEVICES.get(device_id)
++    if not d:
++        raise HTTPException(status_code=404)
++    return d
++
++@app.post("/claim/{device_id}")
++def claim(device_id: str, tenant: str):
++    d = DEVICES.get(device_id)
++    if not d:
++        raise HTTPException(status_code=404)
++    d["tenant"] = tenant
++    save()
++    return {"ok": True}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/edge/device_agent.py
++#!/usr/bin/env python3
++"""
++Device agent (PoC)
++ - Registers with device registry and obtains a provisioning token
++ - Buffers telemetry locally and forwards to central endpoint when reachable
++ - Supports OTA check (checks signed_manifest_url) and pulls updates (cosign-verified expected)
++"""
++import os, time, json, logging
++import requests
++
++logger = logging.getLogger("device-agent")
++logging.basicConfig(level=logging.INFO)
++
++REGISTRY_URL = os.environ.get("DEVICE_REGISTRY_URL", "http://device-registry.monitoring.svc:8080")
++DEVICE_ID = os.environ.get("DEVICE_ID", "")
++TELEMETRY_ENDPOINT = os.environ.get("TELEMETRY_ENDPOINT", "http://ros2-bridge.monitoring.svc:8080/telemetry")
++EVIDENCE_DIR = os.environ.get("EVIDENCE_DIR", "/tmp/evidence")
++
++os.makedirs(EVIDENCE_DIR, exist_ok=True)
++
++def enroll():
++    r = requests.post(f"{REGISTRY_URL}/enroll", json={"device_id": DEVICE_ID, "public_key": "pocexample"})
++    r.raise_for_status()
++    return r.json()
++
++def buffer_telemetry(payload):
++    ts = int(time.time())
++    path = os.path.join(EVIDENCE_DIR, f"telemetry-{ts}.json")
++    with open(path, "w") as f:
++        json.dump(payload, f)
++    return path
++
++def forward_buffered():
++    files = sorted(os.listdir(EVIDENCE_DIR))
++    for fname in files:
++        path = os.path.join(EVIDENCE_DIR, fname)
++        with open(path) as f:
++            payload = json.load(f)
++        try:
++            r = requests.post(TELEMETRY_ENDPOINT, json=payload, timeout=5)
++            if r.status_code in (200,201):
++                os.remove(path)
++        except Exception:
++            logger.info("Forward failed, keep file")
++
++def check_ota():
++    # PoC: fetch a manifest and print it
++    manifest_url = os.environ.get("OTA_MANIFEST_URL")
++    if not manifest_url:
++        return
++    try:
++        r = requests.get(manifest_url, timeout=5)
++        r.raise_for_status()
++        logger.info("OTA manifest: %s", r.text[:200])
++    except Exception as e:
++        logger.warning("OTA check failed: %s", e)
++
++if __name__ == "__main__":
++    info = enroll()
++    logger.info("Enrolled: %s", info)
++    # simulate periodic telemetry collection and forwarding
++    for i in range(3):
++        payload = {"node_id": DEVICE_ID or f"dev-{i}", "topic": "sensors.temp", "payload": {"temp": 22 + i}, "timestamp": time.time()}
++        path = buffer_telemetry(payload)
++        logger.info("Buffered telemetry to %s", path)
++        forward_buffered()
++        check_ota()
++        time.sleep(5)
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/edge/buffer_agent.py
++#!/usr/bin/env python3
++"""
++Offline buffer agent (PoC)
++ - Watches a local directory for telemetry files and attempts to POST them to a central endpoint.
++ - Retries with backoff on failure.
++"""
++import os, time, json, logging
++import requests
++
++WATCH_DIR = os.environ.get("WATCH_DIR", "/tmp/evidence")
++ENDPOINT = os.environ.get("CENTRAL_ENDPOINT", "http://ros2-bridge.monitoring.svc:8080/telemetry")
++
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger("buffer-agent")
++
++def forward_file(path):
++    with open(path) as f:
++        payload = json.load(f)
++    try:
++        r = requests.post(ENDPOINT, json=payload, timeout=5)
++        if r.status_code in (200,201):
++            os.remove(path)
++            logger.info("Forwarded and removed %s", path)
++            return True
++    except Exception as e:
++        logger.debug("Forward failed: %s", e)
++    return False
++
++def run_loop():
++    os.makedirs(WATCH_DIR, exist_ok=True)
++    while True:
++        files = sorted([os.path.join(WATCH_DIR,f) for f in os.listdir(WATCH_DIR)])
++        for p in files:
++            forward_file(p)
++        time.sleep(10)
++
++if __name__ == "__main__":
++    run_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tekton/ota-pipeline.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: ota-sign-and-upload
++  namespace: cicd
++spec:
++  params:
++    - name: artifact_path
++      type: string
++    - name: evidence_bucket
++      type: string
++  steps:
++    - name: sign
++      image: sigstore/cosign:2.1.0
++      script: |
++        set -euo pipefail
++        cosign sign --key ${COSIGN_KEY:-/tekton/home/.cosign/cosign.key} $(params.artifact_path)
++    - name: upload
++      image: amazon/aws-cli:2.13.7
++      script: |
++        set -euo pipefail
++        aws s3 cp $(params.artifact_path) s3://$(params.evidence_bucket)/ota/$(basename $(params.artifact_path))
++        # also upload signature
++        if [ -f "$(params.artifact_path).sig" ]; then
++          aws s3 cp "$(params.artifact_path).sig" s3://$(params.evidence_bucket)/ota/$(basename $(params.artifact_path)).sig
++        fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/manifests/device-registry-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: device-registry
++  namespace: monitoring
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: device-registry
++  template:
++    metadata:
++      labels:
++        app: device-registry
++    spec:
++      serviceAccountName: aegis-service-account
++      containers:
++        - name: device-registry
++          image: us.gcr.io/aegis/device-registry:latest
++          ports:
++            - containerPort: 8080
++          volumeMounts:
++            - name: data
++              mountPath: /data
++      volumes:
++        - name: data
++          emptyDir: {}
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: device-registry
++  namespace: monitoring
++spec:
++  selector:
++    app: device-registry
++  ports:
++    - port: 8080
++      targetPort: 8080
++
+*** End Patch
+*** End Patch

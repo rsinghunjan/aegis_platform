@@ -1,0 +1,597 @@
+*** Begin Patch
+*** Add File:services/drift/detector.py
++#!/usr/bin/env python3
++"""
++Drift detector service (PoC) using evidently to detect feature drift and trigger a retrain pipeline.
++
++Behavior:
++ - Loads a small sample of latest input data (from S3 or DB)
++ - Compares against baseline dataset snapshot (S3)
++ - Computes drift metric (e.g., Data Drift via evidently)
++ - Exposes Prometheus metric `aegis_data_drift_score{dataset=...}`
++ - When drift_score > DRIFT_THRESHOLD, triggers the Tekton retrain Pipeline via Kubernetes API or a Tekton Trigger endpoint.
++
++Config (env):
++ - BASELINE_S3_URI: s3://bucket/path/to/baseline.parquet
++ - LATEST_S3_URI: s3://bucket/path/to/latest_sample.parquet
++ - EVIDENCE_BUCKET: where to upload detector evidence (optional)
++ - DRIFT_THRESHOLD: float (default 0.1)
++ - TEKTON_TRIGGER_URL: optional webhook URL to trigger pipeline
++ - TEKTON_NAMESPACE: default cicd
++ - PROM_PORT: default 8000
++"""
++import os
++import time
++import logging
++import tempfile
++import json
++from prometheus_client import start_http_server, Gauge
++
++logger = logging.getLogger("drift-detector")
++logging.basicConfig(level=logging.INFO)
++
++BASELINE = os.environ.get("BASELINE_S3_URI", "")
++LATEST = os.environ.get("LATEST_S3_URI", "")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++DRIFT_THRESHOLD = float(os.environ.get("DRIFT_THRESHOLD", "0.1"))
++TEKTON_TRIGGER_URL = os.environ.get("TEKTON_TRIGGER_URL", "")
++TEKTON_NAMESPACE = os.environ.get("TEKTON_NAMESPACE", "cicd")
++PROM_PORT = int(os.environ.get("PROM_PORT", "8000"))
++
++DRIFT_GAUGE = Gauge("aegis_data_drift_score", "Data drift score for dataset", ["dataset"])
++
++def _download_s3_to_local(s3_uri):
++    if not s3_uri.startswith("s3://"):
++        return s3_uri
++    import boto3, botocore
++    s3 = boto3.client("s3")
++    _, rest = s3_uri.split("s3://", 1)
++    bucket, key = rest.split("/", 1)
++    local = tempfile.NamedTemporaryFile(delete=False, suffix=".parquet").name
++    s3.download_file(bucket, key, local)
++    return local
++
++def compute_drift(baseline_path, latest_path):
++    try:
++        # import here to fail gracefully if library missing
++        from evidently.report import Report
++        from evidently.metric_preset import DataDriftPreset
++        import pandas as pd
++        base = pd.read_parquet(baseline_path)
++        latest = pd.read_parquet(latest_path)
++        report = Report(metrics=[DataDriftPreset()])
++        report.run(reference_data=base, current_data=latest)
++        res = report.as_dict()
++        # This is a simplification: take summary drift score if present
++        drift_score = 0.0
++        for metric in res.get("metrics", []):
++            if metric.get("metric") == "DataDriftPreset":
++                # metric structure varies; attempt to read dataset_drift share
++                value = metric.get("result", {}).get("dataset_drift", {}).get("share", 0.0)
++                drift_score = float(value or 0.0)
++        return drift_score, res
++    except Exception as e:
++        logger.exception("Evidently drift computation failed: %s", e)
++        return 0.0, {"error": str(e)}
++
++def upload_evidence(prefix, payload):
++    if not EVIDENCE_BUCKET:
++        p = f"/tmp/{prefix.replace('/','_')}-{int(time.time())}.json"
++        with open(p, "w") as f:
++            json.dump(payload, f, indent=2)
++        logger.info("Wrote evidence locally: %s", p)
++        return p
++    try:
++        import boto3
++        s3 = boto3.client("s3")
++        key = f"{prefix}/{int(time.time())}.json"
++        s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(payload).encode())
++        uri = f"s3://{EVIDENCE_BUCKET}/{key}"
++        logger.info("Uploaded evidence: %s", uri)
++        return uri
++    except Exception as e:
++        logger.exception("Evidence upload failed: %s", e)
++        return None
++
++def trigger_retrain(payload):
++    if TEKTON_TRIGGER_URL:
++        try:
++            import requests
++            r = requests.post(TEKTON_TRIGGER_URL, json=payload, timeout=10)
++            r.raise_for_status()
++            logger.info("Triggered Tekton Trigger: %s", r.text)
++            return True
++        except Exception:
++            logger.exception("Failed to call Tekton trigger webhook; falling back to kubectl apply")
++    # fallback: write PipelineRun YAML to /tmp and apply via kubectl (requires in-cluster service account)
++    try:
++        pr = {
++            "apiVersion": "tekton.dev/v1beta1",
++            "kind": "PipelineRun",
++            "metadata": {"generateName": "drift-retrain-run-"},
++            "spec": {
++                "pipelineRef": {"name": "drift-retrain-canary-pipeline"},
++                "params": [
++                    {"name":"dataset_snapshot_s3","value": BASELINE or ""},
++                    {"name":"evidence_bucket","value": EVIDENCE_BUCKET or ""}
++                ]
++            }
++        }
++        import tempfile, subprocess, yaml
++        f = tempfile.NamedTemporaryFile(delete=False, suffix=".yaml")
++        f.write(yaml.dump(pr).encode()); f.close()
++        subprocess.check_call(["kubectl", "apply", "-f", f.name])
++        logger.info("Applied PipelineRun via kubectl: %s", f.name)
++        return True
++    except Exception:
++        logger.exception("Failed to create PipelineRun via kubectl")
++        return False
++
++def run_loop(poll_interval=300):
++    start_http_server(PROM_PORT)
++    logger.info("Started Prometheus metrics on port %d", PROM_PORT)
++    while True:
++        try:
++            baseline_local = _download_s3_to_local(BASELINE) if BASELINE else None
++            latest_local = _download_s3_to_local(LATEST) if LATEST else None
++            if not baseline_local or not latest_local:
++                logger.warning("Missing baseline or latest sample; skipping run")
++            else:
++                score, details = compute_drift(baseline_local, latest_local)
++                DRIFT_GAUGE.labels(dataset="default").set(score)
++                upload_evidence("drift/detector", {"score": score, "details": details})
++                logger.info("Drift score=%s", score)
++                if score >= DRIFT_THRESHOLD:
++                    logger.warning("Drift threshold exceeded: %s >= %s -> triggering retrain", score, DRIFT_THRESHOLD)
++                    trigger_retrain({"score": score, "dataset": "default"})
++        except Exception:
++            logger.exception("Drift detector loop error")
++        time.sleep(poll_interval)
++
++if __name__ == "__main__":
++    run_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tekton/tasks/materialize-features-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: materialize-features
++  namespace: cicd
++spec:
++  steps:
++    - name: materialize
++      image: python:3.10-slim
++      script: |
++        #!/bin/sh
++        set -euo pipefail
++        pip install feast boto3 || true
++        echo "Materializing features (PoC)"
++        python - <<'PY'
++from feast import FeatureStore
++fs = FeatureStore(repo_path=".")
++print("Materialize incremental (end_date=None)")
++fs.materialize_incremental(end_date=None)
++print("Materialize done")
++PY
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tekton/tasks/hpo-train-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: hpo-train
++  namespace: cicd
++spec:
++  params:
++    - name: s3_artifact_bucket
++      type: string
++    - name: evidence_bucket
++      type: string
++  steps:
++    - name: run-training
++      image: python:3.10
++      script: |
++        #!/bin/sh
++        set -euo pipefail
++        pip install boto3 optuna scikit-learn joblib || true
++        python - <<'PY'
++import os, time, json, boto3, joblib
++import optuna
++from sklearn.ensemble import RandomForestClassifier
++from sklearn.model_selection import cross_val_score
++import numpy as np
++
++def load_training_data():
++    # PoC: load from /workspace/data or from S3 if present
++    import pandas as pd
++    p = "/workspace/data/train.parquet"
++    if not os.path.exists(p):
++        # create synthetic dataset
++        from sklearn.datasets import make_classification
++        X, y = make_classification(n_samples=1000, n_features=10, n_informative=5)
++        df = pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
++        df["label"] = y
++        df.to_parquet(p)
++    return pd.read_parquet(p)
++
++data = load_training_data()
++X = data.drop(columns=["label"]).values
++y = data["label"].values
++
++def objective(trial):
++    n_estimators = trial.suggest_int("n_estimators", 16, 256)
++    max_depth = trial.suggest_int("max_depth", 2, 20)
++    clf = RandomForestClassifier(n_estimators=n_estimators, max_depth=max_depth, n_jobs=1)
++    scores = cross_val_score(clf, X, y, cv=3, scoring="accuracy")
++    return float(np.mean(scores))
++
++study = optuna.create_study(direction="maximize")
++study.optimize(objective, n_trials=8)
++best = study.best_params
++print("Best params:", best)
++clf = RandomForestClassifier(**best)
++clf.fit(X, y)
++model_path = "/workspace/artifacts/model.joblib"
++joblib.dump(clf, model_path)
++
++# upload model to S3
++bucket = os.environ.get("S3_ARTIFACT_BUCKET", "")
++if bucket:
++    s3 = boto3.client("s3")
++    key = f"models/retrain-{int(time.time())}.joblib"
++    s3.upload_file(model_path, bucket, key)
++    model_s3 = f"s3://{bucket}/{key}"
++else:
++    model_s3 = model_path
++
++evidence = {"model_s3": model_s3, "params": best, "ts": int(time.time())}
++evidence_path = f"/workspace/artifacts/evidence-{int(time.time())}.json"
++with open(evidence_path, "w") as f:
++    json.dump(evidence, f)
++
++eb = os.environ.get("EVIDENCE_BUCKET","")
++if eb:
++    s3 = boto3.client("s3")
++    s3.put_object(Bucket=eb, Key=f"retrain/evidence-{int(time.time())}.json", Body=json.dumps(evidence).encode())
++    print("Uploaded evidence to s3")
++print("Training & HPO finished. model:", model_s3)
++print(json.dumps(evidence))
++PY
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tekton/tasks/package-and-sign-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: package-and-sign
++  namespace: cicd
++spec:
++  params:
++    - name: model_s3
++      type: string
++    - name: evidence_bucket
++      type: string
++    - name: cosign_key_path
++      type: string
++      default: "/secrets/cosign.key"
++  steps:
++    - name: download-model
++      image: python:3.10
++      script: |
++        #!/bin/sh
++        set -euo pipefail
++        pip install boto3 || true
++        MODEL_S3=$(params.model_s3)
++        if [ -z "$MODEL_S3" ]; then
++          echo "no model_s3"
++          exit 1
++        fi
++        python - <<'PY'
++import os, boto3, tempfile
++s3uri = os.environ["MODEL_S3"]
++bucket, key = s3uri.replace("s3://","").split("/",1)
++tmp = "/workspace/artifacts/$(basename %s)" % key
++boto3.client("s3").download_file(bucket, key, tmp)
++print("Downloaded to", tmp)
++PY
++    - name: sign
++      image: sigstore/cosign:latest
++      script: |
++        #!/bin/sh
++        set -euo pipefail
++        if [ -f "$(params.cosign_key_path)" ]; then
++          cosign sign --key "$(params.cosign_key_path)" "$(params.model_s3)" || true
++        else
++          echo "cosign key not found; skipping sign"
++        fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tekton/pipelines/drift_retrain_canary_pipeline.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Pipeline
++metadata:
++  name: drift-retrain-canary-pipeline
++  namespace: cicd
++spec:
++  params:
++    - name: dataset_snapshot_s3
++      type: string
++      default: ""
++    - name: evidence_bucket
++      type: string
++      default: ""
++    - name: cosign_key_path
++      type: string
++      default: "/secrets/cosign.key"
++  tasks:
++    - name: materialize
++      taskRef:
++        name: materialize-features
++    - name: train
++      runAfter:
++        - materialize
++      taskRef:
++        name: hpo-train
++      params:
++        - name: s3_artifact_bucket
++          value: "$(tasks.train.results.s3_bucket)" # optional, tasks can set results
++        - name: evidence_bucket
++          value: "$(params.evidence_bucket)"
++    - name: validate
++      runAfter:
++        - train
++      taskRef:
++        name: great-expectations-validate
++    - name: package
++      runAfter:
++        - validate
++      taskRef:
++        name: package-and-sign
++      params:
++        - name: model_s3
++          value: "$(tasks.train.results.model_s3)"
++        - name: evidence_bucket
++          value: "$(params.evidence_bucket)"
++        - name: cosign_key_path
++          value: "$(params.cosign_key_path)"
++    - name: deploy-canary
++      runAfter:
++        - package
++      taskRef:
++        name: deploy-canary-task
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tekton/tasks/deploy-canary-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: deploy-canary-task
++  namespace: cicd
++spec:
++  params:
++    - name: model_s3
++      type: string
++    - name: canary_name
++      type: string
++      default: "model-canary"
++    - name: image
++      type: string
++      default: "us.gcr.io/aegis/model-serving:latest"
++  steps:
++    - name: render
++      image: bitnami/kubectl:1.27
++      script: |
++        #!/bin/sh
++        set -euo pipefail
++        CANARY=${CANARY_NAME:-model-canary}
++        MODEL_S3=$(params.model_s3)
++        cat > /tmp/canary.yaml <<EOF
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: ${CANARY}
++  namespace: monitoring
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: ${CANARY}
++  template:
++    metadata:
++      labels:
++        app: ${CANARY}
++    spec:
++      containers:
++        - name: server
++          image: $(params.image)
++          env:
++            - name: MODEL_S3
++              value: "${MODEL_S3}"
++          ports:
++            - containerPort: 8080
++EOF
++        kubectl apply -f /tmp/canary.yaml
++        echo "Applied canary manifest"
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/monitoring/canary_controller.py
++#!/usr/bin/env python3
++"""
++Canary monitor & rollback controller (PoC).
++ - Monitors a business metric for canary vs baseline via Prometheus HTTP API
++ - If canary metric drops by more than REL_DROP_THRESHOLD relative to baseline for WINDOW seconds, triggers rollback:
++   - deletes/scales down the canary deployment and uploads rollback evidence to EVIDENCE_BUCKET
++
++Config (env):
++ - PROM_URL: http://prometheus.monitoring.svc:9090
++ - CANARY_DEPLOYMENT: name of canary deployment (default: model-canary)
++ - BASELINE_SERVICE_LABEL: app=production-model
++ - METRIC_EXPR_CANARY: PromQL expression to measure canary (e.g. sum(rate(model_success_count{app="model-canary"}[1m])))
++ - METRIC_EXPR_BASELINE: same for baseline
++ - REL_DROP_THRESHOLD: relative drop threshold (0.05 => 5%)
++ - WINDOW: seconds over which to evaluate degradation (default 300)
++ - EVIDENCE_BUCKET: optional S3
++"""
++import os, time, logging, subprocess, json
++from datetime import datetime
++
++logger = logging.getLogger("canary-controller")
++logging.basicConfig(level=logging.INFO)
++
++PROM_URL = os.environ.get("PROM_URL", "http://prometheus.monitoring.svc:9090")
++CANARY = os.environ.get("CANARY_DEPLOYMENT", "model-canary")
++METRIC_CANARY = os.environ.get("METRIC_EXPR_CANARY", 'sum(rate(model_success_count{app="model-canary"}[1m]))')
++METRIC_BASE = os.environ.get("METRIC_EXPR_BASELINE", 'sum(rate(model_success_count{app="production-model"}[1m]))')
++REL_DROP_THRESHOLD = float(os.environ.get("REL_DROP_THRESHOLD", "0.1"))
++WINDOW = int(os.environ.get("WINDOW", "300"))
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++
++def prom_query(expr):
++    import requests
++    try:
++        r = requests.get(f"{PROM_URL}/api/v1/query", params={"query": expr}, timeout=10)
++        r.raise_for_status()
++        data = r.json()
++        v = 0.0
++        if data.get("data", {}).get("result"):
++            # take first result value
++            val = data["data"]["result"][0]["value"][1]
++            v = float(val)
++        return v
++    except Exception:
++        logger.exception("Prometheus query failed for %s", expr)
++        return 0.0
++
++def upload_evidence(prefix, payload):
++    if not EVIDENCE_BUCKET:
++        p = f"/tmp/{prefix.replace('/','_')}-{int(time.time())}.json"
++        with open(p, "w") as f:
++            json.dump(payload, f, indent=2)
++        logger.info("Wrote evidence locally: %s", p)
++        return p
++    try:
++        import boto3
++        s3 = boto3.client("s3")
++        key = f"{prefix}/{int(time.time())}.json"
++        s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(payload).encode())
++        uri = f"s3://{EVIDENCE_BUCKET}/{key}"
++        logger.info("Uploaded evidence: %s", uri)
++        return uri
++    except Exception:
++        logger.exception("Upload failed")
++        return None
++
++def rollback_canary():
++    try:
++        subprocess.check_call(["kubectl","-n","monitoring","delete","deployment",CANARY])
++        payload = {"action":"rollback", "deployment": CANARY, "ts": datetime.utcnow().isoformat()}
++        upload_evidence("canary/rollback", payload)
++        logger.warning("Canary %s rolled back", CANARY)
++    except Exception:
++        logger.exception("Rollback failed")
++
++def run_loop(interval=30):
++    while True:
++        try:
++            canary_v = prom_query(METRIC_CANARY)
++            baseline_v = prom_query(METRIC_BASE)
++            logger.info("Canary=%s baseline=%s", canary_v, baseline_v)
++            # avoid divide by zero
++            if baseline_v <= 0:
++                logger.warning("Baseline metric zero or missing; skipping check")
++            else:
++                rel_drop = (baseline_v - canary_v) / baseline_v
++                if rel_drop >= REL_DROP_THRESHOLD:
++                    logger.warning("Relative drop %s >= threshold %s -> rollback", rel_drop, REL_DROP_THRESHOLD)
++                    rollback_canary()
++        except Exception:
++            logger.exception("Canary monitor loop error")
++        time.sleep(interval)
++
++if __name__ == "__main__":
++    run_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/prometheus/alerts_canary.yaml
++groups:
++- name: canary-alerts
++  rules:
++  - alert: CanaryPerformanceDegraded
++    expr: (sum(rate(model_success_count{app="production-model"}[5m])) - sum(rate(model_success_count{app="model-canary"}[5m]))) / sum(rate(model_success_count{app="production-model"}[5m])) > 0.1
++    for: 5m
++    labels:
++      severity: page
++    annotations:
++      summary: "Canary performance degraded >10% relative to baseline"
++      description: "Canary deployment {{ $labels.app }} shows >10% relative drop vs baseline for the last 5m."
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/scripts/trigger_pipeline_from_detector.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Helper to trigger the Tekton drift-retrain-canary-pipeline using kubectl apply (requires kubeconfig)
++DATASET_SNAPSHOT=${1:-""}
++EVIDENCE_BUCKET=${2:-""}
++
++cat > /tmp/pipelinerun.yaml <<EOF
++apiVersion: tekton.dev/v1beta1
++kind: PipelineRun
++metadata:
++  generateName: drift-retrain-run-
++spec:
++  pipelineRef:
++    name: drift-retrain-canary-pipeline
++  params:
++    - name: dataset_snapshot_s3
++      value: "${DATASET_SNAPSHOT}"
++    - name: evidence_bucket
++      value: "${EVIDENCE_BUCKET}"
++EOF
++
++kubectl apply -f /tmp/pipelinerun.yaml
++echo "Triggered PipelineRun"
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/runbook_drift_retrain_canary.md
++# Drift → Retrain → Canary Runbook (PoC)
++
++Purpose:
++- Automate detection of data drift, retrain a candidate model with HPO, validate via Great Expectations, deploy as a canary and automatically rollback if business metric degrades.
++
++Components (added by this patch):
++- services/drift/detector.py - drift detector using evidently, triggers Tekton PipelineRun
++- Tekton tasks & pipeline under ops/tekton/* for materialize → hpo-train → validate → package → deploy-canary
++- services/monitoring/canary_controller.py - monitors canary vs baseline via Prometheus and rolls back on degradation
++- Prometheus alert rule ops/prometheus/alerts_canary.yaml
++- scripts/trigger_pipeline_from_detector.sh helper
++
++Quickstart (staging):
++1. Ensure baseline dataset and latest sample URIs are set as environment variables for the detector:
++   - BASELINE_S3_URI, LATEST_S3_URI, EVIDENCE_BUCKET, DRIFT_THRESHOLD
++2. Deploy the drift detector as a Deployment:
++   - image: python:3.10 with dependencies (evidently, prometheus_client, boto3, requests)
++3. Install Tekton tasks and pipeline in cicd namespace:
++   - kubectl apply -f ops/tekton/tasks/*.yaml
++   - kubectl apply -f ops/tekton/pipelines/drift_retrain_canary_pipeline.yaml
++4. Deploy canary controller as a Deployment with permissions to delete deployments and S3 write:
++   - configure PROM_URL, CANARY_DEPLOYMENT, METRIC expressions, REL_DROP_THRESHOLD, EVIDENCE_BUCKET
++5. Start the detector: it will compute drift periodically and trigger a PipelineRun when DRIFT_THRESHOLD exceeded.
++
++Notes & safety:
++- The flow is PoC: in production, use robust auth for Tekton triggers, use IAM roles & IRSA for S3 access, and ensure cosign keys are stored securely (KMS/Vault).
++- HPO/training is resource-intensive; run in controlled spot/cluster with quotas.
++- Canary controller uses simple Prometheus expressions; adapt to your business metrics and SLOs.
++
+*** End Patch
+*** End Patch

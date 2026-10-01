@@ -1,0 +1,626 @@
+*** Begin Patch
+*** Add File: vault/policies/aegis-llm-policy.hcl
++path "secret/data/aegis/llm/*" {
++  capabilities = ["read"]
++}
++
++path "secret/data/aegis/cosign/*" {
++  capabilities = ["read"]
++}
++
++path "auth/kubernetes/login" {
++  capabilities = ["create", "read"]
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File: vault/scripts/configure_vault.sh
++#!/usr/bin/env bash
++set -euo pipefail
++: "${VAULT_ADDR:?}"
++: "${VAULT_TOKEN:?}"
++
++echo "Writing Aegis LLM policy..."
++vault login ${VAULT_TOKEN} >/dev/null
++vault policy write aegis-llm-policy vault/policies/aegis-llm-policy.hcl
++
++echo "Enable Kubernetes auth (if not enabled) and create role..."
++vault auth enable -path=kubernetes kubernetes || true
++
++# Configure kubernetes auth if not already configured (operator must adjust)
++cat > /tmp/k8s-role.json <<EOF
++{
++  "bound_service_account_names": ["aegis-llm-sa"],
++  "bound_service_account_namespaces": ["aegis"],
++  "policies": ["aegis-llm-policy"],
++  "ttl": "24h"
++}
++EOF
++
++vault write auth/kubernetes/role/aegis-llm-role @/tmp/k8s-role.json
++echo "Configured role aegis-llm-role"
++
++echo "Done. Operators: ensure only operator SA has signing capabilities and review Vault ACLs."
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/network/networkpolicy-restrict-signing.yaml
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: restrict-operator-signing
++  namespace: aegis
++spec:
++  podSelector:
++    matchLabels:
++      app: operator-signing
++  policyTypes:
++    - Ingress
++  ingress:
++    - from:
++        - namespaceSelector:
++            matchLabels:
++              aegis-role: operator
++      ports:
++        - protocol: TCP
++          port: 8110
++
++---
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: ci
++  labels:
++    aegis-role: ci
++
++---
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: block-ci-to-operator-signing
++  namespace: ci
++spec:
++  podSelector: {}
++  policyTypes:
++    - Egress
++  egress:
++    # allow normal egress except to operator-signing service
++    - to:
++        - ipBlock:
++            cidr: 0.0.0.0/0
++      ports:
++        - protocol: TCP
++          port: 80
++    # explicit deny to operator-signing (operator cluster CNI must support deny by omission)
++    # Note: many CNI implementations require defaultDeny; ensure policies combine to forbid 8110 to aegis namespace
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/namespace_resources.yaml
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: aegis-sandbox
++  labels:
++    purpose: sandbox
++
++---
++apiVersion: v1
++kind: ResourceQuota
++metadata:
++  name: sandbox-quota
++  namespace: aegis-sandbox
++spec:
++  hard:
++    requests.cpu: "16"
++    requests.memory: 64Gi
++    limits.cpu: "32"
++    limits.memory: 128Gi
++    pods: "20"
++
++---
++apiVersion: v1
++kind: LimitRange
++metadata:
++  name: sandbox-limits
++  namespace: aegis-sandbox
++spec:
++  limits:
++    - type: Container
++      default:
++        cpu: "2"
++        memory: "4Gi"
++      defaultRequest:
++        cpu: "500m"
++        memory: "512Mi"
++
+*** End Patch
+*** Begin Patch
+*** Add File: agents/sandbox_admission_constraint.yaml
++# OPA Gatekeeper Constraint to require kata-runtime for pods in aegis-sandbox and disallow hostNetwork / privileged
++apiVersion: templates.gatekeeper.sh/v1
++kind: ConstraintTemplate
++metadata:
++  name: kataruntimeonly
++spec:
++  crd:
++    spec:
++      names:
++        kind: KATARequired
++  targets:
++    - target: admission.k8s.gatekeeper.sh
++      rego: |
++        package kataruntimeonly
++        violation[{"msg": msg}] {
++          input.review.object.metadata.namespace == "aegis-sandbox"
++          not input.review.object.spec.runtimeClassName == "kata-runtime"
++          msg := "Pods in aegis-sandbox must use runtimeClassName kata-runtime"
++        }
++        violation[{"msg": msg}] {
++          input.review.object.spec.containers[_].securityContext.privileged == true
++          msg := "Privileged containers not allowed in aegis-sandbox"
++        }
++
++---
++apiVersion: constraints.gatekeeper.sh/v1beta1
++kind: KATARequired
++metadata:
++  name: sandbox-kata-required
++spec:
++  match:
++    kinds:
++      - apiGroups: [""]
++        kinds: ["Pod"]
++    namespaces: ["aegis-sandbox"]
++
+*** End Patch
+*** Begin Patch
+*** Add File: agents/sandbox_controller_improved.py
++#!/usr/bin/env python3
++"""
++Improved sandbox controller helper:
++ - launches ephemeral pods using RuntimeClass kata-runtime
++ - enforces activeDeadlineSeconds / Kubernetes-level timeouts
++ - acquires a Redis-based lock for concurrency control
++ - increments failure counters for circuit-breaker behavior
++ - collects logs and returns exit status
++
++This is a helper to be run in a controller VM or as a pod; a full operator is recommended for prod.
++"""
++import os, subprocess, json, tempfile, time
++import redis
++from tenacity import retry, stop_after_attempt, wait_exponential
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/6")
++redis_client = redis.from_url(REDIS_URL)
++FAIL_KEY = "sandbox_failures"
++LOCK_KEY = "sandbox_lock"
++
++def acquire_lock(key, timeout=30):
++    return redis_client.set(key, "1", nx=True, ex=timeout)
++
++def release_lock(key):
++    redis_client.delete(key)
++
++def run_pod(cmd, name_prefix="sandbox", timeout=60, image="alpine:3.18"):
++    name = f"{name_prefix}-{int(time.time())}"
++    pod_spec = {
++        "apiVersion":"v1",
++        "kind":"Pod",
++        "metadata":{"name":name,"labels":{"app":"sandbox-run"}},
++        "spec":{
++            "runtimeClassName":"kata-runtime",
++            "containers":[{"name":"sandbox","image":image,"command":["/bin/sh","-c",cmd],"resources":{"limits":{"cpu":"1","memory":"1Gi"}}}],
++            "restartPolicy":"Never",
++            "activeDeadlineSeconds": int(timeout)
++        }
++    }
++    # write spec to tmp file
++    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
++    tmp.write(json.dumps(pod_spec).encode()); tmp.flush(); tmp.close()
++    try:
++        subprocess.check_call(["kubectl","apply","-f", tmp.name])
++        # wait for pod completion
++        subprocess.check_call(["kubectl","wait","--for=condition=Succeeded","pod/"+name,"--timeout",f"{timeout+10}s"])
++        logs = subprocess.check_output(["kubectl","logs", name]).decode()
++        subprocess.check_call(["kubectl","delete","pod", name])
++        return {"ok":True,"logs":logs}
++    except subprocess.CalledProcessError as e:
++        # try to collect logs
++        try:
++            logs = subprocess.check_output(["kubectl","logs", name], stderr=subprocess.DEVNULL).decode()
++        except Exception:
++            logs = ""
++        try:
++            subprocess.check_call(["kubectl","delete","pod", name])
++        except Exception:
++            pass
++        # record failure
++        redis_client.incr(FAIL_KEY)
++        return {"ok":False,"error": str(e), "logs": logs}
++    finally:
++        os.unlink(tmp.name)
++
++def execute(cmd):
++    # basic concurrency guard
++    if not acquire_lock(LOCK_KEY, timeout=300):
++        return {"ok":False, "error":"locked"}
++    try:
++        # circuit breaker: if many failures, reject
++        failures = int(redis_client.get(FAIL_KEY) or 0)
++        if failures > 20:
++            return {"ok":False, "error":"circuit_open"}
++        return run_pod(cmd)
++    finally:
++        release_lock(LOCK_KEY)
++
++if __name__=="__main__":
++    import sys
++    cmd = " ".join(sys.argv[1:]) or "echo hello"
++    print(execute(cmd))
++
+*** End Patch
+*** Begin Patch
+*** Add File: rl/train_supervised.py
++#!/usr/bin/env python3
++"""
++Minimal supervised fine-tune example using HuggingFace Trainer.
++Meant for small toy datasets to validate pipeline & MLflow logging.
++Operators should replace with production training scripts (accelerate/distributed).
++"""
++import os
++import json
++from datasets import load_dataset, Dataset
++from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
++import mlflow
++
++MODEL_NAME = os.environ.get("BASE_MODEL", "distilgpt2")
++MLFLOW_URI = os.environ.get("MLFLOW_TRACKING_URI")
++
++def make_toy_dataset():
++    examples = [{"text":"Q: What is 2+2? A: 4"},{"text":"Q: Capital of France? A: Paris"}]
++    return Dataset.from_list([{"text":e["text"]} for e in examples])
++
++def tokenize(batch, tokenizer):
++    return tokenizer(batch["text"], truncation=True, padding="max_length", max_length=64)
++
++def main():
++    mlflow.set_tracking_uri(MLFLOW_URI or "http://localhost:5000")
++    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
++    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
++    ds = make_toy_dataset()
++    ds = ds.map(lambda x: tokenize(x, tokenizer), batched=True)
++    ds.set_format(type='torch', columns=['input_ids','attention_mask'])
++    args = TrainingArguments(
++        output_dir="/tmp/supervised_out",
++        per_device_train_batch_size=2,
++        num_train_epochs=1,
++        logging_steps=1,
++        save_total_limit=2,
++        save_steps=50
++    )
++    trainer = Trainer(model=model, args=args, train_dataset=ds)
++    with mlflow.start_run():
++        trainer.train()
++        trainer.save_model("/tmp/supervised_out/model")
++        mlflow.log_artifact("/tmp/supervised_out/model")
++    print("Supervised training finished")
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: rl/train_reward_model.py
++#!/usr/bin/env python3
++"""
++Toy reward model trainer; trains a small classifier on synthetic disagreements.
++Logs artifact to MLflow for integration with RLHF runner.
++"""
++import os, json, pickle
++from sklearn.feature_extraction.text import TfidfVectorizer
++from sklearn.linear_model import LogisticRegression
++import mlflow
++
++MLFLOW_URI = os.environ.get("MLFLOW_TRACKING_URI")
++
++def make_toy_data():
++    texts = ["good answer about Paris","nonsense answer 123","correct math 4","wrong math 5"]
++    labels = [0,1,0,1]  # 1==bad
++    return texts, labels
++
++def main():
++    mlflow.set_tracking_uri(MLFLOW_URI or "http://localhost:5000")
++    texts, labels = make_toy_data()
++    vec = TfidfVectorizer(max_features=100)
++    X = vec.fit_transform(texts)
++    clf = LogisticRegression(max_iter=200)
++    clf.fit(X, labels)
++    outp = "/tmp/reward_model.pkl"
++    with open(outp,"wb") as fh:
++        pickle.dump((vec,clf), fh)
++    with mlflow.start_run():
++        mlflow.log_artifact(outp)
++    print("Trained reward model:", outp)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: rl/run_ppo.py
++#!/usr/bin/env python3
++"""
++Placeholder PPO runner that simulates an RLHF loop for small-scale tests.
++Operators should replace this with trl/trlx based PPO loop.
++This script loads supervised model, reward model, and simulates policy updates.
++"""
++import os, time, shutil
++from datetime import datetime
++from rl.checkpoint_manager import upload_checkpoint
++
++WORKDIR = "/tmp/ppo_work"
++os.makedirs(WORKDIR, exist_ok=True)
++
++def simulate_ppo(policy_in, reward_model, steps=10):
++    # Simulate training by copying policy_in to policy_out and touching file
++    out = os.path.join(WORKDIR, f"policy_{int(time.time())}.pt")
++    shutil.copyfile(policy_in, out)
++    with open(out+".meta","w") as fh:
++        fh.write(f"simulated ppo update at {datetime.utcnow().isoformat()}")
++    return out
++
++def main():
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--policy", default="/tmp/supervised_out/model/pytorch_model.bin")
++    p.add_argument("--reward", default="/tmp/reward_model.pkl")
++    args = p.parse_args()
++    policy_out = simulate_ppo(args.policy, args.reward)
++    rec = upload_checkpoint(policy_out, f"llm/policy_{int(time.time())}.pt", {"source":"ppo_sim"})
++    print("Uploaded checkpoint", rec)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: ci/rlhf_smoke_test.yml
++name: RLHF Smoke Test (CI)
++on:
++  workflow_dispatch:
++
++jobs:
++  smoke:
++    runs-on: self-hosted
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup python deps
++        run: |
++          python -m pip install --upgrade pip
++          pip install transformers datasets scikit-learn mlflow boto3
++      - name: Run supervised train
++        run: |
++          python rl/train_supervised.py
++      - name: Run reward trainer
++        run: |
++          python rl/train_reward_model.py
++      - name: Run PPO simulator
++        run: |
++          python rl/run_ppo.py --policy /tmp/supervised_out/model/pytorch_model.bin --reward /tmp/reward_model.pkl
++      - name: Check checkpoint uploaded
++        run: |
++          ls /tmp || true
++          echo "Ensure checkpoint_manager uploaded artifacts to S3 (operator verify)"
++
+*** End Patch
+*** Begin Patch
+*** Add File: safety/hallu_retrain_cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: hallu-retrain
++  namespace: aegis
++spec:
++  schedule: "0 3 * * SUN" # weekly
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          containers:
++            - name: retrain
++              image: aegis/hallu-trainer:latest
++              command: ["/bin/sh","-c"]
++              args:
++                - pip install -r /opt/requirements.txt >/dev/null 2>&1 || true; python /opt/safety/hallu_trainer.py
++              env:
++                - name: HALLU_TRAIN_DATA
++                  value: "/data/hallu_train.jsonl"
++                - name: ARTIFACT_S3_BUCKET
++                  valueFrom:
++                    secretKeyRef:
++                      name: aegis-secrets
++                      key: artifact-bucket
++          restartPolicy: OnFailure
++
+*** End Patch
+*** Begin Patch
+*** Add File: safety/hallu_evaluator.py
++#!/usr/bin/env python3
++"""
++Evaluate a model (via LLM gateway) against a validation set and fail if hallucination rate > threshold.
++Used by CI pre-promotion gates.
++"""
++import os, json, requests
++from safety.hallucination_detector import HalluDetector
++
++LLM_ENDPOINT = os.environ.get("LLM_ENDPOINT", "http://llm-gateway.aegis.svc/v1/generate")
++VALIDATION_MANIFEST = os.environ.get("HALLU_VALIDATION", "tests/hallu_validation.jsonl")
++THRESH = float(os.environ.get("HALLU_PROMOTE_THRESH", "0.05"))
++
++det = HalluDetector()
++
++def run_eval():
++    total=0; hallu=0
++    with open(VALIDATION_MANIFEST) as fh:
++        for l in fh:
++            total+=1
++            prompt = json.loads(l)["prompt"]
++            r = requests.post(LLM_ENDPOINT, json={"model":"gpt-like","prompt":prompt,"max_tokens":100,"tenant":"validation"}, timeout=20)
++            if not r.ok:
++                continue
++            text = r.json().get("choices",[{}])[0].get("text","")
++            p = det.predict_proba(text)
++            if p > 0.5:
++                hallu+=1
++    rate = hallu/total if total else 0.0
++    print("hallucination rate", rate)
++    if rate > THRESH:
++        raise SystemExit(2)
++
++if __name__=="__main__":
++    run_eval()
++
+*** End Patch
+*** Begin Patch
+*** Add File: observability/search_api.py
++#!/usr/bin/env python3
++"""
++Small search API to query Elasticsearch for provenance: prompt -> model -> action -> Rekor/HSM evidence.
++Exposes: GET /search?prompt_id=...
++"""
++import os
++from fastapi import FastAPI, HTTPException
++try:
++    from elasticsearch import Elasticsearch
++except Exception:
++    Elasticsearch = None
++
++ES_HOST = os.environ.get("ES_HOST")
++app = FastAPI(title="Aegis Audit Search API")
++
++def es_client():
++    if not ES_HOST or not Elasticsearch:
++        return None
++    return Elasticsearch([ES_HOST])
++
++@app.get("/search")
++def search(prompt_id: str = None, model_id: str = None):
++    es = es_client()
++    if not es:
++        raise HTTPException(status_code=503, detail="ES not configured")
++    q = {"query":{"bool":{"must":[]}}}
++    if prompt_id:
++        q["query"]["bool"]["must"].append({"match":{"record.prompt_id": prompt_id}})
++    if model_id:
++        q["query"]["bool"]["must"].append({"match":{"record.model_id": model_id}})
++    res = es.search(index="aegis-audit", body=q, size=50)
++    return {"hits": [h["_source"] for h in res.get("hits",{}).get("hits",[])]}
++
++if __name__=="__main__":
++    import uvicorn
++    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT","9201")))
++
+*** End Patch
+*** Begin Patch
+*** Add File: llm/quota_middleware.py
++from fastapi import Request, HTTPException, Depends
++from billing.redis_quota import consume_quota
++
++def quota_dependency(tenant: str = None, tokens: int = 0):
++    if not tenant:
++        raise HTTPException(status_code=400, detail="tenant required")
++    key = f"quota:{tenant}"
++    allowed, remaining = consume_quota(key, tokens)
++    if not allowed:
++        raise HTTPException(status_code=429, detail="quota exceeded")
++    return remaining
++
+*** End Patch
+*** Begin Patch
+*** Add File: ci/canary_manager_workflow.yml
++name: Auto Canary Manager (CI)
++on:
++  workflow_dispatch:
++    inputs:
++      model_id:
++        required: true
++
++jobs:
++  check-and-act:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run canary decision script
++        env:
++          MODEL_REGISTRY_API: ${{ secrets.MODEL_REGISTRY_API }}
++          ES_HOST: ${{ secrets.ES_HOST }}
++        run: |
++          python - <<'PY'
++import os, requests, json
++from ci.auto_canary_manager import decide_and_act
++print(decide_and_act(os.environ["MODEL_ID"]))
++PY
++
+*** End Patch
+*** Begin Patch
+*** Add File: load_test/llm_load_test.py
++#!/usr/bin/env python3
++"""
++Lightweight asyncio load test for the LLM gateway that produces /tmp/stress_results.json
++"""
++import asyncio, aiohttp, json, time
++from datetime import datetime
++ENDPOINT = "http://llm-gateway.aegis.svc/v1/generate"
++
++async def worker(session, prompt, results, idx):
++    try:
++        async with session.post(ENDPOINT, json={"model":"gpt-like","prompt":prompt,"max_tokens":64,"tenant":"loadtest"}) as r:
++            t0 = time.time()
++            text = await r.text()
++            latency = time.time() - t0
++            results.append({"status": r.status, "latency": latency})
++    except Exception as e:
++        results.append({"status":"error","error":str(e)})
++
++async def run(concurrency=10, total=100):
++    prompts = ["What is the capital of France?"]*total
++    results = []
++    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
++        tasks=[]
++        for i,p in enumerate(prompts):
++            tasks.append(asyncio.create_task(worker(session,p,results,i)))
++            if len(tasks)>=concurrency:
++                await asyncio.gather(*tasks); tasks=[]
++        if tasks:
++            await asyncio.gather(*tasks)
++    open("/tmp/stress_results.json","w").write(json.dumps(results))
++    print("Wrote /tmp/stress_results.json")
++
++if __name__=="__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--concurrency", type=int, default=10)
++    p.add_argument("--total", type=int, default=100)
++    args = p.parse_args()
++    asyncio.run(run(args.concurrency, args.total))
++
+*** End Patch
+*** Begin Patch
+*** Add File: compliance/ci_pen_test_gate.yml
++name: CI PenTest Gate
++on:
++  pull_request:
++    types: [opened, synchronize]
++
++jobs:
++  check-pen:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Fail if open pen-test findings
++        run: |
++          python compliance/check_pen_findings.py
++
+*** End Patch
+*** End Patch

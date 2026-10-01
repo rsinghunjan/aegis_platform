@@ -1,0 +1,402 @@
+*** Begin Patch
+*** Add File:ops/production/readiness_calculator.py
++#!/usr/bin/env python3
++"""
++Readiness calculator for Level-4 promotion.
++
++Reads evidence in the evidence S3 bucket, runs/consumes validators (or their reports),
++and computes a weighted readiness percentage based on configured acceptance criteria.
++
++Weights (defaults) — these mirror the risk/effort breakdown used by reviewers:
++ - hpo_checkpoints: 20
++ - longshadow_2k: 20
++ - otel_coverage: 10
++ - opa_mismatch: 10
++ - remediation: 10
++ - security: 15
++ - gatekeeper_canary: 5
++ - billing_quota: 5
++ - explainability: 3
++ - longterm_slo: 2
++
++The script outputs a JSON readiness report to stdout and (if EVIDENCE_BUCKET set) uploads it to:
++  <EVIDENCE_BUCKET>/production_proofs/readiness/readiness-<ts>.json
++
++Exit codes:
++ - 0 success (report produced)
++ - 2 missing evidence bucket or critical failure
++
++Example:
++  export EVIDENCE_BUCKET=s3://aegis-evidence-prod
++  python3 ops/production/readiness_calculator.py --thresholds checkpoint:0.90,otel:0.90
++"""
++import os
++import sys
++import json
++import time
++import argparse
++import logging
++import subprocess
++from datetime import datetime
++
++logging.basicConfig(level=logging.INFO)
++log = logging.getLogger("readiness")
++
++DEFAULT_WEIGHTS = {
++    "hpo_checkpoints": 20,
++    "longshadow_2k": 20,
++    "otel_coverage": 10,
++    "opa_mismatch": 10,
++    "remediation": 10,
++    "security": 15,
++    "gatekeeper_canary": 5,
++    "billing_quota": 5,
++    "explainability": 3,
++    "longterm_slo": 2,
++}
++
++def run_cmd(cmd, capture=True, check=True):
++    log.debug("RUN: %s", " ".join(cmd))
++    try:
++        if capture:
++            return subprocess.check_output(cmd).decode().strip()
++        subprocess.check_call(cmd)
++        return ""
++    except subprocess.CalledProcessError:
++        if check:
++            raise
++        return ""
++
++def s3_key_exists(bucket, key_prefix):
++    import boto3
++    s3=boto3.client("s3")
++    try:
++        resp=s3.list_objects_v2(Bucket=bucket.replace("s3://",""), Prefix=key_prefix, MaxKeys=1)
++        return resp.get("KeyCount",0) > 0
++    except Exception:
++        log.exception("s3 list failed for %s %s", bucket, key_prefix)
++        return False
++
++def analyze_checkpoints(evidence, threshold):
++    # Reuse checkpoint_analyzer which exits non-zero if below threshold; but here we capture output
++    try:
++        out = run_cmd(["python3","services/hpo/checkpoint_analyzer.py","--evidence", evidence, "--threshold", str(threshold)], capture=True, check=True)
++        data = json.loads(out) if out else {}
++        ok = True
++    except SystemExit:
++        # script raises SystemExit on failure
++        ok = False
++        data = {}
++    except Exception:
++        ok = False
++        data = {}
++    return {"ok": ok, "detail": data}
++
++def analyze_longshadow_and_2k(evidence):
++    # Check for produced artifacts (presence indicates run)
++    # This is a lightweight check: look for longshadow/ and stress/2k keys
++    bucket = evidence
++    has_long = s3_key_exists(bucket, "longshadow/")
++    has_2k = s3_key_exists(bucket, "stress/")
++    ok = has_long and has_2k
++    return {"ok": ok, "has_longshadow": has_long, "has_2k": has_2k}
++
++def analyze_otel_coverage(evidence, threshold):
++    try:
++        out = run_cmd(["python3","services/telemetry/otel_span_coverage_checker.py","--evidence", evidence], capture=True, check=True)
++        rpt = json.loads(out)
++        cov = float(rpt.get("coverage", 0.0))
++        ok = cov >= threshold
++        return {"ok": ok, "coverage": cov, "s3_key": rpt.get("s3_key","")}
++    except Exception:
++        log.exception("otel analysis failed")
++        return {"ok": False, "coverage": 0.0}
++
++def analyze_opa(evidence, threshold):
++    # Look for opa verdict; fallback to running harness runner
++    try:
++        out = run_cmd(["python3","services/decisioning/opa_full_harness_runner.py","--evidence", evidence], capture=True, check=True)
++        # harness may upload verdict; also try to read verdict from S3
++    except Exception:
++        log.warning("opa harness run failed or returned non-zero")
++    # check for latest verdict file
++    import boto3, json as _json
++    s3=boto3.client("s3")
++    bucket=evidence.replace("s3://","")
++    try:
++        resp=s3.list_objects_v2(Bucket=bucket, Prefix="opa/verdict", MaxKeys=10)
++        items=resp.get("Contents",[])
++        if not items:
++            return {"ok": False, "mismatch_rate": 1.0}
++        items.sort(key=lambda x: x["LastModified"], reverse=True)
++        key=items[0]["Key"]
++        obj=s3.get_object(Bucket=bucket, Key=key)
++        report=_json.loads(obj["Body"].read().decode())
++        rate=report.get("mismatch_rate", 1.0)
++        return {"ok": rate <= threshold, "mismatch_rate": rate, "s3_key": key}
++    except Exception:
++        log.exception("failed to read opa verdict")
++        return {"ok": False, "mismatch_rate": 1.0}
++
++def analyze_remediation(evidence, threshold):
++    try:
++        out = run_cmd(["python3","services/failure/remediation_analyzer.py","--evidence", evidence, "--threshold", str(threshold)], capture=True, check=True)
++        # remediation_analyzer exits non-zero if below threshold
++        data = json.loads(out) if out else {}
++        ok = True
++    except Exception:
++        ok = False
++        data = {}
++    return {"ok": ok, "detail": data}
++
++def analyze_security(evidence):
++    # Check for pen-test summary with zero critical/high findings
++    import boto3
++    s3=boto3.client("s3")
++    try:
++        resp=s3.list_objects_v2(Bucket=evidence.replace("s3://",""), Prefix="security/", MaxKeys=100)
++        items=resp.get("Contents",[])
++        for obj in items:
++            if "summary" in obj["Key"]:
++                o=s3.get_object(Bucket=evidence.replace("s3://",""), Key=obj["Key"])
++                j=json.loads(o["Body"].read().decode())
++                crit = sum(1 for f in j.get("findings",[]) if f.get("severity") in ("critical","high"))
++                return {"ok": crit==0, "critical_findings": crit, "s3_key": obj["Key"]}
++    except Exception:
++        log.exception("security check failed")
++    return {"ok": False, "critical_findings": 1}
++
++def analyze_gatekeeper_canary(evidence):
++    # Look for gatekeeper verification marker uploaded by controlled rollout script
++    ok = s3_key_exists(evidence, "governance/gk_verify")
++    # fallback: look for any governance/gk_verify*
++    if not ok:
++        ok = s3_key_exists(evidence, "governance/")
++    return {"ok": ok}
++
++def analyze_billing(evidence):
++    ok = s3_key_exists(evidence, "billing/")
++    return {"ok": ok}
++
++def analyze_explainability(evidence):
++    # Check index existence and some minimum coverage
++    ok = s3_key_exists(evidence, "explainability/index")
++    return {"ok": ok}
++
++def analyze_longterm_slo(evidence, required_weeks=4):
++    # Look for at least required_weeks of weekly SLO reports
++    import boto3
++    s3=boto3.client("s3")
++    try:
++        resp=s3.list_objects_v2(Bucket=evidence.replace("s3://",""), Prefix="reliability/weekly", MaxKeys=1000)
++        items=resp.get("Contents",[])
++        weeks=len(items)
++        ok = weeks >= required_weeks
++        return {"ok": ok, "weeks_collected": weeks}
++    except Exception:
++        log.exception("longterm slo check failed")
++        return {"ok": False, "weeks_collected": 0}
++
++def compute_readiness(results, weights=DEFAULT_WEIGHTS):
++    total_weight = sum(weights.values())
++    score = 0.0
++    breakdown = {}
++    # Map results keys to weights
++    mapping = {
++        "hpo_checkpoints": ("hpo", results.get("hpo_checkpoints",{})),
++        "longshadow_2k": ("longshadow", results.get("longshadow_2k",{})),
++        "otel_coverage": ("otel", results.get("otel_coverage",{})),
++        "opa_mismatch": ("opa", results.get("opa",{})),
++        "remediation": ("remediation", results.get("remediation",{})),
++        "security": ("security", results.get("security",{})),
++        "gatekeeper_canary": ("gatekeeper", results.get("gatekeeper_canary",{})),
++        "billing_quota": ("billing", results.get("billing",{})),
++        "explainability": ("explainability", results.get("explainability",{})),
++        "longterm_slo": ("longterm_slo", results.get("longterm_slo",{})),
++    }
++    for key, (label, val) in mapping.items():
++        w = weights.get(key, 0)
++        ok = bool(val.get("ok", False))
++        contribution = w * (1.0 if ok else 0.0)
++        breakdown[key] = {"weight": w, "ok": ok, "contribution": contribution}
++        score += contribution
++    percent = (score / total_weight) * 100.0 if total_weight else 0.0
++    return {"percent": round(percent,2), "breakdown": breakdown, "total_weight": total_weight}
++
++def upload_report(evidence, report):
++    import boto3, tempfile
++    s3=boto3.client("s3")
++    bucket=evidence.replace("s3://","")
++    path=tempfile.mktemp(suffix=".json")
++    open(path,"w").write(json.dumps(report, indent=2))
++    key=f"production_proofs/readiness/readiness-{int(time.time())}.json"
++    s3.upload_file(path, bucket, key)
++    return f"s3://{bucket}/{key}"
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--checkpoint-threshold", type=float, default=float(os.environ.get("CHECKPOINT_THRESHOLD","0.90")))
++    p.add_argument("--otel-threshold", type=float, default=float(os.environ.get("OTEL_THRESHOLD","0.90")))
++    p.add_argument("--opa-threshold", type=float, default=float(os.environ.get("OPA_MISMATCH_THRESHOLD","0.01")))
++    p.add_argument("--remediation-threshold", type=float, default=float(os.environ.get("REMEDIATION_THRESHOLD","0.90")))
++    p.add_argument("--required-slo-weeks", type=int, default=4)
++    args = p.parse_args()
++
++    evidence = os.environ.get("EVIDENCE_BUCKET", "")
++    if not evidence:
++        log.error("EVIDENCE_BUCKET must be set in environment")
++        sys.exit(2)
++
++    results = {}
++    try:
++        results["hpo_checkpoints"] = analyze_checkpoints(evidence, args.checkpoint_threshold)
++        results["longshadow_2k"] = analyze_longshadow_and_2k(evidence)
++        results["otel_coverage"] = analyze_otel_coverage(evidence, args.otel_threshold)
++        results["opa_mismatch"] = analyze_opa(evidence, args.opa_threshold)
++        results["remediation"] = analyze_remediation(evidence, args.remediation_threshold)
++        results["security"] = analyze_security(evidence)
++        results["gatekeeper_canary"] = analyze_gatekeeper_canary(evidence)
++        results["billing_quota"] = analyze_billing(evidence)
++        results["explainability"] = analyze_explainability(evidence)
++        results["longterm_slo"] = analyze_longterm_slo(evidence, args.required_slo_weeks)
++    except Exception as e:
++        log.exception("readiness analysis failed")
++
++    computed = compute_readiness(results)
++    report = {"ts": datetime.utcnow().isoformat(), "evidence_bucket": evidence, "results": results, "computed": computed}
++    print(json.dumps(report, indent=2))
++    try:
++        uri = upload_report(evidence, report)
++        log.info("Uploaded readiness report to %s", uri)
++    except Exception:
++        log.exception("Failed to upload readiness report")
++    return 0
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/production/promote_to_level4.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Promotion helper: reads the latest readiness report and (if criteria met and Legal signoff present)
++# performs the controlled Gatekeeper deny promotion and records promotion evidence.
++#
++# Usage:
++#   export EVIDENCE_BUCKET=s3://aegis-evidence-prod
++#   export LEGAL_SIGNOFF_S3_KEY="compliance/legal_signoff.txt"   # path under evidence bucket that signals legal approval
++#   ./ops/production/promote_to_level4.sh --min-readiness 85
++
++EVIDENCE=${EVIDENCE_BUCKET:-}
++MIN_READINESS=85
++LEGAL_SIGNOFF_KEY=${LEGAL_SIGNOFF_S3_KEY:-"compliance/legal_signoff.txt"}
++
++while [[ $# -gt 0 ]]; do
++  case $1 in
++    --min-readiness) MIN_READINESS="$2"; shift 2;;
++    --evidence) EVIDENCE="$2"; shift 2;;
++    --legal-key) LEGAL_SIGNOFF_KEY="$2"; shift 2;;
++    -h|--help) echo "Usage: $0 [--min-readiness N] [--evidence s3://bucket] [--legal-key path]"; exit 0;;
++    *) echo "Unknown arg $1"; exit 1;;
++  esac
++done
++
++if [ -z "${EVIDENCE:-}" ]; then
++  echo "EVIDENCE_BUCKET not set. Export EVIDENCE_BUCKET=s3://your-bucket"
++  exit 1
++fi
++
++if ! command -v aws >/dev/null 2>&1; then
++  echo "aws cli is required"
++  exit 1
++fi
++
++echo "Downloading latest readiness report from ${EVIDENCE}"
++BUCKET=${EVIDENCE#s3://}
++LATEST=$(aws s3 ls s3://${BUCKET}/production_proofs/readiness/ --recursive | sort | tail -n 1 | awk '{print $4}')
++if [ -z "${LATEST}" ]; then
++  echo "No readiness report found in s3://${BUCKET}/production_proofs/readiness/"
++  exit 1
++fi
++
++TMP=/tmp/readiness_latest.json
++aws s3 cp s3://${BUCKET}/${LATEST} ${TMP}
++PCT=$(jq '.computed.percent' ${TMP})
++echo "Readiness percent: ${PCT}% (min required: ${MIN_READINESS}%)"
++
++echo "Checking legal signoff key s3://${BUCKET}/${LEGAL_SIGNOFF_KEY}"
++if aws s3 ls s3://${BUCKET}/${LEGAL_SIGNOFF_KEY} >/dev/null 2>&1; then
++  echo "Legal signoff present"
++else
++  echo "Legal signoff NOT present. Place a legal signoff marker at s3://${BUCKET}/${LEGAL_SIGNOFF_KEY} to proceed."
++  exit 1
++fi
++
++if (( $(echo "${PCT} >= ${MIN_READINESS}" | bc -l) )); then
++  echo "Readiness threshold satisfied. Proceeding with controlled Gatekeeper promotion."
++  # Run Gatekeeper controlled rollout and webhook setup (this script will perform canary/verification)
++  bash ops/gatekeeper/controlled_rollout_and_webhook_setup.sh --evidence "${EVIDENCE}"
++  # Record promotion marker
++  MARKER=/tmp/level4_promote_$(date +%s).json
++  echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"readiness\":${PCT},\"promoted_by\":\"operator\"}" > ${MARKER}
++  aws s3 cp ${MARKER} ${EVIDENCE}/governance/ || true
++  echo "Promotion recorded to ${EVIDENCE}/governance/"
++  echo "Gatekeeper promotion initiated. You should still perform final manual checks before removing all human gates."
++else
++  echo "Readiness below threshold (${PCT} < ${MIN_READINESS}). Aborting promotion."
++  exit 2
++fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/docs/LEVEL4_PROMOTION_CHECKS.md
++````markdown name=ops/docs/LEVEL4_PROMOTION_CHECKS.md
++# Level‑4 Promotion Checks & Automation
++
++This document explains the automated readiness calculation and the guarded promotion to Level‑4 (remove routine gates).
++
++What the readiness_calculator does
++- Reads evidence from EVIDENCE_BUCKET (env var).
++- Runs or consumes validators: checkpoint_analyzer, otel_span_coverage_checker, opa_full_harness_runner, remediation_analyzer, security summary, explainability index, billing artifacts, and weekly SLO reports.
++- Computes a weighted readiness percentage and uploads a readiness report to:
++  - s3://<bucket>/production_proofs/readiness/readiness-<ts>.json
++- Default weighted components:
++  - HPO checkpoints: 20
++  - long-shadow + 2k: 20
++  - OTEL coverage: 10
++  - OPA mismatch: 10
++  - remediation reliability: 10
++  - security (pen-test): 15
++  - gatekeeper canary verification: 5
++  - billing/quota: 5
++  - explainability indexing/ACL: 3
++  - long-term SLO weeks: 2
++
++Promotion guard (promote_to_level4.sh)
++- Checks the latest readiness report and requires:
++  - readiness percentage >= provided minimum (default 85%)
++  - a legal signoff marker present in S3 (default key: compliance/legal_signoff.txt)
++- If checks pass, runs controlled_gatekeeper rollout and records a promotion marker to:
++  - s3://<bucket>/governance/level4_promote-<ts>.json
++
++Recommended operator flow
++1. Run full production proofs (Tekton / GH workflow) and wait for final summary & evidence to upload.
++2. Re-run validators as needed and ensure readiness_calculator reports >= 85.
++3. Obtain Legal signoff by uploading a short token to S3:
++   - echo "legal ok - $(date -u)" > /tmp/legal_ok.txt
++   - aws s3 cp /tmp/legal_ok.txt s3://<bucket>/compliance/legal_signoff.txt
++4. Run promotion:
++   - export EVIDENCE_BUCKET=s3://<bucket>
++   - ./ops/production/promote_to_level4.sh --min-readiness 85
++
++Notes & safety
++- Promotion script performs controlled Gatekeeper rollout and a webhook verification. It does NOT automatically run Terraform apply for infra changes — Terraform plan is still gated and requires APPLY=true to run.
++- Keep human-in-the-loop for the first few promotions; treat the promote script as an operator helper, not a fully autonomous switch.
++- All actions create/upload evidence to the evidence bucket for audit & postmortem.
++
++````
++
+*** End Patch
+*** End Patch

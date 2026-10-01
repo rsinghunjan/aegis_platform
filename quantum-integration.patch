@@ -1,0 +1,575 @@
+*** Begin Patch
+*** Add File:docker/quantum/Dockerfile
++FROM python:3.10-slim
++LABEL maintainer="aegis-platform@example.com"
++RUN apt-get update && apt-get install -y build-essential git curl jq wget unzip libgomp1 && rm -rf /var/lib/apt/lists/*
++RUN python3 -m pip install --upgrade pip
++# Quantum SDKs and common libs: Qiskit, PennyLane, Cirq, Braket SDK (if needed), and classical deps
++RUN pip install qiskit==0.39.0 qiskit-aer==0.11.0 pennylane cirq amazon-braket-sdk boto3 mlflow pandas numpy scipy scikit-learn
++RUN pip install sentence-transformers pymilvus || true
++WORKDIR /opt/quantum
++COPY quantum/ /opt/quantum/
++ENV PYTHONPATH=/opt/quantum:${PYTHONPATH:-}
++CMD ["bash"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:quantum/braket_job.py
++#!/usr/bin/env python3
++"""
++Submit or run a quantum circuit using AWS Braket (or fall back to local simulator).
++Saves results to S3, logs to MLflow, optionally cosign-signs the result bundle and uploads signature.
++
++Usage:
++  python quantum/braket_job.py --circuit-file circuit.py --s3-output s3://bucket/path/job123 --run-type braket --device "Aspen-11" --mlflow-uri ...
++
++Notes:
++- Requires AWS credentials or IRSA role allowing braket:* and s3 operations.
++- If run_type=simulate (or Braket SDK unavailable), runs local Qiskit Aer simulator.
++"""
++import argparse, os, json, tempfile, subprocess, tarfile, time
++from datetime import datetime
++
++def parse_args():
++    p = argparse.ArgumentParser()
++    p.add_argument("--circuit-file", required=True, help="Python file that defines a build_circuit() function")
++    p.add_argument("--run-type", choices=["braket", "simulate"], default="simulate")
++    p.add_argument("--device", default=None, help="Braket device name or simulator marker")
++    p.add_argument("--s3-output", required=True, help="s3://bucket/prefix where results are uploaded")
++    p.add_argument("--mlflow-tracking-uri", default=os.environ.get("MLFLOW_TRACKING_URI"))
++    p.add_argument("--cosign-kms-arn", default=os.environ.get("COSIGN_KMS_ARN"))
++    return p.parse_args()
++
++def tar_path(path):
++    out = tempfile.mktemp(suffix=".tgz")
++    with tarfile.open(out, "w:gz") as tar:
++        tar.add(path, arcname=os.path.basename(path))
++    return out
++
++def upload_s3(local, s3uri):
++    # simple uploader using awscli, requires aws CLI present in image or use boto3
++    from urllib.parse import urlparse
++    parsed = urlparse(s3uri)
++    bucket = parsed.netloc
++    key = parsed.path.lstrip('/')
++    import boto3
++    s3 = boto3.client("s3")
++    s3.upload_file(local, bucket, key)
++    return f"s3://{bucket}/{key}"
++
++def run_local_simulator(circuit_module_path):
++    # Import the user's circuit file and call build_circuit to get a qiskit QuantumCircuit
++    import importlib.util
++    spec = importlib.util.spec_from_file_location("qcmod", circuit_module_path)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    if not hasattr(mod, "build_circuit"):
++        raise RuntimeError("circuit file must define build_circuit() returning a Qiskit QuantumCircuit or equivalent")
++    qc = mod.build_circuit()
++    # Qiskit execute
++    try:
++        from qiskit import Aer, execute
++        backend = Aer.get_backend('aer_simulator')
++        job = execute(qc, backend=backend, shots=1024)
++        result = job.result().get_counts()
++    except Exception as e:
++        result = {"error": str(e)}
++    return result
++
++def run_braket(circuit_module_path, device_name):
++    # Try to use Amazon Braket SDK; expects circuit_module.build_braket_task() returning a Braket circuit or instruction to submit
++    try:
++        from braket.aws import AwsDevice
++        from braket.devices import LocalSimulator
++    except Exception as e:
++        raise RuntimeError("Braket SDK not installed or available: " + str(e))
++    import importlib.util
++    spec = importlib.util.spec_from_file_location("qcmod", circuit_module_path)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    if not hasattr(mod, "build_braket_task"):
++        raise RuntimeError("circuit file must define build_braket_task(device) to produce an executable task")
++    # Submit task and poll
++    device = AwsDevice(device_name) if device_name and device_name != "local" else LocalSimulator()
++    task = mod.build_braket_task(device)
++    # If task is already executed by build_braket_task (e.g., device.run), return produced result structure
++    if isinstance(task, dict):
++        return task
++    # Otherwise, assume it's a braket task future
++    try:
++        # device.run() returns an object with result() maybe - adapt per provider
++        res = task.result() if hasattr(task, "result") else task
++        return {"result": str(res)}
++    except Exception as e:
++        return {"error": str(e)}
++
++def main():
++    args = parse_args()
++    started = datetime.utcnow().isoformat() + "Z"
++    job_meta = {"started": started, "run_type": args.run_type, "device": args.device}
++    # run
++    if args.run_type == "braket":
++        try:
++            res = run_braket(args.circuit_file, args.device or "arn:aws:braket:::device/quantum-simulator/amazon/sv1")
++        except Exception as e:
++            res = {"error": str(e)}
++    else:
++        res = run_local_simulator(args.circuit_file)
++    job_meta["result"] = res
++    # write local result bundle
++    outdir = tempfile.mkdtemp()
++    outpath = os.path.join(outdir, "job_result.json")
++    with open(outpath, "w") as f:
++        json.dump(job_meta, f, indent=2, default=str)
++    # tar and upload
++    archive = tar_path(outdir)
++    s3_prefix = args.s3_output.rstrip("/")
++    # put to s3 with timestamp
++    target = f"{s3_prefix}/quantum_job_{int(time.time())}.tgz"
++    s3uri = upload_s3(archive, target)
++    print("Uploaded results to", s3uri)
++
++    # MLflow logging if available
++    try:
++        import mlflow
++        if args.mlflow_tracking_uri:
++            mlflow.set_tracking_uri(args.mlflow_tracking_uri)
++        with mlflow.start_run() as r:
++            mlflow.log_param("run_type", args.run_type)
++            mlflow.log_param("device", args.device)
++            mlflow.log_artifact(outpath, artifact_path="quantum")
++            mlflow.set_tag("quantum_result_s3", s3uri)
++    except Exception as e:
++        print("MLflow logging skipped:", e)
++
++    # Optionally cosign sign the archive using KMS
++    if args.cosign_kms_arn:
++        try:
++            subprocess.check_call(["cosign","sign","--key",args.cosign_kms_arn, archive])
++            sig = archive + ".sig"
++            sig_key = target + ".sig"
++            upload_s3(sig, sig_key)
++            print("Signed archive and uploaded signature to", sig_key)
++        except Exception as e:
++            print("cosign sign failed:", e)
++
++    print(json.dumps(job_meta))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:quantum/qiskit_mlflow_helper.py
++"""
++Helpers to log quantum circuit metadata and provider receipts to MLflow and to sign bundles.
++"""
++import mlflow, json, subprocess, tempfile, os
++
++def log_circuit_and_receipt(circuit_spec: dict, provider_meta: dict, result_local_path: str, mlflow_tracking_uri=None, cosign_kms_arn=None):
++    if mlflow_tracking_uri:
++        mlflow.set_tracking_uri(mlflow_tracking_uri)
++    with mlflow.start_run() as r:
++        mlflow.log_dict(circuit_spec, "quantum/circuit_spec.json")
++        mlflow.log_dict(provider_meta, "quantum/provider_meta.json")
++        mlflow.log_artifact(result_local_path, artifact_path="quantum/result")
++        mlflow.set_tag("quantum_provider", provider_meta.get("provider"))
++        # sign the bundle if requested
++        if cosign_kms_arn:
++            # create a tar of result_local_path (or containing dir)
++            base = os.path.dirname(result_local_path) or "."
++            archive = tempfile.mktemp(suffix=".tgz")
++            import tarfile
++            with tarfile.open(archive, "w:gz") as tar:
++                tar.add(result_local_path, arcname=os.path.basename(result_local_path))
++            try:
++                subprocess.check_call(["cosign","sign","--key",cosign_kms_arn, archive])
++                sig = archive + ".sig"
++                mlflow.log_artifact(sig, artifact_path="quantum/signature")
++            except Exception as e:
++                print("cosign sign failed:", e)
++    return r.info.run_id
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/quantum_pr_simulate.yml
++name: Quantum PR Simulation Tests
++
++on:
++  pull_request:
++    types: [opened, synchronize, reopened]
++
++jobs:
++  simulate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.10'
++      - name: Install quantum libs (lightweight)
++        run: |
++          pip install qiskit==0.39.0 qiskit-aer==0.11.0
++      - name: Run sample circuit unit test
++        run: |
++          python3 testing/quantum_sample_circuit.py
++
+*** End Patch
+*** Begin Patch
+*** Add File:testing/quantum_sample_circuit.py
++#!/usr/bin/env python3
++"""
++Small self-contained Qiskit circuit test for PRs: builds a Bell pair and checks expected counts with simulator.
++"""
++from qiskit import QuantumCircuit, Aer, execute
++
++def build_circuit():
++    qc = QuantumCircuit(2,2)
++    qc.h(0)
++    qc.cx(0,1)
++    qc.measure([0,1],[0,1])
++    return qc
++
++def main():
++    qc = build_circuit()
++    backend = Aer.get_backend('aer_simulator')
++    job = execute(qc, backend=backend, shots=256)
++    result = job.result().get_counts()
++    print("Result counts:", result)
++    # Expect mostly 00 and 11
++    assert sum(result.get(k,0) for k in ("00","11")) >= 200, "Bell pair not simulated as expected"
++    print("Quantum sample circuit test passed")
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:argo/quantum_braket_workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: quantum-braket-
++  namespace: aegis
++spec:
++  entrypoint: braket-job
++  arguments:
++    parameters:
++      - name: circuit-file-s3
++        value: "s3://REPLACE_BUCKET/quantum/circuits/example_circuit.py"
++      - name: run-type
++        value: "braket" # or simulate
++      - name: device
++        value: "arn:aws:braket:::device/quantum-simulator/amazon/sv1"
++      - name: s3-output
++        value: "s3://REPLACE_BUCKET/quantum/results/{{workflow.uid}}"
++      - name: image
++        value: "ghcr.io/yourorg/aegis-quantum:latest"
++  templates:
++    - name: braket-job
++      inputs:
++        parameters:
++          - name: circuit-file-s3
++          - name: run-type
++          - name: device
++          - name: s3-output
++          - name: image
++      container:
++        image: "{{inputs.parameters.image}}"
++        command: ["/bin/bash","-lc"]
++        args:
++          - |
++            set -euo pipefail
++            # download circuit file
++            CIRCUIT_LOCAL=/tmp/circuit.py
++            aws s3 cp "{{inputs.parameters.circuit-file-s3}}" "$CIRCUIT_LOCAL"
++            python /opt/quantum/braket_job.py --circuit-file "$CIRCUIT_LOCAL" \
++              --run-type "{{inputs.parameters.run-type}}" \
++              --device "{{inputs.parameters.device}}" \
++              --s3-output "{{inputs.parameters.s3-output}}" \
++              --mlflow-tracking-uri "${MLFLOW_TRACKING_URI:-}" \
++              --cosign-kms-arn "${COSIGN_KMS_ARN:-}"
++      resources:
++        requests:
++          cpu: "1000m"
++          memory: "2Gi"
++        limits:
++          cpu: "2000m"
++          memory: "4Gi"
++
+*** End Patch
+*** Begin Patch
+*** Add File:quantum/demo_hybrid_notebook.ipynb
++{
++ "cells": [
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "# Hybrid classical-quantum demo (preprocess → quantum kernel → classical classifier)\n",
++    "This notebook demonstrates a tiny hybrid pipeline using Qiskit simulator and MLflow tracking."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "import mlflow, json, numpy as np\n",
++    "from qiskit import QuantumCircuit, Aer, execute\n",
++    "from sklearn.linear_model import LogisticRegression\n",
++    "from sklearn.model_selection import train_test_split\n",
++    "from sklearn.metrics import accuracy_score\n",
++    "\n",
++    "def featurize_to_quantum_circuit(x):\n",
++    "    # trivial rotation encoding for 2 features\n",
++    "    qc = QuantumCircuit(2,2)\n",
++    "    qc.ry(x[0],0)\n",
++    "    qc.ry(x[1],1)\n",
++    "    qc.cx(0,1)\n",
++    "    qc.measure([0,1],[0,1])\n",
++    "    return qc\n",
++    "\n",
++    "X = np.random.rand(200,2)*3.14\n",
++    "y = (X[:,0] + X[:,1] > 3.14).astype(int)\n",
++    "embeddings = []\n",
++    "backend = Aer.get_backend('aer_simulator')\n",
++    "for xi in X:\n",
++    "    qc = featurize_to_quantum_circuit(xi)\n",
++    "    job = execute(qc, backend=backend, shots=64)\n",
++    "    counts = job.result().get_counts()\n",
++    "    # simple embedding: probability of '11'\n",
++    "    p11 = counts.get('11',0)/64\n",
++    "    embeddings.append([p11])\n",
++    "Xq = np.array(embeddings)\n",
++    "X_train, X_test, y_train, y_test = train_test_split(Xq, y, test_size=0.2)\n",
++    "clf = LogisticRegression().fit(X_train, y_train)\n",
++    "pred = clf.predict(X_test)\n",
++    "print('Accuracy', accuracy_score(y_test, pred))\n",
++    "\n",
++    "mlflow.set_tracking_uri('${MLFLOW_TRACKING_URI:-}')\n",
++    "with mlflow.start_run() as r:\n",
++    "    mlflow.log_param('shots', 64)\n",
++    "    mlflow.log_metric('accuracy', accuracy_score(y_test, pred))\n",
++    "    mlflow.log_artifact('this_notebook.ipynb')\n"
++   ]
++  }
++ ],
++ "metadata": { "kernelspec": { "display_name": "Python 3", "language": "python", "name": "python3" }, "language_info": { "name": "python", "version": "3.10" } },
++ "nbformat": 4,
++ "nbformat_minor": 5
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/externalsecrets/braket_secret.yaml
++apiVersion: external-secrets.io/v1beta1
++kind: ExternalSecret
++metadata:
++  name: braket-credentials
++  namespace: security
++spec:
++  refreshInterval: "1h"
++  secretStoreRef:
++    name: aws-secret-store
++    kind: SecretStore
++  target:
++    name: braket-creds
++    creationPolicy: Owner
++  data:
++    - secretKey: AWS_ACCESS_KEY_ID
++      remoteRef:
++        key: "aegis/braket/credentials"
++        property: access_key_id
++    - secretKey: AWS_SECRET_ACCESS_KEY
++      remoteRef:
++        key: "aegis/braket/credentials"
++        property: secret_access_key
++    - secretKey: AWS_SESSION_TOKEN
++      remoteRef:
++        key: "aegis/braket/credentials"
++        property: session_token
++
+*** End Patch
+*** Begin Patch
+*** Add File:iam/braket_policy.json
++{
++  "Version": "2012-10-17",
++  "Statement": [
++    {
++      "Sid": "AllowBraketTasks",
++      "Effect": "Allow",
++      "Action": [
++        "braket:CreateQuantumTask",
++        "braket:GetQuantumTask",
++        "braket:SearchQuantumTasks",
++        "braket:CancelQuantumTask"
++      ],
++      "Resource": "*"
++    },
++    {
++      "Sid": "AllowS3ForQuantum",
++      "Effect": "Allow",
++      "Action": [
++        "s3:PutObject",
++        "s3:GetObject",
++        "s3:ListBucket"
++      ],
++      "Resource": [
++        "arn:aws:s3:::REPLACE_EVIDENCE_BUCKET",
++        "arn:aws:s3:::REPLACE_EVIDENCE_BUCKET/*"
++      ]
++    },
++    {
++      "Sid": "AllowKMSDecrypt",
++      "Effect": "Allow",
++      "Action": [
++        "kms:Decrypt",
++        "kms:Encrypt",
++        "kms:GenerateDataKey"
++      ],
++      "Resource": "REPLACE_KMS_KEY_ARN"
++    }
++  ]
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/gatekeeper/constraint_require_signed_braket.yaml
++apiVersion: constraints.gatekeeper.sh/v1beta1
++kind: K8sRequiredSignedAnnotation
++metadata:
++  name: require-quantum-signed
++spec:
++  match:
++    kinds:
++      - apiGroups: ["batch"]
++        kinds: ["Job"]
++    namespaces: ["aegis", "security"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/qpu_prometheus_rules.yaml
++groups:
++- name: aegis-qpu.rules
++  rules:
++  - alert: QPUJobFailed
++    expr: sum(increase(aegis_qpu_job_failures_total[1h])) > 0
++    for: 5m
++    labels:
++      severity: critical
++    annotations:
++      summary: "One or more QPU jobs failed in the last hour"
++
++  - alert: QPUJobLongRunning
++    expr: max_over_time(aegis_qpu_job_run_seconds[1h]) > 3600
++    for: 10m
++    labels:
++      severity: warning
++    annotations:
++      summary: "A QPU job has been running for over one hour"
++
++  - alert: QPUEstimatedCostHigh
++    expr: increase(aegis_qpu_estimated_cost_usd_total[1h]) > 50
++    for: 30m
++    labels:
++      severity: warning
++    annotations:
++      summary: "Estimated QPU spend > $50 in the last hour"
++
+*** End Patch
+*** Begin Patch
+*** Add File:grafana/dashboards/qpu_dashboard.json
++{
++  "title": "Quantum Job Overview",
++  "panels": [
++    { "type": "graph", "title": "QPU Jobs / minute", "targets": [{"expr":"rate(aegis_qpu_jobs_started_total[5m])"}] },
++    { "type": "graph", "title": "QPU Job Duration (max 1h)", "targets": [{"expr":"max_over_time(aegis_qpu_job_run_seconds[1h])"}] },
++    { "type": "table", "title": "Estimated QPU Cost (1h)", "targets": [{"expr":"increase(aegis_qpu_estimated_cost_usd_total[1h])"}] }
++  ]
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/qpu_metrics_exporter.py
++#!/usr/bin/env python3
++"""
++Lightweight Prometheus exporter for basic QPU job metrics.
++Expose counters/gauges:
++ - aegis_qpu_jobs_started_total
++ - aegis_qpu_job_failures_total
++ - aegis_qpu_job_run_seconds (histogram)
++ - aegis_qpu_estimated_cost_usd_total (counter)
++
++This is an example that operators can run as a sidecar or CronJob that queries logs/MLflow for QPU job metadata.
++"""
++from prometheus_client import start_http_server, Counter, Gauge, Histogram
++import time, random
++
++JOBS_STARTED = Counter('aegis_qpu_jobs_started_total', 'QPU jobs started')
++JOBS_FAILED = Counter('aegis_qpu_job_failures_total', 'QPU job failures')
++JOB_RUN_SECONDS = Histogram('aegis_qpu_job_run_seconds', 'QPU job run durations seconds')
++QPU_COST = Counter('aegis_qpu_estimated_cost_usd_total', 'Estimated QPU cost USD')
++
++def scrape_loop():
++    # This demo exporter emits synthetic metrics; replace with real MLflow/CloudTrail/Braket lookups
++    while True:
++        # synthetic increment
++        started = random.randint(0,2)
++        for _ in range(started):
++            JOBS_STARTED.inc()
++            dur = random.random()*600
++            JOB_RUN_SECONDS.observe(dur)
++            QPU_COST.inc(round(random.random()*5,2))
++            if random.random() < 0.05:
++                JOBS_FAILED.inc()
++        time.sleep(15)
++
++if __name__ == "__main__":
++    start_http_server(9400)
++    print("QPU exporter listening on :9400")
++    scrape_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/quantum_integration_README.md
++# Quantum integration for Aegis
++
++This patch adds an initial quantum integration layer to Aegis. It is intentionally conservative: it provides simulator-first workflows, Braket integration helpers, MLflow logging and signing hooks, and monitoring scaffolds. Operator review and security checks are required before running real QPU jobs.
++
++Included artifacts
++- docker/quantum/Dockerfile — image with Qiskit, PennyLane, Cirq, Braket SDK and common ML libs
++- quantum/braket_job.py — Argo-executable job script to run circuits (Braket or local simulate), archive results, MLflow log and cosign-sign bundle
++- quantum/qiskit_mlflow_helper.py — helper to log circuit spec, provider metadata and sign artifacts
++- argo/quantum_braket_workflow.yaml — Argo Workflow template to run Braket job and upload results to S3
++- .github/workflows/quantum_pr_simulate.yml — PR-time simulator test running Qiskit sample circuit
++- testing/quantum_sample_circuit.py — Qiskit unit test for CI
++- quantum/demo_hybrid_notebook.ipynb — notebook demonstrating a hybrid workflow
++- k8s/externalsecrets/braket_secret.yaml — ExternalSecret mapping for Braket/AWS creds
++- iam/braket_policy.json — IAM policy snippet for Braket + S3 + KMS
++- k8s/gatekeeper/constraint_require_signed_braket.yaml — Gatekeeper constraint to require signed receipts for Job resources
++- monitoring/qpu_prometheus_rules.yaml and grafana/dashboards/qpu_dashboard.json
++- monitoring/qpu_metrics_exporter.py — example exporter for QPU metrics
++
++How to use (quick)
++1. Build and push docker/quantum image via your CI (use existing build workflows).
++2. Populate secrets: create AWS credentials for Braket in SecretsManager and configure ExternalSecret (k8s/externalsecrets/braket_secret.yaml). Prefer IRSA role mapping instead of long-term secrets.
++3. Annotate SAs for IRSA as needed for Braket access (ops/annotate_serviceaccounts.sh).
++4. Test locally or via PR by running the quantum PR simulation workflow (.github/workflows/quantum_pr_simulate.yml).
++5. Submit Argo workflow in staging after reviewing security: argo submit argo/quantum_braket_workflow.yaml (update S3 prefixes, image names and device ARN).
++6. Inspect results: MLflow run, S3 archive, cosign signature (if KMS configured) and Rekor entries.
++
++Security notes
++- Always prefer IRSA rather than storing AWS credentials in cluster secrets.
++- Enforce Gatekeeper constraint require-quantum-signed to ensure result bundles are signed before promotion.
++- Restrict who can run QPU jobs via RBAC and approval process; QPUs are costly.
++
++Next steps (optional)
++- Add a Braket cost estimator and quota enforcement.
++- Implement provider-agnostic submitters (IBM/Azure) with pluggable provider modules.
++- Expand MLflow quantum plugin to store circuit transpilation parameters, noise model, and provider receipts.
++
+*** End Patch
+*** End Patch

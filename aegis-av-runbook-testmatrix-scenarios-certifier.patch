@@ -1,0 +1,371 @@
+*** Begin Patch
+*** Add File:ops/av/runbooks/operator_full_runbook.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Operator runbook script (one‑shot) to:
++#  1) Run deterministic RT validation on representative vehicle/robot hardware
++#  2) Run HIL certification harness (controllers)
++#  3) Run perception OOD & adversarial suites
++#  4) Run formal triage (Apalache)
++#  5) Assemble safety case and produce signed auditor bundle
++#  6) Perform simple acceptance checks and exit non‑zero if gate fails
++#
++# Usage:
++#  COSIGN_KMS_URI=kms://... S3_UPLOAD=s3://aegis-evidence/<run-id>/ ./ops/av/runbooks/operator_full_runbook.sh --node <host> --manifest manifests/deploy.yaml
++
++NODE=localhost
++OUT_BASE=${OUT_BASE:-/tmp/aegis_operator_run_$(date +%s)}
++S3_UPLOAD=${S3_UPLOAD:-}
++COSIGN_KMS_URI=${COSIGN_KMS_URI:-}
++MANIFESTS=${1:-}
++
++function usage(){
++  echo "Usage: $0 [--node host] [--out /tmp/out] [--s3 s3://...]"
++  exit 1
++}
++
++while [[ $# -gt 0 ]]; do
++  case $1 in
++    --node) NODE="$2"; shift 2;;
++    --out) OUT_BASE="$2"; shift 2;;
++    --s3) S3_UPLOAD="$2"; shift 2;;
++    --help) usage;;
++    *) shift;;
++  esac
++done
++
++mkdir -p "$OUT_BASE"
++echo "Operator run starting: node=$NODE out=$OUT_BASE"
++
++echo "[1] Run vehicle RT validation"
++./ops/av/rt/vehicle_rt_validation.sh --out "$OUT_BASE/rt" || true
++
++echo "[2] Run vehicle controller certification harness (HIL)"
++python3 ops/av/certification/vehicle_controller_cert_harness.py --out "$OUT_BASE/cert" --cosign-key "${COSIGN_KMS_URI:-}" || true
++
++echo "[3] Run perception OOD / adversarial suites"
++python3 ops/av/perception/ood_and_adversarial_runner.py --model ops/dl/inference/test_models/tiny_model.onnx --images_dir ops/av/perception/test_images --out "$OUT_BASE/perception" || true
++python3 ops/agents/safety/adversarial_eval.py --outdir "$OUT_BASE/adv_eval" || true
++
++echo "[4] Run Apalache triage"
++./ops/formal/apalache_triage_runner.sh "$OUT_BASE/apalache" || true
++
++echo "[5] Build safety case & submission bundle"
++python3 ops/av/ops/safety_case_builder.py --base . --out "$OUT_BASE/safety_case_bundle.tar.gz" || true
++
++echo "[6] Perform automated acceptance checks (best-effort)"
++FAIL=0
++# check RT SLO proof
++if [ -f "$OUT_BASE/rt_slo_proof.json" ]; then
++  P99_OK=$(jq -r '.p99_ok' "$OUT_BASE/rt_slo_proof.json" 2>/dev/null || echo "false")
++  SAFE_OK=$(jq -r '.safe_ok' "$OUT_BASE/rt_slo_proof.json" 2>/dev/null || echo "false")
++  echo "RT p99_ok=$P99_OK safe_ok=$SAFE_OK"
++  if [ "$P99_OK" != "true" ] || [ "$SAFE_OK" != "true" ]; then
++    echo "RT SLO check failed"
++    FAIL=1
++  fi
++else
++  echo "RT SLO proof not found"
++  FAIL=1
++fi
++
++# check HIL waveform compare result
++if [ -f "$OUT_BASE/cert/waveform_compare.json" ]; then
++  MSE=$(jq -r '.mse' "$OUT_BASE/cert/waveform_compare.json" 2>/dev/null || echo "null")
++  echo "Waveform MSE=$MSE"
++else
++  echo "Waveform compare result missing"
++  FAIL=1
++fi
++
++# check perception OOD: ensure some results exist and failure rate below threshold
++if [ -f "$OUT_BASE/perception/ood_results.json" ]; then
++  TOTAL=$(jq 'length' "$OUT_BASE/perception/ood_results.json" 2>/dev/null || echo 0)
++  FAILS=$(jq '[.[] | select(.ok==false)] | length' "$OUT_BASE/perception/ood_results.json" 2>/dev/null || echo 0)
++  echo "Perception OOD: total=$TOTAL fails=$FAILS"
++  # threshold: fail rate must be under 10% for this automated gate
++  if [ "$TOTAL" -gt 0 ]; then
++    RATE=$(awk "BEGIN {print ($FAILS/$TOTAL)}")
++    awk "BEGIN{ if ($RATE > 0.10) exit 1; else exit 0 }" || (echo "Perception fail rate too high ($RATE)" && FAIL=1)
++  fi
++else
++  echo "Perception OOD results missing"
++  FAIL=1
++fi
++
++echo "[7] Finalize bundle"
++BUNDLE="$OUT_BASE/audit_bundle_$(date +%s).tar.gz"
++tar -czf "$BUNDLE" -C "$(dirname "$OUT_BASE")" "$(basename "$OUT_BASE")" || true
++if [ -n "$COSIGN_KMS_URI" ]; then
++  cosign sign --key "$COSIGN_KMS_URI" "$BUNDLE" || true
++fi
++if [ -n "$S3_UPLOAD" ]; then
++  aws s3 cp "$BUNDLE" "$S3_UPLOAD" || true
++fi
++
++python3 - <<PY || true
++from ops.sdk.evidence_sdk import record_manifest
++record_manifest("operator_full_run", {"bundle":"$BUNDLE", "node":"$NODE"})
++print("manifest recorded")
++PY
++
++if [ "$FAIL" -ne 0 ]; then
++  echo "Operator gating FAILED. Inspect $OUT_BASE for artifacts."
++  exit 2
++fi
++echo "Operator gating PASSED. Bundle: $BUNDLE"
++exit 0
++
+*** End File
+*** Add File:ops/av/test_matrices/generate_test_matrix.py
++#!/usr/bin/env python3
++"""
++Generate a test matrix CSV mapping requirements -> scenarios -> acceptance criteria -> artifact paths.
++Produces: ops/av/test_matrices/test_matrix.csv and test_matrix.json
++"""
++import csv, json, os
++from datetime import datetime
++
++OUT_DIR="ops/av/test_matrices"
++os.makedirs(OUT_DIR, exist_ok=True)
++
++rows = [
++    {"req_id":"RT-001","domain":"AV","requirement":"Control loop p99 jitter","scenario":"Idle load / max load","acceptance":"p99_jitter_ms <= 0.2","artifact":"*/rt_slo_proof.json"},
++    {"req_id":"RT-002","domain":"Robotics","requirement":"Safe-stop latency","scenario":"Emergency brake at max speed","acceptance":"safe_stop_ms <= computed threshold","artifact":"*/rt_slo_proof.json"},
++    {"req_id":"CTRL-001","domain":"Humanoid","requirement":"Contact handling","scenario":"Unexpected external contact","acceptance":"no unsafe torque excursion; waveform MSE < threshold","artifact":"*/cert/*.ndjson,*/waveform_compare.json"},
++    {"req_id":"PER-001","domain":"AV","requirement":"Obstacle detection FN rate","scenario":"Rain/Night/Glare/OOD","acceptance":"false_negative_rate <= 1e-3","artifact":"*/perception/ood_results.json"},
++    {"req_id":"SUPPLY-001","domain":"Platform","requirement":"Builder provenance","scenario":"All images","acceptance":"cosign signed and Rekor entry present","artifact":"CI promotion logs / rekor search outputs"},
++]
++
++csv_path=os.path.join(OUT_DIR,"test_matrix.csv")
++json_path=os.path.join(OUT_DIR,"test_matrix.json")
++with open(csv_path,"w",newline='') as fh:
++    writer=csv.DictWriter(fh, fieldnames=["req_id","domain","requirement","scenario","acceptance","artifact"])
++    writer.writeheader()
++    for r in rows:
++        writer.writerow(r)
++
++with open(json_path,"w") as fh:
++    json.dump({"generated_at": datetime.utcnow().isoformat()+"Z","rows":rows}, fh, indent=2)
++
++print("Wrote test matrix:", csv_path, json_path)
++
+*** End File
+*** Add File:ops/av/test_matrices/test_matrix.csv
++req_id,domain,requirement,scenario,acceptance,artifact
++RT-001,AV,Control loop p99 jitter,Idle load / max load,"p99_jitter_ms <= 0.2","*/rt_slo_proof.json"
++RT-002,Robotics,Safe-stop latency,Emergency brake at max speed,"safe_stop_ms <= computed threshold","*/rt_slo_proof.json"
++CTRL-001,Humanoid,Contact handling,Unexpected external contact,"no unsafe torque excursion; waveform MSE < threshold","*/cert/*.ndjson,*/waveform_compare.json"
++PER-001,AV,Obstacle detection FN rate,Rain/Night/Glare/OOD,"false_negative_rate <= 1e-3","*/perception/ood_results.json"
++SUPPLY-001,Platform,Builder provenance,All images,"cosign signed and Rekor entry present","CI promotion logs / rekor search outputs"
++
+*** End File
+*** Add File:ops/av/sim_hil/carla_scenario_pack_generator.py
++#!/usr/bin/env python3
++"""
++Generate CARLA scenario packs from templates and package them for HIL consumption.
++Outputs a tar.gz that can be pushed to HIL runners or S3.
++"""
++import argparse, os, json, tarfile, tempfile
++from datetime import datetime
++
++TEMPLATE = {
++  "id": None,
++  "description": "generated scenario",
++  "actors": ["vehicle","pedestrian"],
++  "weather": "clear",
++  "spawn": {"x":0,"y":0,"z":0},
++  "events": []
++}
++
++def make_scenarios(count, outdir):
++    os.makedirs(outdir, exist_ok=True)
++    for i in range(count):
++        s = dict(TEMPLATE)
++        s["id"] = f"scenario_{i}"
++        s["description"] = f"Auto-generated scenario {i}"
++        s["events"] = [{"type":"cut_in","time":2.0}] if i%2==0 else [{"type":"sensor_dropout","time":3.0}]
++        with open(os.path.join(outdir, f"{s['id']}.json"), "w") as fh:
++            json.dump(s, fh, indent=2)
++
++def package(outdir, outpath):
++    with tarfile.open(outpath, "w:gz") as t:
++        t.add(outdir, arcname=os.path.basename(outdir))
++
++def main():
++    p=argparse.ArgumentParser()
++    p.add_argument("--count", type=int, default=10)
++    p.add_argument("--out", default=f"/tmp/carla_scenarios_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.tar.gz")
++    p.add_argument("--tmp", default=None)
++    args=p.parse_args()
++    tmp = args.tmp or tempfile.mkdtemp(prefix="carla_scen_")
++    make_scenarios(args.count, tmp)
++    package(tmp, args.out)
++    print("Wrote scenario pack to", args.out)
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:ops/av/sim_hil/hil_adapter_stub.py
++#!/usr/bin/env python3
++"""
++HIL adapter stub: submit scenario artifacts to HIL runner.
++Operator: replace submit_hil_command with specific HIL orchestration commands.
++"""
++import argparse, os, subprocess, tempfile
++
++def submit_to_hil(scenarios_tar, outdir):
++    os.makedirs(outdir, exist_ok=True)
++    # unpack
++    subprocess.check_call(["tar","-xzf",scenarios_tar,"-C",outdir])
++    # placeholder: iterate scenario files and "submit" to HIL runner
++    for root,_,files in os.walk(outdir):
++        for f in files:
++            if f.endswith(".json"):
++                path=os.path.join(root,f)
++                print("Submitting", path, "to HIL runner (stub)")
++                # Example: subprocess.call(["hil_runner_cli","submit","--scenario",path])
++
++if __name__=="__main__":
++    p=argparse.ArgumentParser()
++    p.add_argument("--pack", required=True)
++    p.add_argument("--outdir", default="/tmp/hil_in")
++    args=p.parse_args()
++    submit_to_hil(args.pack, args.outdir)
++
+*** End File
+*** Add File:ops/av/certifier/submission_package.py
++#!/usr/bin/env python3
++"""
++Create a certifier submission package:
++ - Collect safety case bundle, RT/HIL/perception artifacts
++ - Produce a manifest mapping requirements -> artifact files
++ - Sign package with cosign (KMS) if COSIGN_KMS_URI is set
++ - Optionally upload to S3 and print Rekor verification hints
++"""
++import argparse, os, json, tarfile, subprocess, tempfile
++from datetime import datetime
++from glob import glob
++
++def collect_artifacts(base_paths):
++    files=[]
++    for p in base_paths:
++        files.extend(glob(p, recursive=True))
++    return sorted(set(files))
++
++def build_manifest(artifacts, outpath):
++    manifest={"generated_at": datetime.utcnow().isoformat()+"Z","artifacts": artifacts}
++    with open(outpath,"w") as fh:
++        json.dump(manifest, fh, indent=2)
++
++def package_bundle(files, outbundle):
++    tmpdir=tempfile.mkdtemp(prefix="aegis_cert_")
++    for f in files:
++        try:
++            dest=os.path.join(tmpdir, os.path.relpath(f,"."))
++            os.makedirs(os.path.dirname(dest), exist_ok=True)
++            subprocess.check_call(["cp","-a",f,dest])
++        except Exception:
++            pass
++    with tarfile.open(outbundle,"w:gz") as t:
++        t.add(tmpdir, arcname="bundle")
++
++def sign_bundle(bundle, cosign_key):
++    try:
++        subprocess.check_call(["cosign","sign","--key",cosign_key,bundle])
++    except Exception as e:
++        print("cosign sign failed:", e)
++
++def main():
++    p=argparse.ArgumentParser()
++    p.add_argument("--artifacts", nargs="+", default=["*/rt_slo_proof.json","*/cert*.tar.gz","*/perception/ood_results.json","ops/formal/*.tla"])
++    p.add_argument("--out", default=f"/tmp/certifier_submission_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.tar.gz")
++    p.add_argument("--cosign-key", default=os.environ.get("COSIGN_KMS_URI",""))
++    p.add_argument("--s3", default=os.environ.get("S3_UPLOAD",""))
++    args=p.parse_args()
++    files=collect_artifacts(args.artifacts)
++    manifest_path="/tmp/cert_manifest.json"
++    build_manifest(files, manifest_path)
++    files.append(manifest_path)
++    package_bundle(files, args.out)
++    print("Created submission bundle:", args.out)
++    if args.cosign_key:
++        sign_bundle(args.out, args.cosign_key)
++    if args.s3:
++        subprocess.call(["aws","s3","cp",args.out,args.s3])
++    # record evidence
++    try:
++        from ops.sdk.evidence_sdk import record_manifest
++        record_manifest("certifier_submission", {"bundle": args.out})
++    except Exception:
++        pass
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:ops/av/certifier/submit_to_certifier.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Wrapper to create and optionally upload certifier submission package.
++#
++OUT=${1:-/tmp/certifier_submission.tar.gz}
++S3=${S3_UPLOAD:-}
++COSIGN=${COSIGN_KMS_URI:-}
++
++python3 ops/av/certifier/submission_package.py --out "$OUT" --cosign-key "$COSIGN" --s3 "$S3"
++echo "Submission package is ready: $OUT"
++
+*** End File
+*** Add File:ops/av/ops/acceptance_criteria.md
++# Acceptance criteria (recommended starting values)
++
++- RT SLOs
++  - p99 loop jitter <= 0.2 ms (adjust per hardware)
++  - safe-stop latency <= derived threshold from vehicle_slo_table.py (use braking model)
++
++- Controller certification
++  - Waveform comparators: MSE <= operator-defined threshold (capture golden traces)
++  - No torque/actuator excursions outside safety envelope during HIL scenarios
++  - All HIL scenarios pass with no critical failures
++
++- Perception
++  - False negative rate for obstacles <= 1e-3 in certified detection envelope
++  - OOD/adversarial fail rate <= 10% for baseline automated gate; target <= 1e-3 after hardening
++
++- Supply chain
++  - All images that affect hardware must be built on labeled/hardened runners, cosign-signed and have Rekor entries
++
++- Safety case & governance
++  - Completed HARA and test_matrix.csv mapping requirements -> tests -> artifacts
++  - Safety case bundle produced and signed
++  - Evidence retention policy applied to S3 evidence bucket
++
+*** End File
+*** Add File:ops/av/README_AV_OPERATOR_FULL.md
++Operator playbook: runbook, test matrix, scenarios & certifier submission
++
++This patch provides:
++- A one‑shot operator runbook script to execute RT → HIL → perception → formal → safety case flows and produce a signed auditor bundle (ops/av/runbooks/operator_full_runbook.sh).
++- Test matrix generator and template CSV mapping requirements → scenarios → acceptance criteria → artifacts.
++- CARLA scenario pack generator and HIL adapter stub to pipe simulation failures into HIL tests.
++- Certification submission tooling to assemble artifacts, manifest and sign the bundle for third‑party reviewers.
++- Acceptance criteria guidance and checklist for operator gates.
++
++Operator responsibilities / next steps:
++1. Provision representative hardware (ECUs, CAN/CAN‑FD, TSN switches, HIL rigs) and label/harden self‑hosted runners.  
++2. Install vendor SDKs and ensure tools (cansend,candump,tsntool,cosign,neuron-cc,poprun,habana tools) are present on labeled runners.  
++3. Populate golden traces and per‑domain acceptance thresholds (edit ops/av/ops/acceptance_criteria.md and test_matrix.csv).  
++4. Run the operator runbook: ./ops/av/runbooks/operator_full_runbook.sh --out /tmp/audit_run --s3 s3://aegis-evidence/<run-id>/  
++5. Review artifacts, triage failures, iterate on controllers, model ensembles and retest until gates pass.  
++6. Run ops/av/certifier/submit_to_certifier.sh to produce final signed submission bundle for auditors.
++
++Security & evidence:
++- All runs call ops.sdk.evidence_sdk.record_manifest where available; ensure the evidence bucket and MLflow are configured and accessible.
++- Cosign KMS signing and Rekor entries are strongly recommended for all artifacts and images.
++
+*** End File
+*** End Patch

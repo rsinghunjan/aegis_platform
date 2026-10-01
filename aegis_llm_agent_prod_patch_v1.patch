@@ -1,0 +1,105 @@
+*** Begin Patch
+*** Add File: llm/serving.py
++#!/usr/bin/env python3
++"""
++A production-oriented LLM serving gateway that supports:
++ - routing to hosted providers (OpenAI-compatible) or local model server
++ - batching (simple), retries, exponential backoff
++ - Redis token-bucket quota enforcement per-tenant
++ - local caching for prompt+model combinations
++ - detailed request/response audit logging (writes to audit_indexer)
++
++This is an illustrative scaffold. In production operators should:
++ - provision Vault secrets for provider keys and mount via CSI/Agent
++ - run behind authenticated ingress (OIDC) and RBAC controls
++ - deploy multi-replica with HPA/KEDA and sidecars for metrics/logging
++"""
++import os
++import time
++import json
++import asyncio
++from typing import Optional
++from fastapi import FastAPI, HTTPException, Request, Depends
++from pydantic import BaseModel
++import httpx
++import backoff
++import redis
++from prometheus_client import start_http_server, Counter, Histogram, Gauge
++
++from llm.cache import LLMCache
++from observability.llm_metrics import record_usage, INFLIGHT
++from observability.audit_indexer import index_request
++from secrets.vault_client import get_secret  # helper to fetch provider keys from Vault
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/1")
++redis_client = redis.from_url(REDIS_URL)
++
++TOKEN_COUNTER = Counter("llm_tokens_total", "Total LLM tokens used", ["tenant", "model"])
++REQ_COUNTER = Counter("llm_requests_total", "Total LLM requests", ["tenant", "model"])
++LATENCY = Histogram("llm_request_latency_seconds", "LLM latency", ["model"])
++INFLIGHT = Gauge("llm_inflight_requests", "Inflight LLM requests")
++
++app = FastAPI(title="Aegis LLM Serving")
++cache = LLMCache(redis_client)
++
++class GenerateRequest(BaseModel):
++    model: str
++    prompt: str
++    max_tokens: int = 256
++    tenant: str
++    temperature: Optional[float] = 0.2
++    stream: Optional[bool] = False
++
++def token_bucket_allow(tenant: str, tokens: int) -> bool:
++    """
++    Simple token-bucket: key per tenant in Redis with refill rate configured via env.
++    """
++    key = f"quota:{tenant}"
++    bucket = redis_client.get(key)
++    if bucket is None:
++        # initialize a generous bucket for staging; operator must set realistic quotas
++        capacity = int(os.environ.get("QUOTA_CAPACITY", "100000"))
++        redis_client.set(key, capacity, nx=True)
++        bucket = capacity
++    bucket = int(redis_client.get(key) or 0)
++    if bucket < tokens:
++        return False
++    # decrement atomically
++    redis_client.decrby(key, tokens)
++    return True
++
++@backoff.on_exception(backoff.expo, (httpx.RequestError, httpx.HTTPStatusError), max_tries=3, jitter=backoff.full_jitter)
++def call_hosted_provider(payload: dict, api_key: str, provider_url: str):
++    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
++    r = httpx.post(provider_url, json=payload, headers=headers, timeout=30.0)
++    r.raise_for_status()
++    return r.json()
++
++@app.post("/v1/generate")
++async def generate(req: GenerateRequest, request: Request):
++    tenant = req.tenant
++    model = req.model
++    cache_key = f"{tenant}:{model}:{hash(req.prompt)}:{req.max_tokens}:{req.temperature}"
++    # Check cache
++    cached = cache.get(cache_key)
++    if cached:
++        index_request("llm", tenant, model, req.prompt, cached, cached.get("usage", {}), cached=True)
++        return cached
++
++    # Quota enforcement: estimate tokens == max_tokens for simplicity
++    tokens = int(req.max_tokens)
++    if not token_bucket_allow(tenant, tokens):
++        raise HTTPException(status_code=429, detail="Quota exceeded")
++
++    # choose provider: local or hosted via config
++    provider_type = os.environ.get("LLM_PROVIDER_TYPE", "hosted")  # "hosted" or "local"
++    resp_json = None
++    INFLIGHT.inc()
++    start = time.time()
++    try:
++        if provider_type == "hosted":
++            # fetch API key from Vault per model
++            api_key = get_secret(f"llm/keys/{model}") or os.environ.get("OPENAI_API_KEY")
++            provider_url = os.environ.get("LLM_HOSTED_URL", "https://api.openai.com/v1/completions")
++            payload = {"model": model, "prompt": req.prompt, "max_tokens": req.max_tokens
+

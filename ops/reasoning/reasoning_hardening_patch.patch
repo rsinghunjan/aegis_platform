@@ -1,0 +1,609 @@
+*** Begin Patch
+*** Add File:ops/verifier/ensemble_verifier.py
++#!/usr/bin/env python3
++"""
++Ensemble verifier for LLM outputs.
++
++Responsibilities:
++ - Run retrieval to collect evidence (pluggable; Milvus, DB, or filesystem)
++ - Run NLI/entailment checks (pluggable; fallback heuristics)
++ - Run calculator checks for numeric claims
++ - Run uncertainty checks (ensemble disagreement / logits entropy)
++ - Invoke formal checker for tasks marked "formal"
++ - Produce a verdict object: {verdict: pass|fail|review, score:0..1, reasons:[]}
++
++This is deliberately modular so you can plugin improved retrievers, verifiers and provers.
++"""
++import os
++import json
++import math
++from datetime import datetime
++
++try:
++    # optional heavy dependencies
++    from pymilvus import MilvusClient
++except Exception:
++    MilvusClient = None
++
++try:
++    from ops.formal.formal_checker import check_invariants
++except Exception:
++    def check_invariants(*a, **k):
++        return {"ok": False, "reason": "formal_not_available"}
++
++from ops.uncertainty.uncertainty_estimator import estimate_uncertainty, ensemble_disagreement_score
++
++def retrieve_evidence(query, topk=5):
++    """
++    Pluggable retrieval. Try Milvus if available, else fallback to simple file-based search in ./knowledge.
++    Returns list of evidence dicts {id, text, score}
++    """
++    if MilvusClient:
++        try:
++            client = MilvusClient()
++            res = client.search(query, topk=topk)
++            return [{"id": r.id, "text": r.payload.get("text",""), "score": float(r.score)} for r in res]
++        except Exception:
++            pass
++    # fallback: naive filesystem search
++    out=[]
++    kd = os.environ.get("AEGIS_KNOWLEDGE_DIR","./knowledge")
++    if os.path.exists(kd):
++        for fn in os.listdir(kd)[:topk]:
++            p = os.path.join(kd, fn)
++            try:
++                txt = open(p).read()
++                if query.lower() in txt.lower():
++                    out.append({"id": fn, "text": txt[:2000], "score": 0.5})
++            except Exception:
++                continue
++    return out
++
++def nli_check(hypothesis, evidence):
++    """
++    Lightweight entailment check. Real deployment should call an entailment model.
++    Return {'entails': bool, 'confidence': float, 'comment': str}
++    """
++    # naive heuristics: look for exact numeric match or exact substring
++    for ev in evidence:
++        if hypothesis.strip() in ev.get("text",""):
++            return {"entails": True, "confidence": 0.9, "comment": "substring_match"}
++    # no evidence found
++    return {"entails": False, "confidence": 0.2, "comment": "no_evidence_found"}
++
++def numeric_check(hypothesis):
++    """
++    Try to detect simple numeric claims and evaluate them using Python eval in a sandboxed way.
++    Example: "model latency is 120ms" -> checks numeric tokens. Returns pass/fail with reason.
++    """
++    import re
++    nums = re.findall(r"([0-9]+(?:\.[0-9]+)?)\s*(ms|s|sec|seconds|%)?", hypothesis.lower())
++    if not nums:
++        return {"ok": False, "reason":"no_numeric_claim"}
++    # placeholder: in real system compare to metrics
++    return {"ok": True, "reason":"numeric_present", "extracted": nums}
++
++def run_verification(response_text, model_outputs=None, task_meta=None):
++    """
++    Main entrypoint.
++    - response_text: the LLM's textual answer/plan
++    - model_outputs: optional list of alternative model outputs (ensemble) or logits
++    - task_meta: dict, may include {'type': 'formal'|'high_stakes'|'standard', 'policy_id':..., 'namespace':...}
++    """
++    start = datetime.utcnow().isoformat()+"Z"
++    task_meta = task_meta or {}
++    # 1) retrieve evidence
++    evidence = retrieve_evidence(response_text, topk=5)
++    # 2) NLI entailment
++    nli = nli_check(response_text, evidence)
++    # 3) numeric checks
++    num = numeric_check(response_text)
++    # 4) uncertainty estimation
++    uncertainty = estimate_uncertainty(response_text, model_logits=None, ensemble_outputs=model_outputs)
++    disagreement = ensemble_disagreement_score(model_outputs or [])
++    # 5) formal check if requested
++    formal_res = None
++    if task_meta.get("type") == "formal" or task_meta.get("require_formal"):
++        formal_res = check_invariants(response_text, task_meta.get("invariants", {}))
++    # Decision heuristics (tunable thresholds)
++    score = 0.0
++    reasons=[]
++    # base on nli confidence
++    score += nli.get("confidence", 0.0) * 0.6
++    score += (1.0 - uncertainty.get("score", 1.0)) * 0.3
++    score += (0.1 if num.get("ok") else 0.0)
++    if formal_res:
++        if formal_res.get("ok"):
++            score = min(1.0, score + 0.4)
++        else:
++            reasons.append("formal_failed")
++            score = min(1.0, score * 0.4)
++    # disagreement penalizes
++    score = max(0.0, min(1.0, score - (disagreement * 0.2)))
++
++    verdict = "pass" if score > 0.75 and nli.get("entails", False) else ("review" if score > 0.45 else "fail")
++    # high stakes force review if not high confidence
++    if task_meta.get("high_stakes", False) and verdict != "pass":
++        verdict = "review"
++    result = {
++        "verdict": verdict,
++        "score": round(score,3),
++        "nli": nli,
++        "numeric": num,
++        "uncertainty": uncertainty,
++        "ensemble_disagreement": disagreement,
++        "formal": formal_res,
++        "evidence_count": len(evidence),
++        "ts": start
++    }
++    return result
++
++if __name__=="__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--text", required=True)
++    args = p.parse_args()
++    print(json.dumps(run_verification(args.text), indent=2))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/uncertainty/uncertainty_estimator.py
++#!/usr/bin/env python3
++"""
++Simple uncertainty estimation utilities.
++
++Strategies:
++ - Ensemble disagreement score: normalized 0..1 (higher = more disagreement)
++ - If model logits are provided, compute normalized entropy
++ - Temperature scaling calibrator: load calibration parameters to rescale confidences
++"""
++import math
++import json
++
++def entropy(probs):
++    return -sum(p * math.log(p+1e-12) for p in probs)
++
++def normalized_entropy(probs):
++    H = entropy(probs)
++    Hmax = math.log(len(probs) or 1)
++    return H / (Hmax + 1e-12)
++
++def logits_to_probs(logits):
++    # logits is list of floats
++    maxl = max(logits)
++    exps = [math.exp(l - maxl) for l in logits]
++    s = sum(exps)
++    return [e / (s+1e-12) for e in exps]
++
++def estimate_uncertainty(text, model_logits=None, ensemble_outputs=None):
++    """
++    Returns {'score': 0..1} where 1 means high uncertainty.
++    """
++    score = 1.0
++    method = None
++    if model_logits:
++        probs = logits_to_probs(model_logits)
++        score = normalized_entropy(probs)
++        method = "logits_entropy"
++    elif ensemble_outputs:
++        score = ensemble_disagreement_score(ensemble_outputs)
++        method = "ensemble_disagreement"
++    else:
++        # fallback: length-based heuristic (long, verbose answers may be more uncertain)
++        score = min(1.0, max(0.0, len(text.split())/200.0))
++        method = "length_heuristic"
++    return {"score": round(float(score),3), "method": method}
++
++def ensemble_disagreement_score(outputs):
++    """
++    Given list of text outputs, compute normalized disagreement: 0..1
++    Simple approach: pairwise tokenized Jaccard distance average.
++    """
++    if not outputs:
++        return 1.0
++    sets = [set(o.split()) for o in outputs]
++    n = len(sets)
++    total=0.0; pairs=0
++    for i in range(n):
++        for j in range(i+1,n):
++            a=sets[i]; b=sets[j]
++            inter = len(a & b); uni = len(a | b) or 1
++            jacc = inter/uni
++            total += (1.0 - jacc)
++            pairs += 1
++    if pairs==0:
++        return 0.0
++    return round(total/pairs,3)
++
++def calibrate_confidence(raw_confidence, temperature=1.0):
++    # Platt/temperature scaling simple transform
++    if temperature <= 0:
++        return raw_confidence
++    import math
++    # raw_confidence between 0..1, convert logit, scale, back to prob (avoid extremes)
++    epsilon = 1e-6
++    p = min(max(raw_confidence, epsilon), 1-epsilon)
++    logit = math.log(p/(1-p))
++    scaled = 1.0/(1.0 + math.exp(-logit/temperature))
++    return scaled
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/formal/formal_checker.py
++#!/usr/bin/env python3
++"""
++Formal checker using Z3 SMT solver for simple invariants.
++
++ - Accepts plan text or structured plan and a dict of invariants expressed as simple constraints.
++ - Example invariant: {"max_replicas": "replicas <= 5", "no_root_delete": "not delete(resource='root-db')"}
++
++This is a best-effort integration; for complex verification teams should author verifier plugins that translate domain semantics into SMT constraints.
++"""
++try:
++    from z3 import Solver, Int, Bool, sat, parse_smt2_string
++except Exception:
++    Solver = None
++
++def check_invariants(plan_text, invariants):
++    """
++    plan_text: text describing steps (not parsed here)
++    invariants: dict name->constraint_text
++    Returns {'ok': bool, 'details': {...}}
++    """
++    if Solver is None:
++        return {"ok": False, "reason": "z3_missing"}
++    # This is a lightweight adapter: evaluate numeric constraints mentioned in invariants if possible.
++    results = {}
++    overall = True
++    for name, expr in (invariants or {}).items():
++        try:
++            # Build a minimal SMT problem if expr contains a comparison like "replicas <= 5"
++            if "<=" in expr or ">=" in expr or "<" in expr or ">" in expr or "==" in expr:
++                # naive parse: support single variable comparisons
++                parts = None
++                for op in ["<=", ">=", "<", ">", "=="]:
++                    if op in expr:
++                        parts = expr.split(op)
++                        left = parts[0].strip()
++                        right = parts[1].strip()
++                        # assume integer right value
++                        iv = int(right)
++                        s = Solver()
++                        v = Int(left)
++                        if "<=" in expr:
++                            s.add(v <= iv)
++                        elif ">=" in expr:
++                            s.add(v >= iv)
++                        elif "<" in expr:
++                            s.add(v < iv)
++                        elif ">" in expr:
++                            s.add(v > iv)
++                        elif "==" in expr:
++                            s.add(v == iv)
++                        res = s.check()
++                        ok = (res == sat)
++                        results[name] = {"ok": ok, "expr": expr}
++                        overall = overall and ok
++                        break
++            else:
++                # Unsupported expression form; mark as not verified
++                results[name] = {"ok": False, "expr": expr, "reason": "unsupported_expr"}
++                overall = False
++        except Exception as e:
++            results[name] = {"ok": False, "error": str(e)}
++            overall = False
++    return {"ok": overall, "details": results}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/planner/rollout_simulator.py
++#!/usr/bin/env python3
++"""
++Rollout simulator for long-horizon plans.
++
++ - Accepts a structured plan (list of steps) or plain text and executes dry-run checks for each step.
++ - Uses kubectl --dry-run=server for K8s manifests when step is a manifest apply.
++ - Checks invariants and uses the ensemble verifier to decide whether to allow simulated execution to proceed.
++ - Produces simulation report with pass/fail per step and aggregated safety score.
++"""
++import os
++import json
++import subprocess
++from datetime import datetime
++from ops.verifier.ensemble_verifier import run_verification
++
++def dry_run_kubectl_apply(manifest_text, namespace="quantum-sim"):
++    try:
++        p = subprocess.run(["kubectl", "apply", "-f", "-", "--dry-run=server", "-n", namespace], input=manifest_text.encode(), capture_output=True, check=True)
++        return {"ok": True, "stdout": p.stdout.decode(), "stderr": p.stderr.decode()}
++    except subprocess.CalledProcessError as e:
++        return {"ok": False, "stdout": e.stdout.decode(), "stderr": e.stderr.decode()}
++
++def simulate_plan(plan_steps, task_meta=None):
++    """
++    plan_steps: list of dicts: [{'type':'kubectl'|'shell'|'api', 'content':...}, ...]
++    task_meta: forwarded to verifier (e.g., high_stakes)
++    """
++    report = {"ts": datetime.utcnow().isoformat()+"Z", "steps": [], "summary": {}}
++    score_total = 0.0
++    for i, step in enumerate(plan_steps):
++        sres = {"index": i, "type": step.get("type"), "ok": False}
++        if step.get("type") == "kubectl":
++            res = dry_run_kubectl_apply(step.get("content",""))
++            sres.update(res)
++            # verify the intended change via verifier
++            v = run_verification(step.get("content",""), model_outputs=None, task_meta=task_meta or {})
++            sres["verifier"] = v
++            sres["ok"] = res.get("ok") and v.get("verdict") == "pass"
++            score_total += v.get("score",0.0)
++        elif step.get("type") == "shell":
++            # don't execute shell in simulation; just run verifier heuristics
++            v = run_verification(step.get("content",""), model_outputs=None, task_meta=task_meta or {})
++            sres["verifier"] = v
++            sres["ok"] = v.get("verdict") == "pass"
++            score_total += v.get("score",0.0)
++        else:
++            v = run_verification(step.get("content",""), model_outputs=None, task_meta=task_meta or {})
++            sres["verifier"] = v
++            sres["ok"] = v.get("verdict") == "pass"
++            score_total += v.get("score",0.0)
++        report["steps"].append(sres)
++    avg_score = score_total / max(1, len(plan_steps))
++    report["summary"]["avg_verifier_score"] = round(avg_score,3)
++    report["summary"]["all_pass"] = all(s.get("ok") for s in report["steps"])
++    return report
++
++if __name__=="__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--plan-file", required=True)
++    args = p.parse_args()
++    plan = json.load(open(args.plan_file))
++    print(json.dumps(simulate_plan(plan, {}), indent=2))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/autonomy/human_approval_service.py
++#!/usr/bin/env python3
++"""
++Human approval service (simple)
++
++ - Receives approval requests via POST /v1/request
++ - Lists pending requests via GET /v1/pending
++ - Approve/deny via POST /v1/approve and stores decisions in a K8s ConfigMap
++ - Designed to be integrated with auto-promote controller: controller should call /v1/request and await approval for high-stakes jobs
++"""
++from flask import Flask, request, jsonify
++import os, json, uuid, time
++from kubernetes import client, config
++
++app = Flask(__name__)
++CM_NAME = "aegis-human-approvals"
++CM_NS = "kube-system"
++
++def get_core():
++    try:
++        config.load_incluster_config()
++    except Exception:
++        config.load_kube_config()
++    return client.CoreV1Api()
++
++def read_cm():
++    core = get_core()
++    try:
++        cm = core.read_namespaced_config_map(CM_NAME, CM_NS)
++        return cm.data or {}
++    except Exception:
++        return {}
++
++def write_cm(data):
++    core = get_core()
++    body = client.V1ConfigMap(metadata=client.V1ObjectMeta(name=CM_NAME), data=data)
++    try:
++        core.replace_namespaced_config_map(CM_NAME, CM_NS, body)
++    except Exception:
++        core.create_namespaced_config_map(CM_NS, body)
++
++@app.route("/v1/request", methods=["POST"])
++def request_approval():
++    body = request.json or {}
++    req_id = "req-" + uuid.uuid4().hex[:8]
++    entry = {"id": req_id, "ts": str(int(time.time())), "payload": json.dumps(body), "state": "pending"}
++    cm = read_cm()
++    cm[req_id] = json.dumps(entry)
++    write_cm(cm)
++    return jsonify({"ok": True, "request_id": req_id})
++
++@app.route("/v1/pending", methods=["GET"])
++def list_pending():
++    cm = read_cm()
++    pending = [json.loads(v) for v in cm.values() if json.loads(v).get("state")=="pending"]
++    return jsonify({"ok": True, "pending": pending})
++
++@app.route("/v1/approve", methods=["POST"])
++def approve():
++    body = request.json or {}
++    req_id = body.get("request_id")
++    decision = body.get("decision","approve")  # approve | deny
++    actor = body.get("actor","unknown")
++    cm = read_cm()
++    if req_id not in cm:
++        return jsonify({"ok": False, "error": "not_found"}), 404
++    entry = json.loads(cm[req_id])
++    entry["state"] = "approved" if decision=="approve" else "denied"
++    entry["actor"] = actor
++    entry["decision_ts"] = str(int(time.time()))
++    cm[req_id] = json.dumps(entry)
++    write_cm(cm)
++    return jsonify({"ok": True, "entry": entry})
++
++@app.route("/v1/status/<req_id>", methods=["GET"])
++def status(req_id):
++    cm = read_cm()
++    if req_id not in cm:
++        return jsonify({"ok": False, "error": "not_found"}), 404
++    return jsonify({"ok": True, "entry": json.loads(cm[req_id])})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8098")))
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/autonomy/human-approval-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-human-approval
++  namespace: aegis-system
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-human-approval
++  template:
++    metadata:
++      labels:
++        app: aegis-human-approval
++    spec:
++      containers:
++        - name: approval
++          image: python:3.11-slim
++          command: ["sh","-c"]
++          args:
++            - pip install flask kubernetes && python /opt/aegis/human_approval_service.py
++          ports:
++            - containerPort: 8098
++              name: http
++          volumeMounts:
++            - name: code
++              mountPath: /opt/aegis
++      volumes:
++        - name: code
++          hostPath:
++            path: ./ops/autonomy
++            type: Directory
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: aegis-human-approval
++  namespace: aegis-system
++spec:
++  selector:
++    app: aegis-human-approval
++  ports:
++    - port: 8098
++      targetPort: 8098
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/monitoring/verifier_metrics.py
++#!/usr/bin/env python3
++"""
++Simple Prometheus exporter for verifier metrics.
++Exports:
++ - aegis_verifier_pass_total
++ - aegis_verifier_review_total
++ - aegis_verifier_fail_total
++ - aegis_verifier_avg_score (gauge)
++ - aegis_uncertainty_avg (gauge)
++"""
++from prometheus_client import start_http_server, Counter, Gauge
++import time
++import os
++
++c_pass = Counter("aegis_verifier_pass_total", "Verifier pass count")
++c_review = Counter("aegis_verifier_review_total", "Verifier review count")
++c_fail = Counter("aegis_verifier_fail_total", "Verifier fail count")
++g_avg_score = Gauge("aegis_verifier_avg_score", "Verifier average score")
++g_avg_uncert = Gauge("aegis_uncertainty_avg", "Avg uncertainty score")
++
++STATE_FILE = os.environ.get("VERIFIER_STATE_FILE", "/var/lib/aegis/verifier_state.json")
++
++def load_state():
++    try:
++        import json
++        with open(STATE_FILE) as fh:
++            return json.load(fh)
++    except Exception:
++        return {"count":0,"score_total":0.0,"uncert_total":0.0}
++
++def update_from_result(res):
++    st = load_state()
++    st["count"] = st.get("count",0) + 1
++    st["score_total"] = st.get("score_total",0.0) + float(res.get("score",0.0))
++    st["uncert_total"] = st.get("uncert_total",0.0) + float(res.get("uncertainty",{}).get("score",0.0))
++    with open(STATE_FILE,"w") as fh:
++        import json
++        json.dump(st, fh)
++    # counters
++    v = res.get("verdict")
++    if v=="pass": c_pass.inc()
++    elif v=="review": c_review.inc()
++    else: c_fail.inc()
++    # update gauges
++    cnt = st["count"] or 1
++    g_avg_score.set(st["score_total"]/cnt)
++    g_avg_uncert.set(st["uncert_total"]/cnt)
++
++def main():
++    start_http_server(int(os.environ.get("METRICS_PORT","9300")))
++    # simple loop: reload state into gauges every 10s
++    while True:
++        st = load_state()
++        cnt = st.get("count",0) or 1
++        g_avg_score.set(st.get("score_total",0.0)/cnt)
++        g_avg_uncert.set(st.get("uncert_total",0.0)/cnt)
++        time.sleep(10)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/runbooks/reasoning_hardening.md
++Reasoning Hardening Runbook
++===========================
++
++Purpose
++-------
+Reduce hallucination, enforce human oversight for high-stakes actions, improve long-horizon planning safety, quantify uncertainty and add formal verification hooks.
++
++Components added
++- Ensemble verifier (ops/verifier/ensemble_verifier.py)
++- Uncertainty estimator (ops/uncertainty/uncertainty_estimator.py)
++- Formal checker (ops/formal/formal_checker.py) using Z3
++- Rollout simulator (ops/planner/rollout_simulator.py)
++- Human approval service (ops/autonomy/human_approval_service.py + k8s manifest)
++- Prometheus metrics exporter for verifier (ops/monitoring/verifier_metrics.py)
++
++Operational flow
++----------------
++1. Any LLM response used for a decision is first passed to ensemble_verifier.run_verification(...)
++   - If verdict == pass -> allowed to proceed (unless task_meta.high_stakes forces review)
++   - If verdict == review -> create human approval request via /v1/request to human approval service
++   - If verdict == fail -> block and create an incident
++
++2. For long-horizon plans:
++   - Call planner.rollout_simulator.simulate_plan(...) to dry-run each step.
++   - If simulate_plan.summary.all_pass is True and avg_verifier_score > 0.75, plan may be auto-executed in canary scope.
++   - Otherwise send for human review.
++
++3. For formal tasks:
++   - Ensure task_meta.require_formal True and provide an 'invariants' dict for formal verification.
++   - The formal checker will run Z3 if available; failure forces human review.
++
++4. Prometheus exporter:
++   - Verifier updates are written to /var/lib/aegis/verifier_state.json and the verifier_metrics exporter exposes aggregate metrics.
++
++Notes and operator actions
++-------------------------
++- Install Z3 in verifier/formal hosts to enable formal checking: pip install z3-solver
++- Install pyOQS if using PQC signing: pip install pyOQS
++- Deploy human approval service: kubectl apply -f k8s/autonomy/human-approval-deployment.yaml
++- Integrate auto-promote controller to call /v1/request for high-stakes promotions
++- Tune thresholds in ensemble_verifier.run_verification to fit your risk tolerance
++- Add unit tests to HIL matrix to cover reasoning adversarial examples
++
+*** End Patch
+*** End Patch

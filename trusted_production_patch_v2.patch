@@ -1,0 +1,544 @@
+*** Begin Patch
+*** Add File: k8s/cron/enforce_snapshot_signing_cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: aegis-enforce-snapshot-signing
++  namespace: aegis
++spec:
++  schedule: "*/30 * * * *" # every 30 minutes
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          containers:
++            - name: enforce-sign
++              image: python:3.10-slim
++              env:
++                - name: SNAPSHOT_LIST_S3_PREFIX
++                  value: "s3://aegis-carbon-snapshots/snapshots/"
++                - name: REKOR_SERVER
++                  valueFrom:
++                    secretKeyRef:
++                      name: aegis-rekor
++                      key: server
++                - name: SNAPSHOT_SERVICE_URL
++                  value: "http://snapshot-service.aegis.svc:8085/register"
++              command: ["/bin/sh","-c"]
++              args:
++                - pip install awscli rekor-cli requests >/dev/null 2>&1 || true; python /opt/scripts/enforce_snapshots.py
++              volumeMounts:
++                - name: scripts
++                  mountPath: /opt/scripts
++          restartPolicy: OnFailure
++          volumes:
++            - name: scripts
++              configMap:
++                name: aegis-carbon-scripts
++
+*** End Patch
+*** Begin Patch
+*** Add File: carbon/enforce_snapshots.py
++#!/usr/bin/env python3
++"""
++Enforce that recent carbon snapshots have Rekor entries and are registered in the snapshot_service.
++ - Downloads recent snapshot list (operator-provided) or enumerates S3 prefix
++ - For each snapshot ensures that Rekor contains an entry (best-effort)
++ - If Rekor missing, writes a marker to /tmp/aegis_snapshot_issues.json and notifies operator via optional webhook
++"""
++import os, subprocess, json, boto3, requests
++from urllib.parse import urlparse
++
++S3_PREFIX = os.environ.get("SNAPSHOT_LIST_S3_PREFIX")
++REKOR_SERVER = os.environ.get("REKOR_SERVER", "")
++SNAPSHOT_SERVICE = os.environ.get("SNAPSHOT_SERVICE_URL", "http://snapshot-service.aegis.svc:8085/register")
++NOTIFY_WEBHOOK = os.environ.get("OPERATOR_NOTIFY_WEBHOOK")
++
++def list_snapshots_s3(prefix):
++    s3 = boto3.client("s3")
++    u = urlparse(prefix)
++    bucket = u.netloc
++    pfx = u.path.lstrip("/")
++    res = s3.list_objects_v2(Bucket=bucket, Prefix=pfx)
++    items = []
++    for o in res.get("Contents", []):
++        items.append(f"s3://{bucket}/{o['Key']}")
++    return items
++
++def has_rekor_entry(local_path):
++    if not REKOR_SERVER:
++        return False
++    try:
++        out = subprocess.check_output(["rekor-cli", "search", "--rekor_server", REKOR_SERVER, "--artifact", local_path], stderr=subprocess.DEVNULL)
++        return bool(out.strip())
++    except Exception:
++        return False
++
++def download_s3(path, dst):
++    subprocess.check_call(["aws", "s3", "cp", path, dst])
++
++def main():
++    snapshots = []
++    if S3_PREFIX:
++        snapshots = list_snapshots_s3(S3_PREFIX)
++    issues = []
++    for s in snapshots[-20:]:
++        try:
++            local = "/tmp/" + os.path.basename(s)
++            download_s3(s, local)
++            if not has_rekor_entry(local):
++                issues.append({"snapshot": s, "reason": "missing_rekor"})
++            else:
++                # ensure registered
++                r = requests.get(SNAPSHOT_SERVICE + "/latest", timeout=5)
++                # best effort; operator can reconcile
++        except Exception as e:
++            issues.append({"snapshot": s, "reason": str(e)})
++    if issues:
++        open("/tmp/aegis_snapshot_issues.json","w").write(json.dumps(issues, indent=2))
++        if NOTIFY_WEBHOOK:
++            try:
++                requests.post(NOTIFY_WEBHOOK, json={"issues": issues}, timeout=5)
++            except Exception:
++                pass
++    print("Enforce snapshot done; issues:", len(issues))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: admission/require_signed_snapshot.py
++#!/usr/bin/env python3
++"""
++Admission pre-check: ensure the system has a recent signed carbon snapshot and uses it.
++This small utility is intended to be called by the scheduler prior to making placement decisions.
++It queries snapshot_service /latest and rejects if Rekor evidence missing or snapshot age > threshold.
++"""
++import os, requests, sys
++from datetime import datetime, timezone, timedelta
++
++SNAPSHOT_SERVICE = os.environ.get("SNAPSHOT_SERVICE_URL", "http://snapshot-service.aegis.svc:8085/latest")
++MAX_AGE_MIN = int(os.environ.get("SNAPSHOT_MAX_AGE_MIN", "60"))
++
++def check_latest():
++    r = requests.get(SNAPSHOT_SERVICE, timeout=5)
++    if r.status_code != 200:
++        print("No snapshot available"); return False, "no_snapshot"
++    j = r.json()
++    if not j.get("rekor_entry"):
++        return False, "no_rekor"
++    ts = j.get("created_at")
++    if not ts:
++        return False, "no_ts"
++    t = datetime.fromisoformat(ts)
++    if datetime.now(timezone.utc) - t > timedelta(minutes=MAX_AGE_MIN):
++        return False, "snapshot_too_old"
++    return True, j
++
++if __name__=="__main__":
++    ok, info = check_latest()
++    if not ok:
++        print("Snapshot check failed:", info); sys.exit(2)
++    print("Snapshot ok:", info)
++
+*** End Patch
+*** Begin Patch
+*** Add File: device/device_registry_api.py
++#!/usr/bin/env python3
++"""
++Device registry API for registering PDUs/IPMI devices and mapping jobs -> devices.
++Provides:
++ - POST /devices to register device metadata
++ - POST /map to map job->device
++ - GET /coverage to report device mapping coverage statistics
++"""
++from flask import Flask, request, jsonify
++from device.device_registry import register_device, map_job_device, get_device_for_job
++from sqlalchemy import create_engine, text
++import os
++
++DB_URL = os.environ.get("DATABASE_URL", "sqlite:///./device_registry.db")
++engine = create_engine(DB_URL)
++app = Flask("device-registry-api")
++
++@app.route("/devices", methods=["POST"])
++def devices():
++    j = request.json or {}
++    device_id = j.get("device_id")
++    meta = j.get("meta", {})
++    if not device_id:
++        return jsonify({"error":"device_id required"}), 400
++    register_device(device_id, meta)
++    return jsonify({"ok": True})
++
++@app.route("/map", methods=["POST"])
++def map_job():
++    j = request.json or {}
++    job = j.get("job_id"); device = j.get("device_id")
++    if not job or not device:
++        return jsonify({"error":"job_id and device_id required"}), 400
++    map_job_device(job, device)
++    return jsonify({"ok": True})
++
++@app.route("/coverage", methods=["GET"])
++def coverage():
++    # quick coverage metric: percent of recent jobs with device mapping (simple prototype)
++    with engine.connect() as conn:
++        total = conn.execute(text("SELECT count(*) FROM job_ledger")).scalar() or 0
++        mapped = conn.execute(text("SELECT count(*) FROM job_device_map")).scalar() or 0
++    pct = (mapped/total*100.0) if total>0 else 0.0
++    return jsonify({"total_jobs": total, "mapped_jobs": mapped, "coverage_pct": pct})
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8123")))
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/daemonset/pdu_exporter_daemonset.yaml
++apiVersion: apps/v1
++kind: DaemonSet
++metadata:
++  name: aegis-pdu-exporter
++  namespace: aegis
++spec:
++  selector:
++    matchLabels:
++      app: aegis-pdu-exporter
++  template:
++    metadata:
++      labels:
++        app: aegis-pdu-exporter
++    spec:
++      serviceAccountName: edge-metrics
++      containers:
++        - name: pdu-exporter
++          image: aegis/pdu-exporter:latest
++          args: ["--mapping-file=/etc/aegis/device_mapping.json"]
++          volumeMounts:
++            - name: mapping
++              mountPath: /etc/aegis
++      volumes:
++        - name: mapping
++          configMap:
++            name: aegis-device-mapping
++
+*** End Patch
+*** Begin Patch
+*** Add File: telemetry/calibration_validation_job.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: aegis-calibration-validate
++  namespace: aegis
++spec:
++  template:
++    spec:
++      containers:
++        - name: calib
++          image: python:3.10-slim
++          command: ["/bin/sh","-c"]
++          args:
++            - pip install requests >/dev/null 2>&1 || true; python /opt/scripts/calibrate_and_validate.py
++          volumeMounts:
++            - name: scripts
++              mountPath: /opt/scripts
++      restartPolicy: OnFailure
++      volumes:
++        - name: scripts
++          configMap:
++            name: aegis-calibration-scripts
++
+*** End Patch
+*** Begin Patch
+*** Add File: telemetry/calibrate_and_validate.py
++#!/usr/bin/env python3
++"""
++K8s job script to run calibration samples for a set of devices, compute basic stats,
++store profiles and upload a validation report to the compliance bucket.
++"""
++import json, os, subprocess, statistics, boto3
++DEVICES = os.environ.get("CALIB_DEVICES", "device-1,device-2").split(",")
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++REPORT="/tmp/calibration_report.json"
++
++def collect_sample(device):
++    # operator must ensure exporter writes sample file per device at /tmp/{device}_power_samples.jsonl
++    f = f"/tmp/{device}_power_samples.jsonl"
++    if not os.path.exists(f):
++        return []
++    lines = open(f).read().splitlines()
++    vals = [json.loads(l).get("w") for l in lines if l]
++    return vals[-100:]
++
++report = {"devices":{}}
++for d in DEVICES:
++    samples = collect_sample(d)
++    if not samples:
++        report["devices"][d] = {"error":"no_samples"}
++        continue
++    report["devices"][d] = {"count": len(samples), "median": statistics.median(samples), "mean": statistics.mean(samples), "stdev": statistics.pstdev(samples)}
++open(REPORT,"w").write(json.dumps(report, indent=2))
++if COMPLIANCE_BUCKET:
++    s3 = boto3.client("s3")
++    key = f"calibration_reports/{os.path.basename(REPORT)}"
++    s3.upload_file(REPORT, COMPLIANCE_BUCKET, key)
++    print("Uploaded", key)
++print("Wrote report", REPORT)
++
+*** End Patch
+*** Begin Patch
+*** Add File: forecast/prophet_monitor.py
++#!/usr/bin/env python3
++"""
++Monitor Prophet model performance, compute backtest MAE and upload metrics to compliance bucket.
++This script is meant to run as a scheduled job after retrain.
++"""
++import os, json, boto3
++from forecast.prophet_pipeline import train_and_backtest
++
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++
++def main():
++    regions = os.environ.get("MONITOR_REGIONS", "US,EU").split(",")
++    summary = {}
++    for r in regions:
++        try:
++            res = train_and_backtest(r)
++            if not res:
++                summary[r] = {"error": "no_history"}
++            else:
++                summary[r] = {"mae": res["mae"]}
++        except Exception as e:
++            summary[r] = {"error": str(e)}
++    out = "/tmp/prophet_monitor.json"
++    open(out,"w").write(json.dumps(summary, indent=2))
++    if COMPLIANCE_BUCKET:
++        s3 = boto3.client("s3")
++        key = f"forecast_monitor/{os.path.basename(out)}"
++        s3.upload_file(out, COMPLIANCE_BUCKET, key)
++        print("Uploaded", key)
++    print("Monitor summary:", summary)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: scheduler/scheduler_adapter_with_admission.py
++#!/usr/bin/env python3
++"""
++Example scheduler adapter that:
++ - checks admission/production_admission_service for tenant budget and snapshot provenance
++ - attempts to reserve tokens from throttle DB before scheduling
++ - records snapshot_id and attestation_ids into admission log (audit)
++This file is a template to adapt into the real scheduler invocation path.
++"""
++import os, requests, json
++from admission.throttle_db import try_consume
++
++ADMISSION_URL = os.environ.get("ADMISSION_URL", "http://admission-prod.aegis.svc:9110/admit")
++SNAPSHOT_SERVICE = os.environ.get("SNAPSHOT_SERVICE_URL", "http://snapshot-service.aegis.svc:8085/latest")
++
++def schedule_job(job):
++    tenant = job["tenant"]
++    est_kg = job["estimated_kgco2e"]
++    # fetch latest snapshot id
++    snap = requests.get(SNAPSHOT_SERVICE, timeout=5).json()
++    snapshot_id = snap.get("id")
++    # optionally consult provider attestations (empty for now)
++    attestation_ids = job.get("attestation_ids", [])
++    # call admission
++    resp = requests.post(ADMISSION_URL, json={"tenant":tenant, "requested_kgco2e": est_kg, "mode":"soft", "snapshot_id": snapshot_id, "attestation_ids": attestation_ids}, timeout=5)
++    if resp.status_code != 200:
++        print("Admission denied or error:", resp.text); return False
++    # try token consume as soft-throttle
++    ok = try_consume(tenant, est_kg)
++    if not ok:
++        print("Throttle suggested for tenant", tenant)
++        # scheduler could queue or delay the job instead of immediate placement
++        return False
++    # proceed to schedule with provider selection logic...
++    print("Job allowed and tokens consumed; schedule now")
++    # record audit information (admission log created by service)
++    return True
++
++if __name__=="__main__":
++    # demo
++    job={"tenant":"alice","estimated_kgco2e":0.5}
++    print(schedule_job(job))
++
+*** End Patch
+*** Begin Patch
+*** Add File: experiments/ab_orchestrator.py
++#!/usr/bin/env python3
++"""
++End-to-end A/B orchestrator:
++ - computes sample size
++ - fetches experiment results from MLflow or JSON files
++ - runs evaluation and archives verdict with model_id and snapshot provenance
++ - intended to be run after experiments have finished collecting data
++"""
++import os, json, subprocess, boto3
++from experiments.sample_size import sample_size_mean
++
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++
++def upload_verdict(path, model_id):
++    if not COMPLIANCE_BUCKET:
++        return
++    s3 = boto3.client("s3")
++    key = f"ab_verdicts/{model_id}_{os.path.basename(path)}"
++    s3.upload_file(path, COMPLIANCE_BUCKET, key)
++    print("Uploaded verdict", key)
++
++def run(a_json_path, b_json_path, model_id, alpha=0.05, min_effect=0.01):
++    with open(a_json_path) as fh: A=json.load(fh)
++    with open(b_json_path) as fh: B=json.load(fh)
++    # compute suggested sample size
++    import statistics
++    std = (statistics.pstdev(A) + statistics.pstdev(B))/2 if A and B else 0.05
++    n = sample_size_mean(std, min_effect, alpha, 0.8)
++    print("Suggested per-group sample size:", n)
++    out="/tmp/ab_verdict.json"
++    subprocess.run(["python","provider/learner/evaluate_ab_results.py","--a",json.dumps(A),"--b",json.dumps(B),"--out",out], check=False)
++    if os.path.exists(out):
++        upload_verdict(out, model_id)
++
++if __name__=="__main__":
++    import argparse
++    p=argparse.ArgumentParser()
++    p.add_argument("--a"); p.add_argument("--b"); p.add_argument("--model-id")
++    args=p.parse_args()
++    run(args.a, args.b, args.model_id)
++
+*** End Patch
+*** Begin Patch
+*** Add File: compliance/control_to_evidence_expanded.yaml
++controls:
++  DATA_TRUST:
++    description: "Snapshots must be signed and Rekor-registered; snapshot_service must contain rekor_entry"
++    artifacts:
++      - carbon/ingest_and_sign_snapshot_cron.sh
++      - carbon/rekor_sign_and_register_snapshot.py
++    evidence:
++      - carbon_snapshots table records
++      - Rekor log ids and /var/log/aegis/hsm_signing.log (HSM admin)
++  SENSOR_COVERAGE:
++    description: "Exporters deployed; device registry mapping and calibration profiles"
++    artifacts:
++      - edge/pdu_exporter_full.py
++      - device/device_registry_api.py
++      - telemetry/calibrate_and_validate.py
++    evidence:
++      - device mapping records in device_registry
++      - calibration reports uploaded to COMPLIANCE_BUCKET
++  FORECASTING:
++    description: "Prophet retrain/backtest and monitor"
++    artifacts:
++      - forecast/prophet_pipeline.py
++      - forecast/prophet_monitor.py
++    evidence:
++      - backtest MAE reports in COMPLIANCE_BUCKET
++  ENFORCEMENT:
++    description: "Admission & throttle DB enforced in scheduler"
++    artifacts:
++      - admission/production_admission_service.py
++      - admission/throttle_db.py
++    evidence:
++      - admissions table entries and throttle logs
++  AB_RIGOR:
++    description: "Automated AB orchestration and archival"
++    artifacts:
++      - experiments/ab_orchestrator.py
++    evidence:
++      - archived AB verdicts in COMPLIANCE_BUCKET
++
+*** End Patch
+*** Begin Patch
+*** Add File: docs/runbooks/hsm_rotation_runbook.md
++# HSM Rotation & Signing Runbook (Operator)
++
++Purpose:
++- Perform monthly signing/rotation drill and ensure Rekor coverage for snapshots.
++
++Preconditions:
++- HSM admin host accessible via SSH (HSM_SIGN_REMOTE configured)
++- COSIGN_PKCS11_* variables known to operator and not stored in CI
++- Rekor server address configured
++
++Steps:
++1. List recent snapshots: aws s3 ls s3://aegis-carbon-snapshots/snapshots/ --recursive | tail -n 20
++2. For each snapshot run:
++   - On operator host: python carbon/rekor_sign_and_register_snapshot.py s3://aegis-carbon-snapshots/snapshots/<snapshot.json>
++   - If PKCS11 not available locally, ensure hsm/hsm_sign_snapshot_remote.sh is present on admin host and callable
++3. Verify Rekor entries: rekor-cli search --rekor_server ${REKOR_SERVER} --artifact /tmp/<snapshot.json>
++4. Upload logs to compliance bucket: aws s3 cp /var/log/aegis/hsm_signing.log s3://${COMPLIANCE_BUCKET}/hsm_logs/
++5. Record drill in audit tracker (ticket system) and attach evidence
++
++If any snapshot lacks Rekor evidence, raise incident and do not use the snapshot for enforcement until resolved.
++
+*** End Patch
+*** Begin Patch
+*** Add File: ui/showback_ui_extended.py
++#!/usr/bin/env python3
++"""
++Extended showback UI endpoints with per-decision explainability:
++ - /tenant/<tenant>/tradeoff (cost, carbon, most used snapshot)
++ - /decision/<job_id> (decision record including snapshot_id and provider attestation ids)
++ - /tenant/<tenant>/recommendation (actionable recommendations for tenant: throttle, defer, alternative provider)
++"""
++import os, json
++from flask import Flask, jsonify, request
++from sqlalchemy import create_engine, text
++from carbon.snapshot_service import snapshots as _snapshots_table # for import side-effect if DB not yet created
++
++DB_URL = os.environ.get("DATABASE_URL", "postgresql://aegis:aegis@localhost:5432/aegis")
++engine = create_engine(DB_URL, future=True)
++app = Flask("aegis-showback-ui-ext")
++
++@app.route("/tenant/<tenant>/tradeoff")
++def tradeoff(tenant):
++    with engine.connect() as conn:
++        total = conn.execute(text("SELECT COALESCE(sum(cost_usd),0) as cost, COALESCE(sum(kgco2e),0) as kg FROM job_ledger WHERE tenant=:t"), {"t":tenant}).first()
++        snap = conn.execute(text("SELECT snapshot_id, count(*) as cnt FROM admissions WHERE tenant=:t GROUP BY snapshot_id ORDER BY cnt DESC LIMIT 1"), {"t": tenant}).first()
++        return jsonify({"tenant": tenant, "total_cost": float(total.cost), "total_kg": float(total.kg), "most_used_snapshot": snap.snapshot_id if snap else None})
++
++@app.route("/decision/<job_id>")
++def decision(job_id):
++    with engine.connect() as conn:
++        row = conn.execute(text("SELECT * FROM admissions WHERE id=(SELECT max(id) FROM admissions WHERE tenant=(SELECT tenant FROM job_ledger WHERE job_id=:j LIMIT 1))"), {"j": job_id}).first()
++        if not row:
++            return jsonify({"error":"no decision found"}), 404
++        rec = dict(row._mapping)
++        # enrich with snapshot metadata
++        snap_id = rec.get("snapshot_id")
++        if snap_id:
++            snap = conn.execute(text("SELECT * FROM carbon_snapshots WHERE id=:id"), {"id": snap_id}).first()
++            rec["snapshot"] = dict(snap._mapping) if snap else None
++        return jsonify({"decision": rec})
++
++@app.route("/tenant/<tenant>/recommendation", methods=["POST"])
++def recommend(tenant):
++    # Accept payload with requested runtime & flexibility and return suggested actions
++    payload = request.json or {}
++    est_kg = payload.get("estimated_kgco2e")
++    flexible = payload.get("flexible", False)
++    # simple rule: if budget soft exceeded, recommend deferral to recommendation from forecast
++    with engine.connect() as conn:
++        row = conn.execute(text("SELECT budget_monthly_kg, used_monthly_kg FROM tenant_budgets WHERE tenant=:t"), {"t": tenant}).first()
++        if not row:
++            return jsonify({"recommendation":"no_budget_info"})
++        remaining = row.budget_monthly_kg - row.used_monthly_kg
++        if est_kg and est_kg > remaining:
++            if flexible:
++                return jsonify({"recommendation":"defer_to_low_carbon_window","details":"use prebooking API to schedule later"})
++            else:
++                return jsonify({"recommendation":"throttle_or_reduce_size","details":"consider reducing runtime or model size"})
++    return jsonify({"recommendation":"proceed"})
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8099")))
++
+*** End Patch
+*** End Patch

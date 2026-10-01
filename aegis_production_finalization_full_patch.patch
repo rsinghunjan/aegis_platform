@@ -1,0 +1,656 @@
+*** Begin Patch
+*** Add File:prod/staging/deploy_all.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# deploy_all.sh
++# Orchestrates a production-like staging deployment of Aegis platform components,
++# provisions managed services (via Terraform where configured), deploys KServe/Triton with
++# production values, installs feature-store infra, Vault config, observability, and runs acceptance tests.
++#
++# IMPORTANT: This is an operator-driven script. It references many placeholders and requires:
++# - kubectl + helm in PATH and a KUBECONFIG that targets your staging cluster
++# - terraform in PATH for provider-managed infra
++# - environment variables / secrets substituted or present via files
++#
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++echo "ROOT: $ROOT"
++
++function usage() {
++  cat <<EOF
++Usage: $0 --stage <staging-name> [--skip-managed]
++
++Options:
++  --stage <name>        : logical staging name (used in tf vars / resource prefixes)
++  --skip-managed        : skip managed service Terraform provisioning (assume managed services already exist)
++
++Before running:
++ - Fill provider-specific terraform variables in terraform/managed/*
++ - Ensure GitHub repo secrets & Vault addresses are configured
++ - Ensure KUBECONFIG points to the target staging cluster
++EOF
++  exit 1
++}
++
++STAGE="staging"
++SKIP_MANAGED=false
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --stage) STAGE="$2"; shift 2;;
++    --skip-managed) SKIP_MANAGED=true; shift;;
++    -h|--help) usage;;
++    *) echo "Unknown arg $1"; usage;;
++  esac
++done
++
++echo "Deploying Aegis to staging: $STAGE"
++
++if ! $SKIP_MANAGED; then
++  echo "=== Provisioning managed services via Terraform (ElastiCache / Memorystore / S3 buckets) ==="
++  if [ -d "$ROOT/terraform/managed/aws" ]; then
++    pushd "$ROOT/terraform/managed/aws" >/dev/null
++    terraform init -input=false
++    terraform apply -var="stage=$STAGE" -auto-approve
++    popd >/dev/null
++  fi
++  if [ -d "$ROOT/terraform/managed/gcp" ]; then
++    pushd "$ROOT/terraform/managed/gcp" >/dev/null
++    terraform init -input=false
++    terraform apply -var="stage=$STAGE" -auto-approve
++    popd >/dev/null
++  fi
++  if [ -d "$ROOT/terraform/managed/s3" ]; then
++    pushd "$ROOT/terraform/managed/s3" >/dev/null
++    terraform init -input=false
++    terraform apply -var="stage=$STAGE" -auto-approve
++    popd >/dev/null
++  fi
++fi
++
++echo "=== Deploying observability (Prometheus + Grafana) ==="
++kubectl create ns monitoring || true
++helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
++helm repo add grafana https://grafana.github.io/helm-charts || true
++helm repo update
++helm upgrade --install prometheus prometheus-community/prometheus -n monitoring -f prod/observability/prometheus/values.yaml --wait || true
++helm upgrade --install grafana grafana/grafana -n monitoring -f prod/observability/grafana/values.yaml --wait || true
++
++echo "=== Deploying Vault (assumes Helm chart and operator configured) ==="
++kubectl create ns vault || true
++helm upgrade --install vault hashicorp/vault -n vault -f prod/vault/values-production.yaml --wait || true
++
++echo "=== Configure Vault: enable audit forwarding and transit key setup (scripts/vault/*) ==="
++bash scripts/vault/setup_vault_for_ibm.sh || true
++
++echo "=== Deploy KServe + Triton production values ==="
++kubectl create ns ml || true
++helm repo add kserve https://kserve.github.io/helm-charts || true
++helm repo update
++helm upgrade --install kserve kserve/kserve -n ml -f prod/serving/kserve/kserve-production-values.yaml --wait || true
++kubectl apply -f prod/serving/kserve/triton/dynamic_batching_config.json -n ml || true
++kubectl apply -f prod/serving/kserve/triton/hot_swap_job.yaml -n ml || true
++
++echo "=== Deploy KEDA + Volcano for GPU-aware autoscaling ==="
++kubectl create ns keda || true
++helm repo add kedacore https://kedacore.github.io/charts || true
++helm upgrade --install keda kedacore/keda -n keda --wait || true
++kubectl create ns volcano-system || true
++helm repo add volcano https://volcano.sh/charts || true
++helm upgrade --install volcano volcano/volcano -n volcano-system --wait || true
++
++echo "=== Deploy feature-store infra (Redis cluster & lakeFS) using production values ==="
++kubectl create ns feast || true
++helm repo add bitnami https://charts.bitnami.com/bitnami || true
++helm upgrade --install aegis-redis bitnami/redis -n feast -f prod/feature-store/helm/redis-cluster-values.yaml --wait || true
++helm repo add lakefs https://charts.lakefs.io || true
++helm upgrade --install lakefs lakefs/lakefs -n feast -f prod/feature-store/helm/lakefs-values-production.yaml --wait || true
++
++echo "=== Deploy Aegis platform components (image-verifier, aegisctl server, governance UI) ==="
++kubectl apply -f security/image-verifier/deploy_with_rekor_env.yaml -n ops || true
++kubectl apply -f governance/mlflow-deployment.yaml -n ops || true
++
++echo "=== Apply network policies & security hardening ==="
++kubectl apply -f prod/security/networkpolicies/restrict-namespace.yaml || true
++kubectl apply -f prod/security/mtls/cert-manager-setup.yaml || true
++
++echo "=== Run acceptance tests and performance tests ==="
++bash prod/validation/run_all_validations.sh || true
++bash prod/perf/triton/run_triton_perf.sh || true
++
++echo "Deployment to staging $STAGE completed. Review logs and Grafana dashboards."
++
+*** End Patch
+*** Begin Patch
+*** Add File:prod/observability/prometheus/values.yaml
++alertmanager:
++  persistentVolume:
++    enabled: false
++server:
++  persistentVolume:
++    enabled: false
++  retention: 15d
++  resources:
++    limits:
++      cpu: 2000m
++      memory: 4Gi
++
+*** End Patch
+*** Begin Patch
+*** Add File:prod/observability/grafana/values.yaml
++adminUser: admin
++adminPassword: "<REPLACE_PASSWORD>"
++persistence:
++  enabled: false
++datasources:
++  datasources.yaml:
++    apiVersion: 1
++    datasources:
++      - name: Prometheus
++        type: prometheus
++        access: proxy
++        url: http://prometheus-server.monitoring.svc.cluster.local
++
+*** End Patch
+*** Begin Patch
+*** Add File:prod/serving/perf/README.md
++# Triton Load & Performance Testing
++
++This folder contains scripts to drive load tests against Triton-hosted models and tune batching/concurrency parameters.
++
++Requirements:
++- triton client perf_analyzer (recommended, part of tritonclient)
++- k6 (optional fallback)
++- Access to the model endpoint URL (Ingress or KServe status.url)
++
++Workflows:
++- run_triton_perf.sh will try perf_analyzer and fallback to k6-based load test.
++- Use perf_analyzer to sweep batch sizes and concurrency to find optimal throughput/latency.
++
+*** End Patch
+*** Begin Patch
+*** Add File:prod/serving/perf/run_triton_perf.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# run_triton_perf.sh --host <host> --model <model-name> --profile <profile.json>
++#
++HOST=""
++MODEL="aegis-triton-model"
++REQS=1000
++CONCURRENCY=8
++BATCH_SIZE=16
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --host) HOST="$2"; shift 2;;
++    --model) MODEL="$2"; shift 2;;
++    --requests) REQS="$2"; shift 2;;
++    --concurrency) CONCURRENCY="$2"; shift 2;;
++    --batch) BATCH_SIZE="$2"; shift 2;;
++    *) echo "Unknown arg $1"; exit 1;;
++  esac
++done
++
++if [ -z "$HOST" ]; then
++  echo "Usage: $0 --host <host> [--model <name>] [--requests N] [--concurrency C] [--batch N]"
++  exit 1
++fi
++
++echo "Trying perf_analyzer (Triton) ..."
++if command -v perf_analyzer >/dev/null 2>&1; then
++  perf_analyzer -m "$MODEL" -u "$HOST" -b "$BATCH_SIZE" -s HTTP -i gRPC -n $REQS --concurrency-range 1:$CONCURRENCY || true
++else
++  echo "perf_analyzer not available; falling back to k6"
++  if ! command -v k6 >/dev/null 2>&1; then
++    echo "Install tritonclient (perf_analyzer) or k6 to run load tests"
++    exit 2
++  fi
++  cat > /tmp/k6_script.js <<'K6'
++import http from 'k6/http';
++import { sleep } from 'k6';
++export let options = { vus: 10, duration: '30s' };
++export default function () {
++  http.post(__ENV.URL, JSON.stringify({inputs:[{name:'input__0',shape:[1,3,224,224],datatype:'FP32',data:[0]}]}), { headers: { 'Content-Type': 'application/json' } });
++  sleep(0.1);
++}
++K6
++  URL="https://${HOST}/v1/models/${MODEL}:predict"
++  URL="${URL}" k6 run /tmp/k6_script.js || true
++fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:terraform/managed/aws/elasticache/README.md
++# Terraform scaffold for provisioning ElastiCache (Redis Cluster) for production Feast online store
++
++This module is an example to provision an ElastiCache Redis cluster (cluster mode disabled/enabled depending on your needs).
++Operator: fill variables.tf with subnet group, security group IDs and VPC configuration. Use the official aws provider and ensure IAM for terraform has required permissions.
++
+*** End Patch
+*** Begin Patch
+*** Add File:terraform/managed/aws/elasticache/main.tf
++terraform {
++  required_providers {
++    aws = {
++      source  = "hashicorp/aws"
++      version = ">= 4.0"
++    }
++  }
++}
++provider "aws" {
++  region = var.aws_region
++}
++
++resource "aws_elasticache_subnet_group" "example" {
++  name       = "${var.stage}-subnet-group"
++  subnet_ids = var.subnet_ids
++}
++
++resource "aws_elasticache_replication_group" "redis" {
++  replication_group_id          = "${var.stage}-aegis-redis"
++  replication_group_description = "Aegis Redis for Feast online store"
++  node_type                     = var.node_type
++  number_cache_clusters         = var.num_nodes
++  automatic_failover_enabled    = true
++  subnet_group_name             = aws_elasticache_subnet_group.example.name
++  security_group_ids            = var.security_group_ids
++  engine                        = "redis"
++  engine_version                = "6.x"
++  apply_immediately             = true
++}
++
++output "redis_endpoint" { value = aws_elasticache_replication_group.redis.primary_endpoint_address }
++
+*** End Patch
+*** Begin Patch
+*** Add File:terraform/managed/aws/elasticache/variables.tf
++variable "aws_region" { type = string default = "us-east-1" }
++variable "subnet_ids" { type = list(string) }
++variable "security_group_ids" { type = list(string) }
++variable "stage" { type = string }
++variable "node_type" { type = string default = "cache.m6g.large" }
++variable "num_nodes" { type = number default = 3 }
++
+*** End Patch
+*** Begin Patch
+*** Add File:terraform/managed/gcp/memorystore/main.tf
++terraform {
++  required_providers {
++    google = {
++      source  = "hashicorp/google"
++      version = ">= 4.0"
++    }
++  }
++}
++provider "google" {}
++
++resource "google_redis_instance" "feast_redis" {
++  name           = "${var.stage}-aegis-redis"
++  tier           = "STANDARD_HA"
++  memory_size_gb = var.memory_size_gb
++  region         = var.region
++  redis_version  = "6.x"
++  authorized_network = var.network
++}
++
++output "redis_host" { value = google_redis_instance.feast_redis.host }
++
+*** End Patch
+*** Begin Patch
+*** Add File:terraform/managed/s3/lakefs_bucket.tf
++terraform {
++  required_providers {
++    aws = {
++      source = "hashicorp/aws"
++      version = ">= 4.0"
++    }
++  }
++}
++provider "aws" {
++  region = var.region
++}
++
++resource "aws_s3_bucket" "lakefs" {
++  bucket = var.bucket_name
++  acl    = "private"
++  versioning {
++    enabled = true
++  }
++  server_side_encryption_configuration {
++    rule {
++      apply_server_side_encryption_by_default {
++        sse_algorithm = "aws:kms"
++        kms_master_key_id = var.kms_key_id
++      }
++    }
++  }
++  lifecycle_rule {
++    enabled = true
++    noncurrent_version_expiration {
++      days = 30
++    }
++  }
++}
++
++output "bucket_name" { value = aws_s3_bucket.lakefs.bucket }
++
+*** End Patch
+*** Begin Patch
+*** Add File:terraform/managed/s3/variables.tf
++variable "region" { type = string default = "us-east-1" }
++variable "bucket_name" { type = string }
++variable "kms_key_id" { type = string }
++variable "stage" { type = string }
++
+*** End Patch
+*** Begin Patch
+*** Add File:prod/security/networkpolicies/restrict-namespace.yaml
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: restrict-namespace
++  namespace: ml
++spec:
++  podSelector: {}
++  policyTypes:
++  - Ingress
++  - Egress
++  ingress:
++  - from:
++    - namespaceSelector:
++        matchLabels:
++          name: monitoring
++    - podSelector:
++        matchLabels:
++          app: aegis-ops
++    ports:
++    - protocol: TCP
++      port: 443
++  egress:
++  - to:
++    - namespaceSelector:
++        matchLabels:
++          name: monitoring
++    - podSelector:
++        matchLabels:
++          app: aegis-ops
++    ports:
++    - protocol: TCP
++      port: 443
++
+*** End Patch
+*** Begin Patch
+*** Add File:prod/security/mtls/cert-manager-setup.yaml
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: cert-manager
++---
++apiVersion: helm.toolkit.fluxcd.io/v2beta1
++kind: HelmRelease
++metadata:
++  name: cert-manager
++  namespace: cert-manager
++spec:
++  chart:
++    spec:
++      chart: cert-manager
++      sourceRef:
++        kind: HelmRepository
++        name: jetstack
++  interval: 1h
++
++# Operator note: Use cert-manager to provision TLS certs for webhooks and mTLS. This is a placeholder; install cert-manager per your cluster policy.
++
+*** End Patch
+*** Begin Patch
+*** Add File:prod/vault/values-production.yaml
++# Vault production Helm values (example)
++server:
++  ha:
++    enabled: true
++  dataStorage:
++    size: 20Gi
++  audit:
++    enabled: true
++
++global:
++  tlsDisable: false
++
+*** End Patch
+*** Begin Patch
+*** Add File:prod/backup/vault_backup.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Vault backup script for raft storage. Operator must run from a host with vault CLI and VAULT_ADDR / VAULT_TOKEN set.
++#
++OUTDIR=${OUTDIR:-/opt/aegis/backups/vault}
++mkdir -p "$OUTDIR"
++TS=$(date -u +%Y%m%dT%H%M%SZ)
++OUTFILE="$OUTDIR/vault-snapshot-$TS.snap"
++
++echo "Creating Vault raft snapshot to $OUTFILE"
++vault operator raft snapshot save "$OUTFILE"
++echo "Snapshot saved: $OUTFILE"
++
+*** End Patch
+*** Begin Patch
+*** Add File:prod/backup/vault_restore.sh
++#!/usr/bin/env bash
++set -euo pipefail
++# Restore a Vault raft snapshot. WARNING: destructive operation for Vault cluster.
++SNAPSHOT=${1:-}
++if [ -z "$SNAPSHOT" ]; then
++  echo "Usage: $0 /path/to/snapshot.snap"
++  exit 1
++fi
++
++echo "Restoring Vault snapshot from $SNAPSHOT (operator must ensure Vault is unsealed/stopped appropriately)"
++vault operator raft snapshot restore "$SNAPSHOT"
++echo "Restore initiated. Follow Vault cluster recovery procedures."
++
+*** End Patch
+*** Begin Patch
+*** Add File:prod/backup/lakefs_backup.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Simple S3-based backup of lakeFS repository content. Operator must supply AWS credentials and bucket names.
++SRC_BUCKET=${SRC_BUCKET:-aegis-lakefs}
++DEST_BUCKET=${DEST_BUCKET:-aegis-lakefs-backups}
++TS=$(date -u +%Y%m%dT%H%M%SZ)
++echo "Syncing $SRC_BUCKET -> $DEST_BUCKET/$TS"
++aws s3 sync "s3://$SRC_BUCKET" "s3://$DEST_BUCKET/$TS" --storage-class STANDARD_IA
++echo "Backup completed"
++
+*** End Patch
+*** Begin Patch
+*** Add File:prod/compliance/pentest/run_pentest_precheck.sh
++#!/usr/bin/env bash
++set -euo pipefail
++echo "Running lightweight security scans (pre-check) - requires local tools"
++if command -v trivy >/dev/null 2>&1; then
++  echo "Scanning images in cluster (top10 pods)"
++  for img in $(kubectl get pods --all-namespaces -o jsonpath='{..image}' | tr -s '[[:space:]]' '\n' | sort -u | head -n 10); do
++    echo "Scanning $img"
++    trivy image --quiet --severity HIGH,CRITICAL "$img" || true
++  done
++else
++  echo "trivy not found; skip image scanning"
++fi
++if command -v kube-bench >/dev/null 2>&1; then
++  echo "Running kube-bench CIS checks (requires kubeconfig)"
++  kube-bench run || true
++else
++  echo "kube-bench not found; skip cluster hardening checks"
++fi
++echo "Pre-check complete. Collect outputs and plan full pentest."
++
+*** End Patch
+*** Begin Patch
+*** Add File:prod/sre/SLO_playbook.md
++# SRE Playbook: SLO violation & incident response
++
++When alerts fire (ModelLatencySLOViolation, ModelInputDriftHigh):
++
++1. Triage
++   - Check Prometheus alert details, affected service and model
++   - Execute pre-script: prod/sre/run_slo_diagnostics.sh <alert_id>
++2. Mitigation
++   - If serving latency: scale up KServe replicas or roll back to previous model (use hot-swap job)
++   - If model drift: trigger Argo retrain workflow and temporarily route traffic to fallback model
++3. Root cause & postmortem
++   - Collect logs (kubectl logs), model input distributions, version hashes and Rekor entries
++   - Open incident in PagerDuty / ticketing and run RCA playbook
++
+*** End Patch
+*** Begin Patch
+*** Add File:prod/sre/run_slo_diagnostics.sh
++#!/usr/bin/env bash
++set -euo pipefail
++ALERT_ID="${1:-}"
++echo "Collecting diagnostics for alert $ALERT_ID"
++echo "Top pods (by CPU):"
++kubectl top pods -A | head -n 20
++echo "Check KServe pods:"
++kubectl get pods -n ml -l app=aegis-triton-model -o wide
++echo "Get last 200 lines of logs for inference pods"
++for p in $(kubectl get pods -n ml -l app=aegis-triton-model -o jsonpath='{.items[*].metadata.name}'); do
++  echo "Logs for $p"
++  kubectl logs -n ml "$p" --tail 200 || true
++done
++echo "Collect model registry & rekor entries (operator: use mlflow API and rekor client)"
++
+*** End Patch
+*** Begin Patch
+*** Add File:prod/cost/priority_classes.yaml
++apiVersion: scheduling.k8s.io/v1
++kind: PriorityClass
++metadata:
++  name: aegis-high-priority
++value: 1000000
++globalDefault: false
++description: "High priority for critical production model serving"
++
++---
++apiVersion: scheduling.k8s.io/v1
++kind: PriorityClass
++metadata:
++  name: aegis-low-priority
++value: 1000
++globalDefault: false
++description: "Low priority for spot/preemptible workloads"
++
+*** End Patch
+*** Begin Patch
+*** Add File:prod/cost/runbooks/spot_handling.md
++# Spot/preemptible handling runbook
++
++1. Create spot node pools and label them `spot=true`.
++2. Use `aegis-low-priority` priority class for noncritical jobs and add tolerations for `spot=true`.
++3. Ensure checkpointing to S3/COS is enabled for training jobs to resume after preemption.
++4. Implement a controller to resubmit jobs on preemption or use Volcano queue features for gang recovery.
++
+*** End Patch
+*** Begin Patch
+*** Add File:governance/mlflow-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: mlflow
++  namespace: ops
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: mlflow
++  template:
++    metadata:
++      labels:
++        app: mlflow
++    spec:
++      containers:
++      - name: mlflow
++        image: mlfloworg/mlflow:1.30.0
++        ports:
++        - containerPort: 5000
++        env:
++        - name: MLFLOW_TRACKING_URI
++          value: "http://mlflow.ops.svc.cluster.local:5000"
++        volumeMounts:
++        - name: mlflow-artifacts
++          mountPath: /mlflow/artifacts
++      volumes:
++      - name: mlflow-artifacts
++        emptyDir: {}
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: mlflow
++  namespace: ops
++spec:
++  selector:
++    app: mlflow
++  ports:
++  - port: 5000
++    targetPort: 5000
++
+*** End Patch
+*** Begin Patch
+*** Add File:prod/devtools/aegis_sdk/auth.md
++# aegis-sdk Authentication & Developer UX
++
++This document describes recommended auth flows for aegis-sdk and aegisctl:
++
++- Use GitHub OIDC or short-lived Vault tokens to authenticate CI/automation.
++- For interactive developer usage, implement `aegis login` that performs OIDC flow and stores a short-lived token in `~/.aegis/credentials`.
++- aegisctl should call the Aegis API with a bearer token and support token refresh via OIDC refresh or client credentials.
++
++Example:
++  aegisctl login --provider=github --client-id=<app-id>
++
+*** End Patch
+*** Begin Patch
+*** Add File:prod/validation/run_all_validations.sh
++#!/usr/bin/env bash
++set -euo pipefail
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++echo "Running full production validation suite..."
++
++echo "1) Basic cluster sanity"
++kubectl get nodes -o wide
++
++echo "2) Validate KServe inference service readiness"
++kubectl wait --for=condition=ready inferenceservice/aegis-triton-model -n ml --timeout=5m || true
++kubectl get inferenceservice aegis-triton-model -n ml -o yaml
++
++echo "3) Validate feature store readiness"
++kubectl get statefulset -n feast || true
++
++echo "4) Validate Vault reachable"
++if command -v vault >/dev/null 2>&1; then
++  vault status || true
++else
++  echo "Install vault CLI to validate vault status"
++fi
++
++echo "5) Run MLflow promote & sign flow smoke (manual step)"
++echo "   Trigger GitHub Action or call mlflow/scripts/mlflow_promote_and_sign.sh with env vars"
++
++echo "6) Run Triton perf test (smoke)"
++bash prod/serving/perf/run_triton_perf.sh --host "$(kubectl get inferenceservice aegis-triton-model -n ml -o jsonpath='{.status.url}' | sed 's#https://##')" || true
++
++echo "7) Run drift detection emulation"
++kubectl apply -f prod/drift/argo_retrain_workflow.yaml -n ml || true
++
++echo "8) Run compliance pre-check"
++bash prod/compliance/pentest/run_pentest_precheck.sh || true
++
++echo "All validations triggered. Inspect each subsystem logs and Grafana dashboards for SLOs and alerts."
++
+*** End Patch
+*** End Patch

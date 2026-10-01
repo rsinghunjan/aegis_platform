@@ -1,0 +1,431 @@
+*** Begin Patch
+*** Add File:tools/install_kube_prometheus_stack.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Install the kube-prometheus-stack (Prometheus Operator + Grafana + Alertmanager) via Helm.
++# Usage: ./install_kube_prometheus_stack.sh <namespace>
++NAMESPACE=${1:-monitoring}
++RELEASE=${2:-kube-prom-stack}
++
++echo "Creating namespace ${NAMESPACE}"
++kubectl create ns "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
++
++helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
++helm repo add grafana https://grafana.github.io/helm-charts || true
++helm repo update
++
++cat > /tmp/values-kube-prom.yaml <<EOF
++prometheus:
++  prometheusSpec:
++    serviceMonitorSelectorNilUsesHelmValues: false
++    ruleSelectorNilUsesHelmValues: false
++    retention: 15d
++grafana:
++  adminUser: admin
++  adminPassword: changeme  # override in production via secrets
++  sidecar:
++    dashboards:
++      enabled: true
++EOF
++
++echo "Installing kube-prometheus-stack into ${NAMESPACE}"
++helm upgrade --install "${RELEASE}" prometheus-community/kube-prometheus-stack -n "${NAMESPACE}" -f /tmp/values-kube-prom.yaml
++
++echo "kube-prometheus-stack install requested. Wait for pods to be ready and secure Grafana admin password."
++
+*** End File
+*** Add File:k8s/prometheus/alertmanager-oncall-config.yaml
++apiVersion: v1
++kind: Secret
++metadata:
++  name: alertmanager-smtp
++  namespace: monitoring
++type: Opaque
++stringData:
++  smtp_auth_password: "REPLACE_WITH_SECRET"
++
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: alertmanager-config
++  namespace: monitoring
++data:
++  alertmanager.yml: |
++    global:
++      resolve_timeout: 5m
++    route:
++      receiver: "oncall-slack"
++      group_by: ['alertname', 'severity']
++      group_wait: 30s
++      group_interval: 5m
++      repeat_interval: 4h
++    receivers:
++      - name: "oncall-slack"
++        webhook_configs:
++          - url: "https://hooks.slack.com/services/REPLACE/REPLACE/REPLACE"
++      - name: "oncall-email"
++        email_configs:
++          - to: "oncall@your-org.com"
++            from: "alertmanager@your-org.com"
++            smarthost: "smtp.your-org.com:587"
++            auth_username: "alertmanager"
++            auth_password: ${ALERT_SMTP_PASSWORD:-"REPLACE_WITH_SECRET"}
++
+*** End File
+*** Add File:k8s/prometheus/prometheus-slo-rules.yaml
++apiVersion: monitoring.coreos.com/v1
++kind: PrometheusRule
++metadata:
++  name: aegis-slo-rules
++  namespace: monitoring
++spec:
++  groups:
++    - name: aegis.slo.rules
++      rules:
++        # Recording rule: request error rate for webhook
++        - record: job:webhook:error_rate:rate5m
++          expr: increase(aegis_request_count_total{service="model-provenance-webhook",status=~"5.."}[5m])
++        - record: job:webhook:request_rate:rate5m
++          expr: increase(aegis_request_count_total{service="model-provenance-webhook"}[5m])
++        - record: job:webhook:error_ratio:ratio5m
++          expr: job:webhook:error_rate:rate5m / (job:webhook:request_rate:rate5m + 1)
++
++        # Alert when error ratio exceeds threshold for an SLO
++        - alert: WebhookErrorBudgetBurn
++          expr: job:webhook:error_ratio:ratio5m > 0.05
++          for: 10m
++          labels:
++            severity: page
++          annotations:
++            summary: "Webhook is burning error budget ({{ $value }})"
++
++        # Triton high p95 latency example (recording + alert)
++        - record: triton_p95
++          expr: histogram_quantile(0.95, sum(rate(triton_server_inference_request_duration_seconds_bucket[5m])) by (le))
++        - alert: TritonHighP95
++          expr: triton_p95 > 0.2
++          for: 10m
++          labels:
++            severity: page
++          annotations:
++            summary: "Triton P95 latency is high"
++
+*** End File
+*** Add File:k8s/grafana/core_slo_dashboard.json
++{
++  "dashboard": {
++    "title": "Aegis SLOs & Health",
++    "panels": [
++      {
++        "type": "graph",
++        "title": "Webhook Error Ratio (5m)",
++        "targets": [{"expr":"job:webhook:error_ratio:ratio5m"}]
++      },
++      {
++        "type": "graph",
++        "title": "Triton P95 Latency",
++        "targets": [{"expr":"triton_p95"}]
++      },
++      {
++        "type": "singlestat",
++        "title": "Active Federated Rounds",
++        "targets": [{"expr":"aegis_federated_rounds_total"}]
++      }
++    ]
++  }
++}
++
+*** End File
+*** Add File:services/federated/orchestrator_secure.py
++#!/usr/bin/env python3
++"""
++Federated orchestrator with client enrollment/auth and DP aggregation.
++Prototype: uses JWT for client auth and applies Gaussian DP via dp_utils.
++Production: replace or augment with secure aggregation libraries (e.g., PySyft / TF Federated secure aggregation).
++"""
++import os
++import time
++import json
++from flask import Flask, request, jsonify
++import jwt
++import numpy as np
++from services.dp.dp_utils import add_gaussian_noise
++import requests
++
++app = Flask(__name__)
++SECRET = os.environ.get("FED_JWT_SECRET", "dev-fed-secret")  # replace with Vault secret
++AEGIS_MCP = os.environ.get("AEGIS_MCP_API", "http://mcp:8082")
++GLOBAL_WEIGHTS_PATH = "/data/federated/global.json"
++DP_EPSILON = float(os.environ.get("DP_EPSILON", "1.0"))
++
++def load_global():
++    if os.path.exists(GLOBAL_WEIGHTS_PATH):
++        return np.array(json.load(open(GLOBAL_WEIGHTS_PATH)))
++    return None
++
++def save_global(arr):
++    os.makedirs(os.path.dirname(GLOBAL_WEIGHTS_PATH), exist_ok=True)
++    json.dump(arr.tolist(), open(GLOBAL_WEIGHTS_PATH, "w"))
++
++def verify_jwt(token):
++    try:
++        payload = jwt.decode(token, SECRET, algorithms=["HS256"])
++        return payload
++    except Exception:
++        return None
++
++@app.route("/enroll", methods=["POST"])
++def enroll():
++    j = request.json or {}
++    client_id = j.get("client_id")
++    if not client_id:
++        return jsonify({"error":"client_id required"}), 400
++    # issue a short-lived JWT for client
++    token = jwt.encode({"client_id": client_id, "iat": int(time.time()), "exp": int(time.time()) + 3600}, SECRET, algorithm="HS256")
++    return jsonify({"token": token})
++
++@app.route("/submit", methods=["POST"])
++def submit():
++    auth = request.headers.get("Authorization", "")
++    if not auth.startswith("Bearer "):
++        return jsonify({"error":"missing auth"}), 401
++    token = auth.split(" ",1)[1]
++    payload = verify_jwt(token)
++    if not payload:
++        return jsonify({"error":"invalid auth"}), 401
++    j = request.json or {}
++    weights = np.array(j.get("weights", []), dtype=float)
++    scale = float(j.get("scale", 1.0))
++    if weights.size == 0:
++        return jsonify({"error":"no weights"}), 400
++    # simple aggregation: running mean with DP noise
++    global_w = load_global()
++    if global_w is None:
++        agg = weights * scale
++    else:
++        agg = (global_w + weights * scale) / 2.0
++    noisy = add_gaussian_noise(agg, epsilon=DP_EPSILON)
++    save_global(noisy)
++    # record round to MCP for auditing
++    try:
++        requests.post(f"{AEGIS_MCP.rstrip('/')}/federated/rounds", json={"client":payload.get("client_id"), "ts": time.time()}, timeout=2.0)
++    except Exception:
++        pass
++    return jsonify({"status":"ok"})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8085")))
++
+*** End File
+*** Add File:services/federated/client_secure_stub.py
++#!/usr/bin/env python3
++"""
++Client stub to enroll and submit a small model update using JWT auth.
++Demonstrates client enrollment and authenticated submission for secure federated flow.
++"""
++import os, requests, time, json
++import numpy as np
++
++ORCH = os.environ.get("ORCH", "http://orchestrator:8085")
++CLIENT_ID = os.environ.get("CLIENT_ID", "client-demo")
++
++def enroll():
++    r = requests.post(f"{ORCH.rstrip('/')}/enroll", json={"client_id": CLIENT_ID}, timeout=5.0)
++    r.raise_for_status()
++    return r.json()["token"]
++
++def submit_update(token, weights):
++    headers = {"Authorization": f"Bearer {token}"}
++    body = {"weights": weights, "scale": 1.0}
++    r = requests.post(f"{ORCH.rstrip('/')}/submit", json=body, headers=headers, timeout=10)
++    r.raise_for_status()
++    return r.json()
++
++if __name__ == "__main__":
++    t = enroll()
++    print("Got token, submitting update")
++    w = [0.01, -0.02, 0.005]
++    print(submit_update(t, w))
++
+*** End File
+*** Add File:k8s/security/seccomp-profiles-restricted.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: seccomp-profiles
++  namespace: aegis-system
++data:
++  restricted.json: |
++    {
++      "defaultAction": "SCMP_ACT_ERRNO",
++      "architectures": [
++        "SCMP_ARCH_X86_64",
++        "SCMP_ARCH_X86",
++        "SCMP_ARCH_X32"
++      ],
++      "syscalls": [
++        {
++          "names": ["ptrace","reboot","acct"],
++          "action": "SCMP_ACT_ERRNO"
++        },
++        {
++          "names": ["clone","fork","vfork","execve"],
++          "action": "SCMP_ACT_ERRNO"
++        }
++      ]
++    }
++
+*** End File
+*** Add File:k8s/gatekeeper/image-allowlist-template.yaml
++apiVersion: templates.gatekeeper.sh/v1beta1
++kind: ConstraintTemplate
++metadata:
++  name: k8simageallowlist
++spec:
++  crd:
++    spec:
++      names:
++        kind: K8sImageAllowlist
++  targets:
++    - target: admission.k8s.gatekeeper.sh
++      rego: |
++        package k8simageallowlist
++
++        violation[{"msg": msg}] {
++          input.review.object.spec.template.spec.containers[_].image == img
++          allowed := {a | a := input.parameters.allowed_images[_]}
++          not img_in_allowed(img, allowed)
++          msg := sprintf("image %v is not in allowlist", [img])
++        }
++
++        img_in_allowed(img, allowed) {
++          some i
++          contains(img, allowed[i])
++        }
++
+*** End File
+*** Add File:k8s/gatekeeper/image-allowlist-constraint.yaml
++apiVersion: constraints.gatekeeper.sh/v1beta1
++kind: K8sImageAllowlist
++metadata:
++  name: allowed-images
++spec:
++  parameters:
++    allowed_images:
++      - "ghcr.io/your-org/*"
++      - "public.ecr.aws/your-org/*"
++      - "docker.io/your-org/*"
++  enforcementAction: dryrun
++
+*** End File
+*** Add File:runbooks/ha_rto_rpo_runbook.md
++# HA, RTO & RPO Runbook — Aegis
++
++This runbook documents steps to validate HA and RTO/RPO for critical services (Webhook, Milvus, Approver, Prometheus).
++
++1) Objectives
++- RTO (restore time) targets: Webhook 5m; Milvus partial recover 30m; Approver 10m.
++- RPO (data loss) targets: Webhook audit logs ≤ 5m; Milvus backups hourly.
++
++2) Pre-requisites
++- Have backup operator for Milvus and snapshot target (S3).
++- Prometheus & Alertmanager configured and oncall contact listed.
++- k8s cluster multi-AZ or multi-region nodes available for failover testing.
++
++3) Drill: Milvus restore (automated)
++- Step A: Verify latest backup exists in s3://<bucket>/milvus/
++- Step B: Scale down Milvus statefulset: kubectl -n aegis-system scale sts milvus --replicas=0
++- Step C: Run restore operator job to restore latest snapshot to a test namespace (scripts/restore_milvus_test.sh)
++- Step D: Scale sts to original replicas, verify collections exist, run sample queries.
++- Target: complete within 30 minutes. Document deviations.
++
++4) Drill: Webhook failover test
++- Step A: Record current replicas: kubectl -n aegis-system get deploy model-provenance-webhook -o yaml
++- Step B: Simulate outage: kubectl -n aegis-system scale deploy model-provenance-webhook --replicas=0
++- Step C: Attempt a sample validated deployment (should fail if enforcement=deny). Validate fallback behavior.
++- Step D: Restore replicas and verify request processing resume.
++- Target: identify failure modes and update HPA / HorizontalPodAutoscaler settings.
++
++5) Observability & Alerting verification
++- Ensure alerts for high latency or error rate fire within alert windows and route to oncall via Alertmanager receivers.
++- Validate Escalation & runbook link embedded in Grafana panels.
++
++6) Post-mortem & Improvements
++- Record start/finish times, blockers, and remediation tasks into MCP/Jira.
++- Update runbooks with discovered manual steps or timing constraints.
++
+*** End File
+*** Add File:runbooks/pentest_checklist.sh
++#!/usr/bin/env bash
++set -euo pipefail
++echo "Aegis Pentest Checklist (non-exhaustive)"
++echo "1) Dependency scanning (SCA) - run snyk/tern/clair"
++echo "2) Container image scanning - ensure images in allowlist and scanned"
++echo "3) Kubernetes RBAC review - least privilege for service accounts"
++echo "4) Secrets review - no VAULT_TOKEN or plaintext secrets in repos"
++echo "5) Network policies - enforce PodNetworkPolicy to limit lateral movement"
++echo "6) Seccomp/AppArmor - ensure critical pods use restricted profiles from k8s/security/seccomp-profiles-restricted.yaml"
++echo "7) External exposure - verify ingress hosts and TLS"
++echo "8) Run dynamic scanning & fuzzing of public endpoints"
++echo "9) Validate backup encryption and S3 bucket policies"
++echo "10) Prepare mitigation plan & patching schedule"
++echo "Checklist complete. Record findings in your security tracker."
++
+*** End File
+*** Add File:tools/scale_test_prowler.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Simple scale test generator for webhook using curl in parallel. Use in staging.
++CONCURRENCY=${1:-50}
++TOTAL=${2:-2000}
++URL=${3:-http://model-provenance-webhook.aegis-system.svc.cluster.local:8443/validate}
++echo "Running $TOTAL requests at concurrency $CONCURRENCY against $URL"
++for i in $(seq 1 $CONCURRENCY); do
++  ( for j in $(seq 1 $(($TOTAL / $CONCURRENCY))); do
++      curl -s -o /dev/null -w "%{http_code} " -X POST -H "Content-Type: application/json" -d '{"test":"payload"}' "$URL"
++    done ) &
++done
++wait
++echo "Scale test complete."
++
+*** End File
+*** Add File:README_OBSERVABILITY_FED_SECURITY_HA.md
++# Aegis — Observability, Federated Security, Hardening & HA Patch
++
++What this patch provides:
++- Observability:
++  - tools/install_kube_prometheus_stack.sh: helm installer for kube-prometheus-stack (Prometheus Operator + Grafana + Alertmanager).
++  - k8s/prometheus/alertmanager-oncall-config.yaml: Alertmanager receivers (Slack/email) sample.
++  - k8s/prometheus/prometheus-slo-rules.yaml: Recording rules and alerts tuned for webhook/triton SLOs.
++  - k8s/grafana/core_slo_dashboard.json: Dashboard scaffold for SLOs.
++
++- Federated & DP improvements:
++  - services/federated/orchestrator_secure.py: orchestrator with client enrollment (JWT) and DP aggregation (Gaussian noise).
++  - services/federated/client_secure_stub.py: demo client that enrolls and submits authenticated updates.
++  - Note: this is a prototype; for production integrate secure aggregation libraries (PySyft/TF Federated secure aggregation) and authenticated enrollment via Vault/OIDC.
++
++- Security & hardening:
++  - k8s/security/seccomp-profiles-restricted.yaml: restricted seccomp profile for high-risk pods.
++  - k8s/gatekeeper/image-allowlist-template.yaml + image-allowlist-constraint.yaml: Gatekeeper constraint template + sample constraint in dryrun mode.
++  - runbooks/pentest_checklist.sh: pentest checklist script.
++
++- HA & resilience:
++  - runbooks/ha_rto_rpo_runbook.md: drill steps for Milvus, webhook failover, and RTO/RPO targets.
++  - tools/scale_test_prowler.sh: scale test script for webhook.
++
++Operator notes & next steps:
++1) Deploy kube-prometheus-stack using tools/install_kube_prometheus_stack.sh then apply PrometheusRule and ServiceMonitors. Secure Grafana and rotate admin password to a secret.
++2) Configure Alertmanager receivers (slack/email) with production secrets and receiver templates, and test alert delivery and escalation.
++3) Replace DP prototype with secure aggregation library for real privacy guarantees; harden orchestrator with mTLS and Vault-stored JWT secrets.
++4) Enable Gatekeeper Constraint in dryrun, run audit for 48–72h, then patch enforcementAction to deny after remediations.
++5) Add PodSecurity admission using namespace labels to enforce baseline/strict policies for prod namespaces.
++6) Run pentest checklist and remediation, then schedule periodic scans.
++7) Run HA drills and scale tests in staging; capture timings and update runbooks with measured RTOs/RPOs.
++
++Security reminder:
++- Store JWT secrets, Vault tokens and Alertmanager SMTP/Slack secrets in Vault or a secret manager — do not keep them in repo or CI plaintext.
++
+*** End Patch

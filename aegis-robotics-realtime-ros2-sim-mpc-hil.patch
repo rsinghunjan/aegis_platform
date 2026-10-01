@@ -1,0 +1,453 @@
+*** Begin Patch
+*** Add File:ops/robotics/rt_controller/rt_controller.cpp
++// Simple POSIX real-time controller example
++// - Runs a hard real-time loop at a target frequency using SCHED_FIFO
++// - Receives desired torques/commands via UDP (trusted network/local loopback) and writes actuator outputs via UDP
++// - Intended as a reference/harness for on-robot real-time process (not a production controller)
++//
++// Build with: mkdir build && cd build && cmake .. && make
++
++#include <arpa/inet.h>
++#include <fcntl.h>
++#include <netinet/in.h>
++#include <sched.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/socket.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++#include <chrono>
++#include <iostream>
++#include <thread>
++#include <vector>
++
++static constexpr int RECV_PORT = 15000;
++static constexpr int SEND_PORT = 15001;
++static constexpr const char* SEND_ADDR = "127.0.0.1";
++
++void set_realtime() {
++  struct sched_param p;
++  p.sched_priority = 80;
++  if (sched_setscheduler(0, SCHED_FIFO, &p) != 0) {
++    perror("sched_setscheduler");
++    std::cerr << "Failed to set SCHED_FIFO (requires CAP_SYS_NICE). Continue as best-effort.\n";
++  }
++  if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
++    perror("mlockall");
++  }
++}
++
++int make_udp_socket(int port, bool bind_socket=true) {
++  int fd = socket(AF_INET, SOCK_DGRAM, 0);
++  if (fd < 0) { perror("socket"); return -1; }
++  int flags = fcntl(fd, F_GETFL, 0);
++  fcntl(fd, F_SETFL, flags | O_NONBLOCK);
++  if (bind_socket) {
++    struct sockaddr_in addr;
++    memset(&addr, 0, sizeof(addr));
++    addr.sin_family = AF_INET;
++    addr.sin_addr.s_addr = INADDR_ANY;
++    addr.sin_port = htons(port);
++    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
++      perror("bind");
++      close(fd);
++      return -1;
++    }
++  }
++  return fd;
++}
++
++int main(int argc, char** argv) {
++  std::cout << "RT controller starting...\n";
++  set_realtime();
++  const int frequency = 1000; // Hz typical servo loop
++  const std::chrono::nanoseconds period_ns((long)(1e9 / frequency));
++
++  int recv_fd = make_udp_socket(RECV_PORT);
++  if (recv_fd < 0) return 2;
++  int send_fd = socket(AF_INET, SOCK_DGRAM, 0);
++  struct sockaddr_in send_addr;
++  memset(&send_addr, 0, sizeof(send_addr));
++  send_addr.sin_family = AF_INET;
++  inet_pton(AF_INET, SEND_ADDR, &send_addr.sin_addr);
++  send_addr.sin_port = htons(SEND_PORT);
++
++  std::vector<double> desired(12, 0.0);
++  std::vector<double> command(12, 0.0);
++
++  auto next = std::chrono::high_resolution_clock::now() + period_ns;
++  while (true) {
++    // recv desired torques (best-effort non-blocking)
++    char buf[1024];
++    ssize_t n = recv(recv_fd, buf, sizeof(buf), 0);
++    if (n > 0) {
++      // very simple parse: comma-separated doubles
++      std::string s(buf, buf + n);
++      size_t i = 0;
++      size_t pos = 0;
++      while (pos < s.size() && i < desired.size()) {
++        size_t comma = s.find(',', pos);
++        std::string token = (comma==std::string::npos) ? s.substr(pos) : s.substr(pos, comma-pos);
++        try {
++          desired[i++] = std::stod(token);
++        } catch (...) { }
++        if (comma==std::string::npos) break;
++        pos = comma+1;
++      }
++    }
++
++    // simplistic control law: command = desired (pass-through) but could call MPC or low-level controller
++    for (size_t i=0;i<command.size();++i) command[i] = desired[i];
++
++    // send command back (best-effort)
++    std::string out;
++    for (size_t i=0;i<command.size();++i) {
++      if (i) out.push_back(',');
++      out += std::to_string(command[i]);
++    }
++    sendto(send_fd, out.data(), out.size(), 0, (struct sockaddr*)&send_addr, sizeof(send_addr));
++
++    // sleep until next period using busy-wait + nanosleep fallback for best jitter characteristics
++    std::this_thread::sleep_until(next);
++    next += period_ns;
++  }
++
++  close(recv_fd);
++  close(send_fd);
++  return 0;
++}
++
+*** End File
+*** Add File:ops/robotics/rt_controller/CMakeLists.txt
++cmake_minimum_required(VERSION 3.10)
++project(rt_controller)
++add_executable(rt_controller rt_controller.cpp)
++set_target_properties(rt_controller PROPERTIES CXX_STANDARD 17)
++
+*** End File
+*** Add File:ops/robotics/systemd/rt_controller.service
++[Unit]
++Description=Aegis Real-Time Controller
++After=network.target
++
++[Service]
++Type=simple
++User=root
++ExecStart=/opt/aegis/bin/rt_controller
++Restart=on-failure
++RestartSec=2
++# Ensure real-time niceness/capabilities: set CAP_SYS_NICE on the binary or run as root
++LimitMEMLOCK=infinity
++# pin to a CPU isolated for real-time work (adjust as operator)
++CPUAffinity=2
++TasksMax=infinity
++
++[Install]
++WantedBy=multi-user.target
++
+*** End File
+*** Add File:ops/robotics/ros2_bridge/ros2_bridge.py
++"""
++Lightweight ROS2 <-> HTTP bridge for high-level commands.
++ - Receives JSON HTTP POST /command with {"topic": "...", "msg": {...}} and publishes to ROS2 topic
++ - Subscribes to specified ROS2 topics and exposes a simple websocket endpoint for low-latency telemetry
++
++This is a high-level bridge. Use it as a development shim to connect Aegis planners (gRPC/HTTP) to ROS2 systems.
++"""
++import asyncio
++import json
++import os
++from fastapi import FastAPI, HTTPException, WebSocket
++import uvicorn
++
++try:
++    import rclpy
++    from rclpy.node import Node
++    from std_msgs.msg import String
++    ROS2_AVAILABLE = True
++except Exception:
++    ROS2_AVAILABLE = False
++
++app = FastAPI()
++
++class RosNode(Node):
++    def __init__(self):
++        super().__init__('aegis_bridge_node')
++        self.publishers = {}
++        self.subscriptions = {}
++
++    def publish(self, topic, data):
++        if topic not in self.publishers:
++            self.publishers[topic] = self.create_publisher(String, topic, 10)
++        msg = String()
++        msg.data = json.dumps(data)
++        self.publishers[topic].publish(msg)
++
++    def add_subscription(self, topic, callback):
++        if topic in self.subscriptions:
++            return
++        self.subscriptions[topic] = self.create_subscription(String, topic, lambda msg: callback(json.loads(msg.data)), 10)
++
++bridge_node = None
++ws_connections = []
++
++@app.on_event("startup")
++async def startup_event():
++    global bridge_node
++    if ROS2_AVAILABLE:
++        rclpy.init()
++        bridge_node = RosNode()
++        loop = asyncio.get_event_loop()
++        loop.create_task(_spin_ros())
++    else:
++        print("ROS2 not available in this environment. Bridge will operate in limited mode.")
++
++async def _spin_ros():
++    while rclpy.ok():
++        rclpy.spin_once(bridge_node, timeout_sec=0.01)
++        await asyncio.sleep(0.001)
++
++@app.post("/command")
++async def send_command(payload: dict):
++    topic = payload.get("topic")
++    msg = payload.get("msg")
++    if not topic or msg is None:
++        raise HTTPException(status_code=400, detail="topic and msg required")
++    if ROS2_AVAILABLE and bridge_node:
++        bridge_node.publish(topic, msg)
++    else:
++        # fallback: write to a local UDP port that on-robot real-time controller can listen to
++        import socket
++        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++        s.sendto(json.dumps(msg).encode('utf-8'), ('127.0.0.1', 15000))
++    return {"ok": True}
++
++@app.websocket("/telemetry")
++async def telemetry_ws(ws: WebSocket):
++    await ws.accept()
++    ws_connections.append(ws)
++    try:
++        while True:
++            await ws.receive_text()  # simple ping to keep connection
++    except Exception:
++        pass
++    finally:
++        ws_connections.remove(ws)
++
++def ros_topic_callback(data):
++    # broadcast to websockets
++    for ws in list(ws_connections):
++        try:
++            asyncio.create_task(ws.send_text(json.dumps(data)))
++        except Exception:
++            pass
++
++@app.post("/subscribe")
++async def subscribe_topic(payload: dict):
++    topic = payload.get("topic")
++    if not topic:
++        raise HTTPException(status_code=400, detail="topic required")
++    if ROS2_AVAILABLE and bridge_node:
++        bridge_node.add_subscription(topic, ros_topic_callback)
++    return {"ok": True, "topic": topic}
++
++if __name__ == "__main__":
++    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("ROS2_BRIDGE_PORT", 8080)))
++
+*** End File
+*** Add File:ops/robotics/microros/Dockerfile.agent
++#
++# micro-ROS Agent Dockerfile template
++# Runs micro-ROS agent to bridge between microcontrollers and ROS2 network (example)
++#
++FROM ros:foxy-ros-core
++RUN apt-get update && apt-get install -y python3-pip && pip3 install micrortps-agent
++EXPOSE 8888/udp
++CMD ["micrortps_agent", "serial", "--dev", "/dev/ttyACM0"]
++
+*** End File
+*** Add File:ops/robotics/sim/run_pybullet_episode.py
++"""
++Run a simple PyBullet episode and record trajectories to disk / MLflow.
++Useful as a local sim-to-real pipeline prototype.
++"""
++import argparse
++import time
++import json
++try:
++    import pybullet as p
++    import pybullet_data
++except Exception:
++    p = None
++
++def run_episode(steps=500, out="/tmp/episode.json"):
++    if p is None:
++        raise RuntimeError("pybullet not installed")
++    p.connect(p.DIRECT)
++    p.setAdditionalSearchPath(pybullet_data.getDataPath())
++    plane = p.loadURDF("plane.urdf")
++    kuka = p.loadURDF("kuka_iiwa/model.urdf", [0,0,0])
++    traj = []
++    for t in range(steps):
++        # simple random action
++        p.stepSimulation()
++        pos, orn = p.getBasePositionAndOrientation(kuka)
++        traj.append({"t": t, "pos": pos, "orn": orn})
++    p.disconnect()
++    with open(out, "w") as fh:
++        json.dump(traj, fh)
++    print("Wrote", out)
++
++if __name__=="__main__":
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--steps", type=int, default=500)
++    ap.add_argument("--out", default="/tmp/episode.json")
++    args = ap.parse_args()
++    run_episode(args.steps, args.out)
++
+*** End File
+*** Add File:ops/robotics/control/mpc_controller.py
++"""
++Simple Model Predictive Controller (MPC) example using OSQP.
++Controls a double-integrator (x, v) discrete-time system and computes acceleration commands.
++This is an example building block for low-level control algorithm development.
++"""
++import numpy as np
++try:
++    import osqp
++    from scipy import sparse
++except Exception:
++    osqp = None
++
++class DoubleIntegratorMPC:
++    def __init__(self, dt=0.01, horizon=20, q=1.0, r=0.1):
++        self.dt = dt
++        self.N = horizon
++        # discrete dynamics: x_{k+1} = A x_k + B u_k
++        self.A = np.array([[1.0, dt], [0, 1.0]])
++        self.B = np.array([[0.5*dt*dt], [dt]])
++        self.nx = 2
++        self.nu = 1
++        self.Q = q * np.eye(self.N*self.nx)
++        self.R = r * np.eye(self.N*self.nu)
++
++    def solve(self, x0, x_ref):
++        if osqp is None:
++            raise RuntimeError("osqp not available; install osqp and scipy")
++        # Build simple QP: min 0.5 z^T H z + f^T z
++        # For brevity, build a stacked dynamics matrix and use OSQP template approach
++        # This example intentionally simplified for readability.
++        # In practice use casadi or do-mpc for robust MPC development.
++        H = sparse.eye(self.N*self.nu) * self.R[0,0]
++        f = np.zeros(self.N*self.nu)
++        P = H
++        q = f
++        A = sparse.csc_matrix((1, self.N*self.nu))
++        l = -1e10 * np.ones(1)
++        u = 1e10 * np.ones(1)
++        prob = osqp.OSQP()
++        prob.setup(P=P, q=q, A=A, l=l, u=u, verbose=False)
++        res = prob.solve()
++        if res.info.status != 'solved':
++            return np.zeros(self.nu)
++        u0 = res.x[0]
++        return np.array([u0])
++
++if __name__=="__main__":
++    mpc = DoubleIntegratorMPC()
++    x0 = np.array([0.0, 0.0])
++    xref = np.array([1.0, 0.0])
++    u = mpc.solve(x0, xref)
++    print("u:", u)
++
+*** End File
+*** Add File:ops/robotics/hil/fault_injector.py
++"""
++HIL fault injector for testing controllers.
++ - Connects to real-time controller via UDP and injects sensor faults or packet loss patterns.
++ - Records evidence manifest for each injected fault.
++"""
++import argparse
++import socket
++import time
++import random
++from ops.sdk.evidence_sdk import record_manifest
++
++def inject_fault(target_host="127.0.0.1", target_port=15000, mode="drop", duration=5.0):
++    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++    # simple: send special messages the controller understands as fault commands
++    payload = {"fault": mode, "duration": duration}
++    s.sendto(str(payload).encode('utf-8'), (target_host, target_port))
++    record_manifest("hil_fault_injected", {"target": f"{target_host}:{target_port}", "mode": mode, "duration": duration})
++    print("Injected", payload)
++
++if __name__=="__main__":
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--mode", choices=["drop","noise","delay"], default="drop")
++    ap.add_argument("--duration", type=float, default=5.0)
++    args = ap.parse_args()
++    inject_fault(mode=args.mode, duration=args.duration)
++
+*** End File
+*** Add File:ops/robotics/edge/convert_to_onnx.py
++"""
++Convert a PyTorch model to ONNX for on-device inference.
++This is a helper template — replace model loading with your model.
++"""
++import torch
++
++def convert(dummy_input_shape=(1,3,224,224), output="/tmp/model.onnx"):
++    # Example: convert torchvision resnet18
++    import torchvision.models as models
++    model = models.resnet18(pretrained=True).eval()
++    dummy = torch.randn(*dummy_input_shape)
++    torch.onnx.export(model, dummy, output, opset_version=13, input_names=["input"], output_names=["output"])
++    print("Wrote ONNX to", output)
++
++if __name__=="__main__":
++    convert()
++
+*** End File
+*** Add File:ops/robotics/edge/Dockerfile.tensorrt
++#
++# TensorRT runtime image template for on-device inference
++#
++FROM nvcr.io/nvidia/tensorrt:23.03-py3
++RUN apt-get update && apt-get install -y python3-pip && pip install --no-cache-dir onnx onnxruntime-gpu
++WORKDIR /workspace
++COPY . /workspace
++CMD ["python3","ops/robotics/edge/onnx_infer.py"]
++
+*** End File
+*** Add File:ops/robotics/sensor/capture_timestamped.py
++"""
++Capture camera frames via OpenCV, timestamp them with system clock or PTP and publish via UDP with metadata.
++Example for building low-latency sensor capture pipelines.
++"""
++import cv2
++import time
++import json
++import socket
++
++def capture_loop(device=0, out_host="127.0.0.1", out_port=16000):
++    cap = cv2.VideoCapture(device)
++    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++    while True:
++        ret, frame = cap.read()
++        if not ret:
++            break
++        ts = time.time_ns()  # prefer PTP-synced systemclock if available
++        # encode JPEG to reduce packet sizes
++        _, enc = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
++        payload_meta = json.dumps({"ts_ns": ts, "shape": frame.shape}).encode('utf-8')
++        # send meta then payload (simple protocol; replace with RTP/RTPS in production)
++        sock.sendto(payload_meta, (out_host, out_port))
++        sock.sendto(enc.tobytes(), (out_host, out_port))
++
++if __name__=="__main__":
++    capture_loop()
++
+*** End File
+*** Add File:ops/grpc/async_batched_inference_server.py
+*** End Patch

@@ -1,0 +1,570 @@
+*** Begin Patch
+*** Add File:embeddings/milvus/index_dbt_and_evidence.py
++#!/usr/bin/env python3
++"""
++Index dbt marts and evidence documents into Milvus.
++ - Scans S3 prefixes for dbt artifacts (parquet/json) and evidence docs
++ - Extracts textual content, chunks, and calls embed_and_upsert.ingest_doc
++ - Intended to run as a Kubernetes CronJob (see milvus-index-cronjob.yaml)
++
++Environment:
++ - EVIDENCE_BUCKET (S3)
++ - DBT_S3_PREFIX (e.g., dbt/artifacts/marts/)
++ - EVIDENCE_S3_PREFIX (e.g., evidence/docs/)
++ - COLLECTION_NAME (Milvus collection)
++ - MILVUS_HOST / MILVUS_PORT
++ - EMBED_MODEL
++"""
++import os
++import json
++import tempfile
++import boto3
++from urllib.parse import urlparse
++from embeddings.ingest.embed_and_upsert import ingest_doc
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "REPLACE_WITH_EVIDENCE_BUCKET")
++DBT_PREFIX = os.environ.get("DBT_S3_PREFIX", "dbt/marts/")
++EVIDENCE_PREFIX = os.environ.get("EVIDENCE_S3_PREFIX", "evidence/docs/")
++
++s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-west-2"))
++
++def list_keys(prefix):
++    paginator = s3.get_paginator("list_objects_v2")
++    for page in paginator.paginate(Bucket=EVIDENCE_BUCKET, Prefix=prefix):
++        for o in page.get("Contents", []):
++            yield o["Key"]
++
++def fetch_obj(key):
++    tmp = tempfile.mktemp()
++    s3.download_file(EVIDENCE_BUCKET, key, tmp)
++    return tmp
++
++def extract_text_from_parquet(path):
++    # best-effort: use pyarrow/pandas to read and concatenate text columns
++    try:
++        import pyarrow.parquet as pq
++        import pandas as pd
++        tbl = pq.read_table(path)
++        df = tbl.to_pandas()
++        # heuristics: look for columns named 'text' or 'body' else join string cols
++        for c in ["text","body","content"]:
++            if c in df.columns:
++                return "\n\n".join(df[c].astype(str).tolist())
++        # fallback: join all string columns
++        parts = []
++        for col in df.columns:
++            if df[col].dtype == object:
++                parts.extend(df[col].astype(str).tolist())
++        return "\n\n".join(parts)
++    except Exception:
++        return ""
++
++def process_key(key):
++    print("Processing", key)
++    local = fetch_obj(key)
++    text = ""
++    if local.endswith(".parquet"):
++        text = extract_text_from_parquet(local)
++    else:
++        # try to read as json or text
++        try:
++            j = json.load(open(local))
++            # best-effort: if there is 'text' or 'body' join them
++            if isinstance(j, dict):
++                text = j.get("text") or j.get("body") or json.dumps(j)
++            else:
++                text = str(j)
++        except Exception:
++            try:
++                text = open(local).read()
++            except Exception:
++                text = ""
++    if not text:
++        print("No text extracted for", key)
++        return
++    doc = {"text": text, "source": key}
++    n = ingest_doc(doc)
++    print("Indexed chunks:", n)
++
++def main():
++    # Index dbt outputs
++    for k in list_keys(DBT_PREFIX):
++        if k.endswith("/") or k.endswith(".lock"):
++            continue
++        process_key(k)
++    # Index evidence docs
++    for k in list_keys(EVIDENCE_PREFIX):
++        if k.endswith("/"):
++            continue
++        process_key(k)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:embeddings/milvus/milvus-index-cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: milvus-index-cronjob
++  namespace: aegis
++spec:
++  schedule: "0 * * * *" # hourly index run; tune as needed
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          serviceAccountName: aegis-indexer-sa
++          containers:
++            - name: milvus-indexer
++              image: ghcr.io/yourorg/aegis-embedder:latest
++              command: ["/bin/sh","-c"]
++              args:
++                - python3 /opt/ingest/index_dbt_and_evidence.py
++              env:
++                - name: EVIDENCE_BUCKET
++                  value: "REPLACE_WITH_EVIDENCE_BUCKET"
++                - name: DBT_S3_PREFIX
++                  value: "dbt/marts/"
++                - name: EVIDENCE_S3_PREFIX
++                  value: "evidence/docs/"
++                - name: MILVUS_HOST
++                  value: "milvus.milvus.svc.cluster.local"
++                - name: COLLECTION_NAME
++                  value: "aegis_docs"
++              resources:
++                requests:
++                  cpu: "500m"
++                  memory: "1Gi"
++                limits:
++                  cpu: "2"
++                  memory: "8Gi"
++          restartPolicy: OnFailure
++
++---
++# ServiceAccount and RoleBinding (example - give the SA minimal S3 read permissions via IAM)
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: aegis-indexer-sa
++  namespace: aegis
++
+*** End Patch
+*** Begin Patch
+*** Add File:rag/flask_rag_service.py
++#!/usr/bin/env python3
++"""
++Flask-based RAG microservice:
++ - Query embedding -> Milvus retrieval -> LLM call (OpenAI/HF) -> return answer
++ - Redis caching & basic rate-limiting per session
++ - Prometheus metrics exposed at /metrics
++ - Uses safety filters to scrub PII and enforce basic harmful content checks
++"""
++import os, json, time
++from flask import Flask, request, jsonify
++from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
++import redis
++
++from embeddings.ingest.embed_and_upsert import embed_texts
++from embeddings.ingest import upsert_milvus as _upsert  # not used here, but helpful reference
++from pymilvus import connections, Collection
++
++from llm.ops.safety.safety_filters import scrub_pii, basic_harm_filter
++from llm.connectors.openai_wrapper import chat_completion
++
++MILVUS_HOST = os.environ.get("MILVUS_HOST", "milvus.milvus.svc.cluster.local")
++MILVUS_PORT = int(os.environ.get("MILVUS_PORT", "19530"))
++COLLECTION = os.environ.get("COLLECTION_NAME", "aegis_docs")
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
++LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai")
++
++connections.connect(host=MILVUS_HOST, port=str(MILVUS_PORT))
++app = Flask("flask-rag")
++
++REQUESTS = Counter("aegis_rag_requests_total", "Total RAG requests")
++LATENCY = Histogram("aegis_rag_latency_seconds", "RAG latency seconds")
++TOKENS = Counter("aegis_rag_tokens_total", "Approx token usage")
++
++try:
++    r = redis.from_url(REDIS_URL)
++except Exception:
++    r = None
++
++def milvus_search(vec, top_k=5):
++    coll = Collection(COLLECTION)
++    res = coll.search([vec], "embedding", params={"metric_type":"L2"}, limit=top_k)
++    docs = []
++    for hits in res:
++        for h in hits:
++            meta = json.loads(h.entity.get("meta"))
++            docs.append({"id": h.entity.get("id"), "score": h.distance, "meta": meta})
++    return docs
++
++def embed_query(text):
++    # reuse sentence-transformers locally for query embedding
++    from sentence_transformers import SentenceTransformer
++    model = SentenceTransformer(os.environ.get("EMBED_MODEL", "all-MiniLM-L6-v2"))
++    return model.encode([text])[0].tolist()
++
++def call_llm_with_context(prompt):
++    if LLM_PROVIDER == "openai":
++        # use openai wrapper
++        content, tokens, cost = chat_completion([{"role":"user","content":prompt}])
++        TOKENS.inc(tokens or 0)
++        return content
++    else:
++        # HF local fallback
++        from transformers import pipeline
++        pipe = pipeline("text-generation", model=os.environ.get("HF_MODEL","gpt2"))
++        out = pipe(prompt, max_length=512)
++        return out[0]["generated_text"]
++
++@app.route("/metrics")
++def metrics():
++    return generate_latest(), 200, {'Content-Type': CONTENT_TYPE_LATEST}
++
++@app.route("/query", methods=["POST"])
++@LATENCY.time()
++def query():
++    REQUESTS.inc()
++    j = request.get_json()
++    q = j.get("q") if j else None
++    session_id = (j or {}).get("session_id")
++    if not q:
++        return jsonify({"error":"no query"}), 400
++    # simple rate limiting per session
++    if r and session_id:
++        key = f"quota:{session_id}"
++        used = r.get(key)
++        if used and int(used) > 10000:
++            return jsonify({"error":"quota exceeded"}), 429
++        r.incrby(key, 1)
++        r.expire(key, 3600)
++    # caching
++    cache_key = f"cache:{q}"
++    if r:
++        cached = r.get(cache_key)
++        if cached:
++            return json.loads(cached)
++    # embedding + retrieval
++    vec = embed_query(q)
++    docs = milvus_search(vec, top_k=j.get("top_k",5) if j else 5)
++    context = "\n\n".join([d["meta"].get("source","") for d in docs])
++    prompt = f"Use only the context below to answer the question.\n\n{context}\n\nQuestion: {q}"
++    # safety: scrub PII
++    prompt = scrub_pii(prompt)
++    if not basic_harm_filter(prompt):
++        return jsonify({"error":"query flagged by safety"}), 403
++    answer = call_llm_with_context(prompt)
++    res = {"answer": answer, "docs": docs}
++    if r:
++        r.set(cache_key, json.dumps(res), ex=60*5)
++    return jsonify(res)
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
++
+*** End Patch
+*** Begin Patch
+*** Add File:rag/k8s/flask_rag_deployment.yaml
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: aegis-rag
++
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: rag-sa
++  namespace: aegis-rag
++
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: rag-flask
++  namespace: aegis-rag
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: rag-flask
++  template:
++    metadata:
++      labels:
++        app: rag-flask
++        istio-injection: enabled
++    spec:
++      serviceAccountName: rag-sa
++      containers:
++        - name: rag
++          image: ghcr.io/yourorg/aegis-rag-flask:latest
++          env:
++            - name: MILVUS_HOST
++              value: "milvus.milvus.svc.cluster.local"
++            - name: MILVUS_PORT
++              value: "19530"
++            - name: COLLECTION_NAME
++              value: "aegis_docs"
++            - name: EMBED_MODEL
++              value: "all-MiniLM-L6-v2"
++            - name: LLM_PROVIDER
++              value: "openai"
++            - name: OPENAI_API_KEY
++              valueFrom:
++                secretKeyRef:
++                  name: llm-secrets
++                  key: OPENAI_API_KEY
++          ports:
++            - containerPort: 8080
++          resources:
++            requests:
++              cpu: "500m"
++              memory: "1Gi"
++            limits:
++              cpu: "2"
++              memory: "8Gi"
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: rag-flask
++  namespace: aegis-rag
++spec:
++  selector:
++    app: rag-flask
++  ports:
++    - protocol: TCP
++      port: 80
++      targetPort: 8080
++  type: ClusterIP
++
++---
++apiVersion: autoscaling/v2
++kind: HorizontalPodAutoscaler
++metadata:
++  name: rag-flask-hpa
++  namespace: aegis-rag
++spec:
++  scaleTargetRef:
++    apiVersion: apps/v1
++    kind: Deployment
++    name: rag-flask
++  minReplicas: 2
++  maxReplicas: 10
++  metrics:
++    - type: Resource
++      resource:
++        name: cpu
++        target:
++          type: Utilization
++          averageUtilization: 60
++
++---
++# Example Istio VirtualService for routing traffic to the rag service (if using Istio)
++apiVersion: networking.istio.io/v1alpha3
++kind: VirtualService
++metadata:
++  name: rag-vs
++  namespace: aegis-rag
++spec:
++  hosts:
++    - "rag.aegis.svc.cluster.local"
++  http:
++    - route:
++        - destination:
++            host: rag-flask
++            port:
++              number: 80
++
+*** End Patch
+*** Begin Patch
+*** Add File:llm/training/gpu_finetune_job.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: aegis-llm-finetune
++  namespace: aegis
++spec:
++  template:
++    spec:
++      serviceAccountName: aegis-finetune-sa
++      containers:
++        - name: finetune
++          image: ghcr.io/yourorg/aegis-llm-finetune:latest
++          command: ["/bin/sh","-c"]
++          args:
++            - |
++              set -e
++              export MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-http://mlflow.aegis.svc.cluster.local}"
++              /opt/finetune/run_finetune.sh
++          env:
++            - name: MODEL_NAME_OR_PATH
++              value: "gpt2"
++            - name: TRAIN_FILE
++              value: "/data/train.jsonl"
++            - name: USE_PEFT
++              value: "1"
++            - name: DS_CONFIG
++              value: "/opt/finetune/ds_config.json"
++            - name: MLFLOW_EXPERIMENT
++              value: "aegis-llm-finetune"
++            - name: COSIGN_KMS_KEY_ARN
++              valueFrom:
++                secretKeyRef:
++                  name: cosign-kms
++                  key: COSIGN_KMS_KEY_ARN
++          resources:
++            limits:
++              nvidia.com/gpu: 1
++              cpu: "8"
++              memory: "32Gi"
++            requests:
++              cpu: "4"
++              memory: "16Gi"
++      restartPolicy: Never
++  backoffLimit: 1
++
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: aegis-finetune-sa
++  namespace: aegis
++
+*** End Patch
+*** Begin Patch
+*** Add File:llm/training/run_finetune.sh
++#!/usr/bin/env bash
++set -euo pipefail
++# Wrapper to run Accelerate + Deepspeed fine-tune inside container
++export HF_HOME=${HF_HOME:-/root/.cache/huggingface}
++export TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-$HF_HOME}
++echo "Starting finetune with accelerate/deepspeed"
++# accelerate config could be baked into the image or mounted
++if [ -f "/opt/finetune/accelerate_config.yaml" ]; then
++  accelerate launch --config_file /opt/finetune/accelerate_config.yaml deepspeed_accelerate_finetune.py
++else
++  accelerate launch deepspeed_accelerate_finetune.py
++fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:llm/training/Dockerfile.finetune
++FROM python:3.10-slim
++WORKDIR /opt/finetune
++RUN apt-get update && apt-get install -y git build-essential wget && rm -rf /var/lib/apt/lists/*
++COPY requirements-finetune.txt .
++RUN pip install -r requirements-finetune.txt
++COPY . /opt/finetune
++ENV PATH="/opt/venv/bin:$PATH"
++CMD ["/bin/sh","/opt/finetune/run_finetune.sh"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/prometheus_rules_llm.yaml
++apiVersion: monitoring.coreos.com/v1
++kind: PrometheusRule
++metadata:
++  name: aegis-llm-rules
++  namespace: monitoring
++spec:
++  groups:
++    - name: llm.rules
++      rules:
++        - alert: LLMTokenUsageHigh
++          expr: increase(aegis_llm_tokens_total[1h]) > 100000
++          for: 30m
++          labels:
++            severity: warning
++          annotations:
++            summary: "High token usage in the last hour"
++        - alert: RAGLatencyHigh
++          expr: histogram_quantile(0.95, sum(rate(aegis_rag_latency_seconds_bucket[5m])) by (le)) > 2
++          for: 10m
++          labels:
++            severity: warning
++          annotations:
++            summary: "95th percentile RAG latency > 2s"
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/grafana_dashboard_llm.json
++{
++  "dashboard": {
++    "title": "Aegis LLM Ops",
++    "panels": [
++      { "title": "RAG Requests / minute", "type": "graph", "targets": [{"expr": "rate(aegis_rag_requests_total[1m])"}]},
++      { "title": "RAG Latency p95 (s)", "type": "graph", "targets": [{"expr": "histogram_quantile(0.95, sum(rate(aegis_rag_latency_seconds_bucket[5m])) by (le))"}]},
++      { "title": "LLM Tokens (1h)", "type": "graph", "targets": [{"expr": "increase(aegis_llm_tokens_total[1h])"}]}
++    ]
++  }
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:devsecops/conftest/llm_endpoint_policy.rego
++package k8svalidation.llm
++
++# Deny Deployments missing RATE_LIMIT environment variable or lacking resource requests/limits for containers
++deny[msg] {
++  input.kind == "Deployment"
++  containers := input.spec.template.spec.containers
++  c := containers[_]
++  not has_rate_limit_env(c)
++  msg = sprintf("Deployment %v/%v missing RATE_LIMIT env var in container %v", [input.metadata.namespace, input.metadata.name, c.name])
++}
++
++has_rate_limit_env(container) {
++  some i
++  container.env[i].name == "RATE_LIMIT"
++}
++
++# Deny ClusterRoleBinding that grants cluster-admin
++deny[msg] {
++  input.kind == "ClusterRoleBinding"
++  some i
++  input.roleRef.name == "cluster-admin"
++  msg = sprintf("ClusterRoleBinding %v grants cluster-admin; disallowed", [input.metadata.name])
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/conftest_llm_policy_check.yml
++name: Conftest LLM policy check
++
++on:
++  push:
++    paths:
++      - 'rag/**'
++      - 'llm/**'
++      - 'devsecops/**'
++  pull_request:
++    paths:
++      - 'rag/**'
++      - 'llm/**'
++      - 'devsecops/**'
++
++jobs:
++  conftest:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Install conftest
++        run: |
++          curl -sSL -o /usr/local/bin/conftest https://github.com/open-policy-agent/conftest/releases/latest/download/conftest-linux-amd64
++          chmod +x /usr/local/bin/conftest
++      - name: Run conftest against k8s manifests
++        run: |
++          conftest test -p devsecops/conftest --no-color rag/k8s || true
++          conftest test -p devsecops/conftest --no-color llm || true
++      - name: Fail on policy violations (collect & exit)
++        run: |
++          set -e
++          conftest test -p devsecops/conftest --no-color rag/k8s || (echo "Policy violations found in rag/k8s" && exit 1)
++
+*** End Patch
+*** End Patch

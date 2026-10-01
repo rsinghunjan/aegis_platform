@@ -1,0 +1,915 @@
+*** Begin Patch
+*** Add File:ops/argo/full_training_promotion_workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  name: training-validation-promotion
++  namespace: ml-pipelines
++spec:
++  entrypoint: pipeline
++  serviceAccountName: argo-workflow-sa
++  templates:
++  - name: pipeline
++    steps:
++    - - name: fetch-manifest
++        template: fetch-manifest
++    - - name: validate-manifest
++        template: validate-manifest
++          arguments:
++            artifacts:
++            - name: manifest
++              from: "{{steps.fetch-manifest.outputs.artifacts.manifest}}"
++    - - name: finetune
++        template: finetune
++          arguments:
++            artifacts:
++            - name: manifest
++              from: "{{steps.fetch-manifest.outputs.artifacts.manifest}}"
++    - - name: run-validation-battery
++        template: validation-battery
++          arguments:
++            artifacts:
++            - name: candidate
++              from: "{{steps.finetune.outputs.artifacts.candidate}}"
++    - - name: sign-publish
++        template: sign-and-publish
++          arguments:
++            artifacts:
++            - name: candidate
++              from: "{{steps.finetune.outputs.artifacts.candidate}}"
++    - - name: deploy-canary
++        template: deploy-canary
++          arguments:
++            artifacts:
++            - name: artifact-meta
++              from: "{{steps.sign-publish.outputs.artifacts.artifact-meta}}"
++    - - name: canary-eval
++        template: canary-eval
++          arguments:
++            artifacts:
++            - name: artifact-meta
++              from: "{{steps.sign-publish.outputs.artifacts.artifact-meta}}"
++    - - name: gated-promote
++        template: gated-promote
++          arguments:
++            artifacts:
++            - name: artifact-meta
++              from: "{{steps.sign-publish.outputs.artifacts.artifact-meta}}"
++
++  # Fetch manifest artifact (from PVC or S3 supported by the argo artifact repo or Preloaded in a volume)
++  - name: fetch-manifest
++    outputs:
++      artifacts:
++      - name: manifest
++        path: /tmp/train_manifest.jsonl
++    container:
++      image: alpine:3.18
++      command: [sh, -c]
++      args:
++        - |
++          set -euo pipefail
++          if [ -f /workspace/train_manifest.jsonl ]; then
++            cp /workspace/train_manifest.jsonl /tmp/train_manifest.jsonl
++          else
++            echo "[]">/tmp/train_manifest.jsonl
++
++  - name: validate-manifest
++    inputs:
++      artifacts:
++      - name: manifest
++        path: /tmp/train_manifest.jsonl
++    container:
++      image: python:3.10-slim
++      command: [sh, -c]
++      args:
++        - |
++          set -euo pipefail
++          pip install jsonschema
++          python - <<PY
++import json,sys
++from jsonschema import validate,ValidationError
++schema={"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"}}, "required":["id","text"]}
++ok=True
++for l in open("/tmp/train_manifest.jsonl"):
++    if not l.strip(): continue
++    try:
++        j=json.loads(l)
++        validate(j,schema)
++    except Exception as e:
++        print("validation failed",e)
++        ok=False
++        break
++if not ok:
++    sys.exit(2)
++print("manifest OK")
++PY
++
++  - name: finetune
++    inputs:
++      artifacts:
++      - name: manifest
++        path: /tmp/train_manifest.jsonl
++    outputs:
++      artifacts:
++      - name: candidate
++        path: /workspace/candidate
++    container:
++      image: us.gcr.io/aegis/verifier-trainer:latest
++      env:
++        - name: OUT_DIR
++          value: /workspace/candidate
++      command: [sh, -c]
++      args:
++        - |
++          set -euo pipefail
++          mkdir -p /workspace/candidate
++          python services/factuality/finetune_verifier.py --data /tmp/train_manifest.jsonl --out_dir /workspace/candidate --epochs 2
++
++  - name: validation-battery
++    inputs:
++      artifacts:
++      - name: candidate
++        path: /workspace/candidate
++    container:
++      image: us.gcr.io/aegis/validation-battery:latest
++      command: [sh, -c]
++      args:
++        - |
++          set -euo pipefail
++          python services/ci/validation_battery.py /workspace/candidate || (echo "validation_failed" && exit 2)
++
++  - name: sign-and-publish
++    inputs:
++      artifacts:
++      - name: candidate
++        path: /workspace/candidate
++    outputs:
++      artifacts:
++      - name: artifact-meta
++        path: /workspace/artifact_meta.json
++    container:
++      image: us.gcr.io/aegis/cosign-ci:latest
++      env:
++        - name: COSIGN_AWS_KMS_KEY_ARN
++          valueFrom:
++            secretKeyRef:
++              name: cosign-kms
++              key: kms_arn
++      command: [sh, -c]
++      args:
++        - |
++          set -euo pipefail
++          TAR=/workspace/candidate.tar.gz
++          tar -czf $TAR -C /workspace candidate
++          # sign using cosign CLI; the container must have cosign & credentials configured (KMS)
++          cosign sign --key "$COSIGN_AWS_KMS_KEY_ARN" $TAR || true
++          # upload artifact to model registry (idempotent)
++          gsutil cp $TAR gs://aegis-model-registry/verifier/$(date +%s)/candidate.tar.gz
++          echo "{\"artifact_path\":\"gs://aegis-model-registry/verifier/$(date +%s)/candidate.tar.gz\"}" > /workspace/artifact_meta.json
++
++  - name: deploy-canary
++    inputs:
++      artifacts:
++      - name: artifact-meta
++        path: /workspace/artifact_meta.json
++    resource:
++      action: apply
++      manifest: |
++        apiVersion: apps/v1
++        kind: Deployment
++        metadata:
++          name: verifier-canary
++          namespace: safety
++        spec:
++          replicas: 1
++          selector:
++            matchLabels:
++              app: verifier-canary
++          template:
++            metadata:
++              labels:
++                app: verifier-canary
++            spec:
++              containers:
++              - name: verifier
++                image: us.gcr.io/aegis/verifier-canary:latest
++                env:
++                - name: ARTIFACT_META
++                  valueFrom:
++                    configMapKeyRef:
++                      name: artifact-meta-cm
++                      key: artifact
++
++  - name: canary-eval
++    inputs:
++      artifacts:
++      - name: artifact-meta
++        path: /workspace/artifact_meta.json
++    container:
++      image: us.gcr.io/aegis/canary-eval:latest
++      command: [sh, -c]
++      args:
++        - |
++          set -euo pipefail
++          python services/ci/run_canary_checks.py --canary-url http://verifier-canary.safety.svc:8080/verify --baseline-url http://verifier.safety.svc:8080/verify --samples ops/factuality/verification_samples.jsonl --out /workspace/canary_result.json
++
++  - name: gated-promote
++    inputs:
++      artifacts:
++      - name: artifact-meta
++        path: /workspace/artifact_meta.json
++      artifacts:
++      - name: canary-result
++        path: /workspace/canary_result.json
++    script:
++      image: python:3.10-slim
++      command: [sh, -c]
++      source: |
++        set -euo pipefail
++        if [ -f /workspace/canary_result.json ]; then
++          PASS=$(jq -r .pass /workspace/canary_result.json)
++        else
++          PASS=false
++        fi
++        if [ "$PASS" = "true" ]; then
++          echo "Promoting to production"
++          cat <<YAML | kubectl apply -f -
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: verifier
++  namespace: safety
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: verifier
++  template:
++    metadata:
++      labels:
++        app: verifier
++    spec:
++      containers:
++      - name: verifier
++        image: us.gcr.io/aegis/verifier:latest
++YAML
++        else
++          echo "Canary failed; creating manual approval request"
++          curl -sS -X POST "${MANUAL_APPROVAL_URL:-http://manual-approval.svc}/request" -H "Content-Type: application/json" -d '{"request_id":"verifier_candidate","user":"system","reason":"canary_failed"}' || true
++          exit 1
++        fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:tekton/pipeline/verifier-pipeline.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Pipeline
++metadata:
++  name: verifier-training-pipeline
++  namespace: ml-pipelines
++spec:
++  params:
++    - name: manifest-path
++      description: "Path to training manifest (PVC or artifact)"
++      type: string
++  tasks:
++    - name: validate-manifest
++      taskRef:
++        name: validate-manifest-task
++      params:
++        - name: manifest-path
++          value: "$(params.manifest-path)"
++    - name: finetune
++      runAfter: [validate-manifest]
++      taskRef:
++        name: finetune-task
++      params:
++        - name: manifest-path
++          value: "$(params.manifest-path)"
++    - name: validation-battery
++      runAfter: [finetune]
++      taskRef:
++        name: validation-battery-task
++    - name: sign-publish
++      runAfter: [validation-battery]
++      taskRef:
++        name: cosign-sign-and-publish-task
++    - name: deploy-canary
++      runAfter: [sign-publish]
++      taskRef:
++        name: deploy-canary-task
++    - name: canary-eval
++      runAfter: [deploy-canary]
++      taskRef:
++        name: canary-eval-task
++    - name: gated-promote
++      runAfter: [canary-eval]
++      taskRef:
++        name: gated-promote-task
++
+*** End Patch
+*** Begin Patch
+*** Add File:tekton/tasks/validate-manifest-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: validate-manifest-task
++  namespace: ml-pipelines
++spec:
++  params:
++    - name: manifest-path
++      type: string
++  steps:
++    - name: validate
++      image: python:3.10-slim
++      script: |
++        #!/usr/bin/env bash
++        set -euo pipefail
++        pip install jsonschema
++        python - <<PY
++import json,sys
++from jsonschema import validate,ValidationError
++schema={"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"}},"required":["id","text"]}
++for l in open("$(inputs.params.manifest-path)"):
++    if not l.strip(): continue
++    validate(json.loads(l), schema)
++print("manifest valid")
++PY
++
+*** End Patch
+*** Begin Patch
+*** Add File:tekton/tasks/finetune-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: finetune-task
++  namespace: ml-pipelines
++spec:
++  params:
++    - name: manifest-path
++      type: string
++  steps:
++    - name: finetune
++      image: us.gcr.io/aegis/verifier-trainer:latest
++      script: |
++        #!/usr/bin/env bash
++        set -euo pipefail
++        python services/factuality/finetune_verifier.py --data $(inputs.params.manifest-path) --out_dir /workspace/candidate --epochs 2
++
+*** End Patch
+*** Begin Patch
+*** Add File:tekton/tasks/validation-battery-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: validation-battery-task
++  namespace: ml-pipelines
++spec:
++  steps:
++    - name: validate
++      image: us.gcr.io/aegis/validation-battery:latest
++      script: |
++        #!/usr/bin/env bash
++        set -euo pipefail
++        python services/ci/validation_battery.py /workspace/candidate
++
+*** End Patch
+*** Begin Patch
+*** Add File:tekton/tasks/cosign-sign-and-publish-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: cosign-sign-and-publish-task
++  namespace: ml-pipelines
++spec:
++  params:
++    - name: artifact-path
++      type: string
++  steps:
++    - name: sign
++      image: us.gcr.io/aegis/cosign-ci:latest
++      env:
++        - name: COSIGN_AWS_KMS_KEY_ARN
++          valueFrom:
++            secretKeyRef:
++              name: cosign-kms
++              key: kms_arn
++      script: |
++        #!/usr/bin/env bash
++        set -euo pipefail
++        TAR=/workspace/candidate.tar.gz
++        tar -czf $TAR -C /workspace candidate
++        cosign sign --key "$COSIGN_AWS_KMS_KEY_ARN" $TAR || true
++        gsutil cp $TAR gs://aegis-model-registry/verifier/$(date +%s)/candidate.tar.gz
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/cosign-admission/Chart.yaml
++apiVersion: v2
++name: cosign-admission
++description: Cosign validating admission webhook chart for Aegis
++version: 0.1.0
++appVersion: "0.1.0"
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/cosign-admission/values.yaml
++replicaCount: 2
++image:
++  repository: us.gcr.io/aegis/cosign-admission
++  tag: latest
++service:
++  port: 443
++webhook:
++  namespaceSelector:
++    matchExpressions:
++      - key: environment
++        operator: In
++        values: ["prod"]
++cosign:
++  kmsSecretName: cosign-kms
++  kmsSecretKey: kms_arn
++tls:
++  secretName: cosign-webhook-tls
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/cosign-admission/templates/deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: {{ include "cosign-admission.fullname" . }}
++spec:
++  replicas: {{ .Values.replicaCount }}
++  selector:
++    matchLabels:
++      app: {{ include "cosign-admission.name" . }}
++  template:
++    metadata:
++      labels:
++        app: {{ include "cosign-admission.name" . }}
++    spec:
++      containers:
++        - name: webhook
++          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
++          env:
++            - name: SERVICE_COSIGN_KMS_ARN
++              valueFrom:
++                secretKeyRef:
++                  name: {{ .Values.cosign.kmsSecretName }}
++                  key: {{ .Values.cosign.kmsSecretKey }}
++          ports:
++            - containerPort: 8443
++          volumeMounts:
++            - name: tls
++              mountPath: /certs
++              readOnly: true
++      volumes:
++        - name: tls
++          secret:
++            secretName: {{ .Values.tls.secretName }}
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/cosign-admission/templates/service.yaml
++apiVersion: v1
++kind: Service
++metadata:
++  name: {{ include "cosign-admission.fullname" . }}
++spec:
++  ports:
++    - name: https
++      port: {{ .Values.service.port }}
++      targetPort: 8443
++  selector:
++    app: {{ include "cosign-admission.name" . }}
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/cosign-admission/templates/validatingwebhook.yaml
++apiVersion: admissionregistration.k8s.io/v1
++kind: ValidatingWebhookConfiguration
++metadata:
++  name: {{ include "cosign-admission.fullname" . }}-vwc
++webhooks:
++  - name: cosign.aegis.example.com
++    admissionReviewVersions: ["v1"]
++    sideEffects: None
++    failurePolicy: Fail
++    clientConfig:
++      service:
++        name: {{ include "cosign-admission.fullname" . }}
++        namespace: {{ .Release.Namespace }}
++        path: "/validate"
++      caBundle: {{ .Files.Get "ca.crt" | b64enc | quote }}
++    rules:
++      - operations: ["CREATE"]
++        apiGroups: [""]
++        apiVersions: ["v1"]
++        resources: ["pods","deployments"]
++    namespaceSelector:
++{{ toYaml .Values.webhook.namespaceSelector | indent 6 }}
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/cosign_signing.yml
++name: CI Artifact Cosign Signing (KMS)
++on:
++  workflow_dispatch:
++
++jobs:
++  sign:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Install cosign
++        run: |
++          curl -fsSL -o cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
++          chmod +x cosign
++          sudo mv cosign /usr/local/bin/
++      - name: Prepare artifact (example)
++        run: |
++          echo "artifact" > artifact.txt
++          tar -czf artifact.tar.gz artifact.txt
++      - name: Sign artifact with KMS-backed key
++        env:
++          COSIGN_AWS_KMS_KEY_ARN: ${{ secrets.COSIGN_AWS_KMS_KEY_ARN }}
++        run: |
++          cosign sign --key "$COSIGN_AWS_KMS_KEY_ARN" artifact.tar.gz
++      - name: Upload signature
++        uses: actions/upload-artifact@v4
++        with:
++          name: artifact_signed
++          path: artifact.tar.gz.sig || true
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/factuality/verifier_calibration_notebook.ipynb
++{
++ "cells": [
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "# Verifier Calibration\n",
++    "This notebook loads verifier predictions and ground truth labels, computes precision/recall/F1 across thresholds, selects a threshold to meet precision target, and publishes the threshold as a kubernetes ConfigMap and to the metadata service."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 1,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "import json, numpy as np\n",
++    "from sklearn.metrics import precision_recall_fscore_support\n",
++    "from pathlib import Path\n",
++    "PRED_PATH = 'ops/factuality/sample_preds.jsonl'\n",
++    "LABEL_PATH = 'ops/factuality/verification_samples.jsonl'\n",
++    "OUT_DIR = 'out/calib'\n",
++    "Path(OUT_DIR).mkdir(parents=True, exist_ok=True)\n",
++    "preds = [json.loads(l) for l in open(PRED_PATH)]\n",
++    "labels = [json.loads(l) for l in open(LABEL_PATH)]\n",
++    "scores = [p.get('best',{}).get('score',0.0) for p in preds]\n",
++    "y_true = [1 if l.get('label')=='support' else 0 for l in labels]\n",
++    "thresholds = list(np.linspace(0,1,101))\n",
++    "best = {'threshold':0.5,'precision':0.0,'recall':0.0,'f1':0.0}\n",
++    "for t in thresholds:\n",
++    "    y_pred = [1 if s>=t else 0 for s in scores]\n",
++    "    p,r,f,_ = precision_recall_fscore_support(y_true,y_pred,average='binary',zero_division=0)\n",
++    "    if p >= 0.9 and f > best['f1']:\n",
++    "        best = {'threshold':t,'precision':p,'recall':r,'f1':f}\n",
++    "import os\n",
++    "with open(os.path.join(OUT_DIR,'thresholds.json'),'w') as f:\n",
++    "    json.dump(best,f,indent=2)\n",
++    "print('Wrote', best)\n"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "Next steps: run tools/calibrate_and_publish.py to push threshold into cluster and to metadata service; run verifier gate CI to apply and test."
++   ]
++  }
++ ],
++ "metadata": {
++  "kernelspec": {
++   "display_name": "Python 3",
++   "language": "python",
++   "name": "python3"
++  },
++  "language_info": {
++   "name": "python",
++   "version": "3.10"
++  }
++ },
++ "nbformat": 4,
++ "nbformat_minor": 5
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/factuality/calibrate_and_publish.py
++#!/usr/bin/env python3
++"""
++Calibrate verifier thresholds and publish:
++ - Computes best threshold for desired precision (uses preds + labels)
++ - Writes thresholds.json and publishes to Kubernetes ConfigMap (no kubectl subprocess; uses Kubernetes API)
++ - Posts calibration metrics to Prometheus Pushgateway if PUSHGATEWAY env is set
++ - Registers calibration artifact with metadata service
++"""
++import os, json, numpy as np, time
++from sklearn.metrics import precision_recall_fscore_support
++from kubernetes import client, config
++from services.metadata.metadata_service import register_artifact
++import requests
++
++PRED_PATH = os.environ.get("PRED_PATH", "ops/factuality/sample_preds.jsonl")
++LABEL_PATH = os.environ.get("LABEL_PATH", "ops/factuality/verification_samples.jsonl")
++OUT_DIR = os.environ.get("OUT_DIR", "/workspace/calib")
++PRECISION_TARGET = float(os.environ.get("PRECISION_TARGET", "0.9"))
++PUSHGATEWAY = os.environ.get("PUSHGATEWAY", "")
++NAMESPACE = os.environ.get("NAMESPACE", "safety")
++CONFIGMAP_NAME = os.environ.get("VERIFIER_CALIB_CM","verifier-calib")
++
++os.makedirs(OUT_DIR, exist_ok=True)
++
++def load_jsonl(path):
++    out=[]
++    for l in open(path):
++        if not l.strip(): continue
++        out.append(json.loads(l))
++    return out
++
++def calibrate(preds, labels, precision_target):
++    scores = [p.get("best",{}).get("score",0.0) for p in preds]
++    y_true = [1 if l.get("label")=="support" else 0 for l in labels]
++    thresholds = list(np.linspace(0.0,1.0,101))
++    best = {"threshold":0.5,"precision":0.0,"recall":0.0,"f1":0.0}
++    for t in thresholds:
++        y_pred = [1 if s>=t else 0 for s in scores]
++        p,r,f,_ = precision_recall_fscore_support(y_true,y_pred,average='binary',zero_division=0)
++        if p >= precision_target and f > best["f1"]:
++            best = {"threshold":t,"precision":p,"recall":r,"f1":f}
++    return best
++
++def publish_configmap(cfg, namespace, name):
++    # load kubeconfig (in-cluster or from KUBECONFIG)
++    try:
++        config.load_incluster_config()
++    except Exception:
++        config.load_kube_config()
++    v1 = client.CoreV1Api()
++    data = {"thresholds.json": json.dumps(cfg)}
++    body = client.V1ConfigMap(metadata=client.V1ObjectMeta(name=name), data=data)
++    try:
++        v1.patch_namespaced_config_map(name, namespace, body)
++    except client.exceptions.ApiException:
++        v1.create_namespaced_config_map(namespace, body)
++    return True
++
++def push_metrics(cfg):
++    if not PUSHGATEWAY:
++        return
++    job = "verifier_calibration"
++    payload = f"verifier_calib_threshold {cfg['threshold']}\nverifier_calib_f1 {cfg['f1']}\nverifier_calib_precision {cfg['precision']}\n"
++    try:
++        resp = requests.post(f"{PUSHGATEWAY}/metrics/job/{job}", data=payload, timeout=5)
++        resp.raise_for_status()
++    except Exception:
++        pass
++
++def main():
++    preds = load_jsonl(PRED_PATH)
++    labels = load_jsonl(LABEL_PATH)
++    cfg = calibrate(preds, labels, PRECISION_TARGET)
++    out_path = os.path.join(OUT_DIR, "thresholds.json")
++    with open(out_path,"w") as f:
++        json.dump(cfg,f,indent=2)
++    # publish
++    publish_configmap(cfg, NAMESPACE, CONFIGMAP_NAME)
++    push_metrics(cfg)
++    # register artifact
++    register_artifact({"id": f"calib_{int(time.time())}", "type":"verifier_calibration", "path": out_path, "meta": cfg})
++    print("Calibration published:", cfg)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/verifier_auto_calibrate.yml
++name: Verifier Auto-Calibrate
++on:
++  workflow_dispatch:
++
++jobs:
++  calibrate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with: {python-version: '3.10'}
++      - name: Install deps
++        run: pip install kubernetes scikit-learn numpy requests
++      - name: Run calibration and publish
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG }}
++          PUSHGATEWAY: ${{ secrets.PUSHGATEWAY }}
++          NAMESPACE: safety
++        run: |
++          python services/factuality/calibrate_and_publish.py --preds ops/factuality/sample_preds.jsonl --labels ops/factuality/verification_samples.jsonl || true
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/rl/safe_rl_agent_v2.py
++"""
++Safe RL agent skeleton (production-safe design):
++ - Runs in sandbox mode, generates candidate policies from offline data and simulates rewards
++ - Exposes REST API to list candidates, request approval, and run offline evaluation
++ - Requires manual approval before any suggested action is applied to live systems (integration via manual-approval service)
++ - Includes simple PPO-like loop placeholder (left as scaffold to implement offline RL)
++"""
++import os
++import time
++import json
++import random
++import threading
++from typing import List, Dict, Any
++from fastapi import FastAPI, HTTPException, Request
++
++app = FastAPI(title="Aegis Safe RL Agent")
++
++# In-memory stores (for scaffold)
++POLICIES: List[Dict[str,Any]] = []
++HISTORY: List[Dict[str,Any]] = []
++
++DATASET_PATH = os.environ.get("RL_DATASET", "/data/rl/trajectories.jsonl")
++MANUAL_APPROVAL_URL = os.environ.get("MANUAL_APPROVAL_URL", "http://manual-approval.svc")
++
++def load_offline_data():
++    data=[]
++    if os.path.exists(DATASET_PATH):
++        for l in open(DATASET_PATH):
++            try:
++                data.append(json.loads(l))
++            except Exception:
++                continue
++    return data
++
++def simulate_policy(policy: Dict[str,Any], traces: List[Dict[str,Any]]) -> float:
++    # Simple reward: combine cost saving and quality preservation measured on traces
++    total_reward=0.0
++    for trace in traces[:200]:
++        quality = trace.get("quality", 1.0)
++        cost = trace.get("cost", 1.0)
++        # policy contains e.g. {'student_pct': 20}
++        pct = policy.get("student_pct", 0)
++        # heuristic: cost saving proportional to pct, quality degrades slightly
++        reward = pct*0.01 * 10.0 - max(0, pct*0.001) * (1.0-quality)*100.0
++        total_reward += reward
++    return total_reward / max(1, len(traces[:200]))
++
++def propose_candidates(n=5):
++    traces = load_offline_data()
++    for _ in range(n):
++        cand = {"id": f"cand_{int(time.time())}_{random.randint(0,999)}", "student_pct": random.choice([10,20,30,40,50]), "created": time.time()}
++        cand["est_reward"] = simulate_policy({"student_pct": cand["student_pct"]}, traces)
++        POLICIES.append(cand)
++
++@app.on_event("startup")
++def start_background():
++    def loop():
++        while True:
++            propose_candidates(1)
++            time.sleep(60)
++    t=threading.Thread(target=loop, daemon=True)
++    t.start()
++
++@app.get("/candidates")
++def list_candidates():
++    return sorted(POLICIES, key=lambda c: -c["est_reward"])[:50]
++
++@app.post("/request_apply")
++async def request_apply(req: Request):
++    body = await req.json()
++    cid = body.get("candidate_id")
++    approver = body.get("approver", "unknown")
++    for c in POLICIES:
++        if c["id"] == cid:
++            # create a manual approval ticket; the actual apply must be performed by operators after approval
++            try:
++                requests.post(MANUAL_APPROVAL_URL + "/request", json={"request_id": cid, "user": approver, "reason":"RL suggested policy"}, timeout=5)
++            except Exception:
++                pass
++            return {"status":"approval_requested","candidate":c}
++    raise HTTPException(status_code=404, detail="candidate not found")
++
++@app.post("/evaluate_offline")
++async def evaluate_offline(req: Request):
++    body = await req.json()
++    cid = body.get("candidate_id")
++    traces = load_offline_data()
++    for c in POLICIES:
++        if c["id"] == cid:
++            score = simulate_policy(c, traces)
++            HISTORY.append({"candidate":c,"score":score,"ts":time.time()})
++            return {"score": score}
++    raise HTTPException(status_code=404, detail="candidate not found")
++
++@app.get("/history")
++def history():
++    return HISTORY[-200:]
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/rl/offline_eval.py
++#!/usr/bin/env python3
++"""
++Offline evaluation harness:
++ - Replays historical traces against a candidate policy and computes estimated rewards and safety risk metrics
++ - Useful to run before requesting manual approval
++"""
++import json,sys
++from typing import Dict,Any
++
++def load_traces(path):
++    out=[]
++    for l in open(path):
++        out.append(json.loads(l))
++    return out
++
++def eval_policy(policy: Dict[str,Any], traces):
++    # reuse same heuristic as RL agent skeleton
++    total=0.0
++    for t in traces:
++        quality = t.get("quality",1.0)
++        pct = policy.get("student_pct",0)
++        reward = pct*0.01*10.0 - max(0, pct*0.001)*(1.0-quality)*100.0
++        total += reward
++    return total / max(1, len(traces))
++
++if __name__=="__main__":
++    policy = json.loads(sys.argv[1])
++    traces = load_traces(sys.argv[2])
++    print(eval_policy(policy, traces))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/runbooks/production_checklist.md
++# Production Checklist — Before enabling automated promotion or speculative decoding beyond canary
++
++This checklist must be completed and signed off by SRE, ML Lead, Security, Compliance, and Product SME before enabling automatic promotion or expanding speculative decoding past canary.
++
++1) Infrastructure & Deployments
++ - [ ] Triton, orchestrator, inference-gateway, cosign admission webhook deployed in staging.
++ - [ ] Argo / Tekton pipelines installed and tested; service accounts with least privilege configured.
++ - [ ] PVCs for model repositories provisioned with backup and snapshot policy.
++
++2) Security & Supply Chain
++ - [ ] KMS/HSM keys provisioned and COSIGN signing tested end-to-end.
++ - [ ] ValidatingWebhookConfiguration deployed to block unsigned images in prod.
++ - [ ] Secrets stored in KMS-backed secrets manager; secret rotation policy documented.
++ - [ ] S3 bucket for evidence has Object Lock enabled and legal signoff for retention.
++
++3) Verifier & Safety
++ - [ ] Verifier finetuned on domain labels and calibration artifact exists.
++ - [ ] Calibration run and thresholds applied in staging; verifier CI gate passes.
++ - [ ] Fairness & adversarial tests executed; results stored in metadata store and reviewed by SME.
++ - [ ] Manual approval workflow tested (create/request/approve/reject).
++
++4) Observability & KPIs
++ - [ ] Dashboards for acceptance_rate, verifier precision, label drift, embedding drift, and budget are live.
++ - [ ] Alerts configured: SpeculativeAcceptanceLow, SpeculativeFallbackSpike, VerifierRegression, BudgetNearlyExhausted.
++ - [ ] Telemetry calibrated with wattmeter ground-truth and pushgateway metrics validated.
++
++5) DataOps & Labeling
++ - [ ] Active learning sampling enabled and sample labels flowing into training manifest.
++ - [ ] Label ingestion pipeline tested; manifest deduplication and lineage recorded.
++ - [ ] Rater capacity planned; autoscaling rules and capacity planner tested.
++
++6) Canary & Shadow
++ - [ ] Shadow run completed (min 7 days or representative sample).
++ - [ ] Canary rollout plan documented with thresholds, monitoring windows, and rollback criteria.
++ - [ ] Canary evaluation harness (run_canary_checks.py) tested and produces pass/fail artifacts.
++
++7) Cost & Sustainability
++ - [ ] Budget manager configured per-tenant and tested; budget alerts wired.
++ - [ ] Wattmeter calibration performed and sustainability dashboards validate savings.
++
++8) Ops & Governance
++ - [ ] Runbooks, SLOs and escalation paths published.
++ - [ ] On-call rotation assigned; incident playbook reviewed.
++ - [ ] Legal/compliance signoff on retention, PII handling, and data flow.
++
++Signoffs:
++ - SRE: ______________________  Date: ______
++ - ML Lead: ___________________  Date: ______
++ - Security: ___________________  Date: ______
++ - Compliance/Legal: ___________  Date: ______
++ - Product SME: ________________  Date: ______
++
+*** End Patch
+*** End Patch

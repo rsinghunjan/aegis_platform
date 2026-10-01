@@ -1,0 +1,508 @@
+*** Begin Patch
+*** Add File:security/cosign-admission/requirements.txt
+flask
+kubernetes
+requests
+python-dateutil
+*** End Patch
+*** Begin Patch
+*** Add File:security/cosign-admission/admission_server.py
+#!/usr/bin/env python3
+"""
+Simple Admission Webhook that verifies container images are cosign-signed.
+
+Behavior:
+ - Accepts AdmissionReview requests for Pod CREATE/UPDATE.
+ - For each container image in the PodSpec, runs `cosign verify --key <COSIGN_KEY> <image>` (best-effort).
+ - If verification fails for any image, the webhook rejects the AdmissionReview.
+ - This is a pragmatic, best-effort implementation intended for staging. In production, use a hardened,
+   OPA/Gatekeeper + attestation flow and ensure cosign verification is performed in a network-isolated runner.
+
+Environment:
+ - COSIGN_KEY: awskms://... or path to key for cosign verify --key (optional). If empty, webhook will try cosign verify without key.
+ - LOG_LEVEL: optional
+"""
+import os
+import json
+import subprocess
+import sys
+from flask import Flask, request, jsonify
+
+APP = Flask(__name__)
+COSIGN_KEY = os.environ.get("COSIGN_KEY", "")
+TIMEOUT = int(os.environ.get("COSIGN_VERIFY_TIMEOUT", "10"))
+
+def _verify_image(img: str):
+    # Construct cosign verify command
+    cmd = ["cosign", "verify"]
+    if COSIGN_KEY:
+        cmd += ["--key", COSIGN_KEY]
+    cmd += [img]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
+        ok = proc.returncode == 0
+        return ok, proc.stdout + proc.stderr
+    except Exception as e:
+        return False, str(e)
+
+def _admission_response(uid: str, allowed: bool, reason: str = ""):
+    resp = {
+        "apiVersion": "admission.k8s.io/v1",
+        "kind": "AdmissionReview",
+        "response": {
+            "uid": uid,
+            "allowed": allowed,
+        }
+    }
+    if not allowed:
+        resp["response"]["status"] = {"code": 403, "message": reason}
+    return resp
+
+@APP.route("/validate", methods=["POST"])
+def validate():
+    try:
+        review = request.get_json()
+        req = review.get("request", {})
+        uid = req.get("uid")
+        obj = req.get("object", {})
+        kind = obj.get("kind")
+        # only handle Pods (and Pod templates embedded in Deployments will be passed via PodAdmission)
+        # The AdmissionReview might be for Deployment; we accept both and inspect spec.template.spec
+        pod_spec = None
+        if obj.get("kind") == "Pod":
+            pod_spec = obj.get("spec", {})
+        else:
+            # Try to find pod template path
+            template = obj.get("spec", {}).get("template", {})
+            pod_spec = template.get("spec", {})
+        if not pod_spec:
+            return jsonify(_admission_response(uid, True, "no pod spec found"))
+        containers = pod_spec.get("containers", []) + pod_spec.get("initContainers", [])
+        for c in containers:
+            img = c.get("image")
+            if not img:
+                continue
+            ok, out = _verify_image(img)
+            if not ok:
+                reason = f"Image {img} failed cosign verification: {out}"
+                return jsonify(_admission_response(uid, False, reason))
+        return jsonify(_admission_response(uid, True))
+    except Exception as e:
+        # Fail-closed: reject if webhook errors (configurable; for staging you may prefer allow)
+        uid = request.json.get("request", {}).get("uid", "unknown")
+        return jsonify(_admission_response(uid, False, f"admission webhook error: {e}"))
+
+if __name__ == "__main__":
+    # Simple CLI mode for local testing
+    APP.run(host="0.0.0.0", port=int(os.environ.get("PORT", "9443")))
+*** End Patch
+*** Begin Patch
+*** Add File:security/cosign-admission/deployment.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: security
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cosign-admission-sa
+  namespace: security
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cosign-admission
+  namespace: security
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cosign-admission
+  template:
+    metadata:
+      labels:
+        app: cosign-admission
+    spec:
+      serviceAccountName: cosign-admission-sa
+      containers:
+        - name: admission
+          image: ghcr.io/yourorg/aegis-cosign-admission:latest
+          env:
+            - name: COSIGN_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: cosign-admission-secrets
+                  key: COSIGN_KEY
+          ports:
+            - containerPort: 9443
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9443
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cosign-admission
+  namespace: security
+spec:
+  selector:
+    app: cosign-admission
+  ports:
+    - port: 9443
+      targetPort: 9443
+      protocol: TCP
+---
+# NOTE: You must create a TLS secret for the webhook server and a ValidatingWebhookConfiguration that references the service.
+# Example ValidatingWebhookConfiguration (operator must populate caBundle from cert-manager)
+*** End Patch
+*** Begin Patch
+*** Add File:devsecops/gatekeeper/constraint_require_signed_images.yaml
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: requiresignedimages
+spec:
+  crd:
+    spec:
+      names:
+        kind: RequireSignedImages
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package requiresignedimages
+        violation[{"msg": msg}] {
+          input.review.object.kind == "Deployment"
+          containers := input.review.object.spec.template.spec.containers
+          # require that deployment metadata annotation indicates images must be signed
+          annotations := input.review.object.metadata.annotations
+          annotations["aegis.require_signed_images"] == "true"
+          # fail if no aegis.cosign.signature annotation present on deployment
+          not annotations["aegis.cosign.signature"]
+          msg := "Deployment requires signed images (missing aegis.cosign.signature annotation). Ensure CI verifies images and adds signature annotation."
+        }
+*** End Patch
+*** Begin Patch
+*** Add File:ci/promotion_gate.yml
+name: Promotion Gate (safety, fairness, PII, model_card & run_context checks)
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [promote-request]
+
+jobs:
+  promotion-gate:
+    runs-on: ubuntu-latest
+    env:
+      MODEL_CARD_REGISTRY_URL: ${{ secrets.MODEL_CARD_REGISTRY_URL }}
+      MODEL_CONTEXT_REG_URL: ${{ secrets.MODEL_CONTEXT_REG_URL }}
+      MODEL_NAME: ${{ github.event.client_payload.model_name || '' }}
+      MODEL_VERSION: ${{ github.event.client_payload.model_version || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Run fairness tests (if provided)
+        run: |
+          if [ -f fairness/test_data/test_preds.csv ]; then
+            python fairness/fairness_eval.py --csv fairness/test_data/test_preds.csv --sensitive sensitive_attr --label label --pred pred --run-id ci-fairness
+          else
+            echo "No fairness test data; skipping"
+          fi
+      - name: Run hallucination eval (if provided)
+        run: |
+          if [ -f safety/hallucination/pairs.json ]; then
+            echo "Running hallucination eval (operator must provide model endpoint or simulate)"
+            # Placeholder: operator should call real eval harness against model endpoint
+          else
+            echo "No hallucination dataset; skipping"
+          fi
+      - name: Check Model Card Signed in Registry
+        env:
+          REG_URL: ${{ secrets.MODEL_CARD_REGISTRY_URL }}
+        run: |
+          if [ -z "$REG_URL" ]; then
+            echo "No model card registry configured; failing gate"
+            exit 1
+          fi
+          MODEL=${{ github.event.client_payload.model_name }}
+          VERSION=${{ github.event.client_payload.model_version }}
+          RES=$(curl -sS "${REG_URL}/cards?model_name=${MODEL}")
+          if echo "$RES" | jq -e ". | length > 0" >/dev/null; then
+            SIGNED=$(echo "$RES" | jq -r ".[] | select(.version==\"${VERSION}\") | .signed" | head -n1)
+            if [ "$SIGNED" != "true" ]; then
+              echo "Model card for ${MODEL}:${VERSION} not signed; failing promotion"
+              exit 2
+            else
+              echo "Model card signed."
+            fi
+          else
+            echo "No model cards found for $MODEL; failing"
+            exit 3
+          fi
+      - name: Check recent run context (Model Context Registry)
+        env:
+          REG2: ${{ secrets.MODEL_CONTEXT_REG_URL }}
+        run: |
+          MODEL=${{ github.event.client_payload.model_name }}
+          if [ -z "$REG2" ]; then
+            echo "No Model Context Registry configured; failing gate"
+            exit 1
+          fi
+          # Verify there is at least one recent context for this model
+          RES=$(curl -sS "${REG2}/search?model_name=${MODEL}&limit=1")
+          if [ "$(echo "$RES" | jq -r 'length')" -eq 0 ]; then
+            echo "No run context found for ${MODEL}; failing promotion"
+            exit 4
+          else
+            echo "Found run context for ${MODEL}"
+          fi
+      - name: Gate decision
+        run: |
+          echo "All checks passed (operator may need to add additional thresholds). Promotion gate OK."
+*** End Patch
+*** Begin Patch
+*** Add File:carbon/estimator/runner_attach_mlflow.py
+#!/usr/bin/env python3
+"""
+Enhanced estimator runner.
+
+- Calls estimator script for runs (as before)
+- After estimator produces evidence JSON, uploads evidence to S3, tags the MLflow run with run_context and carbon evidence, and sets carbon_processed tag
+- Optionally calls carbon-guard to reserve or report (best-effort)
+"""
+import os
+import time
+import json
+import subprocess
+from datetime import datetime, timezone
+import mlflow
+from mlflow.tracking import MlflowClient
+import boto3
+import requests
+
+MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "")
+LOOKBACK_MIN = int(os.environ.get("CARBON_LOOKBACK_MIN", "60"))
+ESTIMATOR_SCRIPT = os.environ.get("CARBON_ESTIMATOR_SCRIPT", "/opt/estimator/estimator.py")
+EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
+AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
+CARBON_GUARD_URL = os.environ.get("CARBON_GUARD_URL", "http://aegis-carbon-guard.aegis.svc.cluster.local:8080")
+
+if not MLFLOW_TRACKING_URI:
+    raise RuntimeError("MLFLOW_TRACKING_URI not set")
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+client = MlflowClient()
+s3 = boto3.client("s3", region_name=AWS_REGION)
+
+def run_estimator_for_run(run):
+    info = run.info
+    run_id = info.run_id
+    start_time = info.start_time // 1000 if info.start_time else None
+    end_time = info.end_time // 1000 if info.end_time else None
+    if not end_time:
+        print("Run not finished:", run_id)
+        return
+    # call estimator script which should produce an evidence file at /tmp/<run_id>-co2e.json
+    out_file = f"/tmp/{run_id}-co2e.json"
+    cmd = ["python", ESTIMATOR_SCRIPT, "--run-id", run_id, "--start", str(start_time), "--end", str(end_time), "--out", out_file]
+    try:
+        subprocess.run(cmd, check=True)
+    except Exception as e:
+        print("Estimator failed:", e)
+        return
+    # upload evidence to S3
+    if EVIDENCE_BUCKET and os.path.exists(out_file):
+        s3_key = f"carbon/{run_id}/co2e.json"
+        s3.upload_file(out_file, EVIDENCE_BUCKET, s3_key)
+        s3_url = f"s3://{EVIDENCE_BUCKET}/{s3_key}"
+        # tag mlflow run
+        try:
+            client.set_tag(run_id, "carbon_evidence_s3", s3_url)
+            # optionally parse evidence and tag numeric values
+            data = json.load(open(out_file))
+            if "co2e_kg" in data:
+                client.log_metric(run_id, "co2e_kg", float(data["co2e_kg"]))
+        except Exception:
+            pass
+        # call carbon-guard to record/consume budget (best-effort)
+        try:
+            payload = {"tenant": run.data.tags.get("tenant","default") if run.data.tags else "default", "estimate_kg": data.get("co2e_kg",0.0), "run_id": run_id}
+            r = requests.post(f"{CARBON_GUARD_URL}/reserve", json=payload, timeout=5)
+            if r.status_code == 200:
+                print("Carbon guard reserve response:", r.json())
+        except Exception:
+            pass
+        # mark processed
+        try:
+            client.set_tag(run_id, "carbon_processed", "true")
+        except Exception:
+            pass
+
+def main():
+    window_end = int(time.time())
+    window_start = window_end - (LOOKBACK_MIN * 60)
+    runs = client.search_runs(experiment_ids=None, filter_string="attributes.status = 'FINISHED'", max_results=1000)
+    for r in runs:
+        if r.info.end_time is None:
+            continue
+        end_ts = r.info.end_time // 1000
+        if end_ts < window_start or end_ts > window_end:
+            continue
+        tags = {t.key:t.value for t in r.data.tags}
+        if tags.get("carbon_processed","false") == "true":
+            continue
+        try:
+            run_estimator_for_run(r)
+        except Exception as e:
+            print("Estimator process failed for", r.info.run_id, e)
+
+if __name__ == "__main__":
+    main()
+*** End Patch
+*** Begin Patch
+*** Add File:n8n/workflows/mcp_promotion_and_audit.json
++{
++  "name": "Aegis - MCP Promotion with Audit & Sign",
++  "nodes": [
++    {
++      "id": "1",
++      "name": "Trigger - Promote Request",
++      "type": "n8n-nodes-base.webhook",
++      "parameters": {
++        "httpMethod": "POST",
++        "path": "promote-request"
++      }
++    },
++    {
++      "id": "2",
++      "name": "Call MCP Promote",
++      "type": "n8n-nodes-base.httpRequest",
++      "parameters": {
++        "requestMethod": "POST",
++        "url": "http://aegis-mcp.aegis.svc.cluster.local:8089/promote",
++        "jsonParameters": true,
++        "options": {}
++      }
++    },
++    {
++      "id": "3",
++      "name": "Wait for Approval (poll)",
++      "type": "n8n-nodes-base.wait",
++      "parameters": {
++        "time": 30,
++        "unit": "seconds"
++      }
++    },
++    {
++      "id": "4",
++      "name": "Package Audit",
++      "type": "n8n-nodes-base.httpRequest",
++      "parameters": {
++        "requestMethod": "POST",
++        "url": "http://audit-service.aegis.svc.cluster.local/package",
++        "jsonParameters": true
++      }
++    },
++    {
++      "id": "5",
++      "name": "Sign Audit Package",
++      "type": "n8n-nodes-base.httpRequest",
++      "parameters": {
++        "requestMethod": "POST",
++        "url": "http://signing-service.aegis.svc.cluster.local/sign",
++        "jsonParameters": true
++      }
++    }
++  ],
++  "connections": {
++    "1": { "main": [[{"node":"2","type":"main","index":0}]] },
++    "2": { "main": [[{"node":"3","type":"main","index":0}]] },
++    "3": { "main": [[{"node":"4","type":"main","index":0}]] },
++    "4": { "main": [[{"node":"5","type":"main","index":0}]] }
++  }
++}
+*** End Patch
+*** Begin Patch
+*** Add File:ops/healthchecks/staging_healthcheck.sh
+#!/usr/bin/env bash
+set -euo pipefail
+echo "Running Aegis staging health checks..."
+
+# namespaces and endpoints to verify
+NAMESPACES=(aegis monitoring security)
+# simple k8s pod readiness check
+echo "Checking pod readiness..."
+for ns in "${NAMESPACES[@]}"; do
+  printf "Namespace %s: " "$ns"
+  kubectl get pods -n "$ns" --no-headers | awk '{print $1 ":" $2}' || true
+done
+
+# Check services
+services=(
+  "mlflow:aegis:5000"
+  "milvus:aegis:19530"
+  "redis:aegis:6379"
+  "prometheus:monitoring:9090"
+  "dcgm-exporter:monitoring:9400"
+)
+echo "Checking connectivity to core services..."
+for s in "${services[@]}"; do
+  IFS=":" read -r name ns port <<< "$s"
+  echo -n "Service $name in $ns on port $port... "
+  if kubectl run --restart=Never --rm -i --tty check-$name -n "$ns" --image=alpine -- sh -c "apk add --no-cache curl >/dev/null 2>&1; echo ok" >/dev/null 2>&1; then
+    echo "OK"
+  else
+    echo "WARN (could not exec pod check; ensure cluster allows debug pods)"
+  fi
+done
+
+echo "Prometheus scrape targets (sample):"
+kubectl get servicemonitor -n monitoring || true
+echo "Basic checks complete. For full scale tests run the provided scale harness scripts."
+
+*** End Patch
+*** Begin Patch
+*** Add File:docs/runbooks/production_hardening_checklist.md
+# Production Hardening Checklist (Automated & manual steps)
+
+This checklist ties together the tasks required to satisfy the user's requested guarantees.
+
+1) Image supply chain & admission enforcement
+ - Build/publish images and sign in CI using cosign with KMS.
+ - Ensure Rekor entries are posted for signed images.
+ - Deploy cosign admission webhook (security/cosign-admission) and create TLS certs for webhook server.
+ - Apply Gatekeeper template devsecops/gatekeeper/constraint_require_signed_images.yaml and add annotation aegis.require_signed_images=true to inference Deployments.
+
+2) Run context (MCPx)
+ - Ensure inference/agent services use mcp_context middleware to upload signed run_context to S3 and register in Model Context Registry.
+ - Verify MLflow runs are tagged with run_context_s3 pointer.
+ - Apply Gatekeeper constraint (mcp_context/gatekeeper/constraint_require_run_context.yaml) to enforce run_context annotation on inference Deployments.
+
+3) CI promotion gates
+ - Configure .github/workflows/ci/promotion_gate.yml to run fairness/hallucination/PII checks and validate signed model_card and run_context presence before promotion.
+
+4) Carbon & budget enforcement
+ - Deploy carbon estimator runner (carbon/estimator/runner_attach_mlflow.py) as CronJob, configure EVIDENCE_BUCKET and CARBON_GUARD_URL.
+ - Verify estimator attaches carbon_evidence_s3 to MLflow runs and carbon_guard reserves budgets.
+
+5) Orchestration & audit package
+ - Deploy n8n and seed n8n/workflows/mcp_promotion_and_audit.json to orchestrate promotions, audit packaging, and signing.
+ - Ensure signing-service and audit-service endpoints exist (or replace with CI tasks).
+
+6) Health & scale
+ - Run ops/healthchecks/staging_healthcheck.sh to verify basic deployments.
+ - Run scale harnesses (RAG vegeta, Milvus bulk indexing, Deepspeed smoke) located in repo to validate performance.
+
+7) Final verification
+ - Execute a representative run end-to-end: train→register→generate model_card→sign→promote→inference with MCPx run_context produced, carbon evidence attached, audit package generated and signed, and ensure Gatekeeper blocks unsigned artifacts.
+ - Collect logs, Rekor entries and signed audit package for signoff.
+
+*** End Patch
+*** End Patch

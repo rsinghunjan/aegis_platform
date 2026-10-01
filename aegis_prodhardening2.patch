@@ -1,0 +1,376 @@
+*** Begin Patch
+*** Add File:accuracy/eval_median_error_and_draft.py
++#!/usr/bin/env python3
++"""
++Compute median relative error for reconciliations and produce a conservative calibration draft.
++
++Behavior:
++- Reads reconciliation JSON files from S3 (or optionally from a Postgres DW).
++- Computes median(|measured - estimated| / measured) aggregated by node_type or workload tag.
++- If bias exceeds threshold, produces a draft JSON with suggested multiplicative adjustment to power profiles
++  and uploads it to S3 under calibration/drafts/.
++ - Does NOT apply changes to cluster; operator must review & approve.
++
++Usage:
++  GE_AWS_REGION=... EVIDENCE_BUCKET=... python3 eval_median_error_and_draft.py --prefix reconciliations/ --threshold 0.10
++"""
++import os, json, argparse, tempfile, statistics, boto3
++from collections import defaultdict
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET")
++AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
++
++def list_keys(s3, bucket, prefix):
++    paginator = s3.get_paginator("list_objects_v2")
++    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
++        for obj in page.get("Contents", []):
++            yield obj["Key"]
++
++def load_json_from_s3(s3, bucket, key):
++    resp = s3.get_object(Bucket=bucket, Key=key)
++    return json.loads(resp["Body"].read().decode("utf-8"))
++
++def compute_errors(s3, bucket, prefix):
++    groups = defaultdict(list)
++    for key in list_keys(s3, bucket, prefix):
++        if not key.endswith(".json"):
++            continue
++        try:
++            j = load_json_from_s3(s3, bucket, key)
++            est = j.get("estimate", {}).get("estimated_emissions_kg")
++            meas = j.get("measured", {}).get("measured_emissions_kg")
++            node_type = j.get("node_type") or j.get("meta",{}).get("node_type", "default")
++            if est is None or meas is None or meas == 0:
++                continue
++            rel = abs(meas - est) / float(meas)
++            groups[node_type].append({"key": key, "rel": rel, "est": est, "meas": meas})
++        except Exception:
++            continue
++    return groups
++
++def synthesize_draft(groups, threshold):
++    draft = {"generated_at": __import__("datetime").datetime.utcnow().isoformat()+"Z", "suggestions": {}}
++    for node_type, items in groups.items():
++        rels = [i["rel"] for i in items]
++        median_rel = statistics.median(rels) if rels else 0.0
++        if median_rel > threshold:
++            # Conservative adjustment: scale base power by measured/estimated median ratio
++            # compute median of meas/est ratio
++            ratios = [ (i["meas"] / i["est"]) if i["est"]>0 else 1.0 for i in items ]
++            suggested_multiplier = statistics.median(ratios)
++            draft["suggestions"][node_type] = {
++                "median_rel_error": median_rel,
++                "suggested_multiplier": round(suggested_multiplier, 3),
++                "sample_count": len(items)
++            }
++    return draft
++
++def upload_draft(s3, bucket, draft):
++    key = f"calibration/drafts/draft_{__import__('datetime').datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.json"
++    s3.put_object(Bucket=bucket, Key=key, Body=json.dumps(draft).encode("utf-8"))
++    return key
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--prefix", default="reconciliations/")
++    p.add_argument("--threshold", type=float, default=0.10)
++    args = p.parse_args()
++    if not EVIDENCE_BUCKET:
++        raise SystemExit("EVIDENCE_BUCKET env required")
++    s3 = boto3.client("s3", region_name=AWS_REGION)
++    groups = compute_errors(s3, EVIDENCE_BUCKET, args.prefix)
++    if not groups:
++        print("No reconciliation data found.")
++        return
++    draft = synthesize_draft(groups, args.threshold)
++    if draft["suggestions"]:
++        key = upload_draft(s3, EVIDENCE_BUCKET, draft)
++        print("Uploaded calibration draft:", key)
++        print(json.dumps(draft, indent=2))
++    else:
++        print("No significant biases detected. Nothing to draft.")
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:accuracy/ci_holdout_validator.sql
++-- SQL snippet to compute median relative error per workload from reconciliations table in DW
++-- Assumes table reconciliations(job_id, estimated_emissions_kg, measured_emissions_kg, node_type)
++with errors as (
++  select node_type,
++         abs(measured_emissions_kg - estimated_emissions_kg) / nullif(measured_emissions_kg,0) as rel_err
++  from reconciliations
++  where measured_emissions_kg > 0
++)
++select node_type, percentile_cont(0.5) within group (order by rel_err) as median_rel_error, count(*) as n
++from errors
++group by node_type
++order by median_rel_error desc;
++
+*** End Patch
+*** Begin Patch
+*** Add File:enforcement/enforcement_coverage_exporter.py
++#!/usr/bin/env python3
++"""
++Poll enforcement counters from Redis and push Prometheus metrics to pushgateway.
++Counters expected:
++ - aegis:policy:triggered_total
++ - aegis:enforcer:enforced_total
++ - aegis:enforcer:failures_total
++"""
++import os, time, redis, requests
++
++PUSHGATEWAY = os.environ.get("PUSHGATEWAY", "pushgateway.monitoring.svc:9091")
++REDIS_URL = os.environ.get("REDIS_URL", "redis://aegis-redis.aegis.svc:6379/0")
++INTERVAL = int(os.environ.get("EXPORT_INTERVAL", "30"))
++
++r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
++
++def push_metric(name, value, job="enforcement"):
++    data = f"{name} {value}\n"
++    url = f"http://{PUSHGATEWAY}/metrics/job/{job}"
++    try:
++        requests.post(url, data=data, timeout=5)
++    except Exception:
++        pass
++
++def main():
++    while True:
++        triggered = int(r.get("aegis:policy:triggered_total") or 0)
++        enforced = int(r.get("aegis:enforcer:enforced_total") or 0)
++        failures = int(r.get("aegis:enforcer:failures_total") or 0)
++        push_metric("aegis_policy_triggered_total", triggered)
++        push_metric("aegis_enforcer_enforced_total", enforced)
++        push_metric("aegis_enforcer_failures_total", failures)
++        cov = (enforced / triggered) if triggered else 0
++        push_metric("aegis_enforcement_coverage", round(cov,3))
++        time.sleep(INTERVAL)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:operational/airflow_idempotent_helper.py
++"""
++Helpers and patterns for idempotent Airflow tasks (python operator examples).
++Provide a small utility to check for a marker file or DB flag before executing heavy tasks.
++"""
++import os
++import psycopg2
++
++def already_done_marker(conn_dsn, job_key):
++    # simple idempotency via a bookkeeping table `etl_runs` with primary key job_key
++    conn = psycopg2.connect(conn_dsn)
++    cur = conn.cursor()
++    cur.execute("create table if not exists etl_runs (job_key text primary key, ts timestamptz)")
++    cur.execute("select 1 from etl_runs where job_key=%s", (job_key,))
++    exists = cur.fetchone() is not None
++    cur.close()
++    conn.close()
++    return exists
++
++def mark_done(conn_dsn, job_key):
++    conn = psycopg2.connect(conn_dsn)
++    cur = conn.cursor()
++    cur.execute("insert into etl_runs (job_key, ts) values (%s, now()) on conflict (job_key) do update set ts = now()", (job_key,))
++    conn.commit()
++    cur.close()
++    conn.close()
++
+*** End Patch
+*** Begin Patch
+*** Add File:operational/incident_playbooks.md
++# Incident Playbooks (concise)
++
+## 1) Parquet pipeline failing
++- Symptoms: aegis_etl_parquet_failed metric > 0, Airflow task failed.
++- Immediate actions:
++  1. Inspect Airflow task logs for error.
++ 2. Check S3 checkpoint object (PREFIX/.parquet_checkpoint.json). If missing, use last uploaded parquet key as marker.
++ 3. If job partial, re-run s3_parquet_pipeline_v2.py on a small range locally to reproduce, then re-run Airflow task.
++ 4. If corruption suspected, move suspect S3 objects to a quarantine prefix and rerun.
++- Recovery: rerun pipeline, monitor pushgateway metric and ensure checkpoint advances.
++
+## 2) Bulk load (Redshift/COPY) failure
++- Symptoms: aegis_etl_bulk_load_failed metric triggered.
++- Immediate:
++  1. Check COPY logs in Redshift STV tables and Redshift event logs.
++ 2. Validate manifest file in S3 (copy_manifest.json) and ensure IAM role ARN used by Redshift has read permission.
++ 3. Retry COPY for the manifest or single partition.
++- Recovery: if data partially loaded, use transactional MERGE or reload with dedup logic; restore from previous snapshot if needed.
++
+## 3) Great Expectations failures
++- Symptoms: aegis_ge_latest_success == 0
++- Immediate:
++  1. Download GE validation JSON from S3 (data-quality/validations) and examine failing expectations.
++  2. If upstream data issue, escalate to producer team and create Jira incident.
++  3. If model/input schema change required, update dbt models and re-run validation.
++- Recovery: hold promotions until tests pass; if business-critical, apply manual override with operator sign-off and document in evidence S3.
++
+*** End Patch
+*** Begin Patch
+*** Add File:security/kms/kms_key_policy.tf
++variable "kms_key_alias" { default = "aegis-signing-key" }
++variable "allowed_principals" { type = list(string) }
++
++resource "aws_kms_key" "cosign_signing" {
++  description             = "KMS key for cosign signing (Aegis)"
++  deletion_window_in_days = 30
++  policy = jsonencode({
++    Version = "2012-10-17",
++    Statement = [
++      {
++        Sid = "Allow use of the key",
++        Effect = "Allow",
++        Principal = { AWS = var.allowed_principals },
++        Action = [
++          "kms:Sign",
++          "kms:GetPublicKey",
++          "kms:DescribeKey"
++        ],
++        Resource = "*"
++      },
++      {
++        Sid = "Allow admin",
++        Effect = "Allow",
++        Principal = { AWS = var.allowed_principals },
++        Action = [
++          "kms:*"
++        ],
++        Resource = "*"
++      }
++    ]
++  })
++}
++
++resource "aws_kms_alias" "cosign_alias" {
++  name          = "alias/${var.kms_key_alias}"
++  target_key_id = aws_kms_key.cosign_signing.key_id
++}
++
++output "kms_key_arn" {
++  value = aws_kms_key.cosign_signing.arn
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ingest/parquet_tuning/recommend_parquet_size.py
++#!/usr/bin/env python3
++"""
++Recommend parquet file target size and partitioning heuristics based on sample rows.
++Usage: provide approximate avg row bytes and daily rows to compute recommended file size and partitions.
++"""
++import argparse, math
++
++def recommend(avg_row_bytes, daily_rows, target_file_mb=256):
++    avg_row = avg_row_bytes
++    total_bytes = avg_row * daily_rows
++    files = max(1, math.ceil(total_bytes / (target_file_mb*1024*1024)))
++    # Recommend size between 64MB and 512MB
++    recommended_file_mb = min(max(target_file_mb, 64), 512)
++    return {"recommended_file_mb": recommended_file_mb, "files_per_day": files}
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--avg-row-bytes", type=int, required=True)
++    p.add_argument("--daily-rows", type=int, required=True)
++    args = p.parse_args()
++    r = recommend(args.avg_row_bytes, args.daily_rows)
++    print("Recommendation:", r)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ingest/iam/s3_prefix_policy.tf
++variable "evidence_bucket" {}
++variable "prefix" { default = "parquet/evidence" }
++
++data "aws_iam_policy_document" "s3_prefix" {
++  statement {
++    actions = ["s3:GetObject","s3:ListBucket"]
++    resources = [
++      "arn:aws:s3:::${var.evidence_bucket}",
++      "arn:aws:s3:::${var.evidence_bucket}/${var.prefix}/*"
++    ]
++  }
++}
++
++resource "aws_iam_policy" "s3_prefix_policy" {
++  name   = "aegis_s3_prefix_policy"
++  policy = data.aws_iam_policy_document.s3_prefix.json
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/prometheus_rules_prod.yaml
++groups:
++- name: aegis-prod.rules
++  rules:
++  - alert: MedianEstimatorErrorHigh
++    expr: aegis_reconciliation_median_rel_error > 0.10
++    for: 60m
++    labels:
++      severity: page
++    annotations:
++      summary: "Median relative error for carbon estimates above 10% (audit risk)"
++
++  - alert: EnforcementCoverageBelowSLO
++    expr: (aegis_enforcer_enforced_total / max(aegis_policy_triggered_total, 1)) < 0.95
++    for: 30m
++    labels:
++      severity: page
++    annotations:
++      summary: "Enforcement coverage below 95% SLO"
++
++  - alert: ETLIdempotencyWarning
++    expr: increase(aegis_etl_parquet_failed[1h]) > 0
++    for: 15m
++    labels:
++      severity: warning
++    annotations:
++      summary: "Parquet pipeline experienced failures in the last hour"
++
++  - alert: BulkLoadFailures
++    expr: increase(aegis_etl_bulk_load_failed[1h]) > 0
++    for: 15m
++    labels:
++      severity: page
++    annotations:
++      summary: "Bulk load failures observed"
++
+*** End Patch
+*** Begin Patch
+*** Add File:runbooks/production_hardening_checklist.md
++# Production hardening checklist (concise)
++
++1) Data accuracy
++ - Run eval_median_error_and_draft.py weekly
++ - Configure CI gating: model_validation_gate.yml (already in repo)
++ - Human approve drafts in S3 before applying to ConfigMap
++
++2) Enforcement
++ - Deploy extender and enforcer in staging; run enforcement_coverage_exporter & test harness
++ - Monitor enforcement coverage metric and alert when below 95%
++
++3) Operational maturity
++ - Ensure Airflow DAGs use idempotency helpers, reasonable retries and KubernetesPodOperator for heavy tasks
++ - Configure Alertmanager rules and Slack integration
++ - Periodic incident drills for playbooks documented earlier
++
++4) Security
++ - Provision KMS key with restricted principals (kms_key_policy.tf)
++ - Use cosign with awskms key and Rekor server for evidence signing
++ - Apply minimal RBAC manifests for webhook & enforcer
++
++5) Scale & cost
++ - Use parquet pipeline with recommended file sizing (recommend_parquet_size.py)
++ - Provision IAM role for DW COPY (terraform/...), generate manifest and run bulk loader DAG
++ - Monitor ingestion lag and DW costs (add FinOps integration)
++
+*** End Patch
+*** End Patch

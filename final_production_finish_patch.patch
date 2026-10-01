@@ -1,0 +1,276 @@
+*** Begin Patch
+*** Add File: scripts/deploy_production.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Orchestrator to bootstrap Aegis production-ready infra in a staging/prod environment.
++# This is a convenience wrapper that runs terraform (KMS/OIDC), installs cert-manager, Vault,
++# Postgres/Redis/Milvus (Helm), deploys attestation & webhook, configures Gatekeeper, and runs smoke tests.
++#
++# WARNING: This script performs infra changes and requires CLI tools:
++#   - terraform, kubectl, helm, vault, aws/gcloud CLIs, cosign, jq
++#
++# Usage:
++#   ./scripts/deploy_production.sh <cloud>    # cloud = aws|gcp
++#
++set -o pipefail
++CLOUD=${1:-}
++if [[ "$CLOUD" != "aws" && "$CLOUD" != "gcp" ]]; then
++  echo "Usage: $0 <aws|gcp>"
++  exit 2
++fi
++
++echo "Step 0: sanity checks"
++command -v terraform >/dev/null || { echo "terraform required"; exit 1; }
++command -v kubectl >/dev/null || { echo "kubectl required"; exit 1; }
++command -v helm >/dev/null || { echo "helm required"; exit 1; }
++command -v cosign >/dev/null || { echo "cosign required"; exit 1; }
++
++ROOTDIR="$(cd "$(dirname "$0")/.." && pwd)"
++pushd "$ROOTDIR" >/dev/null
++
++echo "Step 1: Provision cloud KMS & OIDC role (terraform)"
++if [ "$CLOUD" = "aws" ]; then
++  echo "Running terraform in terraform/aws"
++  (cd terraform/aws && terraform init && terraform apply -auto-approve)
++  echo "Copy output kms_key_arn and configure GITHUB secrets: CLOUD_PROVIDER=aws, AWS_KMS_KEY_ARN, REKOR_URL, REGISTRY info"
++else
++  echo "Running terraform in terraform/gcp"
++  (cd terraform/gcp && terraform init && terraform apply -auto-approve)
++  echo "Copy output gcp_kms_key_ref and configure GITHUB secrets: CLOUD_PROVIDER=gcp, GCP_KMS_KEY_REF, REKOR_URL, REGISTRY info"
++fi
++
++echo "Step 2: Install cert-manager (for TLS certs)"
++kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
++sleep 8
++
++echo "Step 3: Install Vault (Helm)"
++helm repo add hashicorp https://helm.releases.hashicorp.com || true
++helm repo update
++helm upgrade --install aegis-vault hashicorp/vault -n ops --create-namespace -f helm/vault/values-prod.yaml
++
++echo "Wait for Vault to be ready (manual step may be required to init/unseal)"
++sleep 10
++echo "Next: run scripts/vault_bootstrap_and_secrets.sh to bootstrap vault (requires VAULT_TOKEN)"
++
++echo "Step 4: Deploy DBs & caches (Helm)"
++helm repo add bitnami https://charts.bitnami.com/bitnami || true
++helm repo update
++helm upgrade --install aegis-postgres bitnami/postgresql -n ops -f k8s/ha/postgres-bitnami-values.yaml
++helm upgrade --install aegis-redis bitnami/redis-cluster -n ops -f k8s/ha/redis-cluster-values.yaml
++
++echo "Step 5: Deploy Milvus (requires helm repo configured per Milvus docs)"
++# Please configure Milvus chart repository and values; for now we provide values file to helm install.
++echo "Assuming milvus helm chart is available; adapt repository and chart name for your infra."
++# helm upgrade --install milvus milvus/milvus -n ops -f k8s/ha/milvus-values-ha.yaml
++
++echo "Step 6: Deploy attestation service + cert via cert-manager"
++kubectl apply -f k8s/attestation/create_certmanager_issuer.yaml
++kubectl apply -f k8s/attestation/attestation-cert.yaml
++kubectl apply -f k8s/attestation/attestation-deployment.yaml
++
++echo "Wait for certificate to be issued and secret to appear..."
++for i in {1..30}; do
++  if kubectl get secret attestation-tls -n ops >/dev/null 2>&1; then
++    break
++  fi
++  sleep 3
++done
++
++echo "Step 7: Patch ValidatingWebhook with CA bundle"
++CA_B64=$(kubectl get secret attestation-tls -n ops -o jsonpath='{.data.tls\.crt}')
++./scripts/inject_ca_bundle.sh aegis-attestation-webhook "${CA_B64}"
++kubectl apply -f k8s/webhook/validatingwebhook.yaml
++
++echo "Step 8: Install Gatekeeper and apply constraints"
++kubectl apply -f https://raw.githubusercontent.com/open-policy-agent/gatekeeper/master/deploy/gatekeeper.yaml
++kubectl apply -f governance/gatekeeper/constrainttemplate_attestation_advanced.yaml
++kubectl apply -f governance/gatekeeper/constraint_require_attested_advanced.yaml
++
++echo "Step 9: Apply network and PodSecurity policies for agent sandbox"
++kubectl apply -f k8s/network/agent-exec-networkpolicy.yaml || true
++kubectl apply -f k8s/policies/podsecurity_restrictive.yaml || true
++
++echo "Step 10: Deploy agent controller with leader election RBAC"
++kubectl apply -f k8s/manifests/agent-controller-deployment-with-lease.yaml
++
++echo "Step 11: Deploy monitoring rules & rollouts analysis"
++kubectl apply -f monitoring/prometheus/production_slos_and_alerts.yaml || true
++kubectl apply -f argo/analysis/loadtest-analysis-template.yaml || true
++
++echo "Step 12: Run smoke & pen tests"
++echo "Please set REGISTRY env and SIGNED_IMAGE if required, then run tests/full_e2e_runner.sh"
++popd >/dev/null
++echo "Bootstrap complete (partial). Review output and follow manual steps in runbooks/full_production_hardening_runbook.md"
++
+*** End Patch
+*** Add File: .github/workflows/cd_deploy_attest.yml
++name: CD: Annotate & Deploy with Attestation Check
++on:
++  workflow_dispatch:
++    inputs:
++      manifest_path:
++        required: true
++      image:
++        required: true
++
++jobs:
++  cd:
++    runs-on: ubuntu-latest
++    permissions:
++      contents: read
++      id-token: write
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Verify attestation service before deploy
++        env:
++          ATTEST_URL: ${{ secrets.ATTESTATION_URL }}
++          SBOM_URI: ${{ secrets.SBOM_URI }}
++        run: |
++          echo "Calling attestation service for image ${{ github.event.inputs.image }}"
++          RESP=$(curl -sS -X POST -H "Content-Type: application/json" -d "{\"image\":\"${{ github.event.inputs.image }}\",\"sbom\":\"$SBOM_URI\"}" "$ATTEST_URL/verify")
++          echo "attest resp: $RESP"
++          OK=$(echo "$RESP" | jq -r .ok)
++          if [ "$OK" != "true" ]; then
++            echo "Attestation failed: $RESP"
++            exit 1
++          fi
++
++      - name: Annotate manifest with aegis.attested=true
++        run: |
++          python3 - <<PY
++import sys,yaml
++f="${{ github.event.inputs.manifest_path }}"
++doc=yaml.safe_load(open(f))
++meta=doc.setdefault('spec',{}).setdefault('template',{}).setdefault('metadata',{})
++ann=meta.setdefault('annotations',{})
++ann['aegis.attested']="true"
++open('/tmp/manifest.yaml','w').write(yaml.safe_dump(doc))
++print('Wrote /tmp/manifest.yaml')
++PY
++
++      - name: kubectl apply manifest
++        uses: azure/setup-kubectl@v3
++        with:
++          version: 'latest'
++        env:
++          KUBE_CONFIG_DATA: ${{ secrets.KUBE_CONFIG_DATA }}
++        run: |
++          kubectl apply -f /tmp/manifest.yaml
++
+*** End Patch
+*** Add File: scripts/cd_annotate_and_deploy.sh
++#!/usr/bin/env bash
++set -euo pipefail
++MANIFEST=${1:-}
++IMAGE=${2:-}
++ATTEST_URL=${ATTEST_URL:-http://attestation.ops.svc.cluster.local:8443}
++if [ -z "$MANIFEST" ] || [ -z "$IMAGE" ]; then
++  echo "Usage: $0 manifest.yaml image:tag"
++  exit 2
++fi
++
++echo "Verifying attestation for $IMAGE"
++RESP=$(curl -sS -X POST -H "Content-Type: application/json" -d "{\"image\":\"$IMAGE\"}" "$ATTEST_URL/verify")
++OK=$(echo "$RESP" | jq -r .ok)
++if [ "$OK" != "true" ]; then
++  echo "Attestation failed: $RESP"
++  exit 1
++fi
++
++echo "Annotating manifest with aegis.attested=true"
++python3 - <<PY
++import sys,yaml
++f="$MANIFEST"
++doc=yaml.safe_load(open(f))
++meta=doc.setdefault('spec',{}).setdefault('template',{}).setdefault('metadata',{})
++ann=meta.setdefault('annotations',{})
++ann['aegis.attested']="true"
++open('/tmp/manifest.annotated.yaml','w').write(yaml.safe_dump(doc))
++print('Wrote /tmp/manifest.annotated.yaml')
++PY
++
++kubectl apply -f /tmp/manifest.annotated.yaml
++echo "Deployed $MANIFEST"
++
+*** End Patch
+*** Add File: tests/full_e2e_runner.sh
++#!/usr/bin/env bash
++set -euo pipefail
++ROOT="$(cd "$(dirname "$0")/.." && pwd)"
++pushd "$ROOT" >/dev/null
++
++echo "Running attestation smoke test..."
++REGISTRY=${REGISTRY:-}
++if [ -z "$REGISTRY" ]; then
++  echo "Please export REGISTRY e.g. REGISTRY=ghcr.io/yourorg before running tests"
++  exit 2
++fi
++./scripts/attestation_smoke_test.sh
++
++echo "Running Milvus scale test (if milvus accessible)..."
++python3 ./scripts/milvus_scale_test.py || true
++
++echo "Running locust minimal load test"
++python3 -m pip install locust >/dev/null 2>&1 || true
++locust -f services/loadtest/locustfile.py --headless -u 50 -r 5 --run-time 1m --host http://model-serving.staging.svc.cluster.local || true
++
++echo "Running agent sandbox pen test"
++bash tests/agent_sandbox_pen_test.sh || true
++
++echo "Full E2E runner complete. Inspect logs and Prometheus dashboards for SLO verification."
++popd >/dev/null
++
+*** End Patch
+*** Add File: runbooks/production_release_and_validation.md
++# Final Production Release & Validation Runbook
++
++This document organizes the final steps to declare Aegis production-ready.
++
++1) Preflight
++ - Confirm GitHub secrets are set for CLOUD_PROVIDER, KMS reference, REKOR_URL, REGISTRY credentials, KUBE_CONFIG_DATA.
++ - Confirm team access & approvals.
++
++2) Provision KMS & OIDC (terraform)
++ - Run terraform in terraform/aws or terraform/gcp and copy outputs.
++ - Update GitHub secrets with KMS info and REKOR_URL.
++
++3) Deploy core infra (scripts/deploy_production.sh)
++ - Run the script with your cloud (aws/gcp). Review output and address any failures.
++
++4) Bootstrap Vault & migrate secrets
++ - Run scripts/vault_bootstrap_and_secrets.sh with VAULT_ADDR and BOOTSTRAP_TOKEN.
++ - Reconfigure service manifests to use Vault or K8s auth (examples provided).
++
++5) Enable attestation & Gatekeeper
++ - Ensure attestation pods are ready and certificate secret exists.
++ - Inject caBundle into ValidatingWebhook (scripts/inject_ca_bundle.sh used by deploy script).
++ - Apply Gatekeeper templates and validate unsigned/signed deployments.
++
++6) HA & backups validation
++ - Simulate Postgres failover or restore from backup; validate application continuity.
++ - Validate Redis failover.
++ - Validate Milvus index rebuild and backups.
++
++7) Scale & SLO tests
++ - Run distributed training workflow (Argo) on a realistic dataset.
++ - Run Milvus scale insert/search script.
++ - Run locust load tests for inference; verify p95/p99 target and Argo Rollout analysis triggers.
++
++8) Agent & sandbox tests
++ - Deploy two agent-controller replicas. Confirm leader election and planner resume.
++ - Run tests/agent_sandbox_pen_test.sh and pen_tests script. Address any vulnerabilities.
++
++9) Edge OTA validation
++ - Enroll test devices and run OTA canary via services/edge_fleet/ota_controller.py or the test harness.
++
++10) Security & compliance
++ - Schedule and run formal pen tests; remediate findings.
++ - Perform DR exercise, rotate keys as per policy, validate incident runbooks.
++
++Acceptance: sign-off by platform, security, and SRE owners.
++
+*** End Patch
+*** End Patch

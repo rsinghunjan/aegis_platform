@@ -1,0 +1,533 @@
+*** Begin Patch
+*** Add File:ops/tekton/pipelines/production_validation_pipeline.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Pipeline
++metadata:
++  name: production-validation-pipeline
++  namespace: cicd
++spec:
++  params:
++    - name: dataset_snapshot_s3
++      type: string
++      default: ""
++    - name: evidence_bucket
++      type: string
++      default: ""
++    - name: runs
++      type: string
++      default: "5"
++    - name: concurrency
++      type: string
++      default: "2"
++  tasks:
++    - name: repeatable-retrain
++      taskSpec:
++        params:
++          - name: dataset_snapshot_s3
++            type: string
++          - name: evidence_bucket
++            type: string
++          - name: runs
++            type: string
++          - name: concurrency
++            type: string
++        steps:
++          - name: run-loop
++            image: python:3.10
++            script: |
++              #!/bin/sh
++              set -euo pipefail
++              RUNS=$(params.runs)
++              DATASET=$(params.dataset_snapshot_s3)
++              EB=$(params.evidence_bucket)
++              i=0
++              while [ $i -lt $RUNS ]; do
++                echo "Triggering retrain iteration $i"
++                cat > /tmp/pr.yaml <<EOF
++apiVersion: tekton.dev/v1beta1
++kind: PipelineRun
++metadata:
++  generateName: drift-retrain-run-
++spec:
++  pipelineRef:
++    name: drift-retrain-canary-pipeline
++  params:
++    - name: dataset_snapshot_s3
++      value: "$DATASET"
++    - name: evidence_bucket
++      value: "$EB"
++EOF
++                kubectl apply -n cicd -f /tmp/pr.yaml
++                i=$((i+1))
++                # short delay to allow concurrency control via KEDA/HPA
++                sleep 10
++              done
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/closed_loop/high_scale_failure_handler.py
++#!/usr/bin/env python3
++"""
++High-scale failure handler for Tekton pipelines.
++ - Watches PipelineRuns
++ - Implements exponential backoff + automated lightweight remediation:
++   - collects logs and artifacts
++   - attempts safe restart of failed tasks (by restarting related pods)
++   - escalates to approval UI / on-call after retry limit
++ - Writes evidence bundles to EVIDENCE_BUCKET
++"""
++import os, time, json, logging, subprocess, tempfile
++from datetime import datetime
++
++logger = logging.getLogger("highscale-failure-handler")
++logging.basicConfig(level=logging.INFO)
++
++TEKTON_NS = os.environ.get("TEKTON_NAMESPACE", "cicd")
++MAX_RETRIES = int(os.environ.get("CLOSEDLOOP_MAX_RETRIES", "4"))
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++APPROVAL_SERVICE = os.environ.get("APPROVAL_SERVICE_URL", "http://approval-service.monitoring.svc:8080")
++
++def list_pipelineruns():
++    out = subprocess.check_output(["kubectl", "-n", TEKTON_NS, "get", "pipelineruns", "-o", "json"])
++    return json.loads(out).get("items", [])
++
++def collect_artifacts(pr_name, target_dir):
++    os.makedirs(target_dir, exist_ok=True)
++    try:
++        subprocess.check_call(["kubectl", "-n", TEKTON_NS, "get", "pipelinerun", pr_name, "-o", "json"], stdout=open(os.path.join(target_dir, "pipelinerun.json"), "w"))
++    except Exception:
++        pass
++    pods = json.loads(subprocess.check_output(["kubectl", "-n", TEKTON_NS, "get", "pods", "-o", "json"]).decode()).get("items", [])
++    for p in pods:
++        owners = p.get("metadata", {}).get("ownerReferences", [])
++        if any(o.get("kind") == "PipelineRun" and o.get("name") == pr_name for o in owners):
++            podname = p["metadata"]["name"]
++            try:
++                logs = subprocess.check_output(["kubectl", "-n", TEKTON_NS, "logs", podname], stderr=subprocess.STDOUT).decode()
++            except Exception as e:
++                logs = f"failed to collect logs: {e}"
++            open(os.path.join(target_dir, f"{podname}.log"), "w").write(logs)
++
++def upload_dir_to_s3(local_dir, prefix):
++    if not EVIDENCE_BUCKET:
++        return local_dir
++    import boto3
++    s3 = boto3.client("s3")
++    bucket = EVIDENCE_BUCKET.replace("s3://","")
++    for root, _, files in os.walk(local_dir):
++        for f in files:
++            path = os.path.join(root, f)
++            key = f"{prefix}/{os.path.relpath(path, local_dir)}"
++            s3.upload_file(path, bucket, key)
++    return f"s3://{bucket}/{prefix}/"
++
++def remediate_by_restart(pr_name):
++    # find pods owned by the pipeline run and restart them (best-effort)
++    pods = json.loads(subprocess.check_output(["kubectl", "-n", TEKTON_NS, "get", "pods", "-o", "json"]).decode()).get("items", [])
++    restarted = []
++    for p in pods:
++        owners = p.get("metadata", {}).get("ownerReferences", [])
++        if any(o.get("kind") == "PipelineRun" and o.get("name") == pr_name for o in owners):
++            podname = p["metadata"]["name"]
++            try:
++                subprocess.check_call(["kubectl", "-n", TEKTON_NS, "delete", "pod", podname, "--grace-period=5"])
++                restarted.append(podname)
++            except Exception:
++                logger.exception("Failed to restart pod %s", podname)
++    return restarted
++
++def escalate(pr_name, evidence_uri, reason):
++    try:
++        import requests
++        payload = {"summary": f"PipelineRun {pr_name} failure: {reason}", "evidence_uri": evidence_uri}
++        requests.post(f"{APPROVAL_SERVICE}/request", json=payload, timeout=10)
++    except Exception:
++        logger.exception("Failed to notify approval service")
++
++def run_loop(poll_interval=30):
++    while True:
++        for pr in list_pipelineruns():
++            name = pr.get("metadata", {}).get("name")
++            conds = pr.get("status", {}).get("conditions", [])
++            if conds and conds[0].get("status") == "False":
++                annotations = pr.get("metadata", {}).get("annotations", {})
++                retries = int(annotations.get("aegis.retries", "0"))
++                logger.info("Detected failed PipelineRun %s retries=%s", name, retries)
++                localdir = tempfile.mkdtemp(prefix=f"fail-{name}-")
++                collect_artifacts(name, localdir)
++                s3uri = upload_dir_to_s3(localdir, f"closedloop/failures/{name}")
++                if retries < MAX_RETRIES:
++                    restarted = remediate_by_restart(name)
++                    subprocess.check_call(["kubectl", "-n", TEKTON_NS, "annotate", "pipelinerun", name, f"aegis.retries={retries+1}", "--overwrite"])
++                    logger.info("Attempted remediation for %s restarted=%s", name, restarted)
++                else:
++                    escalate(name, s3uri, "max_retries_exceeded")
++        time.sleep(poll_interval)
++
++if __name__ == "__main__":
++    run_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/hpo/submission_chargeback.py
++#!/usr/bin/env python3
++"""
++HPO submission recorder: records HPO submissions to chargeback API and a lightweight DB (sqlite PoC).
++ - Called when teams submit HPO jobs; records estimate and links to evidence & Tekton PipelineRun
++ - Provides a simple API to query submissions for billing reconciliation
++"""
++import os, sqlite3, json, time, logging
++from datetime import datetime
++import requests
++
++logger = logging.getLogger("hpo-chargeback")
++logging.basicConfig(level=logging.INFO)
++
++DB_PATH = os.environ.get("HPO_DB", "/tmp/hpo_submissions.db")
++CHARGEBACK_API = os.environ.get("CHARGEBACK_API", "http://chargeback.monitoring.svc:8080")
++
++def init_db():
++    conn = sqlite3.connect(DB_PATH)
++    c = conn.cursor()
++    c.execute("""
++    CREATE TABLE IF NOT EXISTS submissions (
++      id INTEGER PRIMARY KEY AUTOINCREMENT,
++      team TEXT,
++      config TEXT,
++      estimated_usd REAL,
++      pipeline_run TEXT,
++      evidence_uri TEXT,
++      created_at TEXT
++    )""")
++    conn.commit()
++    conn.close()
++
++def record_submission(team, config, estimated_usd, pipeline_run, evidence_uri=""):
++    conn = sqlite3.connect(DB_PATH)
++    c = conn.cursor()
++    c.execute("INSERT INTO submissions(team, config, estimated_usd, pipeline_run, evidence_uri, created_at) VALUES (?,?,?,?,?,?)",
++              (team, json.dumps(config), estimated_usd, pipeline_run, evidence_uri, datetime.utcnow().isoformat()))
++    conn.commit()
++    conn.close()
++    try:
++        requests.post(f"{CHARGEBACK_API}/submit", json={"team":team,"estimated_usd":estimated_usd,"pipeline_run":pipeline_run}, timeout=5)
++    except Exception:
++        logger.exception("Failed to call chargeback API")
++
++if __name__ == "__main__":
++    init_db()
++    # PoC record
++    record_submission("team-a", {"lr":0.01}, 12.34, "pr-example", "s3://evidence/example.json")
++    print("Recorded sample submission")
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/data/connector_harden.py
++#!/usr/bin/env python3
++"""
++Connector hardening & watchdog for Debezium/Flink connectors.
++ - Periodically checks connector health via Debezium REST API
++ - If connector is unhealthy, attempts controlled restart (via REST) and records evidence
++ - Calls Marquez shipper to register datasets if connector becomes healthy after restart
++"""
++import os, time, json, logging, requests
++from datetime import datetime
++
++logger = logging.getLogger("connector-harden")
++logging.basicConfig(level=logging.INFO)
++
++DEBEZIUM_URL = os.environ.get("DEBEZIUM_URL", "http://debezium.connect:8083")
++MARQUEZ_URL = os.environ.get("MARQUEZ_URL", "http://marquez.backend:5000")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++
++def list_connectors():
++    r = requests.get(f"{DEBEZIUM_URL}/connectors", timeout=5)
++    r.raise_for_status()
++    return r.json()
++
++def check_status(connector):
++    r = requests.get(f"{DEBEZIUM_URL}/connectors/{connector}/status", timeout=5)
++    r.raise_for_status()
++    return r.json()
++
++def restart_connector(connector):
++    # safe stop/start sequence
++    try:
++        requests.post(f"{DEBEZIUM_URL}/connectors/{connector}/restart", timeout=10)
++        return True
++    except Exception:
++        logger.exception("Failed restart for %s", connector)
++        return False
++
++def upload_evidence(name, payload):
++    if not EVIDENCE_BUCKET:
++        path=f"/tmp/{name}-{int(time.time())}.json"; open(path,"w").write(json.dumps(payload)); return path
++    import boto3
++    s3=boto3.client("s3")
++    key=f"connectors/{name}-{int(time.time())}.json"
++    s3.put_object(Bucket=EVIDENCE_BUCKET.replace("s3://",""), Key=key, Body=json.dumps(payload).encode())
++    return f"s3://{EVIDENCE_BUCKET}/{key}"
++
++def run_loop(interval=120):
++    while True:
++        try:
++            for c in list_connectors():
++                status = check_status(c)
++                if status.get("connector",{}).get("state") != "RUNNING":
++                    logger.warning("Connector %s not running; attempting restart", c)
++                    ok = restart_connector(c)
++                    upload_evidence("connector-restart", {"connector": c, "ok": ok, "status": status, "ts": datetime.utcnow().isoformat()})
++                    # if recovered, notify Marquez for dataset registration (PoC)
++                    if ok:
++                        try:
++                            requests.post(f"{MARQUEZ_URL}/api/v1/datasets", json={"namespace":"aegis","name":c,"physical_name":f"connector://{c}"}, timeout=5)
++                        except Exception:
++                            logger.exception("Marquez notify failed")
++        except Exception:
++            logger.exception("Connector harden loop error")
++        time.sleep(interval)
++
++if __name__ == "__main__":
++    run_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/monitoring/slo_binding.py
++#!/usr/bin/env python3
++"""
++SLO binding service:
++ - Reads tenant-level SLOs from a ConfigMap or small datastore
++ - Exposes an API for canary controller / auto-promoter to query tenant-specific thresholds
++ - On update writes an audit record to EVIDENCE_BUCKET
++"""
++from fastapi import FastAPI
++import os, json, logging, subprocess
++from datetime import datetime
++
++app = FastAPI()
++logger = logging.getLogger("slo-binding")
++logging.basicConfig(level=logging.INFO)
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++CM_NAME = os.environ.get("SLO_CM", "aegis-tenant-slos")
++NS = os.environ.get("SLO_NS", "cicd")
++
++def read_configmap():
++    try:
++        out = subprocess.check_output(["kubectl","-n",NS,"get","cm",CM_NAME,"-o","json"]).decode()
++        cm = json.loads(out)
++        return cm.get("data", {})
++    except Exception:
++        return {}
++
++def write_audit(tenant, data):
++    if not EVIDENCE_BUCKET:
++        logger.info("Audit: %s %s", tenant, data); return
++    import boto3
++    s3=boto3.client("s3")
++    key=f"slo/audit/{tenant}-{int(time.time())}.json"
++    s3.put_object(Bucket=EVIDENCE_BUCKET.replace("s3://",""), Key=key, Body=json.dumps(data).encode())
++
++@app.get("/slo/{tenant}")
++def get_slo(tenant: str):
++    data = read_configmap()
++    slo = data.get(tenant, "")
++    write_audit(tenant, {"slo": slo, "ts": datetime.utcnow().isoformat()})
++    return {"tenant": tenant, "slo": slo}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/telemetry/mutating_webhook_stub.py
++#!/usr/bin/env python3
++"""
++PoC mutating webhook to inject run_id and OTLP env into Pod specs.
++ - This is a minimal Flask app that responds to AdmissionReview and mutates Pod specs.
++ - In production you must secure with TLS, validate signatures and restrict scope.
++"""
++from flask import Flask, request, jsonify
++import os, uuid, logging
++
++app = Flask(__name__)
++logger = logging.getLogger("mutating-webhook")
++logging.basicConfig(level=logging.INFO)
++
++OTLP_ENDPOINT = os.environ.get("OTLP_ENDPOINT", "http://otel-collector.monitoring.svc:4318")
++
++@app.route("/mutate", methods=["POST"])
++def mutate():
++    req = request.get_json()
++    try:
++        uid = req["request"]["uid"]
++        pod = req["request"]["object"]
++        run_id = pod.get("metadata", {}).get("annotations", {}).get("aegis.run_id") or f"run-{uuid.uuid4().hex[:8]}"
++        # create JSON patch
++        patches = []
++        # add annotation
++        patches.append({"op":"add","path":"/metadata/annotations/aegis.run_id","value":run_id})
++        # inject environment variable into containers
++        containers = pod.get("spec",{}).get("containers",[])
++        for i, _ in enumerate(containers):
++            patches.append({"op":"add","path":f"/spec/containers/{i}/env/-","value":{"name":"OTLP_ENDPOINT","value":OTLP_ENDPOINT}})
++            patches.append({"op":"add","path":f"/spec/containers/{i}/env/-","value":{"name":"RUN_ID","value":run_id}})
++        resp = {
++            "response": {
++                "uid": uid,
++                "allowed": True,
++                "patchType": "JSONPatch",
++                "patch": __import__("base64").b64encode(__import__("json").dumps(patches).encode()).decode()
++            }
++        }
++        return jsonify(resp)
++    except Exception:
++        return jsonify({"response":{"allowed": True, "uid": req.get("request",{}).get("uid","")}})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8443")))
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/approval/keycloak_introspect.py
++#!/usr/bin/env python3
++"""
++Keycloak introspection helper for approval flows.
++ - Given a bearer token, introspect with Keycloak and return username / preferred_username
++ - Used by approval service to record approver identity in audit trail
++"""
++import os, requests, logging
++
++logger = logging.getLogger("kc-introspect")
++logging.basicConfig(level=logging.INFO)
++
++INTROSPECT_URL = os.environ.get("KEYCLOAK_INTROSPECT", "http://keycloak.monitoring.svc:8080/realms/aegis/protocol/openid-connect/userinfo")
++
++def introspect_token(token):
++    try:
++        headers = {"Authorization": f"Bearer {token}"}
++        r = requests.get(INTROSPECT_URL, headers=headers, timeout=5)
++        r.raise_for_status()
++        return r.json()
++    except Exception:
++        logger.exception("Keycloak introspect failed")
++        return {}
++
++if __name__ == "__main__":
++    import sys
++    t=sys.argv[1] if len(sys.argv)>1 else ""
++    print(introspect_token(t))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/terraform/min_iam_least_privilege.tf
++/*
++Terraform snippet: Example least-privilege IAM policy for Tekton/CI role used to interact with Evidence S3 and KMS and limited SecretsManager read.
++Replace variable values in your TF environment.
++*/
++variable "evidence_bucket_arn" {}
++variable "secrets_arns" { type = list(string) }
++variable "kms_key_arn" {}
++
++data "aws_iam_policy_document" "tekton_policy" {
++  statement {
++    sid = "AllowS3PutGet"
++    effect = "Allow"
++    actions = [
++      "s3:PutObject",
++      "s3:GetObject",
++      "s3:ListBucket"
++    ]
++    resources = [var.evidence_bucket_arn, "${var.evidence_bucket_arn}/*"]
++  }
++  statement {
++    sid = "AllowSecretsRead"
++    effect = "Allow"
++    actions = [
++      "secretsmanager:GetSecretValue",
++      "secretsmanager:DescribeSecret"
++    ]
++    resources = var.secrets_arns
++  }
++  statement {
++    sid = "AllowKMSDecrypt"
++    effect = "Allow"
++    actions = [
++      "kms:Decrypt",
++      "kms:GenerateDataKey"
++    ]
++    resources = [var.kms_key_arn]
++  }
++}
++
++resource "aws_iam_policy" "tekton_min" {
++  name   = "aegis-tekton-min"
++  policy = data.aws_iam_policy_document.tekton_policy.json
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/acceptance/signoff_collector.py
++#!/usr/bin/env python3
++"""
++Signoff collector service
++ - Collects SME signoffs (signed text or uploaded file reference), records Keycloak identity via introspection, and writes to EVIDENCE_BUCKET
++ - Provides a simple HTTP endpoint to submit signoff (POST) and to list signoffs for a run_id
++"""
++from fastapi import FastAPI, Request, Header, HTTPException
++import os, json, logging
++from datetime import datetime
++import requests
++
++app = FastAPI()
++logger = logging.getLogger("signoff-collector")
++logging.basicConfig(level=logging.INFO)
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++KEYCLOAK_USERINFO = os.environ.get("KEYCLOAK_USERINFO", "http://keycloak.monitoring.svc:8080/realms/aegis/protocol/openid-connect/userinfo")
++
++def upload_evidence(key, data):
++    if not EVIDENCE_BUCKET:
++        path=f"/tmp/{key}.json"
++        open(path,"w").write(json.dumps(data)); return path
++    import boto3
++    s3=boto3.client("s3")
++    bucket=EVIDENCE_BUCKET.replace("s3://","")
++    key_s=f"signoffs/{key}.json"
++    s3.put_object(Bucket=bucket, Key=key_s, Body=json.dumps(data).encode())
++    return f"s3://{EVIDENCE_BUCKET}/{key_s}"
++
++@app.post("/signoff")
++async def signoff(req: Request, authorization: str = Header(None)):
++    body = await req.json()
++    run_id = body.get("run_id")
++    note = body.get("note", "")
++    if not run_id:
++        raise HTTPException(status_code=400, detail="run_id required")
++    user = {}
++    if authorization:
++        try:
++            resp = requests.get(KEYCLOAK_USERINFO, headers={"Authorization": authorization}, timeout=5)
++            resp.raise_for_status()
++            user = resp.json()
++        except Exception:
++            user = {"identifier":"unknown"}
++    rec = {"run_id": run_id, "note": note, "user": user, "ts": datetime.utcnow().isoformat()}
++    uri = upload_evidence(f"{run_id}-{int(time.time())}", rec)
++    return {"ok": True, "evidence": uri}
++
++@app.get("/signoffs/{run_id}")
++def list_signoffs(run_id: str):
++    # PoC: list from S3 by prefix (requires S3 access)
++    if not EVIDENCE_BUCKET:
++        raise HTTPException(status_code=404, detail="no evidence bucket")
++    import boto3
++    s3=boto3.client("s3")
++    bucket=EVIDENCE_BUCKET.replace("s3://","")
++    prefix=f"signoffs/{run_id}"
++    objs = s3.list_objects_v2(Bucket=bucket, Prefix=prefix).get("Contents", [])
++    entries=[]
++    for o in objs:
++        obj = s3.get_object(Bucket=bucket, Key=o["Key"])
++        entries.append(json.loads(obj["Body"].read()))
++    return entries
++
+*** End Patch
+*** End Patch

@@ -1,0 +1,578 @@
+*** Begin Patch
+*** Add File: services/attestation/rekor_client.py
++"""
++Lightweight Rekor client helpers (HTTP).
++Uses Rekor public API to search for entries by artifact hash/signature.
++"""
++import os
++import requests
++import json
++
++REKOR_URL = os.environ.get("REKOR_URL", "https://rekor.sigstore.dev")
++
++def search_rekor_by_digest(digest):
++    """
++    Search Rekor for entries that reference the given digest.
++    Digest format: sha256:<hex>
++    Returns list of entries (may be empty).
++    """
++    try:
++        # Rekor API: /api/v1/log/entries?hash=<b64_or_hex> - many Rekor instances support multiple endpoints
++        # We'll use the search by hash endpoint if available. Fall back to general search.
++        url = f"{REKOR_URL}/api/v1/log/entries?hash={digest}"
++        r = requests.get(url, timeout=10)
++        if r.status_code == 200:
++            return r.json()
++        # fallback: get all entries is expensive; return empty
++        return {}
++    except Exception as e:
++        return {"error": str(e)}
++
++def get_entry(entry_id):
++    try:
++        url = f"{REKOR_URL}/api/v1/log/entries/{entry_id}"
++        r = requests.get(url, timeout=10)
++        if r.status_code == 200:
++            return r.json()
++        return {"error": f"status {r.status_code}"}
++    except Exception as e:
++        return {"error": str(e)}
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/attestation/verify_service.py
++"""
++Attestation/Admission helper service (enhanced):
++- Verifies image signatures via cosign
++- Verifies Rekor entries via Rekor client
++- Optionally checks SBOM for critical CVEs using Trivy output
++- Exposes /verify endpoint used by webhook
++"""
++import os
++import json
++import subprocess
++from flask import Flask, request, jsonify
++from .rekor_client import search_rekor_by_digest
++
++app = Flask("attestation")
++COSIGN_BIN = os.environ.get("COSIGN_BIN", "cosign")
++REKOR_URL = os.environ.get("REKOR_URL", "https://rekor.sigstore.dev")
++TRIVY_BIN = os.environ.get("TRIVY_BIN", "trivy")
++
++def cosign_verify(image_ref):
++    cmd = [COSIGN_BIN, "verify", "--output", "json", image_ref]
++    if REKOR_URL:
++        cmd.extend(["--rekor-url", REKOR_URL])
++    try:
++        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=30)
++        return True, json.loads(out)
++    except subprocess.CalledProcessError as e:
++        return False, {"error": e.output.decode()}
++    except Exception as e:
++        return False, {"error": str(e)}
++
++def check_sbom_for_critical(sbom_path):
++    # sbom_path may be a local path or s3://... in which case callers should download first
++    # For simple integration we run trivy sbom (requires trivy supports sbom scanning)
++    try:
++        cmd = [TRIVY_BIN, "sbom", "--format", "json", sbom_path]
++        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=60)
++        data = json.loads(out)
++        # search vulnerabilities
++        for r in data.get("Results", []):
++            for v in r.get("Vulnerabilities", []):
++                if v.get("Severity") == "CRITICAL":
++                    return False, v
++        return True, {}
++    except Exception as e:
++        # if trivy not available or fails, default to conservative failure
++        return False, {"error": str(e)}
++
++@app.post("/verify")
++def verify():
++    """
++    Expected JSON:
++    { "image": "ghcr.io/yourorg/image@sha256:...", "sbom_uri": "s3://bucket/manifest.sbom.json" }
++    """
++    body = request.get_json() or {}
++    image = body.get("image")
++    sbom = body.get("sbom_uri")
++    if not image:
++        return jsonify({"ok": False, "error": "image required"}), 400
++    ok, info = cosign_verify(image)
++    if not ok:
++        return jsonify({"ok": False, "reason": "cosign_verify_failed", "info": info}), 403
++    # attempt to check Rekor: cosign verify with --rekor-url should ensure Rekor proof existed
++    digest = None
++    # attempt to extract digest from image@sha form
++    if "@" in image:
++        digest = image.split("@",1)[1]
++    rekor_info = {}
++    if digest:
++        rekor_info = search_rekor_by_digest(digest)
++        # if Rekor returns empty object, treat as a warning but not necessarily fatal (policy may require)
++    # Check SBOM if provided
++    sbom_ok = True
++    sbom_details = {}
++    if sbom:
++        sbom_ok, sbom_details = check_sbom_for_critical(sbom)
++        if not sbom_ok:
++            return jsonify({"ok": False, "reason": "sbom_critical_vuln", "details": sbom_details}), 403
++    return jsonify({"ok": True, "cosign_info": info, "rekor_info": rekor_info, "sbom_ok": sbom_ok})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8443)))
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/agent_controller/app_postgres.py
++"""
++Agent Controller production-ready variant:
++ - Uses Postgres (SQLAlchemy) for persistent agent state
++ - Uses Redis for short-term memory/queues
++ - Executes tools by creating Kubernetes Jobs with projected serviceAccountToken (no long-lived secrets)
++ - Integrates OPA preflight by calling OPA endpoint
++ - Emits Prometheus metrics
++"""
++import os, json, time, uuid, threading
++from flask import Flask, request, jsonify
++from prometheus_client import Counter, Gauge, start_http_server
++from sqlalchemy import create_engine, Column, String, Integer, Text
++from sqlalchemy.ext.declarative import declarative_base
++from sqlalchemy.orm import sessionmaker
++import redis
++from services.agent_controller import k8s_executor_projected
++
++DATABASE_URL = os.environ.get("AGENT_DB_URL", "postgresql://aegis:aegis@postgres.ops.svc.cluster.local:5432/agentdb")
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis.ops.svc.cluster.local:6379/0")
++OPA_URL = os.environ.get("OPA_URL", "http://opa.ops.svc.cluster.local:8181/v1/data/aegis/policies/allow")
++AGENT_NS = os.environ.get("AGENT_EXEC_NS", "agent-exec")
++TOOL_IMAGE = os.environ.get("TOOL_JOB_IMAGE", "ghcr.io/yourorg/agent-tool-runner:latest")
++
++Base = declarative_base()
++
++class Agent(Base):
++    __tablename__ = "agents"
++    id = Column(String, primary_key=True)
++    spec = Column(Text)
++    state = Column(Text)
++    created_ts = Column(Integer)
++    updated_ts = Column(Integer)
++
++engine = create_engine(DATABASE_URL, pool_size=20, max_overflow=10)
++SessionLocal = sessionmaker(bind=engine)
++redis_client = redis.from_url(REDIS_URL)
++
++MET_TOOL_INV = Counter("aegis_agent_tool_invocations_total", "Tool invocations")
++MET_OPA_DEN = Counter("aegis_agent_opa_denials_total", "OPA denials")
++MET_RUNNING = Gauge("aegis_agent_running_gauge", "Running agents")
++
++app = Flask("agent-controller-prod")
++
++def init_db():
++    Base.metadata.create_all(bind=engine)
++
++def opa_preflight(action_name, metadata=None):
++    payload = {"action": action_name, "metadata": metadata or {}}
++    try:
++        import requests
++        r = requests.post(OPA_URL, json=payload, timeout=5)
++        if r.status_code != 200:
++            return False, {"error": "opa_unreachable", "status": r.status_code}
++        body = r.json()
++        allowed = body.get("result", {}).get("allow", False)
++        return allowed, body
++    except Exception as e:
++        return False, {"error": str(e)}
++
++def execute_tool_k8s(action, agent_id):
++    MET_TOOL_INV.inc()
++    tool = action.get("tool")
++    args = action.get("args", {})
++    allowed, opa_resp = opa_preflight(tool, {"agent": agent_id, "args": args})
++    if not allowed:
++        MET_OPA_DEN.inc()
++        return {"ok": False, "reason": "opa_denied", "opa": opa_resp}
++    request_id = f"{agent_id}-{uuid.uuid4().hex[:8]}"
++    job_name = f"tool-exec-{request_id}"
++    # ensure k8s client configured
++    k8s_executor_projected.load_kubeconfig()
++    ok = k8s_executor_projected.create_projected_job(job_name, namespace=AGENT_NS, image=TOOL_IMAGE, tool_name=tool, args_json=args, sa_name="tool-runner-sa")
++    logs = ""
++    if ok:
++        # fetch logs via API provided in k8s_executor or use CoreV1Api (omitted for brevity)
++        result = {"ok": True, "job": job_name}
++    else:
++        result = {"ok": False, "job": job_name, "error": "job_failed"}
++    return result
++
++def planner_loop(agent_id, spec):
++    session = SessionLocal()
++    MET_RUNNING.inc()
++    try:
++        # simplified loop using RAG service
++        import requests
++        rag_url = os.environ.get("RAG_URL", "http://rag-service:8000/query")
++        query = spec.get("query", "Describe system.")
++        max_iters = spec.get("max_iters", 5)
++        for i in range(max_iters):
++            resp = requests.post(rag_url, json={"q": query, "k": 4}, timeout=30)
++            if resp.status_code != 200:
++                break
++            answer = resp.json().get("answer","")
++            # save state
++            agent = session.query(Agent).filter(Agent.id==agent_id).one()
++            agent.state = json.dumps({"iter": i, "answer": answer})
++            agent.updated_ts = int(time.time())
++            session.commit()
++            # detect TOOL lines
++            for line in answer.splitlines():
++                if line.strip().startswith("TOOL:"):
++                    # parse naive
++                    body = line.split("TOOL:",1)[1].strip()
++                    name = body.split("(")[0].strip()
++                    args = {}
++                    if "(" in body and body.endswith(")"):
++                        inner = body[body.find("(")+1:-1]
++                        for part in inner.split(","):
++                            if "=" in part:
++                                k,v = part.split("=",1)
++                                args[k.strip()] = v.strip().strip('"')
++                    res = execute_tool_k8s({"tool": name, "args": args}, agent_id)
++                    # append tool result to memory (Redis)
++                    redis_client.rpush(f"agent:{agent_id}:tool_results", json.dumps(res))
++                    if not res.get("ok"):
++                        # stop on tool failure
++                        return
++                    # incorporate result to next query
++                    query = query + "\nToolResult: " + json.dumps(res)
++            # continue
++    finally:
++        MET_RUNNING.dec()
++        session.close()
++
++@app.post("/agents")
++def create_agent():
++    body = request.get_json() or {}
++    agent_id = f"agent-{uuid.uuid4().hex[:8]}"
++    session = SessionLocal()
++    a = Agent(id=agent_id, spec=json.dumps(body), state=json.dumps({"started":True}), created_ts=int(time.time()), updated_ts=int(time.time()))
++    session.add(a)
++    session.commit()
++    t = threading.Thread(target=planner_loop, args=(agent_id, body), daemon=True)
++    t.start()
++    return jsonify({"agent_id": agent_id})
++
++@app.get("/agents/<agent_id>")
++def get_agent(agent_id):
++    session = SessionLocal()
++    a = session.query(Agent).filter(Agent.id==agent_id).first()
++    if not a:
++        return jsonify({}), 404
++    return jsonify({"id": a.id, "spec": json.loads(a.spec), "state": json.loads(a.state), "created_ts": a.created_ts, "updated_ts": a.updated_ts})
++
++if __name__ == "__main__":
++    start_http_server(9100)
++    init_db()
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8200)))
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/agent_controller/k8s_executor_projected.py
++"""
++Kubernetes executor with projected serviceAccountToken + PodSecurityContext and sidecar egress proxy annotation.
++Uses the Kubernetes Python client; creates a Job and waits for completion.
++"""
++from kubernetes import client, config
++import time, json
++
++def load_kubeconfig():
++    try:
++        config.load_incluster_config()
++    except:
++        config.load_kube_config()
++
++def create_projected_job(job_name, namespace, image, tool_name, args_json, sa_name="tool-runner-sa"):
++    load_kubeconfig()
++    batch = client.BatchV1Api()
++    core = client.CoreV1Api()
++    # container
++    container = client.V1Container(
++        name="tool-runner",
++        image=image,
++        env=[
++            client.V1EnvVar(name="TOOL_NAME", value=tool_name),
++            client.V1EnvVar(name="ARGS_JSON", value=json.dumps(args_json)),
++        ],
++        resources=client.V1ResourceRequirements(limits={"cpu":"500m","memory":"256Mi"}),
++    )
++    # projected token volume
++    projected = client.V1ProjectedVolumeSource(sources=[
++        client.V1VolumeProjection(service_account_token=client.V1ServiceAccountTokenProjection(audience="api", expiration_seconds=600, path="token"))
++    ])
++    vol = client.V1Volume(name="sa-token", projected=projected)
++    vm = client.V1VolumeMount(name="sa-token", mount_path="/var/run/secrets/tokens", read_only=True)
++    container.volume_mounts = [vm]
++    pod_spec = client.V1PodSpec(service_account_name=sa_name, containers=[container], volumes=[vol], restart_policy="Never")
++    # pod security and annotations to enforce sidecar egress proxy / istio
++    pod_spec.security_context = client.V1PodSecurityContext(run_as_non_root=True)
++    template = client.V1PodTemplateSpec(spec=pod_spec, metadata=client.V1ObjectMeta(annotations={"sidecar.istio.io/inject":"false"}))
++    job_spec = client.V1JobSpec(template=template, backoff_limit=0, active_deadline_seconds=300)
++    job = client.V1Job(metadata=client.V1ObjectMeta(name=job_name, namespace=namespace), spec=job_spec)
++    batch.create_namespaced_job(namespace=namespace, body=job)
++    # wait
++    start = time.time()
++    while time.time() - start < 300:
++        j = batch.read_namespaced_job(job_name, namespace)
++        if j.status.succeeded and j.status.succeeded > 0:
++            return True
++        if j.status.failed and j.status.failed > 0:
++            return False
++        time.sleep(2)
++    return False
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/postgres/pg_backup_cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: postgres-backup
++  namespace: ops
++spec:
++  schedule: "0 2 * * *"
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          containers:
++          - name: pgdump
++            image: postgres:15
++            env:
++            - name: PGPASSWORD
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-db
++                  key: password
++            command: ["/bin/sh","-c"]
++            args:
++              - |
++                pg_dump -h postgres -U $POSTGRES_USER -d aegis > /tmp/backup.sql
++                if [ -n "${COMPLIANCE_BUCKET:-}" ]; then
++                  aws s3 cp /tmp/backup.sql ${COMPLIANCE_BUCKET}/backups/backup-$(date +%s).sql
++                fi
++          restartPolicy: OnFailure
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/feast_integration/feast_client.py
++"""
++Feast client integration example.
++Assumes Feast SDK installed & configured; this is a connector that pushes features and materializes to online store.
++"""
++from feast import FeatureStore
++import os
++
++FEAST_REPO = os.environ.get("FEAST_REPO", "/opt/feast-repo")
++
++def materialize(start_date, end_date):
++    fs = FeatureStore(repo_path=FEAST_REPO)
++    fs.materialize(start_date=start_date, end_date=end_date)
++
++def push_online(entity_df, feature_view_name):
++    fs = FeatureStore(repo_path=FEAST_REPO)
++    fs.write_to_online_store(feature_view_name, entity_df)
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/observability/metrics_exporter.py
++"""
++Centralized helpers to expose /metrics in non-Python services and assist with standardized labels.
++This module offers a simple wrapper for Prometheus client to use across services.
++"""
++from prometheus_client import Counter, Gauge, Histogram, start_http_server
++import os
++
++def start_metrics(port=9100):
++    start_http_server(port)
++
++def create_metrics(name):
++    m = {}
++    m["requests"] = Counter(f"{name}_requests_total", "requests total")
++    m["errors"] = Counter(f"{name}_errors_total", "errors total")
++    m["latency"] = Histogram(f"{name}_latency_seconds", "latency seconds")
++    return m
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/retrain/retrain_trigger_improved.py
++"""
++Improved retrain trigger:
++ - Queries Prometheus for drift/model-quality metrics
++ - Uses jitter and cooldown to avoid repeated retrain flooding
++ - Submits Argo workflow to retrain when threshold exceeded
++"""
++import os, time, requests, subprocess, random
++
++PROM = os.environ.get("PROMETHEUS_URL", "http://prometheus.monitoring.svc.cluster.local")
++DRIFT_QUERY = os.environ.get("DRIFT_QUERY", 'increase(model_drift_events_total[1h])')
++THRESHOLD = float(os.environ.get("DRIFT_THRESHOLD", "1"))
++COOLDOWN = int(os.environ.get("RETRAIN_COOLDOWN", "3600"))
++LAST_RUN = 0
++ARGO_WORKFLOW = os.environ.get("RETRAIN_WORKFLOW", "distributed-tpu-training")
++
++def query_prom(q):
++    r = requests.get(f"{PROM}/api/v1/query", params={"query": q}, timeout=10); r.raise_for_status(); return r.json()
++
++def submit_workflow():
++    subprocess.run(["argo","submit","-n","staging",ARGO_WORKFLOW], check=False)
++
++if __name__ == "__main__":
++    while True:
++        try:
++            now = time.time()
++            if now - LAST_RUN < COOLDOWN:
++                time.sleep(60 + random.random()*10); continue
++            resp = query_prom(DRIFT_QUERY)
++            val = 0.0
++            if resp.get("status") == "success":
++                for item in resp.get("data",{}).get("result",[]):
++                    val += float(item.get("value",[0,0])[1])
++            if val >= THRESHOLD:
++                submit_workflow()
++                LAST_RUN = time.time()
++        except Exception as e:
++            print("error", e)
++        time.sleep(60)
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/approval/ui/index.html
++<!doctype html>
++<html>
++<head><title>Aegis Approvals</title></head>
++<body>
++  <h1>Aegis Approval Requests</h1>
++  <div id="list"></div>
++  <script>
++  async function load() {
++    let r = await fetch('/api/requests');
++    let data = await r.json();
++    let html = '<ul>';
++    for (const id in data) {
++      const req = data[id];
++      html += `<li>${id}: ${req.action} status=${req.status} approvers=${req.approvers.length}
++        <button onclick="approve('${id}')">Approve</button></li>`;
++    }
++    html += '</ul>';
++    document.getElementById('list').innerHTML = html;
++  }
++  async function approve(id) {
++    await fetch('/api/approve', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id,approver: 'web-user'})});
++    load();
++  }
++  load();
++  </script>
++</body>
++</html>
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/approval/ui_server.py
++"""
++Serves the static approval UI and proxies to approval_service API.
++"""
++from flask import Flask, send_from_directory, jsonify, request, redirect
++import requests, os
++
++APP = Flask(__name__, static_folder='ui')
++APP_SERVICE = os.environ.get("APPROVAL_SERVICE_URL", "http://approval:8096")
++
++@APP.route("/")
++def root():
++    return send_from_directory("ui", "index.html")
++
++@APP.route("/api/requests")
++def list_requests():
++    r = requests.get(f"{APP_SERVICE}/_all")
++    return jsonify(r.json())
++
++@APP.route("/api/approve", methods=["POST"])
++def approve():
++    body = request.get_json()
++    r = requests.post(f"{APP_SERVICE}/approve", json=body)
++    return jsonify(r.json()), r.status_code
++
++if __name__ == "__main__":
++    APP.run(host="0.0.0.0", port=8097)
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/manifests/agent-controller-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: agent-controller
++  namespace: staging
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: agent-controller
++  template:
++    metadata:
++      labels:
++        app: agent-controller
++      annotations:
++        prometheus.io/scrape: "true"
++        prometheus.io/port: "9100"
++    spec:
++      serviceAccountName: agent-controller-sa
++      containers:
++      - name: controller
++        image: ghcr.io/yourorg/agent-controller:prod
++        ports:
++        - containerPort: 8200
++        env:
++        - name: AGENT_DB_URL
++          valueFrom:
++            secretKeyRef:
++              name: aegis-db
++              key: agent_db_url
++        - name: REDIS_URL
++          value: redis://redis.ops.svc.cluster.local:6379/0
++        - name: RAG_URL
++          value: http://rag-service:8000/query
++
+*** End Patch
+*** Begin Patch
+*** Add File: tests/production_readiness_checklist.md
++# Production Readiness Checklist (high level)
++
++1. Supply chain
++ - CI signs all artifacts with KMS-backed cosign and Rekor entries present.
++ - Attestation webhook denies deployment of unsigned / un-attested images.
++
++2. Secrets & credentials
++ - Vault or cloud Workload Identity in use for all controller/agents/tool jobs.
++ - No long-lived secrets mounted into job pods.
++
++3. HA & persistence
++ - Postgres + Redis deployed in ops with backups.
++ - Controller deployed with leader-election and automatic failover test completed.
++
++4. Scale tests
++ - Milvus scale insert passed.
++ - Inference load test (locust) p95 within SLO.
++ - TPU distributed training job completes and artifact checkpoint validated.
++
++5. Agents
++ - Tool jobs executed via projected token; NetworkPolicy prevents exfiltration.
++ - Multi‑sig approval UI exercised for high-risk tool calls.
++
++6. Observability
++ - All services export Prometheus metrics and dashboards wired.
++ - Retrain triggers and budget watcher active.
++
+*** End Patch
+*** End Patch

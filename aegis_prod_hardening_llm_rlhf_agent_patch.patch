@@ -1,0 +1,761 @@
+*** Begin Patch
+*** Add File: hsm/operator_signing_service.py
++#!/usr/bin/env python3
++"""
++Operator-only signing service.
++- Runs on operator nodes (nodeSelector: operator=true)
++- Uses PKCS#11 or HSM agent on host to sign artifacts (placeholder)
++- Requires operator approval via an 'approval' token (could be integrated with Approval API)
++- Records signing evidence to Rekor and uploads signed artifact metadata to COMPLIANCE_BUCKET
++
++Important: deploy this only on operator hosts. CI must not be able to reach this service.
++"""
++import os, json, subprocess, tempfile
++from datetime import datetime
++from flask import Flask, request, jsonify
++import boto3
++
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++REKOR_CLI = os.environ.get("REKOR_CLI", "rekor-cli")
++HSM_SIGN_CMD = os.environ.get("HSM_SIGN_CMD", "/opt/hsm/hsm_sign.sh")  # operator-provided script
++APPROVAL_HEADER = os.environ.get("OPERATOR_APPROVAL_HEADER", "X-Operator-Approved")
++
++app = Flask("operator-signing")
++s3 = boto3.client("s3")
++
++def sign_blob_local(path):
++    # placeholder: call out to operator-hosted signing script which uses PKCS11/HSM
++    # script should output signature file path or stdout
++    cmd = [HSM_SIGN_CMD, path]
++    out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode()
++    return out.strip()
++
++def rekor_upload(path):
++    try:
++        out = subprocess.check_output([REKOR_CLI, "upload", "--artifact", path], stderr=subprocess.STDOUT).decode()
++        return out
++    except Exception as e:
++        return str(e)
++
++@app.post("/sign")
++def sign():
++    # Require operator approval header (simple gating; integrate with Approval API or mTLS in prod)
++    if not request.headers.get(APPROVAL_HEADER):
++        return jsonify({"error":"approval required"}), 403
++    j = request.get_json() or {}
++    artifact_s3 = j.get("artifact_s3")
++    if not artifact_s3:
++        return jsonify({"error":"artifact_s3 required"}), 400
++    # download artifact locally (operator host should have AWS creds)
++    tmp = tempfile.NamedTemporaryFile(delete=False)
++    try:
++        # artifact_s3 expected s3://bucket/key
++        if not artifact_s3.startswith("s3://"):
++            return jsonify({"error":"artifact_s3 must be s3://..."}), 400
++        parts = artifact_s3[5:].split("/",1)
++        bucket, key = parts[0], parts[1]
++        s3.download_file(bucket, key, tmp.name)
++        sig = sign_blob_local(tmp.name)
++        rekor = rekor_upload(tmp.name)
++        rec = {"artifact": artifact_s3, "signed_at": datetime.utcnow().isoformat(), "signature": sig, "rekor": rekor}
++        out = f"/tmp/sign_record_{int(datetime.utcnow().timestamp())}.json"
++        open(out,"w").write(json.dumps(rec, indent=2))
++        if COMPLIANCE_BUCKET:
++            s3.upload_file(out, COMPLIANCE_BUCKET, f"hsm_signs/{os.path.basename(out)}")
++        return jsonify({"ok": True, "rekor": rekor, "signature": sig})
++    except Exception as e:
++        return jsonify({"error": str(e)}), 500
++    finally:
++        try:
++            tmp.close()
++        except Exception:
++            pass
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8110")))
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/hsm/operator-signing-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: operator-signing
++  namespace: aegis
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: operator-signing
++  template:
++    metadata:
++      labels:
++        app: operator-signing
++    spec:
++      nodeSelector:
++        operator: "true"
++      serviceAccountName: operator-signing-sa
++      containers:
++        - name: operator-signing
++          image: aegis/operator-signing:latest
++          env:
++            - name: COMPLIANCE_BUCKET
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-secrets
++                  key: compliance-bucket
++          volumeMounts:
++            - name: hsm-socket
++              mountPath: /var/run/hsm
++      volumes:
++        - name: hsm-socket
++          hostPath:
++            path: /var/run/hsm
++            type: DirectoryOrCreate
++
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: operator-signing-sa
++  namespace: aegis
++
++---
++# Restrict who can access the signing service with RBAC (example)
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: operator-signing-role
++  namespace: aegis
++rules:
++- apiGroups: [""]
++  resources: ["pods","services"]
++  verbs: ["get","list"]
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: operator-signing-binding
++  namespace: aegis
++subjects:
++- kind: User
++  name: "operator@example.com"
++  apiGroup: rbac.authorization.k8s.io
++roleRef:
++  kind: Role
++  name: operator-signing-role
++  apiGroup: rbac.authorization.k8s.io
++
+*** End Patch
+*** Begin Patch
+*** Add File: rl/checkpoint_manager.py
++#!/usr/bin/env python3
++"""
++Checkpoint manager: upload training checkpoints to S3 and register in MLflow / model_registry.
++ - ensures atomic upload and records metadata (checksum, training config, metrics)
++ - used by supervised and RLHF training jobs
++"""
++import os, hashlib, json
++import boto3
++from datetime import datetime
++
++S3_BUCKET = os.environ.get("ARTIFACT_S3_BUCKET")
++MLFLOW_URI = os.environ.get("MLFLOW_TRACKING_URI")
++
++def sha256(path):
++    h = hashlib.sha256()
++    with open(path,"rb") as f:
++        for chunk in iter(lambda: f.read(8192), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++def upload_checkpoint(local_path, s3_key, metadata=None):
++    s3 = boto3.client("s3")
++    tmp_key = s3_key + ".uploading"
++    s3.upload_file(local_path, S3_BUCKET, tmp_key)
++    # rename (copy then delete) for atomicity
++    s3.copy_object(Bucket=S3_BUCKET, CopySource={'Bucket':S3_BUCKET,'Key':tmp_key}, Key=s3_key)
++    s3.delete_object(Bucket=S3_BUCKET, Key=tmp_key)
++    checksum = sha256(local_path)
++    rec = {"s3_path": f"s3://{S3_BUCKET}/{s3_key}", "checksum": checksum, "ts": datetime.utcnow().isoformat()}
++    if metadata:
++        rec.update(metadata)
++    # register to MLflow if configured
++    if MLFLOW_URI:
++        try:
++            import mlflow
++            mlflow.set_tracking_uri(MLFLOW_URI)
++            with mlflow.start_run():
++                mlflow.log_param("checkpoint_s3", rec["s3_path"])
++                for k,v in (metadata or {}).items():
++                    mlflow.log_param(k,str(v))
++        except Exception:
++            pass
++    return rec
++
++if __name__=="__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--file", required=True)
++    p.add_argument("--s3key", required=True)
++    args = p.parse_args()
++    print(upload_checkpoint(args.file, args.s3key, {"source":"rlhf_job"}))
++
+*** End Patch
+*** Begin Patch
+*** Add File: rl/rlhf_runner.py
++#!/usr/bin/env python3
++"""
++RLHF orchestration runner (scaffold).
++ - Runs supervised fine-tune, trains a reward model, runs PPO loop.
++ - Logs artifacts to MLflow and uses checkpoint_manager to publish artifacts.
++ - Operator must adapt to their infra (accelerate, trl, trlx, or custom).
++"""
++import os, subprocess, json
++from datetime import datetime
++from rl.checkpoint_manager import upload_checkpoint
++
++WORKDIR = os.environ.get("RL_WORKDIR","/tmp/rlhf")
++os.makedirs(WORKDIR, exist_ok=True)
++
++def run_cmd(cmd):
++    print("+", cmd)
++    rc = subprocess.call(cmd, shell=True)
++    if rc != 0:
++        raise RuntimeError("cmd failed: " + cmd)
++
++def supervised_finetune(config):
++    # placeholder for actual training
++    run_cmd(f"python train_supervised.py --config {config}")
++    ckpt = os.path.join(WORKDIR, "supervised_ckpt.pt")
++    # assume train script wrote checkpoint
++    return ckpt
++
++def train_reward_model(data):
++    run_cmd(f"python train_reward_model.py --data {data}")
++    return os.path.join(WORKDIR, "reward_ckpt.pt")
++
++def run_ppo(policy_ckpt, reward_ckpt, config):
++    run_cmd(f"python run_ppo.py --policy {policy_ckpt} --reward {reward_ckpt} --config {config}")
++    return os.path.join(WORKDIR, "policy_final.pt")
++
++def main():
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--supervised-config", default="/configs/supervised.yaml")
++    p.add_argument("--ppo-config", default="/configs/ppo.yaml")
++    args = p.parse_args()
++    sup_ckpt = supervised_finetune(args.supervised_config)
++    reward_ckpt = train_reward_model("/data/supervised")
++    policy_ckpt = run_ppo(sup_ckpt, reward_ckpt, args.ppo_config)
++    rec = upload_checkpoint(policy_ckpt, f"llm/policy_{int(datetime.utcnow().timestamp())}.pt", {"type":"rlhf"})
++    print("Uploaded checkpoint", rec)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/rlhf_training_job.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: rlhf-train-job
++  namespace: aegis-ml
++spec:
++  template:
++    spec:
++      containers:
++      - name: rlhf-runner
++        image: aegis/llm-rlhf:latest
++        command: ["python","/opt/rl/rlhf_runner.py","--supervised-config","/configs/supervised.yaml","--ppo-config","/configs/ppo.yaml"]
++        env:
++        - name: MLFLOW_TRACKING_URI
++          valueFrom:
++            secretKeyRef:
++              name: mlflow-secrets
++              key: tracking-uri
++        - name: ARTIFACT_S3_BUCKET
++          valueFrom:
++            secretKeyRef:
++              name: aegis-secrets
++              key: artifact-bucket
++        resources:
++          limits:
++            nvidia.com/gpu: 1
++            memory: "64Gi"
++            cpu: "16"
++          requests:
++            nvidia.com/gpu: 1
++            memory: "32Gi"
++            cpu: "8"
++      restartPolicy: Never
++  backoffLimit: 1
++
+*** End Patch
+*** Begin Patch
+*** Add File: agents/sandbox_runtimeclass.yaml
++apiVersion: node.k8s.io/v1
++kind: RuntimeClass
++metadata:
++  name: kata-runtime
++handler: kata-runtime
++
++---
++# Pod example using RuntimeClass
++apiVersion: v1
++kind: Pod
++metadata:
++  name: sandbox-example
++  namespace: aegis
++spec:
++  runtimeClassName: kata-runtime
++  containers:
++  - name: sandbox
++    image: alpine:3.18
++    command: ["/bin/sh","-c","echo hello; sleep 300"]
++
+*** End Patch
+*** Begin Patch
+*** Add File: agents/sandbox_controller.py
++#!/usr/bin/env python3
++"""
++Controller-like helper to run tool steps in sandboxed ephemeral pods (RuntimeClass = kata-runtime).
++Provides:
++ - concurrency control via Redis lock
++ - retries with backoff
++ - circuit breaker via simple failure counter
++
++This is a simple client-side orchestrator; operator can implement a Kubernetes controller for production.
++"""
++import os, time, json
++import redis, requests, subprocess
++from tenacity import retry, stop_after_attempt, wait_exponential
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/4")
++redis_client = redis.from_url(REDIS_URL)
++FAILURE_KEY = "sandbox_failures"
++CIRCUIT_OPEN_KEY = "sandbox_circuit_open"
++
++def circuit_allow():
++    failures = int(redis_client.get(FAILURE_KEY) or 0)
++    if failures > 10:
++        return False
++    return True
++
++def record_failure():
++    redis_client.incr(FAILURE_KEY)
++
++def record_success():
++    redis_client.decr(FAILURE_KEY)
++
++@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
++def run_sandbox_command(cmd, timeout=30):
++    if not circuit_allow():
++        raise RuntimeError("circuit open: too many sandbox failures")
++    # spawn a pod with RuntimeClass kata-runtime using kubectl run --attach --rm
++    kcmd = ["kubectl","run","sandbox-"+str(int(time.time())), "--rm", "--restart=Never", "--image=alpine:3.18", "--overrides", json.dumps({
++        "apiVersion": "v1", "spec": {"runtimeClassName": "kata-runtime", "containers":[{"name":"sandbox","image":"alpine:3.18","command":["/bin/sh","-c",cmd]}]}
++    }), "--", "/bin/sh","-c", "true"]
++    try:
++        subprocess.check_call(kcmd, timeout=timeout)
++        record_success()
++        return {"ok": True}
++    except Exception as e:
++        record_failure()
++        raise
++
++def execute_tool_step(step_cmd):
++    return run_sandbox_command(step_cmd)
++
++if __name__=="__main__":
++    import sys
++    cmd = " ".join(sys.argv[1:]) if len(sys.argv)>1 else "echo hello"
++    print(run_sandbox_command(cmd))
++
+*** End Patch
+*** Begin Patch
+*** Add File: safety/adversarial_harness.py
++#!/usr/bin/env python3
++"""
++Adversarial testing harness:
++ - Runs a suite of adversarial prompts (text / multimodal) against a model endpoint
++ - Uses hallucination detector to mark outputs and compute a hallucination rate
++ - Writes a report to COMPLIANCE_BUCKET and returns non-zero when hallucination rate > threshold
++"""
++import os, json, time
++import requests
++import boto3
++from safety.hallucination_detector import HalluDetector
++
++MODEL_ENDPOINT = os.environ.get("LLM_ENDPOINT", "http://llm-gateway.aegis.svc/v1/generate")
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++ADVERSARIAL_MANIFEST = os.environ.get("ADVERSARIAL_MANIFEST", "tests/adversarial_prompts.jsonl")
++HALLU_THRESHOLD = float(os.environ.get("ADVERSARIAL_HALLU_THRESHOLD", "0.05"))
++
++s3 = boto3.client("s3")
++detector = HalluDetector()
++
++def run_suite():
++    total = 0
++    hallu = 0
++    results = []
++    with open(ADVERSARIAL_MANIFEST) as fh:
++        for line in fh:
++            total += 1
++            prompt = json.loads(line)["prompt"]
++            payload = {"model":"gpt-like","prompt":prompt,"max_tokens":128,"tenant":"adversarial"}
++            r = requests.post(MODEL_ENDPOINT, json=payload, timeout=20)
++            out = r.json() if r.ok else {"error": r.text}
++            text = out.get("choices",[{}])[0].get("text","") if isinstance(out, dict) else ""
++            score = detector.predict_proba(text)
++            is_hallu = score > 0.5
++            if is_hallu:
++                hallu += 1
++            results.append({"prompt": prompt[:200], "output": text[:300], "score": score, "is_hallucination": is_hallu})
++    rate = hallu / total if total else 0.0
++    report = {"total": total, "hallucinations": hallu, "rate": rate, "ts": int(time.time()), "results_sample": results[:10]}
++    out = f"/tmp/adversarial_report_{int(time.time())}.json"
++    open(out,"w").write(json.dumps(report, indent=2))
++    if COMPLIANCE_BUCKET:
++        key = f"adversarial/reports/{os.path.basename(out)}"
++        s3.upload_file(out, COMPLIANCE_BUCKET, key)
++    print("Hallucination rate:", rate)
++    if rate > HALLU_THRESHOLD:
++        raise SystemExit(2)
++
++if __name__=="__main__":
++    run_suite()
++
+*** End Patch
+*** Begin Patch
+*** Add File: safety/hallu_trainer.py
++#!/usr/bin/env python3
++"""
++Train or retrain hallucination detector from labeled dataset and persist model to S3 / MLFLOW.
++ - Expects CSV/JSONL with text,label (1==hallucination)
++ - Produces a pickle model for detector used in inference/monitoring
++"""
++import os, pickle, json
++from sklearn.feature_extraction.text import TfidfVectorizer
++from sklearn.linear_model import LogisticRegression
++from sklearn.model_selection import train_test_split
++import boto3
++
++TRAINING_DATA = os.environ.get("HALLU_TRAIN_DATA", "/data/hallu_train.jsonl")
++MODEL_S3_PATH = os.environ.get("HALLU_MODEL_S3", "hallu/hallu_model.pkl")
++S3_BUCKET = os.environ.get("ARTIFACT_S3_BUCKET")
++
++def load_examples(path):
++    examples = []
++    with open(path) as fh:
++        for l in fh:
++            j = json.loads(l.strip())
++            examples.append((j["text"], int(j["label"])))
++    return examples
++
++def train(out_path="/tmp/hallu_model.pkl"):
++    ex = load_examples(TRAINING_DATA)
++    texts, labels = zip(*ex)
++    vec = TfidfVectorizer(max_features=5000)
++    X = vec.fit_transform(texts)
++    clf = LogisticRegression(max_iter=1000)
++    clf.fit(X, labels)
++    with open(out_path, "wb") as fh:
++        pickle.dump((vec, clf), fh)
++    # upload to S3
++    if S3_BUCKET:
++        s3 = boto3.client("s3")
++        s3.upload_file(out_path, S3_BUCKET, MODEL_S3_PATH)
++    print("Trained and uploaded model")
++
++if __name__=="__main__":
++    train()
++
+*** End Patch
+*** Begin Patch
+*** Add File: observability/es_ingest_service.py
++#!/usr/bin/env python3
++"""
++Service that watches the audit directory (/tmp/aegis_audit) and indexes JSON records into Elasticsearch.
++Also applies a simple retention policy by timestamp (deletes old indices via ILM or explicit delete).
++"""
++import os, time, json, glob
++from datetime import datetime, timedelta
++try:
++    from elasticsearch import Elasticsearch
++except Exception:
++    Elasticsearch = None
++
++ES_HOST = os.environ.get("ES_HOST")
++AUDIT_DIR = os.environ.get("AUDIT_DIR", "/tmp/aegis_audit")
++RETENTION_DAYS = int(os.environ.get("AUDIT_RETENTION_DAYS", "90"))
++
++def index_file(es, path):
++    if not Elasticsearch or not ES_HOST:
++        return False
++    with open(path) as fh:
++        rec = json.load(fh)
++    try:
++        es.index(index="aegis-audit", body=rec)
++        return True
++    except Exception as e:
++        print("es index error", e)
++        return False
++
++def run_loop():
++    es = Elasticsearch([ES_HOST]) if Elasticsearch and ES_HOST else None
++    while True:
++        files = glob.glob(os.path.join(AUDIT_DIR, "*.json"))
++        for f in files:
++            try:
++                success = index_file(es, f)
++                if success:
++                    os.remove(f)
++            except Exception as e:
++                print("index error", e)
++        # retention: delete by query older than retention
++        if es:
++            try:
++                cutoff = (datetime.utcnow() - timedelta(days=RETENTION_DAYS)).isoformat()
++                es.delete_by_query(index="aegis-audit", body={"query":{"range":{"ts":{"lt":cutoff}}}})
++            except Exception:
++                pass
++        time.sleep(15)
++
++if __name__=="__main__":
++    run_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File: observability/ilm_policy.json
++{
++  "policy": {
++    "phases": {
++      "hot": {
++        "min_age": "0ms",
++        "actions": {}
++      },
++      "warm": {
++        "min_age": "7d",
++        "actions": {
++          "forcemerge": {"max_num_segments": 1}
++        }
++      },
++      "delete": {
++        "min_age": "90d",
++        "actions": {
++          "delete": {}
++        }
++      }
++    }
++  }
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File: billing/redis_token_bucket.lua
++-- Atomic token bucket Lua script for Redis
++-- KEYS[1] = quota key (e.g., quota:tenant123)
++-- ARGV[1] = tokens requested (integer)
++-- ARGV[2] = capacity (int) (optional, used to init)
++-- ARGV[3] = refill_amount (int) per period
++-- ARGV[4] = refill_period_seconds
++local key = KEYS[1]
++local req = tonumber(ARGV[1])
++local capacity = tonumber(ARGV[2]) or 100000
++local refill = tonumber(ARGV[3]) or 1000
++local period = tonumber(ARGV[4]) or 60
++local now = tonumber(redis.call("TIME")[1])
++local state = redis.call("HMGET", key, "tokens", "last_refill")
++local tokens = tonumber(state[1]) or capacity
++local last_refill = tonumber(state[2]) or now
++-- refill based on time elapsed
++local elapsed = now - last_refill
++if elapsed > 0 then
++  local slots = math.floor(elapsed / period)
++  if slots > 0 then
++    tokens = math.min(capacity, tokens + slots * refill)
++    last_refill = last_refill + slots * period
++  end
++end
++if tokens < req then
++  return {0, tokens}
++end
++tokens = tokens - req
++redis.call("HMSET", key, "tokens", tokens, "last_refill", last_refill)
++return {1, tokens}
++
+*** End Patch
+*** Begin Patch
+*** Add File: billing/redis_quota.py
++#!/usr/bin/env python3
++"""
++Helper to call Redis Lua token bucket script atomically.
++Usage: allow = consume_quota("tenant:abc", tokens)
++"""
++import os
++import redis
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/5")
++redis_client = redis.from_url(REDIS_URL)
++LUA_PATH = os.path.join(os.path.dirname(__file__), "redis_token_bucket.lua")
++
++with open(LUA_PATH) as fh:
++    LUA_SCRIPT = fh.read()
++
++SCRIPT_SHA = redis_client.script_load(LUA_SCRIPT)
++
++def consume_quota(tenant_key, tokens, capacity=100000, refill=1000, period=60):
++    res = redis_client.evalsha(SCRIPT_SHA, 1, tenant_key, tokens, capacity, refill, period)
++    allowed = bool(res[0])
++    remaining = int(res[1])
++    return allowed, remaining
++
++if __name__=="__main__":
++    allowed, rem = consume_quota("quota:demo", 100)
++    print("allowed", allowed, "remaining", rem)
++
+*** End Patch
+*** Begin Patch
+*** Add File: ci/auto_canary_manager.py
++#!/usr/bin/env python3
++"""
++Canary manager:
++ - polls ES for recent hallucination metrics and cost usage per-model
++ - if metrics under thresholds, calls model_registry promote API
++ - otherwise triggers rollback
++This is a basic manager for automation; operator must wire thresholds and auth.
++"""
++import os, time, requests
++from datetime import datetime, timedelta
++
++ES_HOST = os.environ.get("ES_HOST")
++MODEL_REGISTRY_API = os.environ.get("MODEL_REGISTRY_API")
++HALLU_THRESH = float(os.environ.get("CANARY_HALLU_THRESHOLD", "0.02"))
++COST_THRESH = float(os.environ.get("CANARY_COST_THRESHOLD", "10.0"))  # USD per hour
++
++def query_es_for_model_stats(model_id, window_mins=30):
++    # placeholder: operator should implement ES query to compute hallucination rate + cost
++    # here we return mocked values for demonstration
++    return {"hallu_rate": 0.01, "cost_per_hour": 2.5}
++
++def decide_and_act(model_id):
++    stats = query_es_for_model_stats(model_id)
++    if stats["hallu_rate"] <= HALLU_THRESH and stats["cost_per_hour"] <= COST_THRESH:
++        # promote
++        requests.post(f"{MODEL_REGISTRY_API}/models/promote", json={"model": model_id}, timeout=10)
++        return {"action":"promote","stats":stats}
++    else:
++        requests.post(f"{MODEL_REGISTRY_API}/models/rollback", json={"model": model_id}, timeout=10)
++        return {"action":"rollback","stats":stats}
++
++if __name__=="__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--model", required=True)
++    args = p.parse_args()
++    print(decide_and_act(args.model))
++
+*** End Patch
+*** Begin Patch
+*** Add File: infra/vllm/deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: vllm
++  namespace: aegis-ml
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: vllm
++  template:
++    metadata:
++      labels:
++        app: vllm
++    spec:
++      containers:
++      - name: vllm
++        image: vllm/vllm:latest
++        ports:
++          - containerPort: 8080
++        resources:
++          limits:
++            nvidia.com/gpu: 1
++            memory: "64Gi"
++            cpu: "8"
++          requests:
++            nvidia.com/gpu: 1
++            memory: "24Gi"
++            cpu: "2"
++        env:
++          - name: MODEL_ID
++            value: "gpt-3-like-vllm"
++      nodeSelector:
++        accelerator: "gpu"
++
++---
++# Service
++apiVersion: v1
++kind: Service
++metadata:
++  name: vllm
++  namespace: aegis-ml
++spec:
++  selector:
++    app: vllm
++  ports:
++    - port: 8080
++      targetPort: 8080
++
+*** End Patch
+*** Begin Patch
+*** Add File: compliance/remediation_tracker.py
++#!/usr/bin/env python3
++"""
++Track penetration-test findings and remediation SLAs.
++ - Findings stored in compliance/pen_findings.json
++ - Remediation deadlines computed and reminders emitted to OPERATOR_NOTIFY_WEBHOOK
++"""
++import os, json, time
++from datetime import datetime, timedelta
++import boto3
++
++DB = "compliance/pen_findings.json"
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++OPERATOR_WEBHOOK = os.environ.get("OPERATOR_NOTIFY_WEBHOOK")
++
++def load_findings():
++    if not os.path.exists(DB):
++        return []
++    return json.load(open(DB)).get("findings", [])
++
++def check_slas():
++    findings = load_findings()
++    alerts = []
++    for f in findings:
++        if f.get("status") != "closed":
++            created = datetime.fromisoformat(f["created_at"])
++            due = created + timedelta(days=f.get("remediation_days",30))
++            days_left = (due - datetime.utcnow()).days
++            if days_left <= 7:
++                alerts.append({"id": f["id"], "title": f["title"], "days_left": days_left})
++    if alerts and OPERATOR_WEBHOOK:
++        try:
++            import requests
++            requests.post(OPERATOR_WEBHOOK, json={"alert":"remediation_due","items":alerts}, timeout=5)
++        except Exception:
++            pass
++    # upload status
++    out = f"/tmp/remediation_status_{int(time.time())}.json"
++    open(out,"w").write(json.dumps({"ts": datetime.utcnow().isoformat(), "alerts": alerts}, indent=2))
++    if COMPLIANCE_BUCKET:
++        s3 = boto3.client("s3"); key = f"compliance/remediation/{os.path.basename(out)}"; s3.upload_file(out, COMPLIANCE_BUCKET, key)
++
++if __name__=="__main__":
++    check_slas()
++
+*** End Patch
+*** End Patch

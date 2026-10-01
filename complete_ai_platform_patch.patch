@@ -1,0 +1,378 @@
+*** Begin Patch
+*** Add File: services/provenance/dataset_sbom.py
++"""
++Dataset SBOM / Provenance generator
++Generates a JSON manifest describing dataset provenance, sources, transforms and a checksum summary.
++Intended to run after ingest or as part of ETL workflows.
++"""
++import os
++import json
++import hashlib
++import time
++from pathlib import Path
++
++def file_checksum(path):
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            chunk = f.read(8192)
++            if not chunk:
++                break
++            h.update(chunk)
++    return h.hexdigest()
++
++def generate_sbom(manifest_jsonl_path, output_path=None, tool_version="aegis-etl-v1"):
++    """
++    manifest_jsonl_path: path to manifest produced by ingest (one JSON per line)
++    output_path: where to write SBOM JSON (defaults next to manifest)
++    """
++    if not output_path:
++        output_path = str(Path(manifest_jsonl_path).with_suffix(".sbom.json"))
++    entries = []
++    with open(manifest_jsonl_path) as f:
++        for line in f:
++            obj = json.loads(line)
++            uri = obj.get("uri")
++            # If local path, compute checksum; if s3:// skip and leave placeholder
++            checksum = None
++            if uri and not uri.startswith("s3://") and os.path.exists(uri):
++                checksum = file_checksum(uri)
++            entries.append({
++                "id": obj.get("id"),
++                "modality": obj.get("modality"),
++                "uri": uri,
++                "metadata": obj.get("metadata", {}),
++                "checksum": checksum
++            })
++    sbom = {
++        "schema_version": "aegis-dataset-sbom-v1",
++        "generated_at": int(time.time()),
++        "tool_version": tool_version,
++        "entries": entries
++    }
++    with open(output_path, "w") as out:
++        json.dump(sbom, out, indent=2)
++    return output_path
++
++if __name__ == "__main__":
++    import sys
++    if len(sys.argv) < 2:
++        print("Usage: dataset_sbom.py manifest.jsonl [out_sbom.json]")
++        raise SystemExit(2)
++    manifest = sys.argv[1]
++    out = sys.argv[2] if len(sys.argv) > 2 else None
++    print("Writing SBOM to", generate_sbom(manifest, out))
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/lineage/lineage_service.py
++"""
++Simple lineage service records ingest / transform events to COMPLIANCE_BUCKET and exposes API to query lineage.
++Records:
++ - dataset registration
++ - transform steps (script, args, timestamp, input manifests, output manifests)
++ - SBOM location
++"""
++import os
++import json
++import time
++from flask import Flask, request, jsonify
++import boto3
++
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++S3_CLIENT = boto3.client("s3") if COMPLIANCE_BUCKET and COMPLIANCE_BUCKET.startswith("s3://") else None
++LINEAGE_DB = os.environ.get("LINEAGE_DB", "/data/lineage.json")
++
++app = Flask("lineage")
++
++def load_db():
++    if os.path.exists(LINEAGE_DB):
++        return json.load(open(LINEAGE_DB))
++    return {"datasets": {}, "transforms": {}}
++
++def save_db(db):
++    os.makedirs(os.path.dirname(LINEAGE_DB) or ".", exist_ok=True)
++    with open(LINEAGE_DB, "w") as f:
++        json.dump(db, f, indent=2)
++    # optionally copy to COMPLIANCE_BUCKET
++    if S3_CLIENT:
++        bucket = COMPLIANCE_BUCKET.split("s3://",1)[1].split("/",1)[0]
++        key = f"lineage/{int(time.time())}_lineage.json"
++        S3_CLIENT.put_object(Bucket=bucket, Key=key, Body=json.dumps(db))
++
++@app.post("/datasets/register")
++def register_dataset():
++    body = request.get_json()
++    name = body["name"]
++    manifest = body["manifest"]
++    sbom = body.get("sbom")
++    db = load_db()
++    db["datasets"][name] = {"manifest": manifest, "sbom": sbom, "registered_at": int(time.time())}
++    save_db(db)
++    return jsonify({"ok": True})
++
++@app.post("/transforms/record")
++def record_transform():
++    body = request.get_json()
++    tid = f"tx-{int(time.time())}-{os.urandom(4).hex()}"
++    db = load_db()
++    db["transforms"][tid] = body
++    db["transforms"][tid]["ts"] = int(time.time())
++    save_db(db)
++    return jsonify({"ok": True, "transform_id": tid})
++
++@app.get("/datasets/<name>")
++def get_dataset(name):
++    db = load_db()
++    return jsonify(db["datasets"].get(name, {}))
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8090)))
++
+*** End Patch
+*** Begin Patch
+*** Add File: argo/workflows/hpo_and_training.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  name: distributed-train-hpo
++  namespace: staging
++spec:
++  entrypoint: hpo
++  templates:
++  - name: hpo
++    steps:
++    - - name: hpo-search
++        template: hpo-search
++  - name: hpo-search
++    dag:
++      tasks:
++      - name: trial-1
++        template: train-trial
++        arguments:
++          parameters:
++          - name: lr
++            value: "0.01"
++      - name: trial-2
++        template: train-trial
++        arguments:
++          parameters:
++          - name: lr
++            value: "0.001"
++  - name: train-trial
++    inputs:
++      parameters:
++      - name: lr
++    container:
++      image: ghcr.io/yourorg/aegis-train:latest
++      command: ["/bin/sh","-c"]
++      args: ["python -u /app/train.py --lr {{inputs.parameters.lr}} --epochs 2 --log-mlflow"]
++      env:
++      - name: MLFLOW_TRACKING_URI
++        value: "http://mlflow.mlflow.svc.cluster.local:5000"
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/training/train.py
++"""
++Training entrypoint that logs to MLflow and supports checkpointing to COMPLIANCE_BUCKET.
++This is a simplified example to show integration points.
++"""
++import os, time, argparse, json
++import mlflow
++import random
++
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++
++def train(lr, epochs, report_mlflow=False):
++    run_id = None
++    if report_mlflow:
++        mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI", "http://localhost:5000"))
++        mlflow.start_run()
++        run_id = mlflow.active_run().info.run_id
++        mlflow.log_param("lr", lr)
++    # fake training loop
++    for e in range(epochs):
++        loss = random.random() * 0.1
++        print(f"epoch {e} loss {loss:.4f}")
++        if report_mlflow:
++            mlflow.log_metric("loss", loss, step=e)
++        # write a checkpoint file locally
++        ckpt_path = f"/tmp/checkpoint_epoch_{e}.json"
++        with open(ckpt_path, "w") as f:
++            json.dump({"epoch": e, "loss": loss}, f)
++        # upload checkpoint to COMPLIANCE_BUCKET if set
++        if COMPLIANCE_BUCKET and COMPLIANCE_BUCKET.startswith("s3://"):
++            import boto3
++            bucket = COMPLIANCE_BUCKET.split("s3://",1)[1].split("/",1)[0]
++            key = f"checkpoints/{int(time.time())}_epoch_{e}.json"
++            boto3.client("s3").upload_file(ckpt_path, bucket, key)
++            print("uploaded checkpoint s3://{}/{}".format(bucket,key))
++        time.sleep(1)
++    if report_mlflow:
++        mlflow.end_run()
++    return run_id
++
++if __name__ == "__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--lr", type=float, default=0.01)
++    p.add_argument("--epochs", type=int, default=3)
++    p.add_argument("--log-mlflow", action="store_true")
++    args = p.parse_args()
++    train(args.lr, args.epochs, args.log_mlflow)
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/model_registry/integrations/cosign_rekor.py
++"""
++Helpers to verify cosign signature and Rekor entry for a given image.
++This is a lightweight wrapper that calls cosign CLI (for now).
++"""
++import os, subprocess, json
++
++def verify_image_attestation(image_ref, cosign_key=None, rekor_url=None):
++    """
++    Returns dict with verification details. This uses cosign verify and optionally queries Rekor.
++    """
++    cmd = ["cosign", "verify", image_ref]
++    if cosign_key:
++        cmd.extend(["--key", cosign_key])
++    try:
++        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
++        return {"ok": True, "output": out.decode()}
++    except subprocess.CalledProcessError as e:
++        return {"ok": False, "err": e.output.decode()}
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/manifests/rollout_canary.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: model-serving
++  namespace: staging
++spec:
++  replicas: 3
++  selector:
++    matchLabels:
++      app: model-serving
++  template:
++    metadata:
++      labels:
++        app: model-serving
++    spec:
++      containers:
++      - name: serving
++        image: ghcr.io/yourorg/model-serving:stable@sha256:REPLACE_ME
++        ports:
++        - containerPort: 8085
++
++---
++apiVersion: argoproj.io/v1alpha1
++kind: Rollout
++metadata:
++  name: model-serving-rollout
++  namespace: staging
++spec:
++  replicas: 3
++  strategy:
++    canary:
++      steps:
++      - setWeight: 10
++      - pause: {duration: 60}
++      - setWeight: 50
++      - pause: {duration: 120}
++  selector:
++    matchLabels:
++      app: model-serving
++  template:
++    metadata:
++      labels:
++        app: model-serving
++    spec:
++      containers:
++      - name: serving
++        image: ghcr.io/yourorg/model-serving:stable@sha256:REPLACE_ME
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/agent_controller/quotas_and_approval.py
++"""
++Quotas and human approval integration for agents.
++- quota tracking: simple in-memory counters (replace with Redis for prod)
++- approval workflow: create approval requests that humans can approve via API (this should tie into multi-sig PRs or external approval system)
++"""
++import time, threading
++from flask import Flask, request, jsonify
++
++app = Flask("agent-quotas")
++
++# simple in-memory quota store for demo
++QUOTAS = {}  # agent_id -> {"tokens": remaining}
++APPROVALS = {}  # approval_id -> {"agent_id", "action", "approvers":[], "required":1, "approved_by":[]}
++
++@app.post("/quotas/set")
++def set_quota():
++    body = request.get_json()
++    agent = body["agent_id"]
++    tokens = int(body["tokens"])
++    QUOTAS[agent] = {"tokens": tokens}
++    return jsonify({"ok": True})
++
++@app.post("/quotas/consume")
++def consume_quota():
++    body = request.get_json()
++    agent = body["agent_id"]
++    amount = int(body.get("amount",1))
++    q = QUOTAS.get(agent, {"tokens":0})
++    if q["tokens"] < amount:
++        return jsonify({"ok": False, "reason": "quota_exhausted"}), 403
++    q["tokens"] -= amount
++    QUOTAS[agent] = q
++    return jsonify({"ok": True, "remaining": q["tokens"]})
++
++@app.post("/approvals/request")
++def request_approval():
++    body = request.get_json()
++    aid = f"apr-{int(time.time())}-{os.urandom(3).hex()}"
++    APPROVALS[aid] = {"agent_id": body.get("agent_id"), "action": body.get("action"), "approvers": body.get("approvers", []), "required": int(body.get("required",1)), "approved_by": []}
++    return jsonify({"ok": True, "approval_id": aid})
++
++@app.post("/approvals/approve")
++def approve():
++    body = request.get_json()
++    aid = body["approval_id"]
++    approver = body["approver"]
++    apr = APPROVALS.get(aid)
++    if not apr:
++        return jsonify({"ok": False, "reason": "not_found"}), 404
++    if approver in apr["approved_by"]:
++        return jsonify({"ok": False, "reason": "already_approved"}), 400
++    apr["approved_by"].append(approver)
++    APPROVALS[aid] = apr
++    if len(apr["approved_by"]) >= apr["required"]:
++        apr["status"] = "approved"
++    return jsonify({"ok": True, "status": apr.get("status", "pending")})
++
++@app.get("/approvals/<aid>")
++def approval_status(aid):
++    return jsonify(APPROVALS.get(aid, {}))
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=8095)
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/edge/compile_and_sign.py
++"""
++Compile and sign artifacts for Edge TPU / TFLite
++ - Accepts input model (onnx or saved model)
++ - Runs conversion (placeholder) and signs the resulting file with cosign (KMS recommended)
++ - Writes outputs and Rekor/attestation metadata to COMPLIANCE_BUCKET
++"""
++import os, subprocess, json, time
++
++COMPLIANCE_BUCKET = os.environ.get("COMPLIANCE_BUCKET")
++
++def sign_artifact(path
+

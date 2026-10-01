@@ -1,0 +1,349 @@
+*** Begin Patch
+*** Add File: fleet/controller/production_app.py
++#!/usr/bin/env python3
++"""
++Aegis Fleet Controller - production-ready prototype
++- Uses SQLAlchemy + Postgres for scalable storage
++- Supports simple RBAC via API keys (stored in DB) and optional mTLS validation (via provided client cert CN header)
++- Runs with TLS (server cert + key) and can be deployed behind an ingress that performs mTLS.
++Note: For full production, run behind a K8s Ingress/ALB with mTLS enforced, and integrate with an
++identity provider for OAuth2 tokens. This file provides a self-contained, hardened starting point.
++"""
++import os
++import time
++import json
++import uuid
++import logging
++from typing import Optional
++
++from fastapi import FastAPI, HTTPException, Header, Request, Depends
++from fastapi.security.api_key import APIKeyHeader
++from pydantic import BaseModel
++from sqlalchemy import create_engine, Column, String, Integer, Text, Float, Boolean
++from sqlalchemy.ext.declarative import declarative_base
++from sqlalchemy.orm import sessionmaker
++
++LOG = logging.getLogger("aegis.fleet.prod")
++logging.basicConfig(level=logging.INFO)
++
++DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://aegis:aegis@postgres:5432/aegis")
++CLIENT_CN_HEADER = os.environ.get("CLIENT_CN_HEADER", "x-ssl-client-cn")  # header set by ingress with verified client cert CN
++TLS_CERTFILE = os.environ.get("TLS_CERTFILE", "/etc/tls/tls.crt")
++TLS_KEYFILE = os.environ.get("TLS_KEYFILE", "/etc/tls/tls.key")
++
++engine = create_engine(DATABASE_URL, pool_size=20, max_overflow=10)
++SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
++Base = declarative_base()
++
++
++class Device(Base):
++    __tablename__ = "devices"
++    device_id = Column(String, primary_key=True, index=True)
++    group_name = Column(String, index=True)
++    metadata = Column(Text)
++    registered_at = Column(Float)
++
++
++class Release(Base):
++    __tablename__ = "releases"
++    release_id = Column(String, primary_key=True, index=True)
++    bundle_url = Column(String)
++    manifest = Column(Text)
++    created_at = Column(Float)
++    active = Column(Boolean, default=True)
++
++
++class Rollout(Base):
++    __tablename__ = "rollouts"
++    rollout_id = Column(String, primary_key=True, index=True)
++    release_id = Column(String, index=True)
++    group_name = Column(String, index=True)
++    pct = Column(Integer)
++    status = Column(String, default="running")
++    created_at = Column(Float)
++
++
++class Telemetry(Base):
++    __tablename__ = "telemetry"
++    id = Column(Integer, primary_key=True, index=True)
++    device_id = Column(String, index=True)
++    payload = Column(Text)
++    created_at = Column(Float)
++
++
++class ApiKey(Base):
++    __tablename__ = "api_keys"
++    key = Column(String, primary_key=True, index=True)
++    owner = Column(String)
++    role = Column(String)  # e.g., admin, deployer, viewer
++    created_at = Column(Float)
++
++
++def init_db():
++    Base.metadata.create_all(bind=engine)
++
++
++app = FastAPI(title="Aegis Fleet Controller (prod)")
++init_db()
++
++API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
++
++
++def get_db():
++    db = SessionLocal()
++    try:
++        yield db
++    finally:
++        db.close()
++
++
++def require_role(role: str):
++    def _require(api_key: Optional[str] = Depends(API_KEY_HEADER), request: Request = None, db=Depends(get_db)):
++        # Check API key first
++        if api_key:
++            ak = db.query(ApiKey).filter(ApiKey.key == api_key).first()
++            if ak and (ak.role == role or ak.role == "admin"):
++                return True
++            raise HTTPException(status_code=403, detail="insufficient role for API key")
++        # Fallback to mTLS header-based CN -> role mapping (Ingress must verify client cert)
++        client_cn = request.headers.get(CLIENT_CN_HEADER)
++        if client_cn:
++            # naive mapping: CN contains role (e.g., device-deployer/admin)
++            if role in client_cn or "admin" in client_cn:
++                return True
++        raise HTTPException(status_code=401, detail="authentication required")
++    return _require
++
++
++class RegisterReq(BaseModel):
++    device_id: str
++    group: Optional[str] = "default"
++    metadata: Optional[dict] = {}
++
++
++class ReleaseReq(BaseModel):
++    bundle_url: str
++    manifest: dict
++
++
++class RolloutReq(BaseModel):
++    release_id: str
++    group: str = "default"
++    pct: int = 5
++    step_seconds: int = 300
++
++
++@app.post("/api/v1/devices/register", dependencies=[Depends(require_role("deployer"))])
++def register_device(r: RegisterReq, db=Depends(get_db)):
++    d = db.query(Device).get(r.device_id)
++    now = time.time()
++    if d:
++        d.group_name = r.group
++        d.metadata = json.dumps(r.metadata)
++        d.registered_at = now
++    else:
++        d = Device(device_id=r.device_id, group_name=r.group, metadata=json.dumps(r.metadata), registered_at=now)
++        db.add(d)
++    db.commit()
++    return {"ok": True}
++
++
++@app.post("/api/v1/releases", dependencies=[Depends(require_role("deployer"))])
++def create_release(r: ReleaseReq, db=Depends(get_db)):
++    release_id = str(uuid.uuid4())
++    now = time.time()
++    rel = Release(release_id=release_id, bundle_url=r.bundle_url, manifest=json.dumps(r.manifest), created_at=now, active=True)
++    db.add(rel)
++    db.commit()
++    return {"release_id": release_id}
++
++
++@app.post("/api/v1/rollouts", dependencies=[Depends(require_role("deployer"))])
++def start_rollout(r: RolloutReq, db=Depends(get_db)):
++    rollout_id = str(uuid.uuid4())
++    now = time.time()
++    ro = Rollout(rollout_id=rollout_id, release_id=r.release_id, group_name=r.group, pct=r.pct, status="running", created_at=now)
++    db.add(ro)
++    db.commit()
++
++    # orchestrate in background thread
++    import threading
++
++    def orchestrate(rollout_id, step_seconds):
++        from sqlalchemy.orm import scoped_session
++        sess = scoped_session(sessionmaker(bind=engine))
++        try:
++            while True:
++                ro = sess.query(Rollout).get(rollout_id)
++                if not ro or ro.status != "running":
++                    return
++                new_pct = min(100, ro.pct + 10)
++                ro.pct = new_pct
++                sess.commit()
++                # health evaluation placeholder
++                if evaluate_health(ro.release_id, ro.group_name, sess):
++                    ro.status = "rolled_back"
++                    rel = sess.query(Release).get(ro.release_id)
++                    rel.active = False
++                    sess.commit()
++                    return
++                if new_pct >= 100:
++                    ro.status = "completed"
++                    sess.commit()
++                    return
++                time.sleep(step_seconds)
++        finally:
++            sess.remove()
++
++    t = threading.Thread(target=orchestrate, args=(rollout_id, r.step_seconds), daemon=True)
++    t.start()
++    return {"rollout_id": rollout_id}
++
++
++def evaluate_health(release_id: str, group_name: str, sess) -> bool:
++    window = time.time() - 300
++    errors = sess.query(Telemetry).filter(Telemetry.created_at > window, Telemetry.payload.ilike("%error%")).count()
++    total = sess.query(Telemetry).filter(Telemetry.created_at > window).count() or 1
++    err_rate = errors / float(total)
++    return err_rate > 0.2
++
++
++@app.post("/api/v1/devices/{device_id}/telemetry")
++def ingest_telemetry(device_id: str, payload: dict, db=Depends(get_db)):
++    now = time.time()
++    t = Telemetry(device_id=device_id, payload=json.dumps(payload), created_at=now)
++    db.add(t)
++    db.commit()
++    return {"ok": True}
++
++
++@app.get("/api/v1/devices/{device_id}/bundle")
++def device_bundle(device_id: str, db=Depends(get_db)):
++    d = db.query(Device).get(device_id)
++    group = d.group_name if d else "default"
++    rel = db.query(Release).filter(Release.active == True).order_by(Release.created_at.desc()).first()
++    if not rel:
++        return {"bundle": None}
++    ro = db.query(Rollout).filter(Rollout.release_id == rel.release_id, Rollout.group_name == group).order_by(Rollout.created_at.desc()).first()
++    if not ro:
++        return {"bundle": None}
++    import hashlib
++    h = hashlib.sha256(device_id.encode()).hexdigest()
++    numeric = int(h[:8], 16) % 100
++    if numeric < int(ro.pct):
++        return {"bundle": {"release_id": rel.release_id, "bundle_url": rel.bundle_url, "manifest": json.loads(rel.manifest)}}
++    return {"bundle": None}
++
++
++@app.get("/healthz")
++def health():
++    return {"status": "ok"}
++
++
++if __name__ == "__main__":
++    import uvicorn, ssl
++    ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
++    ssl_ctx.load_cert_chain(TLS_CERTFILE, TLS_KEYFILE)
++    # If ingress supplies client certs or you want direct mTLS, load and require CA
++    CLIENT_CA = os.environ.get("CLIENT_CA_BUNDLE")
++    if CLIENT_CA:
++        ssl_ctx.load_verify_locations(CLIENT_CA)
++        ssl_ctx.verify_mode = ssl.CERT_REQUIRED
++    uvicorn.run("production_app:app", host="0.0.0.0", port=8443, ssl_context=ssl_ctx, workers=int(os.environ.get("UVICORN_WORKERS", "4")))
++
+*** End Patch
+*** Begin Patch
+*** Add File: fleet/controller/Dockerfile
++FROM python:3.10-slim
++WORKDIR /app
++COPY production_app.py /app/production_app.py
++RUN apt-get update && apt-get install -y --no-install-recommends libpq5 ca-certificates && rm -rf /var/lib/apt/lists/*
++RUN pip install "fastapi[all]" sqlalchemy psycopg2-binary uvicorn
++EXPOSE 8443
++CMD ["python", "/app/production_app.py"]
++
+*** End Patch
+*** Begin Patch
+*** Add File: fleet/controller/k8s/production-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-fleet-controller
++  namespace: aegis
++spec:
++  replicas: 3
++  selector:
++    matchLabels:
++      app: aegis-fleet-controller
++  template:
++    metadata:
++      labels:
++        app: aegis-fleet-controller
++    spec:
++      containers:
++        - name: controller
++          image: aegis/fleet-controller:latest
++          ports:
++            - containerPort: 8443
++          env:
++            - name: DATABASE_URL
++              value: postgresql://aegis:aegis@postgres.aegis.svc.cluster.local:5432/aegis
++            - name: CLIENT_CN_HEADER
++              value: "x-ssl-client-cn"
++          resources:
++            requests:
++              cpu: "200m"
++              memory: "256Mi"
++            limits:
++              cpu: "1"
++              memory: "1Gi"
++          volumeMounts:
++            - name: tls
++              mountPath: /etc/tls
++              readOnly: true
++      volumes:
++        - name: tls
++          secret:
++            secretName: aegis-controller-tls
++      restartPolicy: Always
++
+*** End Patch
+*** Begin Patch
+*** Add File: provisioning/vault_rotate_device_certs.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Rotate device certificates using Vault PKI and publish new certs into a Vault secret path or external MDM.
++# Requires: VAULT_ADDR + VAULT_TOKEN env vars.
++# Usage: ./vault_rotate_device_certs.sh --role aegis-device-role --devices device1,device2 --out-path secret/data/aegis/devices
++
++ROLE="aegis-device-role"
++DEVICES=""
++OUT_PATH="secret/data/aegis/devices"
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --role) ROLE="$2"; shift 2;;
++    --devices) DEVICES="$2"; shift 2;; # comma separated
++    --out-path) OUT_PATH="$2"; shift 2;;
++    *) echo "usage"; exit 2;;
++  esac
++done
++
++: "${DEVICES:?--devices required}"
++
++IFS=',' read -ra DARR <<< "$DEVICES"
++for d in "${DARR[@]}"; do
++  CN="${d}.devices.aegis"
++  echo "Issuing cert for $d (CN=${CN})"
++  # issue cert
++  cert_json=$(vault write -format=json pki_int/issue/${ROLE} common_name="${CN}" ttl="720h")
++  if [ -z "$cert_json" ]; then
++    echo "failed to issue for $d"
++    continue
++  fi
++  cert=$(echo "$cert_json" | jq -r '.data.certificate')
++  key=$(echo "$cert_json" | jq -r '.data.private_key')
++  issuing_ca=$(echo "$cert_json" | jq -r '.data.issuing_ca')
++](#)*
+

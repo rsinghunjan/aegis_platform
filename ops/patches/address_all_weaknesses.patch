@@ -1,0 +1,629 @@
+*** Begin Patch
+*** Add File:ops/hil/vendor_impl_example_full.py
++#!/usr/bin/env python3
++"""
++Example vendor adapter (more featureful demo).
++ - Simulates a HIL rack with slots, accepts replay manifests, runs local "replays" (simulated),
++   produces hil_log.json, artifacts, and returns job lifecycle methods used by scheduler.
++ - Intended for onboarding/testing until real vendor adapter is implemented.
++"""
++import os
++import time
++import json
++import threading
++from datetime import datetime
++from typing import Dict, Any, List
++
++_JOBS = {}
++_SLOTS = [{"rack_id": "demo-rack", "slot": i, "status": "idle"} for i in range(1,5)]
++
++class ExampleVendor:
++    def __init__(self, url: str = None, token: str = None):
++        self.url = url
++        self.token = token
++
++    def list_backends(self) -> List[Dict[str, Any]]:
++        return _SLOTS
++
++    def prepare_replay(self, payload: Dict[str, Any]) -> Dict[str, Any]:
++        # Validate manifest fields and simulate mounting bag
++        manifest = payload.get("manifest") or {}
++        # return mount info for debug
++        return {"mounted": manifest.get("bag", "local"), "ok": True}
++
++    def _simulate_run(self, job_id: str, manifest: Dict[str, Any], out_dir: str):
++        # Simulate work: sleep then produce artifacts
++        time.sleep(1 + (len(manifest.get("topics", [])) * 0.1))
++        os.makedirs(out_dir, exist_ok=True)
++        hil_log = {"job_id": job_id, "seed": manifest.get("seed"), "timestamps": [datetime.utcnow().isoformat()+"Z"], "status": "completed"}
++        path = os.path.join(out_dir, f"{job_id}_hil_log.json")
++        with open(path, "w") as fh:
++            json.dump(hil_log, fh)
++        # produce a small artifact list
++        artifacts = [path]
++        _JOBS[job_id]["state"] = "succeeded"
++        _JOBS[job_id]["artifacts"] = artifacts
++
++    def start_run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
++        manifest = payload.get("manifest") or {}
++        jid = f"demo-job-{int(time.time()*1000)}"
++        _JOBS[jid] = {"job_id": jid, "state": "running", "manifest": manifest, "created": datetime.utcnow().isoformat()+"Z", "artifacts": []}
++        # run in background thread to simulate vendor execution
++        out_dir = "/tmp/hil_artifacts"
++        t = threading.Thread(target=self._simulate_run, args=(jid, manifest, out_dir), daemon=True)
++        t.start()
++        return {"job_id": jid, "job_url": f"demo://{jid}"}
++
++    def poll_status(self, job_id: str) -> Dict[str, Any]:
++        job = _JOBS.get(job_id)
++        if not job:
++            return {"state": "unknown"}
++        return {"state": job.get("state", "unknown"), "job": job}
++
++    def fetch_artifacts(self, job_id: str, out_dir: str) -> List[str]:
++        job = _JOBS.get(job_id)
++        if not job:
++            return []
++        artifacts = job.get("artifacts", [])
++        # ensure artifacts exist (they do in our simulate_run)
++        return artifacts
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--list", action="store_true")
++    args = p.parse_args()
++    if args.list:
++        print(ExampleVendor().list_backends())
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/hil/scheduler.py
++#!/usr/bin/env python3
++"""
++Lightweight HIL scheduler for reliable, repeatable runs.
++ - Uses a queue directory (HIL_QUEUE_DIR) where replay manifests are written as JSON to be picked up.
++ - Dispatches to vendor adapters (uses the adapter mapping / vendor_impl_example_full by default).
++ - Retries transient failures, records job metadata and determinism summary location.
++ - Intended to run as a Kubernetes CronJob or as a long-running process.
++"""
++import os
++import json
++import time
++import importlib
++from glob import glob
++from datetime import datetime
++
++HIL_QUEUE_DIR = os.environ.get("HIL_QUEUE_DIR", "/tmp/hil_queue")
++HIL_JOB_DIR = os.environ.get("HIL_JOB_DIR", "/tmp/hil_jobs")
++ADAPTER = os.environ.get("HIL_VENDOR_ADAPTER", "ops.hil.vendor_impl_example_full.ExampleVendor")
++POLL_INTERVAL = int(os.environ.get("HIL_SCHED_POLL", "5"))
++RETRIES = int(os.environ.get("HIL_RETRIES", "2"))
++
++os.makedirs(HIL_QUEUE_DIR, exist_ok=True)
++os.makedirs(HIL_JOB_DIR, exist_ok=True)
++
++def load_adapter(path):
++    modname, clsname = path.rsplit(".", 1)
++    mod = importlib.import_module(modname)
++    cls = getattr(mod, clsname)
++    return cls(os.environ.get("HIL_VENDOR_URL"), os.environ.get("HIL_VENDOR_TOKEN"))
++
++def dispatch(manifest_path, adapter):
++    manifest = json.load(open(manifest_path))
++    # create replay lock
++    from ops/hil/hil_provisioning import create_replay_lock
++    lock = create_replay_lock(manifest_path)
++    try:
++        prep = adapter.prepare_replay({"manifest": manifest})
++    except Exception as e:
++        prep = {"error": str(e)}
++    job = adapter.start_run({"manifest": manifest, "firmware_dump_cmd": manifest.get("firmware_dump_cmd")})
++    jid = job.get("job_id")
++    job_record = {"job_id": jid, "manifest": manifest_path, "lock": lock, "started_at": datetime.utcnow().isoformat()+"Z", "state": "running", "prep": prep}
++    job_path = os.path.join(HIL_JOB_DIR, f"{jid}.json")
++    with open(job_path, "w") as fh:
++        json.dump(job_record, fh, indent=2)
++    return jid, job_path
++
++def poll_and_finalize(jid, job_path, adapter):
++    attempts = 0
++    while attempts <= RETRIES:
++        st = adapter.poll_status(jid)
++        state = st.get("state")
++        if state in ("succeeded","done","completed"):
++            arts = adapter.fetch_artifacts(jid, "/tmp/hil_artifacts")
++            job = json.load(open(job_path))
++            job.update({"state": "succeeded", "finished_at": datetime.utcnow().isoformat()+"Z", "artifacts": arts})
++            with open(job_path, "w") as fh:
++                json.dump(job, fh, indent=2)
++            # produce determinism report if possible
++            try:
++                from ops/hil/deterministic_verifier import produce_report
++                # find replay_meta from environment or default location
++                replay_meta = os.environ.get("HIL_REPLAY_META", "/tmp/hil_replay/ros_replay_metadata.json")
++                hil_log = next((a for a in arts if a.endswith("_hil_log.json")), None)
++                if replay_meta and hil_log:
++                    rep, sig = produce_report(replay_meta, hil_log, os.path.dirname(hil_log), out_path=f"/tmp/determinism_{jid}.json")
++                    job["determinism_report"] = rep
++                    job["determinism_sig"] = sig
++                    with open(job_path, "w") as fh:
++                        json.dump(job, fh, indent=2)
++            except Exception:
++                pass
++            return True
++        if state in ("failed","error"):
++            attempts += 1
++            if attempts > RETRIES:
++                job = json.load(open(job_path))
++                job.update({"state": "failed", "finished_at": datetime.utcnow().isoformat()+"Z", "status_raw": st})
++                with open(job_path, "w") as fh:
++                    json.dump(job, fh, indent=2)
++                return False
++        time.sleep(2)
++    return False
++
++def run_loop():
++    adapter = load_adapter(ADAPTER)
++    while True:
++        files = sorted(glob(os.path.join(HIL_QUEUE_DIR, "*.json")))
++        for f in files:
++            try:
++                print("Dispatching manifest", f)
++                jid, job_path = dispatch(f, adapter)
++                ok = poll_and_finalize(jid, job_path, adapter)
++                print("Job", jid, "completed:", ok)
++                # archive processed manifest
++                os.rename(f, f + ".processed")
++            except Exception as e:
++                print("Failed to process", f, e)
++        time.sleep(POLL_INTERVAL)
++
++if __name__ == "__main__":
++    run_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/cronjobs/hil-scheduler-cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: aegis-hil-scheduler
++  namespace: aegis-hil
++spec:
++  schedule: "*/5 * * * *"
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          containers:
++            - name: hil-scheduler
++              image: ${HIL_SCHEDULER_IMAGE:-aegis/hil-scheduler:latest}
++              command: ["python","/app/ops/hil/scheduler.py"]
++          restartPolicy: OnFailure
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/rt/wcet_campaign.json
++{
++  "entries": [
++    {"name": "control_loop_1", "cmd": "bin/control_loop_1", "rt": true},
++    {"name": "control_loop_2", "cmd": "bin/control_loop_2", "rt": true}
++  ]
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:charts/rt-node/values.prod.yaml
++image:
++  repository: aegis/rt-node-agent
++  tag: stable-rt-1.0
++  pullPolicy: IfNotPresent
++
++tolerations:
++  - key: "vehicle"
++    operator: "Exists"
++    effect: "NoSchedule"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/perception/retrain_orchestrator.py
++#!/usr/bin/env python3
++"""
++Retrain orchestrator:
++ - Watches harvested failures index and triggers retraining jobs when volume threshold reached.
++ - After training, runs evaluation across scenario bank, signs evaluation_summary, and registers model.
++ - This is a scaffold to integrate with your training infra (batch job, Kubeflow, etc.).
++"""
++import os
++import json
++import time
++import subprocess
++from datetime import datetime
++
++FAIL_INDEX = os.environ.get("FAIL_INDEX", "/tmp/harvested_failures.json")
++TRAIN_TRIGGER = int(os.environ.get("TRAIN_TRIGGER", "100"))
++MODEL_REG = os.environ.get("MODEL_REGISTRY_PATH", "ops/models/model_registry.json")
++
++def count_failures():
++    if not os.path.exists(FAIL_INDEX):
++        return 0
++    try:
++        j = json.load(open(FAIL_INDEX))
++        return len(j)
++    except Exception:
++        return 0
++
++def trigger_retrain(dataset_manifest, model_name):
++    # Placeholder: call train_and_serve_pipeline and perception promotion helper
++    subprocess.check_call(["python", "ops/perception/train_and_serve_pipeline.py", "--dataset", dataset_manifest, "--scenario-index", "/tmp/scenario_bank_index.json", "--out-model", f"registry/{model_name}:v{int(time.time())}"])
++    # evaluate and sign is done within pipeline or separately; now register model
++    # attach provenance stub
++    reg = {}
++    if os.path.exists(MODEL_REG):
++        reg = json.load(open(MODEL_REG))
++    reg[model_name] = {"name": model_name, "endpoint": f"registry/{model_name}:latest", "provenance": {"evidence_bundle": "/tmp/perception_sweep/sweep_summary.json", "signed": os.path.exists("/tmp/perception_sweep/sweep_summary.json.sig")}, "registered_at": datetime.utcnow().isoformat()+"Z"}
++    with open(MODEL_REG, "w") as fh:
++        json.dump(reg, fh, indent=2)
++    return True
++
++def main(poll_interval=60):
++    while True:
++        n = count_failures()
++        print("Current harvested failures:", n)
++        if n >= TRAIN_TRIGGER:
++            # create curated manifest from harvested failures and existing sources
++            curated = "/tmp/curated_dataset/manifest.json"
++            # In production, call curation pipeline; here assume manifest exists
++            if os.path.exists(curated):
++                print("Triggering retrain for model 'detector-autoretrain'")
++                trigger_retrain(curated, "detector-autoretrain")
++            else:
++                print("Curated manifest not found:", curated)
++        time.sleep(poll_interval)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/perception/active_learning_worker.py
++#!/usr/bin/env python3
++"""
++Active learning worker:
++ - Picks harvested failure bundles, packages them for annotation, and uploads to annotation S3.
++ - After annotation completes, marks dataset shards for retraining.
++"""
++import os
++import json
++import shutil
++from glob import glob
++from datetime import datetime
++
++HARVEST_DIR = os.environ.get("HARVESTED_DIR", "/tmp/perception_failures")
++S3_BUCKET = os.environ.get("ANNOTATION_S3_BUCKET", "")
++
++def package_for_annotation(bundle_dir):
++    # zip and upload
++    import zipfile
++    base = os.path.basename(bundle_dir.rstrip("/"))
++    zpath = f"/tmp/{base}.zip"
++    with zipfile.ZipFile(zpath, "w") as z:
++        for f in glob(os.path.join(bundle_dir, "**/*"), recursive=True):
++            if os.path.isfile(f):
++                z.write(f, arcname=os.path.relpath(f, bundle_dir))
++    # upload if configured
++    if S3_BUCKET and os.environ.get("AWS_REGION"):
++        try:
++            import boto3
++            s3 = boto3.client("s3")
++            key = f"annotations/{base}.zip"
++            s3.upload_file(zpath, S3_BUCKET, key)
++            return f"s3://{S3_BUCKET}/{key}"
++        except Exception:
++            pass
++    return zpath
++
++def main():
++    for d in glob(os.path.join(HARVEST_DIR, "*")):
++        if os.path.isdir(d):
++            print("Packaging", d)
++            loc = package_for_annotation(d)
++            print("Packaged ->", loc)
++            # create a task for human validators
++            # write a small task file
++            task = {"id": os.path.basename(d), "package": loc, "created": datetime.utcnow().isoformat()+"Z"}
++            tasks_dir = "/tmp/annotation_tasks"
++            os.makedirs(tasks_dir, exist_ok=True)
++            with open(os.path.join(tasks_dir, task["id"] + ".json"), "w") as fh:
++                json.dump(task, fh)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/formal/smt_examples/emergency_stop_invariant.smt2
++;; Emergency stop invariant (example SMT2)
++;; Informal: if obstacle distance < stopping_distance then brake_applied = true
++
++(declare-const obstacle_distance Real)
++(declare-const speed Real)
++(declare-const braking_distance Real)
++(declare-const brake_applied Bool)
++
++;; simple physics: stopping distance = speed * speed / (2 * mu * g) (placeholder)
++(declare-const mu Real)
++(declare-const g Real)
++
++(assert (> g 0.0))
++(assert (> mu 0.0))
++(assert (= braking_distance (/ (* speed speed) (* 2 mu g))))
++
++;; property: if obstacle_distance <= braking_distance then brake_applied
++(assert (not (=> (<= obstacle_distance braking_distance) brake_applied)))
++;; negation: if Z3 finds sat, invariant violated
++(check-sat)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/formal/smt_examples/speed_limit_respect.smt2
++;; Speed limit invariant (example SMT2)
++;; Informal: commanded_speed <= speed_limit + tolerance
++
++(declare-const commanded_speed Real)
++(declare-const speed_limit Real)
++(declare-const tolerance Real)
++
++(assert (> tolerance 0.0))
++
++(assert (not (<= commanded_speed (+ speed_limit tolerance))))
++
++(check-sat)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/governance/oidc_github_action_template.md
++# OIDC GitHub Actions Template (example)
++
++1. Create an OIDC role in your cloud provider that trusts GitHub Actions.
++2. In your workflow, request the id_token:
++
++```yaml
++jobs:
++  ci:
++    runs-on: ubuntu-latest
++    permissions:
++      id-token: write
++      contents: read
++    steps:
++      - name: Get ID token
++        id: idtoken
++        run: echo "ID_TOKEN=$(curl -H 'Accept: application/json' --request POST 'http://169.254.169.254/...' )"
++```
++
++3. Exchange id_token for short-lived credentials (AWS example uses aws-actions/configure-aws-credentials).
++
++Notes: Use least-privilege roles and restrict which repositories/workflows can assume them.
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/governance/setup_kms_hint.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Helper hints (not fully automated) to create KMS keys and Vault transit keys.
++#
++if [ "${1:-}" = "aws" ]; then
++  echo "AWS KMS setup hint:"
++  echo "aws kms create-key --description 'Aegis evidence signing' --key-usage SIGN_VERIFY"
++  echo "aws kms create-alias --alias-name alias/aegis-evidence --target-key-id <key-id>"
++  echo "export AWS_KMS_KEY_ID=<key-id>"
++fi
++
++if [ "${1:-}" = "vault" ]; then
++  echo "Vault setup hint:"
++  echo "vault secrets enable transit"
++  echo "vault write -f transit/keys/aegis-evidence"
++  echo "export VAULT_TRANSIT_KEY=aegis-evidence"
++fi
++
++echo "After creating, run ops/governance/kms_vault_check.py to validate."
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/sre/prometheus_rules.yaml
++groups:
++  - name: aegis.rules
++    rules:
++      - alert: RT_P99_Exceeded
++        expr: aegis_control_loop_latency_seconds_p99 > 0.1
++        for: 5m
++        labels:
++          severity: critical
++        annotations:
++          summary: "Control loop P99 latency exceeded"
++
++      - alert: HIL_Determinism_Failed
++        expr: probe_success == 0
++        for: 10m
++        labels:
++          severity: warning
++        annotations:
++          summary: "HIL deterministic verification failing"
++
++      - alert: Perception_Promotion_Failed
++        expr: absent(perception_promotion_passed_total)
++        for: 20m
++        labels:
++          severity: warning
++        annotations:
++          summary: "Perception promotion gate not passing"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/sre/slo_example.md
++Example SLOs
++-------------
++- Model server availability: 99.9% over 30 days
++- LLM provenance endpoint P99 latency: <= 300ms
++- HIL job success rate: >= 95% over weekly runs
++
++Define objectives, SLOs, and runbook actions for breaches.
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/governance/legal_hold.py
++#!/usr/bin/env python3
++"""
++Mark evidence objects in S3 with legal hold (object lock) or move to a protected bucket.
++Requires boto3 and appropriate permissions.
++"""
++import os
++import json
++from glob import glob
++from datetime import datetime
++
++BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++INDEX = os.environ.get("EVIDENCE_INDEX", "/tmp/evidence_index.json")
++
++def mark_legal_hold(s3_key):
++    import boto3
++    s3 = boto3.client("s3")
++    # Note: Object Lock needs to be enabled on bucket; this is a best-effort example
++    try:
++        s3.put_object_retention(Bucket=BUCKET, Key=s3_key, Retention={'Mode': 'GOVERNANCE', 'RetainUntilDate': datetime.utcnow().isoformat()})
++        return True
++    except Exception as e:
++        print("Failed to set object retention:", e)
++        return False
++
++def main():
++    if not BUCKET:
++        print("EVIDENCE_BUCKET not set")
++        return
++    if not os.path.exists(INDEX):
++        print("Index not found:", INDEX); return
++    idx = json.load(open(INDEX))
++    for entry in idx:
++        key = entry.get("s3")
++        if key and key.startswith(f"s3://{BUCKET}/"):
++            s3_key = key.split(f"s3://{BUCKET}/",1)[1]
++            print("Marking legal hold:", s3_key)
++            mark_legal_hold(s3_key)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/evidence/redact_pii.py
++#!/usr/bin/env python3
++"""
++Simple PII redaction for JSON evidence artifacts.
++ - Scans JSON files and redacts fields that match a configurable list of keys or regex patterns.
++ - Writes redacted copy alongside original with suffix .redacted.json
++"""
++import os
++import json
++import re
++from glob import glob
++
++KEYS = os.environ.get("REDACT_KEYS", "email,ssn,phone").split(",")
++PATTERNS = [re.compile(r"[\w\.-]+@[\w\.-]+"), re.compile(r"\b\d{3}-\d{2}-\d{4}\b")]
++
++def redact_value(v):
++    if isinstance(v, str):
++        for p in PATTERNS:
++            v = p.sub("[REDACTED]", v)
++    return v
++
++def redact_file(path):
++    try:
++        j = json.load(open(path))
++    except Exception:
++        return False
++    def walk(obj):
++        if isinstance(obj, dict):
++            for k in list(obj.keys()):
++                if k.lower() in KEYS:
++                    obj[k] = "[REDACTED]"
++                else:
++                    obj[k] = walk(obj[k])
++            return obj
++        elif isinstance(obj, list):
++            return [walk(x) for x in obj]
++        elif isinstance(obj, str):
++            return redact_value(obj)
++        else:
++            return obj
++    out = walk(j)
++    out_path = path + ".redacted.json"
++    with open(out_path, "w") as fh:
++        json.dump(out, fh, indent=2)
++    return True
++
++if __name__ == "__main__":
++    import sys
++    paths = sys.argv[1:] or glob("/tmp/**/*.json", recursive=True)
++    for p in paths:
++        if redact_file(p):
++            print("Redacted", p)
++
+*** End Patch
+*** Begin Patch
+*** Add File:tests/integration/integration_full_run.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Integration full-run smoke test (demo).
++#
++echo "Starting local demo services..."
++(python ops/models/serve/model_server.py &) ; sleep 2
++(python ops/llm/llm_server_provenance.py &) ; sleep 2
++(python ops/agents/orchestrator_v2.py &) ; sleep 2
++
++echo "Run mitigation runner (short)"
++python ops/mitigations/mitigation_runner.py || true
++
++echo "Run core integration checks"
++./tests/integration/run_integration_tests.sh
++
++echo "Integration full run complete."
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/full_prod_checks.yml
++name: Full Production Checks (demo)
++on:
++  workflow_dispatch:
++
++jobs:
++  full-checks:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.11'
++      - name: Install deps
++        run: |
++          python -m pip install --upgrade pip
++          pip install requests boto3 hvac || true
++      - name: Fast-lane checks
++        run: |
++          chmod +x ops/ci/fastlane_checks.sh
++          ./ops/ci/fastlane_checks.sh
++      - name: Run integration full run
++        run: |
++          chmod +x tests/integration/integration_full_run.sh
++          ./tests/integration/integration_full_run.sh
++      - name: Upload artifacts
++        uses: actions/upload-artifact@v4
++        with:
++          name: full-prod-artifacts
++          path: /tmp/mitigation_run*
++
+*** End Patch
+*** End Patch

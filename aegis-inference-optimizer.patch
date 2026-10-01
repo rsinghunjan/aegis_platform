@@ -1,0 +1,422 @@
+*** Begin Patch
+*** Add File:deploy/triton/triton-deployment.yaml
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: inference
++
++---
++apiVersion: v1
++kind: PersistentVolumeClaim
++metadata:
++  name: triton-model-repo-pvc
++  namespace: inference
++spec:
++  accessModes: ["ReadWriteOnce"]
++  resources:
++    requests:
++      storage: 50Gi
++
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: triton-inference
++  namespace: inference
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: triton
++  template:
++    metadata:
++      labels:
++        app: triton
++    spec:
++      restartPolicy: Always
++      containers:
++        - name: triton
++          image: nvcr.io/nvidia/tritonserver:24.02-py3   # pin to a tested release
++          args: ["tritonserver", "--model-repository=/models", "--strict-model-config=false", "--model-control-mode=explicit"]
++          resources:
++            limits:
++              nvidia.com/gpu: 1
++          ports:
++            - containerPort: 8000   # HTTP
++            - containerPort: 8001   # gRPC
++            - containerPort: 8002   # Metrics
++          volumeMounts:
++            - mountPath: /models
++              name: model-repo
++      volumes:
++        - name: model-repo
++          persistentVolumeClaim:
++            claimName: triton-model-repo-pvc
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: triton
++  namespace: inference
++spec:
++  selector:
++    app: triton
++  ports:
++    - name: http
++      port: 8000
++      targetPort: 8000
++    - name: grpc
++      port: 8001
++      targetPort: 8001
++    - name: metrics
++      port: 8002
++      targetPort: 8002
++
+*** End File
+*** Add File:deploy/triton/model_repo/README.md
++Triton model repository layout and deployment notes
++
++- Layout:
++  - model-repo/
++    - my_model/
++      - 1/
++        - model.onnx (or saved model files)
++      - config.pbtxt
++
++- To add a model into the PVC-backed repo from a CI job or operator host:
++  - Option A (CI uploads to S3 and operator syncs): upload to S3 and copy into PVC using a short-lived helper pod.
++  - Option B (CI pushes directly via kubectl cp for staging).
++
++Example push script: ops/triton/push_model_to_repo.sh
++
+*** End File
+*** Add File:ops/triton/push_model_to_repo.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Push a local model directory into the triton model-repo PVC using a short-lived helper pod.
++# Usage: ./ops/triton/push_model_to_repo.sh ./model-dir my_model 1
++
++LOCAL_DIR=${1:-}
++MODEL_NAME=${2:-my_model}
++MODEL_VERSION=${3:-1}
++NS=${4:-inference}
++
++if [ -z "$LOCAL_DIR" ] || [ ! -d "$LOCAL_DIR" ]; then
++  echo "Usage: $0 <local_model_dir> <model_name> <version> [namespace]"
++  exit 2
++fi
++
++POD="triton-upload-$(date +%s)"
++kubectl -n "$NS" run "$POD" --image=busybox --restart=Never -- sleep 3600
++kubectl -n "$NS" wait --for=condition=ready pod/"$POD" --timeout=30s || true
++kubectl -n "$NS" exec "$POD" -- mkdir -p /models/"$MODEL_NAME"/"$MODEL_VERSION"
++kubectl -n "$NS" cp "$LOCAL_DIR"/. "$NS"/"$POD":/models/"$MODEL_NAME"/"$MODEL_VERSION"
++kubectl -n "$NS" delete pod "$POD" --wait=true
++
++# Call Triton model control API to load model (explicit control)
++TRITON_SVC="triton.$NS.svc.cluster.local:8000"
++curl -s -X POST "http://$TRITON_SVC/v2/repository/models/${MODEL_NAME}/load" || true
++echo "Model pushed and load requested: ${MODEL_NAME}/${MODEL_VERSION}"
++
+*** End File
+*** Add File:.github/workflows/triton-model-deploy.yml
++name: Deploy model to Triton (CI)
++on:
++  workflow_dispatch:
++jobs:
++  upload_model:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Package model
++        run: |
++          # Expect model files under models/<model_name>/<version> in repo workspace
++          ls -la models || true
++      - name: Upload model to S3 (optional)
++        if: ${{ secrets.TRITON_MODEL_S3 != '' }}
++        env:
++          S3_PREFIX: ${{ secrets.TRITON_MODEL_S3 }}
++        run: |
++          aws s3 cp models/ "$S3_PREFIX" --recursive
++      - name: Notify operator to sync model into PVC
++        run: echo "Operator: run ops/triton/push_model_to_repo.sh to copy model into PVC in cluster"
++
+*** End File
+*** Add File:tools/load/wrk_load_test.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Simple wrk-based load test for inference HTTP endpoint. Requires `wrk` installed.
++# Usage: ./tools/load/wrk_load_test.sh http://triton.inference.svc.cluster.local:8000/v2/models/<model>/infer  -c 50 -t 4 -d 60s -b 1
++
++URL=${1:-}
++CONCURRENCY=${2:-50}
++THREADS=${3:-4}
++DURATION=${4:-30s}
++DATA=${5:-./tools/load/sample_request.json}
++
++if [ -z "$URL" ]; then
++  echo "Usage: $0 <url> [concurrency] [threads] [duration] [data]"
++  exit 2
++fi
++
++if [ ! -f "$DATA" ]; then
++  echo "Sample request not found at $DATA"
++  exit 2
++fi
++
++wrk -t"$THREADS" -c"$CONCURRENCY" -d"$DURATION" -s tools/load/wrk_script.lua --latency --timeout 30s --lua-args "$DATA,$URL"
++
+*** End File
+*** Add File:tools/load/wrk_script.lua
++-- wrk Lua script that posts JSON payload file read by wrapper script
++local file = nil
++local url = nil
++init = function(args)
++  file = io.open(args[1], "r")
++  payload = file:read("*a")
++  url = args[2]
++end
++request = function()
++  return wrk.format("POST", url, {["Content-Type"]="application/json"}, payload)
++end
++
+*** End File
+*** Add File:tools/load/collect_metrics.py
++#!/usr/bin/env python3
++"""
++Query Prometheus for latency and DCGM metrics and write a simple CSV summary.
++Requires PROM_URL env var (e.g., http://prometheus.monitoring.svc:9090)
++"""
++import os, requests, csv, time
++PROM = os.environ.get("PROM_URL","http://prometheus:9090")
++OUT = os.environ.get("OUT","/tmp/load_report.csv")
++
++def query(prom, q):
++    r = requests.get(f"{prom}/api/v1/query", params={"query": q}, timeout=10)
++    r.raise_for_status()
++    return r.json()
++
++def main():
++    # Example queries (adjust metric names if different)
++    q_latency_p99 = 'histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[1m])) by (le))'
++    q_gpu_util = 'avg(nvidia_gpu_utilization_gpu)'
++    now = int(time.time())
++    rows = []
++    try:
++        lat = query(PROM, q_latency_p99)
++        util = query(PROM, q_gpu_util)
++        rows.append({"ts": now, "p99_latency": lat.get("data",{}).get("result",[]), "gpu_util": util.get("data",{}).get("result",[])})
++    except Exception as e:
++        print("Prometheus query failed:", e)
++    with open(OUT, "w") as f:
++        f.write("ts,p99_latency,gpu_util_json\n")
++        for r in rows:
++            f.write(f"{r['ts']},\"{r['p99_latency']}\",\"{r['gpu_util']}\"\n")
++    print("Wrote report to", OUT)
++
++if __name__=="__main__":
++    main()
++
+*** End File
+*** Add File:ops/convert/convert_to_onnx_and_tensorrt.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Convert a PyTorch model to ONNX then build a TensorRT engine using trtexec (requires TensorRT installed)
++# Usage: ./ops/convert/convert_to_onnx_and_tensorrt.sh <pt_model.py or traced.pt> <input_shape> <output_engine.trt>
++
++MODEL_PATH=${1:-}
++INPUT_SHAPE=${2:-"1,3,224,224"}
++OUT_ENGINE=${3:-engine.trt}
++
++if [ -z "$MODEL_PATH" ]; then
++  echo "Usage: $0 <model.pt> <input_shape> <out_engine.trt>"
++  exit 2
++fi
++
++PY_SCRIPT=$(mktemp /tmp/convert-XXXX.py)
++cat > "$PY_SCRIPT" <<PY
++import torch, sys
++model = torch.jit.load(sys.argv[1]) if sys.argv[1].endswith('.pt') else torch.load(sys.argv[1])
++model.eval()
++dummy = torch.randn(tuple(map(int, sys.argv[2].split(','))))
++torch.onnx.export(model, dummy, "model.onnx", opset_version=13, input_names=["input"], output_names=["output"])
++print("Exported model.onnx")
++PY
++
++python3 "$PY_SCRIPT" "$MODEL_PATH" "$INPUT_SHAPE"
++echo "Building TensorRT engine with trtexec..."
++trtexec --onnx=model.onnx --saveEngine="$OUT_ENGINE" --workspace=2048 --fp16 || trtexec --onnx=model.onnx --saveEngine="$OUT_ENGINE"
++echo "Built engine at $OUT_ENGINE"
++
+*** End File
+*** Add File:tools/convert/Dockerfile.convert
++FROM nvcr.io/nvidia/tensorrt:24.02  # Example base image with TensorRT
++RUN apt-get update && apt-get install -y python3 python3-pip git
++RUN python3 -m pip install --upgrade pip torch torchvision
++WORKDIR /work
++COPY ops/convert/convert_to_onnx_and_tensorrt.sh /usr/local/bin/convert_to_onnx_and_tensorrt.sh
++RUN chmod +x /usr/local/bin/convert_to_onnx_and_tensorrt.sh
++ENTRYPOINT ["/usr/local/bin/convert_to_onnx_and_tensorrt.sh"]
++
+*** End File
+*** Add File:.github/workflows/tensorrt-convert.yml
++name: Convert model to ONNX + TensorRT (stub)
++on:
++  workflow_dispatch:
++jobs:
++  convert:
++    runs-on: self-hosted
++    steps:
++      - uses: actions/checkout@v4
++      - name: Build convert image (self-hosted runner must be GPU + TensorRT)
++        run: |
++          docker build -t aegis-convert -f tools/convert/Dockerfile.convert .
++      - name: Run conversion
++        run: |
++          docker run --gpus all -v $PWD:/work aegis-convert /work/models/example_model.pt "1,3,224,224" /work/out/example.trt
++      - name: Upload artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: trt-engine
++          path: out/example.trt
++
+*** End File
+*** Add File:deploy/autoscale/keda-scaledobject-modelserver.yaml
++apiVersion: keda.sh/v1alpha1
++kind: ScaledObject
++metadata:
++  name: modelserver-scaledobject
++  namespace: inference
++spec:
++  scaleTargetRef:
++    name: triton-inference
++  minReplicaCount: 1
++  maxReplicaCount: 10
++  pollingInterval: 30
++  cooldownPeriod: 300
++  triggers:
++    - type: prometheus
++      metadata:
++        serverAddress: http://prometheus.monitoring.svc:9090
++        metricName: queue_length
++        threshold: "50"
++        query: |
++          sum(queue_length_total{service="triton"})  # replace with your queue metric
++
+*** End File
+*** Add File:ops/autoscale/tuning_recommendations.md
++Autoscaler tuning recommendations (KEDA + autoscale_guard)
++
++- For latency-sensitive inference:
++  - Set minReplicaCount >= 1 to avoid cold starts.
++  - cooldownPeriod: 300s (5 minutes) to avoid rapid oscillation.
++  - pollingInterval: 10-30s depending on metric freshness.
++- Use a combination of queue-length (prometheus) and GPU utilization:
++  - primary trigger: queue length or pending requests
++  - secondary guard: gpu utilization thresholds enforced by autoscale_guard script (increase cooldown or cap maxReplicaCount if oscillation detected)
++- Example safe values:
++  - minReplicaCount: 1
++  - maxReplicaCount: 10 for small clusters, scale accordingly
++  - KEDA cooldownPeriod: 300
++  - autoscale_guard N_EVENTS: 5 in WINDOW_MIN: 10
++
+*** End File
+*** Add File:grafana/dashboards/inference_dashboard.json
++{
++  "annotations": { "list": [] },
++  "panels": [
++    {
++      "type": "graph",
++      "title": "Request Latency (p50/p95/p99)",
++      "targets": [
++        { "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))", "refId": "A" },
++        { "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))", "refId": "B" },
++        { "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))", "refId": "C" }
++      ]
++    },
++    {
++      "type": "graph",
++      "title": "GPU Utilization (%)",
++      "targets": [
++        { "expr": "avg(nvidia_gpu_utilization_gpu) * 100", "refId": "A" }
++      ]
++    },
++    {
++      "type": "singlestat",
++      "title": "Queue Length",
++      "targets": [
++        { "expr": "sum(queue_length_total{service=\"triton\"})", "refId": "A" }
++      ]
++    }
++  ],
++  "schemaVersion": 16,
++  "title": "Aegis Inference Overview",
++  "uid": "aegis-inference-overview"
++}
++
+*** End File
+*** Add File:services/serving/inference/proxy_server.py
++#!/usr/bin/env python3
++"""
++Lightweight Python inference proxy that forwards requests to Triton and emits OpenTelemetry traces.
++Use this when you want to instrument request-level traces across preproc -> triton -> postproc.
++"""
++from flask import Flask, request, Response, jsonify
++import requests, os, json
++from opentelemetry import trace
++from opentelemetry.sdk.resources import Resource
++from opentelemetry.sdk.trace import TracerProvider
++from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
++from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
++
++TRITON_URL = os.environ.get("TRITON_URL", "http://triton.inference.svc.cluster.local:8000")
++OTEL_COLLECTOR = os.environ.get("OTEL_COLLECTOR", "http://otel-collector.observability.svc:4317")
++
++resource = Resource.create({"service.name": "inference-proxy"})
++provider = TracerProvider(resource=resource)
++trace.set_tracer_provider(provider)
++otlp_exporter = OTLPSpanExporter(endpoint=OTEL_COLLECTOR, insecure=True)
++provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
++provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
++tracer = trace.get_tracer(__name__)
++
++app = Flask(__name__)
++
++@app.route("/v2/models/<model>/infer", methods=["POST"])
++def infer(model):
++    with tracer.start_as_current_span("inference_request") as span:
++        payload = request.get_data()
++        span.set_attribute("model", model)
++        # Forward to Triton HTTP inference (simplified)
++        url = f"{TRITON_URL}/v2/models/{model}/infer"
++        headers = {"Content-Type": "application/json"}
++        r = requests.post(url, data=payload, headers=headers, timeout=60)
++        span.set_attribute("triton_status", r.status_code)
++        return Response(r.content, status=r.status_code, content_type=r.headers.get("Content-Type", "application/json"))
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=8080)
++
+*** End File
+*** Add File:services/serving/inference/requirements.txt
++flask
++requests
++opentelemetry-sdk
++opentelemetry-exporter-otlp
++
+*** End File
+*** Add File:services/serving/inference/Dockerfile
++FROM python:3.10-slim
++WORKDIR /app
++COPY services/serving/inference/requirements.txt /app/
++RUN pip install --no-cache-dir -r requirements.txt
++COPY services/serving/inference/proxy_server.py /app/
++EXPOSE 8080
++CMD ["python3", "proxy_server.py"]
++
+*** End File
+*** End Patch

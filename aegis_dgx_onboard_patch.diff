@@ -1,0 +1,431 @@
+diff --git a/scripts/dgx/onboard_and_validate.sh b/scripts/dgx/onboard_and_validate.sh
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/scripts/dgx/onboard_and_validate.sh
+@@ -0,0 +1,320 @@
++#!/usr/bin/env bash
++#
++# Orchestrator: Onboard a DGX cluster into Aegis and run validation.
++#
++# This script ties together the helpers in scripts/dgx to:
++#  - push kubeconfig / scheduler credentials into GitHub Actions secrets
++#  - optionally register a self-hosted runner (see register_self_hosted_runner.sh)
++#  - label DGX nodes (or update manifests' nodeSelector)
++#  - build/publish/sign images and record provenance in IMAGE_MATRIX.md
++#  - install GPU Operator with chosen driver strategy
++#  - run NCCL tuning and apply suggested envs to dgx-nccl-config
++#  - ensure fast checkpoint PVC exists and deploy offloader CronJob
++#  - run multi-node DeepSpeed benchmark and basic NCCL verification
++#  - run nightly validation & chaos workflows (triggered)
++#  - verify Alertmanager routing by sending a test alert
++#  - enforce promotion gating (requires artifacts produced by validation)
++#
++# This script is a helper for operators and CI. It does not replace manual review.
++# Review all recommended variables and required secrets before running.
++#
++# Requirements:
++#  - gh CLI authenticated (for secret writes and workflow triggers)
++#  - kubectl with network access to DGX control plane (or provide KUBECONFIG_DGX secret)
++#  - docker / cosign / syft / trivy available on the builder runner (when building images)
++#  - repo contains the supporting scripts in scripts/dgx/
++#
++# Usage example (local operator):
++#  export REGISTRY=ghcr.io/myorg
++#  export TARGET=h100
++#  export IMAGE_TAG=aegis-deepspeed:h100-cuda12.1-pytorch2.2
++#  export KUBECONFIG_DGX_PATH=./kubeconfigs/kubeconfig-dgx
++#  ./scripts/dgx/onboard_and_validate.sh --repo myorg/aegis --register-runner false --label-nodes dgx-1,dgx-2 --autoInstall false --s3-bucket my-bucket --promote true
++
++set -euo pipefail
++
++REPO=""
++KUBECONFIG_DGX_PATH="${KUBECONFIG_DGX_PATH:-}"
++SLURM_CREDS_PATH="${SLURM_CREDS_PATH:-}"
++REGISTER_RUNNER="false"
++RUNNER_TOKEN="${RUNNER_TOKEN:-}"
++RUNNER_LABELS="${RUNNER_LABELS:-dgx}"
++LABEL_NODES=""
++UPDATE_NODE_SELECTOR=""
++AUTO_INSTALL=""   # expected "true" or "false" (override)
++BUILD_AND_PUBLISH="true"
++REGISTRY="${REGISTRY:-}"
++TARGET="${TARGET:-h100}"
++IMAGE_TAG="${IMAGE_TAG:-}"
++S3_BUCKET="${S3_BUCKET:-}"
++PROMOTE="false"
++ALERTMANAGER_URL="${ALERTMANAGER_URL:-}"
++DECISION_LOG_URL="${DECISION_LOG_URL:-}"
++
++print_help() {
++  cat <<EOF
++Usage: $0 [options]
++Options:
++  --repo owner/repo            GitHub repo to store secrets and trigger workflows (required)
++  --kubeconfig path            Path to kubeconfig file for DGX cluster (will be uploaded as KUBECONFIG_DGX secret)
++  --slurm-creds path           Optional scheduler credentials file to be stored as SLURM_CREDS
++  --register-runner true|false Whether to register a self-hosted runner (requires RUNNER_TOKEN environment)
++  --runner-token token         GitHub runner registration token (if registering runner)
++  --label-nodes node1,node2    Comma-separated DGX node names to label node.kubernetes.io/dgx=true
++  --update-node-selector key=value  Update manifests nodeSelector to this selector instead of labeling nodes
++  --autoInstall true|false     GPU Operator driver autoInstall override
++  --registry registry          Container registry (e.g., ghcr.io/org)
++  --target h100|a100           Hardware target for image build
++  --image-tag tag              Image tag to build/publish (e.g., aegis-deepspeed:h100-cuda12.1)
++  --s3-bucket bucket           S3 bucket for checkpoint offload checks
++  --promote true|false         If true, run promotion checks after validation
++  --alertmanager-url url       Alertmanager endpoint to test routing
++  --decision-log-url url       Decision log endpoint to post provenance (optional)
++  -h, --help                   Show this help
++EOF
++}
++
++while [[ $# -gt 0 ]]; do
++  case $1 in
++    --repo) REPO="$2"; shift 2;;
++    --kubeconfig) KUBECONFIG_DGX_PATH="$2"; shift 2;;
++    --slurm-creds) SLURM_CREDS_PATH="$2"; shift 2;;
++    --register-runner) REGISTER_RUNNER="$2"; shift 2;;
++    --runner-token) RUNNER_TOKEN="$2"; shift 2;;
++    --label-nodes) LABEL_NODES="$2"; shift 2;;
++    --update-node-selector) UPDATE_NODE_SELECTOR="$2"; shift 2;;
++    --autoInstall) AUTO_INSTALL="$2"; shift 2;;
++    --registry) REGISTRY="$2"; shift 2;;
++    --target) TARGET="$2"; shift 2;;
++    --image-tag) IMAGE_TAG="$2"; shift 2;;
++    --s3-bucket) S3_BUCKET="$2"; shift 2;;
++    --promote) PROMOTE="$2"; shift 2;;
++    --alertmanager-url) ALERTMANAGER_URL="$2"; shift 2;;
++    --decision-log-url) DECISION_LOG_URL="$2"; shift 2;;
++    -h|--help) print_help; exit 0;;
++    *) echo "Unknown arg: $1"; print_help; exit 2;;
++  esac
++done
++
++if [[ -z "$REPO" ]]; then
++  echo "ERROR: --repo is required"; print_help; exit 2
++fi
++
++echo "Onboarding run starts for repo: $REPO"
++
++# 1) Push CI secrets: KUBECONFIG_DGX, optional SLURM_CREDS, registry and cosign keys
++if [[ -n "$KUBECONFIG_DGX_PATH" ]]; then
++  if [[ ! -f "$KUBECONFIG_DGX_PATH" ]]; then
++    echo "ERROR: kubeconfig file not found: $KUBECONFIG_DGX_PATH"; exit 3
++  fi
++  echo "Writing KUBECONFIG_DGX secret to $REPO"
++  gh secret set KUBECONFIG_DGX --repo "$REPO" --body-file "$KUBECONFIG_DGX_PATH"
++fi
++
++if [[ -n "$SLURM_CREDS_PATH" ]]; then
++  if [[ ! -f "$SLURM_CREDS_PATH" ]]; then
++    echo "ERROR: SLURM creds file not found: $SLURM_CREDS_PATH"; exit 4
++  fi
++  gh secret set SLURM_CREDS --repo "$REPO" --body-file "$SLURM_CREDS_PATH"
++fi
++
++if [[ -n "$REGISTRY" ]]; then
++  gh secret set DGX_IMAGE_REGISTRY --repo "$REPO" --body "$REGISTRY" || true
++fi
++
++echo "Make sure COSIGN_KEY, DGX_REGISTRY_USER/DGX_REGISTRY_PASS, ALERTMANAGER_URL, DECISION_LOG_URL are added to repo secrets before proceeding if required."
++
++# 2) Optionally register a self-hosted runner
++if [[ "$REGISTER_RUNNER" == "true" ]]; then
++  if [[ -z "$RUNNER_TOKEN" ]]; then
++    echo "ERROR: RUNNER_TOKEN must be set when --register-runner true"; exit 5
++  fi
++  echo "Registering self-hosted runner (interactive script will run on the machine to be registered)"
++  echo "Run the following on the runner host (as the runner operator):"
++  echo "  ./scripts/dgx/register_self_hosted_runner.sh --repo $REPO --token <RUNNER_TOKEN> --labels $RUNNER_LABELS"
++  echo "This script cannot remotely create a runner; it must be executed on the target runner host."
++fi
++
++# 3) Label nodes or update nodeSelector in manifests
++if [[ -n "$LABEL_NODES" ]]; then
++  echo "Labeling DGX nodes: $LABEL_NODES"
++  ./scripts/dgx/automate_node_label_and_selector.sh --nodes "$LABEL_NODES"
++elif [[ -n "$UPDATE_NODE_SELECTOR" ]]; then
++  echo "Updating manifests to nodeSelector: $UPDATE_NODE_SELECTOR"
++  ./scripts/dgx/automate_node_label_and_selector.sh --update-manifests --selector "$UPDATE_NODE_SELECTOR"
++else
++  echo "No node labeling/action requested. Ensure DGX nodes are labeled node.kubernetes.io/dgx=true or adjust manifests manually."
++fi
++
++# 4) Build/publish/sign images (if requested)
++if [[ -n "$REGISTRY" && -n "$IMAGE_TAG" && "$BUILD_AND_PUBLISH" == "true" ]]; then
++  echo "Building/publishing/signing image: ${REGISTRY}/${IMAGE_TAG} (target=${TARGET})"
++  export REGISTRY TARGET IMAGE_TAG
++  ./scripts/dgx/automate_build_publish_sign.sh || { echo "Image build/publish/sign failed"; exit 6; }
++  # register provenance in IMAGE_MATRIX
++  REGISTRY="$REGISTRY" IMAGE_TAG="$IMAGE_TAG" ./scripts/dgx/ensure_image_provenance.sh --sbom-dir ./artifacts/sbom --image-matrix docs/dgx/IMAGE_MATRIX.md || true
++else
++  echo "Skipping image build/publish step (REGISTRY/IMAGE_TAG not provided or BUILD_AND_PUBLISH disabled)"
++fi
++
++# 5) Install/validate GPU Operator driver strategy
++if [[ -n "$AUTO_INSTALL" ]]; then
++  echo "Installing/upgrading GPU Operator with autoInstall=$AUTO_INSTALL"
++  ./scripts/dgx/automate_gpu_operator_install.sh --autoInstall "$AUTO_INSTALL"
++fi
++echo "Running GPU operator & driver validation"
++./scripts/dgx/validate_gpu_operator_and_drivers.sh --expected-autoInstall "${AUTO_INSTALL:-}" --expected-cuda "12.1" --expected-driver "535" --out ./artifacts/driver_check || true
++
++# 6) Run NCCL tuning and apply envs
++echo "Running NCCL tuning and applying ConfigMap"
++./scripts/dgx/run_nccl_tune_apply_and_update_job.sh --out ./artifacts/nccl --job-manifest k8s/manifests/dgx/deepspeed-dgx-job-with-configmap.yaml || true
++
++# 7) Ensure checkpoint PVC and offloader exist
++echo "Ensuring checkpoint PVC and checkpoint offloader CronJob"
++kubectl apply -f k8s/manifests/dgx/checkpoints-pvc.yaml || true
++kubectl apply -f k8s/manifests/dgx/checkpoint-offloader-cronjob.yaml || true
++./scripts/dgx/create_offloader_cronjob.sh --s3-bucket "$S3_BUCKET" --namespace aegis-ml || true
++
++# 8) Run multi-node DeepSpeed benchmark/smoke and verify
++if [[ -n "$REGISTRY" && -n "$IMAGE_TAG" ]]; then
++  echo "Running multi-node benchmark using image ${REGISTRY}/${IMAGE_TAG}"
++  IMAGE="${REGISTRY}/${IMAGE_TAG}" ./scripts/dgx/apply_nccl_and_run_multinode.sh --nodes 2 --gpus-per-node 8 --out ./artifacts/multinode || true
++  ./scripts/dgx/verify_multi_node_scaling_results.sh --artifact-dir ./artifacts/multinode || true
++else
++  echo "Skipping multi-node benchmark (image not provided)"
++fi
++
++# 9) Trigger nightly validation & chaos runs
++echo "Triggering DGX validation & chaos workflows (requires gh CLI authenticated)"
++if command -v gh >/dev/null 2>&1; then
++  ./scripts/dgx/automate_run_validation_and_chaos.sh --repo "$REPO" --image "$IMAGE_TAG" || true
++else
++  echo "gh CLI not available; please trigger validation workflows manually."
++fi
++
++# 10) Test Alertmanager routing
++if [[ -n "$ALERTMANAGER_URL" ]]; then
++  echo "Sending test alert to Alertmanager: $ALERTMANAGER_URL"
++  ALERTMANAGER_URL="$ALERTMANAGER_URL" ./scripts/dgx/send_test_alert.sh --url "$ALERTMANAGER_URL" --summary "DGX onboarding test" --instance "onboard-$(date +%s)" || true
++else
++  echo "ALERTMANAGER_URL not provided; skipping alert test"
++fi
++
++# 11) Run checkpoint offload test
++if [[ -n "$S3_BUCKET" ]]; then
++  ./scripts/dgx/test_checkpoint_offload_and_pvc.sh --namespace aegis-ml --s3-bucket "$S3_BUCKET" --out ./artifacts/offload || true
++else
++  echo "No S3 bucket provided; skipping offload verification"
++fi
++
++# 12) Enforce promotion gating optionally
++if [[ "$PROMOTE" == "true" ]]; then
++  IMAGE_FULL="${REGISTRY}/${IMAGE_TAG}"
++  echo "Running promotion gating checks for $IMAGE_FULL"
++  ./scripts/dgx/require_promotion_policy_check.sh --image "$IMAGE_FULL" --artifact-path ./artifacts/dgx_prod_validate || { echo "Promotion gating checks failed"; exit 7; }
++fi
++
++echo "Onboard & validate script complete. Review artifacts under ./artifacts."
++exit 0
++
+diff --git a/scripts/dgx/register_self_hosted_runner.sh b/scripts/dgx/register_self_hosted_runner.sh
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/scripts/dgx/register_self_hosted_runner.sh
+@@ -0,0 +1,220 @@
++#!/usr/bin/env bash
++#
++# Bootstrap and register a GitHub Actions self-hosted runner on a host that can reach DGX.
++#
++# WARNING: This script must be run on the runner host (not remotely) and requires a GitHub runner registration token.
++#
++# Usage:
++#   ./scripts/dgx/register_self_hosted_runner.sh --repo owner/repo --token RUNNER_TOKEN --labels dgx --workdir /opt/actions-runner
++
++set -euo pipefail
++
++REPO=""
++TOKEN=""
++LABELS="dgx"
++WORKDIR="${WORKDIR:-/opt/actions-runner}"
++ARCH="${ARCH:-x64}"
++OS_NAME="${OS_NAME:-linux}"
++
++print_help() {
++  cat <<EOF
++Usage: $0 --repo owner/repo --token RUNNER_TOKEN [--labels dgx] [--workdir /opt/actions-runner]
++Run this on the host you want to register as a self-hosted runner.
++EOF
++}
++
++while [[ $# -gt 0 ]]; do
++  case $1 in
++    --repo) REPO="$2"; shift 2;;
++    --token) TOKEN="$2"; shift 2;;
++    --labels) LABELS="$2"; shift 2;;
++    --workdir) WORKDIR="$2"; shift 2;;
++    --help|-h) print_help; exit 0;;
++    *) echo "Unknown arg: $1"; print_help; exit 2;;
++  esac
++done
++
++if [[ -z "$REPO" || -z "$TOKEN" ]]; then
++  echo "ERROR: --repo and --token are required"; print_help; exit 2
++fi
++
++mkdir -p "$WORKDIR"
++cd "$WORKDIR"
++
++ARCH_TAG="actions-runner-${OS_NAME}-${ARCH}"
++if [[ ! -f actions-runner/v2.308.0 ]]; then
++  echo "Downloading GitHub Actions runner (v2.308.0) to $WORKDIR"
++  mkdir -p actions-runner
++  # detect latest stable runner archive URL if needed; this is an example link - adjust as required
++  RUNNER_TAR="actions-runner-linux-x64-2.308.0.tar.gz"
++  curl -fsSL -o "$RUNNER_TAR" "https://github.com/actions/runner/releases/download/v2.308.0/${RUNNER_TAR}"
++  tar xzf "$RUNNER_TAR" -C actions-runner
++  rm -f "$RUNNER_TAR"
++fi
++
++cd actions-runner
++
++echo "Configuring runner for repo $REPO with labels: $LABELS"
++./config.sh --url "https://github.com/${REPO}" --token "$TOKEN" --labels "$LABELS" --unattended --replace || true
++
++echo "Installing service (Linux systemd)"
++sudo ./svc.sh install || true
++sudo ./svc.sh start || true
++
++echo "Runner configured and service started. Verify in GitHub repo -> Settings -> Actions -> Runners."
++echo "To remove runner later: ./svc.sh stop; ./svc.sh uninstall; ./config.sh remove --token <token>"
++exit 0
++
+diff --git a/.github/workflows/dgx_onboard_orchestrator.yml b/.github/workflows/dgx_onboard_orchestrator.yml
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/.github/workflows/dgx_onboard_orchestrator.yml
+@@ -0,0 +1,220 @@
++name: DGX Onboard Orchestrator
++
++on:
++  workflow_dispatch:
++    inputs:
++      repo:
++        description: "Repository to store secrets and trigger workflows (owner/repo)"
++        required: true
++      build_image:
++        description: "Build and publish image (true/false)"
++        required: true
++        default: "true"
++      registry:
++        description: "Container registry (eg. ghcr.io/org)"
++        required: false
++        default: ""
++      image_tag:
++        description: "Image tag to create/use"
++        required: false
++        default: ""
++      label_nodes:
++        description: "Comma-separated DGX node names to label"
++        required: false
++        default: ""
++      auto_install:
++        description: "GPU Operator driver autoInstall (true|false)"
++        required: false
++        default: "false"
++      s3_bucket:
++        description: "S3 bucket to use for checkpoint offload checks"
++        required: false
++        default: ""
++
++jobs:
++  onboard:
++    runs-on: self-hosted
++    if: runner.labels contains 'dgx'
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Restore KUBECONFIG secret
++        env:
++          KUBECONFIG_DGX: ${{ secrets.KUBECONFIG_DGX }}
++        run: |
++          if [ -z "$KUBECONFIG_DGX" ]; then echo "KUBECONFIG_DGX missing"; exit 1; fi
++          echo "$KUBECONFIG_DGX" > "$HOME/.kube/config_dgx"
++          chmod 600 "$HOME/.kube/config_dgx"
++          export KUBECONFIG="$HOME/.kube/config_dgx"
++
++      - name: Run onboarding script
++        env:
++          REGISTRY: ${{ github.event.inputs.registry }}
++          TARGET: "h100"
++          IMAGE_TAG: ${{ github.event.inputs.image_tag }}
++          DECISION_LOG_URL: ${{ secrets.DECISION_LOG_URL }}
++          ALERTMANAGER_URL: ${{ secrets.ALERTMANAGER_URL }}
++        run: |
++          chmod +x scripts/dgx/onboard_and_validate.sh
++          ./scripts/dgx/onboard_and_validate.sh --repo "${{ github.event.inputs.repo }}" \
++            --kubeconfig "$HOME/.kube/config_dgx" \
++            $( [ "${{ github.event.inputs.build_image }}" = "true" ] && echo "--registry '${{ github.event.inputs.registry }}' --image-tag '${{ github.event.inputs.image_tag }}'" ) \
++            $( [ -n "${{ github.event.inputs.label_nodes }}" ] && echo "--label-nodes '${{ github.event.inputs.label_nodes }}'" ) \
++            --autoInstall "${{ github.event.inputs.auto_install }}" \
++            --s3-bucket "${{ github.event.inputs.s3_bucket }}" \
++            --promote true || true
++
++      - name: Upload artifacts
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: dgx-onboard-artifacts
++          path: artifacts || .
++
++      - name: Cleanup kubeconfig
++        if: always()
++        run: rm -f "$HOME/.kube/config_dgx" || true
++
+diff --git a/docs/dgx/ONBOARDING_QUICKSTART.md b/docs/dgx/ONBOARDING_QUICKSTART.md
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/docs/dgx/ONBOARDING_QUICKSTART.md
+@@ -0,0 +1,240 @@
++# DGX Onboarding Quickstart (Aegis)
++
++This quickstart shows how to use the onboarding helpers to provision DGX support and run initial validation.
++
++Prereqs
++- A DGX Cloud cluster (or access to Slurm scheduler) and kubeconfig / scheduler creds.  
++- GitHub repository admin or secret write permissions and gh CLI authenticated.  
++- A host to run a self-hosted GitHub Actions runner with network access to DGX; label it 'dgx'.  
++- Required tools on the runner: kubectl, helm, docker, cosign, syft, trivy, gh, jq, yq.
++
++Steps (operator)
++1. Save your kubeconfig file locally: ./kubeconfigs/kubeconfig-dgx
++2. Add secrets to the repository using the helper (or via GitHub UI):
++   ./scripts/dgx/ci_add_secrets_gh.sh --repo owner/repo --kubeconfig ./kubeconfigs/kubeconfig-dgx --registry ghcr.io/org --cosign-key ./cosign.key
++
++3. (Optional) On the runner host, register the runner:
++   ./scripts/dgx/register_self_hosted_runner.sh --repo owner/repo --token <RUNNER_TOKEN> --labels dgx
++
++4. From a machine with gh CLI configured, run:
++   ./scripts/dgx/onboard_and_validate.sh --repo owner/repo --kubeconfig ./kubeconfigs/kubeconfig-dgx --label-nodes dgx-1,dgx-2 --autoInstall false --registry ghcr.io/org --image-tag aegis-deepspeed:h100-cuda12.1-pytorch2.2 --s3-bucket my-bucket --promote true
++
++5. The script will:
++   - write the KUBECONFIG_DGX secret to the repo,
++   - optionally instruct you to register a runner,
++   - label nodes (or update manifests),
++   - build/publish/sign images and append an entry to docs/dgx/IMAGE_MATRIX.md,
++   - install GPU Operator (autoInstall toggle),
++   - run NCCL tuning and apply envs to dgx-nccl-config,
++   - ensure checkpoint PVC and offloader CronJob exist,
++   - run multi-node validation and basic NCCL verification,
++   - trigger nightly validation & chaos workflows and send a test alert to Alertmanager,
++   - optionally run promotion checks to enforce SBOM + cosign + validation artifacts.
++
++Notes & security
++- Protect secrets (COSIGN_KEY, KUBECONFIG_DGX) via GitHub Environments and require approvals for release workflows.  
++- Use ephemeral kubeconfigs where possible and rotate keys regularly.
++
++If you want, I can also:
++- Pre-fill Dockerfiles with exact CUDA/cuDNN/NCCL/PyTorch/DeepSpeed versions for H100/A100 and create the GH Action build job, or  
++- Generate a non-k8s Slurm integration that posts job lifecycle events back to Aegis decision_log.
++
++End of quickstart.
++

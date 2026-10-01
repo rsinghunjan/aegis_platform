@@ -1,0 +1,511 @@
+*** Begin Patch
+*** Add File:services/serving/diffusers/server.py
++#!/usr/bin/env python3
++"""
++Diffusers service wrapper (FastAPI) — PoC production-ready pattern.
++
++- Exposes /v1/generate-image that accepts prompt + sampling params.
++- Uses a bounded asyncio worker queue for requests and runs generation on GPU(s).
++- Uploads evidence (prompt, seed, model config, output image) to S3 as immutable artifacts.
++"""
++import os
++import io
++import json
++import time
++import asyncio
++import uuid
++from typing import Optional
++from fastapi import FastAPI, HTTPException, BackgroundTasks
++from pydantic import BaseModel
++import boto3
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++MODEL_NAME_DEFAULT = os.environ.get("DIFFUSERS_MODEL", "runwayml/stable-diffusion-v1-5")
++MAX_QUEUE = int(os.environ.get("DIFFUSER_QUEUE_MAX", "8"))
++WORKER_COUNT = int(os.environ.get("DIFFUSER_WORKERS", "1"))
++
++app = FastAPI(title="Aegis Diffusers Service")
++
++class GenRequest(BaseModel):
++    prompt: str
++    seed: Optional[int] = None
++    steps: Optional[int] = 25
++    guidance_scale: Optional[float] = 7.5
++    width: Optional[int] = 512
++    height: Optional[int] = 512
++    model: Optional[str] = None
++    priority: Optional[str] = "interactive"  # interactive | batch
++
++
++class GenResult(BaseModel):
++    request_id: str
++    status: str
++    s3_image_key: Optional[str] = None
++    metadata_key: Optional[str] = None
++    error: Optional[str] = None
++
++# Simple in-memory asyncio queue — for production, swap to Redis / RabbitMQ + workers
++QUEUE = asyncio.PriorityQueue(MAX_QUEUE)
++WORKERS = []
++
++def _s3_upload_bytes(bucket: str, key: str, data: bytes, content_type="application/octet-stream"):
++    s3 = boto3.client("s3")
++    s3.put_object(Bucket=bucket.replace("s3://", ""), Key=key, Body=data, ContentType=content_type)
++    return f"s3://{bucket.replace('s3://','')}/{key}"
++
++async def diffusers_worker(worker_id: int):
++    # Import the heavy DL dependencies inside worker to avoid cold-start for the API process
++    try:
++        import torch
++        from diffusers import StableDiffusionPipeline
++    except Exception as e:
++        app.logger = getattr(app, "logger", None)
++        print("Worker failed to import DL libs:", e)
++        return
++
++    model_name = os.environ.get("DIFFUSERS_MODEL", MODEL_NAME_DEFAULT)
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    pipe = StableDiffusionPipeline.from_pretrained(model_name, torch_dtype=torch.float16 if device=="cuda" else torch.float32)
++    if device == "cuda":
++        pipe.to(device)
++
++    while True:
++        prio, item = await QUEUE.get()
++        req: GenRequest = item["req"]
++        req_id = item["id"]
++        ts0 = time.time()
++        out = {"request_id": req_id, "status": "failed"}
++        try:
++            seed = req.seed or int((time.time() * 1000) % (2**31-1))
++            generator = None
++            if device == "cuda":
++                generator = torch.Generator(device).manual_seed(seed)
++            # run inference
++            image = pipe(req.prompt, num_inference_steps=req.steps, guidance_scale=req.guidance_scale, height=req.height, width=req.width, generator=generator).images[0]
++            buf = io.BytesIO()
++            image.save(buf, format="PNG")
++            buf.seek(0)
++            image_bytes = buf.read()
++            # evidence upload
++            key_img = f"diffusion/outputs/{req_id}.png"
++            key_meta = f"diffusion/metadata/{req_id}.json"
++            if EVIDENCE_BUCKET:
++                s3img = _s3_upload_bytes(EVIDENCE_BUCKET, key_img, image_bytes, content_type="image/png")
++                meta = {
++                    "request_id": req_id,
++                    "prompt": req.prompt,
++                    "seed": int(seed),
++                    "model": req.model or model_name,
++                    "steps": int(req.steps),
++                    "guidance_scale": float(req.guidance_scale),
++                    "width": int(req.width),
++                    "height": int(req.height),
++                    "timestamp": time.time(),
++                    "s3_image": s3img,
++                }
++                _s3_upload_bytes(EVIDENCE_BUCKET, key_meta, json.dumps(meta).encode("utf-8"), content_type="application/json")
++                out.update({"status":"ok", "s3_image_key": s3img, "metadata_key": f"s3://{EVIDENCE_BUCKET.replace('s3://','')}/{key_meta}"})
++            else:
++                # local save fallback
++                os.makedirs("/tmp/diffusion_out", exist_ok=True)
++                with open(f"/tmp/diffusion_out/{req_id}.png", "wb") as f:
++                    f.write(image_bytes)
++                out.update({"status":"ok", "s3_image_key": None})
++        except Exception as e:
++            out["status"] = "failed"
++            out["error"] = str(e)
++        # place result into item's future
++        if "future" in item and not item["future"].done():
++            item["future"].set_result(out)
++        QUEUE.task_done()
++        elapsed = time.time() - ts0
++        print(f"worker[{worker_id}] finished req {req_id} status {out.get('status')} elapsed={elapsed:.2f}s")
++
++@app.on_event("startup")
++async def startup_event():
++    # start worker pool
++    for i in range(WORKER_COUNT):
++        w = asyncio.create_task(diffusers_worker(i))
++        WORKERS.append(w)
++
++@app.post("/v1/generate-image", response_model=GenResult)
++async def generate_image(req: GenRequest, background: BackgroundTasks):
++    if QUEUE.qsize() >= MAX_QUEUE:
++        raise HTTPException(status_code=429, detail="Queue full")
++    req_id = str(uuid.uuid4())
++    prio = 0 if req.priority == "interactive" else 1
++    loop = asyncio.get_event_loop()
++    fut = loop.create_future()
++    item = {"id": req_id, "req": req, "future": fut}
++    await QUEUE.put( (prio, item) )
++    # wait with timeout
++    try:
++        res = await asyncio.wait_for(fut, timeout=600)
++    except asyncio.TimeoutError:
++        raise HTTPException(status_code=504, detail="Generation timeout")
++    return GenResult(request_id=req_id, status=res.get("status","failed"), s3_image_key=res.get("s3_image_key"), metadata_key=res.get("metadata_key"), error=res.get("error"))
++
++@app.get("/healthz")
++def health():
++    return {"status":"ok", "queue_size": QUEUE.qsize()}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/serving/diffusers/Dockerfile
++FROM python:3.10-slim
++ENV DEBIAN_FRONTEND=noninteractive
++RUN apt-get update && apt-get install -y git build-essential libsndfile1 ffmpeg && rm -rf /var/lib/apt/lists/*
++RUN pip install --upgrade pip
++RUN pip install fastapi uvicorn boto3 pillow torch torchvision diffusers accelerate transformers safetensors
++WORKDIR /app
++COPY server.py /app/server.py
++EXPOSE 8080
++CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:deploy/diffusers/deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-diffusers
++  namespace: ml-serving
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-diffusers
++  template:
++    metadata:
++      labels:
++        app: aegis-diffusers
++        sandbox: "true"
++    spec:
++      serviceAccountName: sandbox-runner
++      runtimeClassName: runsc
++      containers:
++        - name: diffusers
++          image: your-registry/aegis-diffusers:latest
++          resources:
++            limits:
++              nvidia.com/gpu: 1
++            requests:
++              cpu: "4"
++              memory: "16Gi"
++          env:
++            - name: EVIDENCE_BUCKET
++              value: "s3://aegis-evidence-prod"
++          ports:
++            - containerPort: 8080
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: aegis-diffusers
++  namespace: ml-serving
++spec:
++  selector:
++    app: aegis-diffusers
++  ports:
++    - protocol: TCP
++      port: 8080
++      targetPort: 8080
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/diffusers-chart/Chart.yaml
++apiVersion: v2
++name: diffusers-chart
++description: Aegis Diffusers serving Helm chart
++version: 0.1.0
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/diffusers-chart/values.yaml
++replicaCount: 1
++image:
++  repository: your-registry/aegis-diffusers
++  tag: latest
++  pullPolicy: IfNotPresent
++resources:
++  limits:
++    nvidia.com/gpu: 1
++  requests:
++    cpu: "4"
++    memory: "16Gi"
++service:
++  port: 8080
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/diffusers-chart/templates/deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: {{ include "diffusers-chart.fullname" . }}
++spec:
++  replicas: {{ .Values.replicaCount }}
++  selector:
++    matchLabels:
++      app: {{ include "diffusers-chart.name" . }}
++  template:
++    metadata:
++      labels:
++        app: {{ include "diffusers-chart.name" . }}
++        sandbox: "true"
++    spec:
++      containers:
++        - name: diffusers
++          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
++          resources:
++            limits:
++              nvidia.com/gpu: {{ .Values.resources.limits.nvidia.com/gpu | default 1 }}
++            requests:
++              cpu: "{{ .Values.resources.requests.cpu }}"
++              memory: "{{ .Values.resources.requests.memory }}"
++          ports:
++            - containerPort: {{ .Values.service.port }}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/llm/managed_adapter/server.py
++#!/usr/bin/env python3
++"""
++Managed API adapter and simple RAG wiring.
++
++- /v1/chat -> routes to configured managed API (OpenAI/Anthropic) with unified interface and evidence logging.
++- /v1/rag -> performs retrieval via FAISS using embeddings and appends context to prompt before calling managed API.
++"""
++import os
++import json
++import time
++import uuid
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++import boto3
++import requests
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
++EMBED_MODEL = os.environ.get("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
++
++app = FastAPI(title="Aegis Managed LLM Adapter")
++
++class ChatReq(BaseModel):
++    prompt: str
++    user: str = "unknown"
++    model: str = "openai/gpt-4"  # logical model name
++
++def _upload_json(bucket, key, obj):
++    s3 = boto3.client("s3")
++    s3.put_object(Bucket=bucket.replace("s3://",""), Key=key, Body=json.dumps(obj).encode("utf-8"), ContentType="application/json")
++    return f"s3://{bucket.replace('s3://','')}/{key}"
++
++def call_openai(prompt: str, model: str = "gpt-4"):
++    # PoC: minimal call using requests; in production use official client with retries and telemetry
++    if not OPENAI_API_KEY:
++        raise RuntimeError("OPENAI_API_KEY not configured")
++    url = "https://api.openai.com/v1/chat/completions"
++    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
++    payload = {"model": model, "messages":[{"role":"user","content":prompt}], "temperature":0.2}
++    r = requests.post(url, headers=headers, json=payload, timeout=30)
++    r.raise_for_status()
++    return r.json()
++
++@app.post("/v1/chat")
++def chat(req: ChatReq):
++    req_id = str(uuid.uuid4())
++    ts = time.time()
++    try:
++        resp = call_openai(req.prompt, model=req.model)
++    except Exception as e:
++        raise HTTPException(status_code=500, detail=str(e))
++    # evidence upload
++    if EVIDENCE_BUCKET:
++        meta = {"id": req_id, "user": req.user, "prompt": req.prompt, "model": req.model, "response": resp, "ts": ts}
++        key = f"llm/managed/{req_id}.json"
++        _upload_json(EVIDENCE_BUCKET, key, meta)
++    return {"request_id": req_id, "response": resp}
++
++################ RAG ####################################
++try:
++    import faiss
++    from sentence_transformers import SentenceTransformer
++except Exception:
++    faiss = None
++    SentenceTransformer = None
++
++INDEX = None
++EMBEDDER = None
++
++@app.on_event("startup")
++def init_index():
++    global INDEX, EMBEDDER
++    if SentenceTransformer:
++        EMBEDDER = SentenceTransformer(EMBED_MODEL)
++    # For PoC, initialize empty index
++    if faiss:
++        INDEX = faiss.IndexFlatL2(384)
++
++class RagReq(BaseModel):
++    query: str
++    top_k: int = 4
++    user: str = "unknown"
++    model: str = "gpt-4"
++
++@app.post("/v1/rag")
++def rag(req: RagReq):
++    if EMBEDDER is None or INDEX is None:
++        raise HTTPException(status_code=500, detail="RAG components not available (missing faiss or embedder)")
++    q_emb = EMBEDDER.encode([req.query])
++    D, I = INDEX.search(q_emb.astype("float32"), req.top_k)
++    # For PoC, pretend we retrieved text snippets
++    snippets = [f"retrieved-snippet-{i}" for i in range(req.top_k)]
++    # build augmented prompt
++    augmented = "Context:\n" + "\n".join(snippets) + f"\n\nUser Query: {req.query}"
++    resp = call_openai(augmented, model=req.model)
++    # audit
++    req_id = str(uuid.uuid4())
++    if EVIDENCE_BUCKET:
++        _upload_json(EVIDENCE_BUCKET, f"llm/rag/{req_id}.json", {"query": req.query, "snippets": snippets, "response": resp})
++    return {"request_id": req_id, "response": resp, "snippets": snippets}
++
++@app.get("/healthz")
++def health():
++    return {"status":"ok"}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/llm/Dockerfile
++FROM python:3.10-slim
++RUN apt-get update && apt-get install -y build-essential && rm -rf /var/lib/apt/lists/*
++RUN pip install --upgrade pip
++RUN pip install fastapi uvicorn requests boto3 faiss-cpu sentence-transformers
++WORKDIR /app
++COPY server.py /app/server.py
++EXPOSE 8080
++ENTRYPOINT ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:deploy/llm/adapter-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-llm-adapter
++  namespace: ml-serving
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-llm-adapter
++  template:
++    metadata:
++      labels:
++        app: aegis-llm-adapter
++    spec:
++      containers:
++        - name: llm-adapter
++          image: your-registry/aegis-llm-adapter:latest
++          env:
++            - name: OPENAI_API_KEY
++              valueFrom:
++                secretKeyRef:
++                  name: openai-secret
++                  key: api_key
++            - name: EVIDENCE_BUCKET
++              value: "s3://aegis-evidence-prod"
++          resources:
++            requests:
++              cpu: "1"
++              memory: "2Gi"
++            limits:
++              cpu: "2"
++              memory: "4Gi"
++          ports:
++            - containerPort: 8080
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: aegis-llm-adapter
++  namespace: ml-serving
++spec:
++  selector:
++    app: aegis-llm-adapter
++  ports:
++    - port: 8080
++      targetPort: 8080
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/diffusers_smoke.yml
++name: Diffusers smoke test
++
++on:
++  workflow_dispatch:
++
++jobs:
++  smoke:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: 3.10
++      - name: Install deps
++        run: |
++          pip install requests pillow
++      - name: Call diffusers API (requires service endpoint env var)
++        env:
++          DIFFUSER_ENDPOINT: ${{ secrets.DIFFUSER_ENDPOINT }}
++        run: |
++          python - <<'PY'
++import os,requests,json
++ep=os.environ.get("DIFFUSER_ENDPOINT")
++if not ep:
++    print("DIFFUSER_ENDPOINT not configured")
++    raise SystemExit(1)
++resp=requests.post(ep+"/v1/generate-image", json={"prompt":"A scenic mountain landscape, photorealistic","steps":20}, timeout=120)
++print("status", resp.status_code)
++print(resp.text)
++PY
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/eval/diffusion/eval_diffusion.py
++#!/usr/bin/env python3
++"""
++Simple diffusion evaluation helpers:
++ - CLIP similarity and FID placeholder for batches of images
++ - Produces JSON-compatible report for CI consumption
++"""
++import os
++import json
++import numpy as np
++from PIL import Image
++
++def clip_similarity_stub(image_paths, texts):
++    # Placeholder: return random scores (replace with CLIP model in prod)
++    import random
++    return [random.random() for _ in texts]
++
++def fid_placeholder(real_feats, gen_feats):
++    # Very small placeholder (not a real FID implementation)
++    return float(np.mean((np.mean(real_feats, axis=0) - np.mean(gen_feats, axis=0))**2))
++
++def run_eval(real_image_paths, gen_image_paths, captions, out_path):
++    # Convert to simple flattened features
++    def feat(p):
++        im = Image.open(p).convert("RGB").resize((224,224))
++        return np.array(im).astype(np.float32).mean(axis=(0,1))
++    real_feats = np.vstack([feat(p) for p in real_image_paths])
++    gen_feats = np.vstack([feat(p) for p in gen_image_paths])
++    report = {"fid": fid_placeholder(real_feats, gen_feats), "clip_sim": clip_similarity_stub(gen_image_paths, captions)}
++    with open(out_path, "w") as f:
++        json.dump(report, f, indent=2)
++    print("Wrote", out_path)
++
+*** End Patch
+*** End Patch

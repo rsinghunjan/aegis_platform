@@ -1,0 +1,493 @@
+*** Begin Patch
+*** Add File: provider/broker_learned.py
++#!/usr/bin/env python3
++"""
++Provider Broker Service (learned policy + shadow/canary support)
++
++- /select       : POST {candidates:[{name,meta}], job_id?, mode?} -> selected provider + scores
++- /shadow       : POST {candidates, job_id} -> returns selection according to current policy but DOES NOT route (for shadowing)
++- /ingest       : POST telemetry {provider, success, cost, latency, fidelity, job_id}
++- /train        : POST triggers offline training (calls learner/train_policy.py)
++- State is stored in /data/provider_broker_state.json and model in /data/policy_model.pkl (pickle)
++
++Notes:
++- Prototype: uses a simple feature transform + sklearn LogisticRegression (multiclass) as a policy.
++- Shadow mode logs decisions to history without affecting production routing.
++"""
++import os
++import json
++import pickle
++from datetime import datetime
++from flask import Flask, request, jsonify
++
++STATE_PATH = "/data/provider_broker_state.json"
++MODEL_PATH = "/data/policy_model.pkl"
++
++def load_state():
++    if os.path.exists(STATE_PATH):
++        return json.load(open(STATE_PATH))
++    return {"history": [], "providers_meta": {}}
++
++def save_state(s):
++    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
++    with open(STATE_PATH, "w") as fh:
++        json.dump(s, fh, indent=2)
++
++def load_model():
++    if os.path.exists(MODEL_PATH):
++        try:
++            with open(MODEL_PATH, "rb") as fh:
++                return pickle.load(fh)
++        except Exception:
++            return None
++    return None
++
++def score_with_model(model, candidates):
++    # Convert candidate metas into feature vectors for model.predict_proba
++    # Feature vector: [1/cost, 1/latency, fidelity, 1/carbon]
++    X = []
++    names = []
++    for c in candidates:
++        m = c.get("meta", {})
++        cost = m.get("cost_per_job", 1.0)
++        latency = m.get("latency_ms", 100)
++        fidelity = m.get("avg_fidelity", 0.5)
++        carbon = m.get("carbon_g_per_kwh", 300)
++        X.append([1.0/max(1e-6, cost), 1.0/max(1.0,latency), fidelity, 1.0/max(1.0, carbon)])
++        names.append(c.get("name"))
++    try:
++        probs = model.predict_proba(X)  # array NxK (K providers)
++        # If model was trained to output a score per candidate, map accordingly.
++        # Here we just compute a synthetic score: max probability per class aligned to candidate index
++        # For prototype, compute a single score per candidate using the model's predict_proba for the candidate class
++        # Fallback: sum of proba across classes
++        scores = [float(sum(p)) for p in probs]
++        return dict(zip(names, scores))
++    except Exception:
++        # model incompatible; return equal scores
++        return dict(zip(names, [1.0 for _ in names]))
++
++app = Flask("provider-broker-learned")
++
++@app.route("/select", methods=["POST"])
++def select():
++    payload = request.json or {}
++    candidates = payload.get("candidates", [])
++    job_id = payload.get("job_id")
++    mode = payload.get("mode", "prod")  # prod | shadow | canary
++    state = load_state()
++    model = load_model()
++    selected = None
++    scores = {}
++    if model:
++        scores = score_with_model(model, candidates)
++        # pick highest score
++        if scores:
++            selected = max(scores.items(), key=lambda x: x[1])[0]
++    else:
++        # fallback heuristic: pick lowest cost then latency
++        best = None
++        best_val = float("inf")
++        for c in candidates:
++            m = c.get("meta", {})
++            val = m.get("cost_per_job", 1.0) + 0.001*m.get("latency_ms", 100)
++            if val < best_val:
++                best_val = val
++                best = c.get("name")
++        selected = best
++        scores = {c.get("name"): (1.0/(c.get("meta",{}).get("cost_per_job",1.0))) for c in candidates}
++
++    # record history for telemetry
++    state["history"].append({"ts": datetime.utcnow().isoformat(), "job_id": job_id, "candidates": candidates, "selected": selected, "mode": mode, "scores": scores})
++    save_state(state)
++
++    # canary mode returns selection but operator must handle routing
++    return jsonify({"timestamp": datetime.utcnow().isoformat(), "selected": selected, "scores": scores, "mode": mode})
++
++@app.route("/shadow", methods=["POST"])
++def shadow():
++    # convenience endpoint: same as select with mode=shadow
++    payload = request.json or {}
++    payload["mode"] = "shadow"
++    return select()
++
++@app.route("/ingest", methods=["POST"])
++def ingest():
++    rec = request.json or {}
++    state = load_state()
++    state.setdefault("telemetry", []).append({"ts": datetime.utcnow().isoformat(), **rec})
++    # update provider meta if provided
++    if "provider" in rec and "meta" in rec:
++        state["providers_meta"][rec["provider"]] = rec["meta"]
++    save_state(state)
++    return jsonify({"ok": True})
++
++@app.route("/train", methods=["POST"])
++def train():
++    # trigger offline training; for prototype we call an external script (learner/train_policy.py)
++    try:
++        import subprocess
++        subprocess.run(["python","provider/learner/train_policy.py","--state",STATE_PATH,"--out",MODEL_PATH], check=True)
++        return jsonify({"ok": True, "model_path": MODEL_PATH})
++    except Exception as e:
++        return jsonify({"ok": False, "error": str(e)}), 500
++
++@app.route("/state", methods=["GET"])
++def state_get():
++    return jsonify(load_state())
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
++
+*** End Patch
+*** Begin Patch
+*** Add File: provider/learner/train_policy.py
++#!/usr/bin/env python3
++"""
++Offline trainer for provider selection policy. Reads broker state JSON and trains
++ a simple multiclass classifier that predicts the best provider given candidate features.
++
++This prototype uses scikit-learn. It expects:
++ - state JSON with `history` entries: {candidates, selected}
++ Each history entry is converted into training examples where the features are candidate meta
++ and the label is which candidate was selected.
++"""
++import argparse
++import json
++import os
++import pickle
++from sklearn.linear_model import LogisticRegression
++from sklearn.preprocessing import StandardScaler
++from sklearn.pipeline import Pipeline
++import numpy as np
++
++def featurize_candidate(meta):
++    cost = meta.get("cost_per_job", 1.0)
++    latency = meta.get("latency_ms", 100)
++    fidelity = meta.get("avg_fidelity", 0.5)
++    carbon = meta.get("carbon_g_per_kwh", 300)
++    return [1.0/max(1e-6,cost), 1.0/max(1.0,latency), fidelity, 1.0/max(1.0,carbon)]
++
++def build_dataset(state):
++    X = []
++    y = []
++    provider_names = []
++    for h in state.get("history", []):
++        candidates = h.get("candidates", [])
++        selected = h.get("selected")
++        if not candidates or not selected:
++            continue
++        for c in candidates:
++            name = c.get("name")
++            feat = featurize_candidate(c.get("meta", {}))
++            X.append(feat)
++            y.append(1 if name == selected else 0)  # binary label per candidate (1 if selected)
++            provider_names.append(name)
++    if not X:
++        return None, None, None
++    return np.array(X), np.array(y), provider_names
++
++def train(state_file, out):
++    state = json.load(open(state_file))
++    X, y, provider_names = build_dataset(state)
++    if X is None:
++        raise RuntimeError("No training examples found in state")
++    # Train a simple logistic regression to predict selection probability per candidate
++    # Note: This is a prototype; for multiclass you would reshape data differently.
++    pipeline = Pipeline([("scaler", StandardScaler()), ("clf", LogisticRegression(max_iter=500))])
++    pipeline.fit(X, y)
++    os.makedirs(os.path.dirname(out), exist_ok=True)
++    with open(out, "wb") as fh:
++        pickle.dump(pipeline, fh)
++    print("Trained policy written to", out)
++
++if __name__ == "__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--state", required=True)
++    p.add_argument("--out", required=True)
++    args = p.parse_args()
++    train(args.state, args.out)
++
+*** End Patch
+*** Begin Patch
+*** Add File: provider/requirements_learned.txt
++scikit-learn==1.2.2
++numpy==1.25.0
++flask==2.2.5
++
+*** End Patch
+*** Begin Patch
+*** Add File: provider/k8s/provider-broker-learned-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: provider-broker-learned
++  namespace: aegis
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: provider-broker-learned
++  template:
++    metadata:
++      labels:
++        app: provider-broker-learned
++    spec:
++      containers:
++        - name: broker
++          image: aegis/provider-broker-learned:latest
++          ports:
++            - containerPort: 8080
++          volumeMounts:
++            - name: data
++              mountPath: /data
++      volumes:
++        - name: data
++          emptyDir: {}
++
+*** End Patch
+*** Begin Patch
+*** Add File: provider/shadow_runner.py
++#!/usr/bin/env python3
++"""
++Shadow runner that calls provider broker in shadow mode for historical data collection.
++Invoke from scheduler during decision time with the same candidate list; records what the broker would choose.
++"""
++import requests, os, json, sys
++
++BROKER_URL = os.environ.get("BROKER_URL", "http://provider-broker-learned.aegis.svc/select")
++
++def run_shadow(candidates, job_id=None):
++    payload = {"candidates": candidates, "job_id": job_id, "mode": "shadow"}
++    r = requests.post(BROKER_URL, json=payload, timeout=10)
++    return r.json()
++
++if __name__ == "__main__":
++    # Example usage: python provider/shadow_runner.py '{"candidates":[{"name":"braket","meta":{"cost_per_job":1.0}}]}' job-123
++    if len(sys.argv) < 2:
++        print("Usage: provider/shadow_runner.py <candidates-json> [job_id]")
++        sys.exit(2)
++    candidates = json.loads(sys.argv[1])
++    job_id = sys.argv[2] if len(sys.argv) > 2 else None
++    print(run_shadow(candidates, job_id=job_id))
++
+*** End Patch
+*** Begin Patch
+*** Add File: quantum/noise_aware_scheduler_mlflow.py
++#!/usr/bin/env python3
++"""
++Noise-aware quantum scheduler that queries MLflow for latest calibration snapshots.
++Selects best device by combining noise_score and broker-provided cost/fidelity/carbon info.
++"""
++import argparse
++import json
++import os
++from mlflow.tracking import MlflowClient
++from datetime import datetime
++
++MLFLOW_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow:5000")
++MLFLOW_EXPERIMENT = os.environ.get("MLFLOW_CALIB_EXPERIMENT", "qpu_calibrations")
++
++def fetch_latest_calibration(device, client: MlflowClient):
++    # Search runs with tag device=<device> and return latest calibration artifact (expected JSON)
++    runs = client.search_runs([MLFLOW_EXPERIMENT], filter_string=f"tags.device = '{device}'", run_view_type=1, max_results=5)
++    if not runs:
++        return None
++    run = runs[0]  # most recent
++    # attempt to download artifact calibration.json
++    try:
++        local_path = client.download_artifacts(run.info.run_id, "calibration.json", dst_path="/tmp")
++        return json.load(open(local_path))
++    except Exception:
++        return run.data.tags.get("calibration_json") or None
++
++def noise_score(calib):
++    readout = calib.get("readout_error", 0.1)
++    gate = calib.get("gate_error", 0.02)
++    fidelity = calib.get("avg_fidelity", 0.6)
++    return (readout * 0.5 + gate * 0.4 + (1.0 - fidelity) * 0.1) * 100.0
++
++def pick_device(candidates, mlflow_uri=MLFLOW_URI):
++    client = MlflowClient(mlflow_uri)
++    best = None
++    best_score = float("inf")
++    details = {}
++    for d in candidates:
++        name = d.get("name")
++        meta = d.get("meta", {})
++        calib = fetch_latest_calibration(name, client) or meta.get("calibration", {})
++        n = noise_score(calib if isinstance(calib, dict) else json.loads(calib))
++        cost = meta.get("cost_per_job", 1.0)
++        composite = 0.7 * n + 0.3 * cost
++        details[name] = {"noise": n, "cost": cost, "composite": composite, "calibration": calib}
++        if composite < best_score:
++            best_score = composite
++            best = name
++    return best, best_score, details
++
++if __name__ == "__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--candidates", nargs="+", required=True)
++    args = p.parse_args()
++    candidates = []
++    for c in args.candidates:
++        # expecting string "name:cost" or just name; for prototype parse simple form
++        if ":" in c:
++            name, cost = c.split(":",1)
++            candidates.append({"name": name, "meta": {"cost_per_job": float(cost)}})
++        else:
++            candidates.append({"name": c, "meta": {}})
++    selected, score, details = pick_device(candidates)
++    print(json.dumps({"selected": selected, "score": score, "details": details}, indent=2))
++
+*** End Patch
+*** Begin Patch
+*** Add File: quantum/mitigation_ab_harness.py
++#!/usr/bin/env python3
++"""
++Adaptive mitigation A/B experiment harness.
++
++ - Launches pairs of runs (A=baseline, B=with mitigation) for the same circuits/devices
++ - Collects MLflow metrics for each run and performs a simple t-test (prototype)
++ - If statistically significant improvement and effect size > threshold, writes suggestion file for mitigation_autopilot
++"""
++import argparse
++import json
++import os
++import statistics
++from mlflow.tracking import MlflowClient
++from datetime import datetime
++
++MLFLOW_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow:5000")
++SUG_FILE = "/tmp/mitigation_suggestions.json"
++MIN_EFFECT = float(os.environ.get("MIT_MIN_EFFECT", "0.01"))
++ALPHA = float(os.environ.get("MIT_ALPHA", "0.05"))
++
++def evaluate_metric(baseline_vals, mitigated_vals):
++    if not baseline_vals or not mitigated_vals:
++        return None
++    mean_a = statistics.mean(baseline_vals)
++    mean_b = statistics.mean(mitigated_vals)
++    var_a = statistics.pvariance(baseline_vals)
++    var_b = statistics.pvariance(mitigated_vals)
++    n1 = len(baseline_vals); n2 = len(mitigated_vals)
++    # Welch's t-test (approx)
++    try:
++        se = ((var_a / n1) + (var_b / n2)) ** 0.5
++        t = (mean_b - mean_a) / se if se > 0 else 0.0
++    except Exception:
++        t = 0.0
++    # crude p-value approximation (large-sample)
++    # For prototype, consider improvement significant if mean_b > mean_a + MIN_EFFECT
++    effect = mean_b - mean_a
++    significant = effect > MIN_EFFECT
++    return {"mean_a": mean_a, "mean_b": mean_b, "effect": effect, "t": t, "significant": significant}
++
++def collect_runs(client: MlflowClient, run_ids, metric_key):
++    vals = []
++    for rid in run_ids:
++        try:
++            vals.append(float(client.get_metric_history(rid, metric_key)[-1].value))
++        except Exception:
++            pass
++    return vals
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--baseline-run-ids", nargs="+", required=True)
++    p.add_argument("--mitigated-run-ids", nargs="+", required=True)
++    p.add_argument("--metric", default="fidelity")
++    args = p.parse_args()
++    client = MlflowClient(MLFLOW_URI)
++    a_vals = collect_runs(client, args.baseline_run_ids, args.metric)
++    b_vals = collect_runs(client, args.mitigated_run_ids, args.metric)
++    res = evaluate_metric(a_vals, b_vals)
++    print("A/B result:", res)
++    suggestions = []
++    if res and res["significant"]:
++        # build suggestion (prototype)
++        suggestions.append({"device": "unknown", "suggestion": {"apply_readout": True}, "expected_gain": res["effect"], "risk": 0.01})
++        with open(SUG_FILE, "w") as fh:
++            json.dump(suggestions, fh, indent=2)
++        print("Wrote suggestion to", SUG_FILE)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: scheduler/prebooker.py
++#!/usr/bin/env python3
++"""
++Predictive pre-booking stub for providers that support prebooking.
++ - Maintains a simple local ledger of booked slots (JSON)
++ - Exposes functions to request a booking and to summarize bookings
++ - In production integrate with provider APIs
++"""
++import argparse
++import json
++import os
++from datetime import datetime, timedelta
++
++LEDGER = "/tmp/prebook_ledger.json"
++
++def load_ledger():
++    if os.path.exists(LEDGER):
++        return json.load(open(LEDGER))
++    return {}
++
++def save_ledger(l):
++    with open(LEDGER, "w") as fh:
++        json.dump(l, fh, indent=2)
++
++def book(provider, start_iso, duration_mins, tenant=None):
++    ledger = load_ledger()
++    booking_id = f"{provider}-{int(datetime.utcnow().timestamp())}"
++    ledger[booking_id] = {"provider": provider, "start": start_iso, "duration_mins": duration_mins, "tenant": tenant}
++    save_ledger(ledger)
++    return booking_id
++
++def summarize():
++    ledger = load_ledger()
++    return ledger
++
++if __name__ == "__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--book", nargs=3, metavar=("PROVIDER","START_ISO","DURATION_MIN"), help="Create a booking")
++    p.add_argument("--summary", action="store_true")
++    args = p.parse_args()
++    if args.book:
++        bid = book(args.book[0], args.book[1], int(args.book[2]))
++        print("Booking created:", bid)
++    if args.summary:
++        print(json.dumps(summarize(), indent=2))
++
+*** End Patch
+*** Begin Patch
+*** Add File: docs/smarter_scheduler_README.md
++# Smarter Scheduling & Quality (Aegis)
++
++This patch implements:
++
++- Provider broker service with learned policy + shadow & canary endpoints (provider/broker_learned.py)
++- Offline trainer for learned policy (provider/learner/train_policy.py) and requirements (provider/requirements_learned.txt)
++- Shadow runner to call broker in shadow mode (provider/shadow_runner.py) for telemetry collection
++- Noise-aware quantum scheduler integrated with MLflow calibration snapshots (quantum/noise_aware_scheduler_mlflow.py)
++- Mitigation A/B experiment harness that evaluates fidelity uplift and writes suggestions (quantum/mitigation_ab_harness.py)
++- Adaptive mitigation autopilot can consume the suggestion file (mitigation_autopilot previously added)
++- Predictive prebooker stub to reserve capacity when providers support prebooking (scheduler/prebooker.py)
++
++Recommended integration steps:
++1. Deploy provider-broker-learned in shadow mode first. Update scheduler to call provider/shadow_runner.py alongside production routing to collect telemetry.
++2. Periodically run provider/learner/train_policy.py against broker state to produce /data/policy_model.pkl, then deploy to broker (or call /train endpoint).
++3. Use quantum/noise_aware_scheduler_mlflow.py to select devices based on MLflow calibration snapshots. Ensure MLflow tracking is reachable.
++4. Run mitigation A/B experiments via quantum/mitigation_ab_harness.py and let mitigation_autopilot apply suggestions when improvement is significant.
++5. Use scheduler/prebooker.py to create prebook entries for flexible jobs; extend to call provider APIs as available.
++
++Notes & caveats:
++- These are prototypes. Replace local file/state usage with durable storage (Postgres, object store) and secure model artifact registries.
++- The learned policy here is a basic prototype (binary logistic regression). For production consider contextual bandits or RL with safe exploration and canary rollouts.
++- Always run new policies in shadow mode and canary traffic before full promotion.
++
+*** End Patch
+*** End Patch

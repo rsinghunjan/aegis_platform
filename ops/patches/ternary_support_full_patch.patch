@@ -1,0 +1,389 @@
+*** Begin Patch
+*** Add File:ops/training/quantization/utils.py
++"""
++Ternary quantization utilities (QAT helpers).
++Contains a minimal ternarize function and a TernaryLinear wrapper that implements
++straight-through estimator behaviour for PoC QAT.
++
++This is intentionally small: for production QAT you'll want more sophisticated
++clipping, per-channel thresholds, and careful optimizer scheduling.
++"""
++import torch
++import torch.nn as nn
++
++def ternarize_tensor(x, threshold):
++    """
++    Map tensor x to ternary values {-1,0,1} using threshold.
++    Returns ternary tensor (same dtype) and a positive scale (scalar).
++    """
++    # scale estimate (mean absolute)
++    s = x.abs().mean().detach()
++    if s == 0:
++        s = torch.tensor(1.0, device=x.device, dtype=x.dtype)
++    t = threshold * s
++    pos = (x > t).to(x.dtype)
++    neg = (x < -t).to(x.dtype)
++    tern = pos - neg
++    return tern, s
++
++class TernaryLinear(nn.Module):
++    """
++    Replace nn.Linear with ternary weights during forward. Stores last computed
++    ternary representation and scale for checkpointing.
++    """
++    def __init__(self, linear: nn.Linear, threshold_init=0.05):
++        super().__init__()
++        # keep original linear as source of parameters and bias
++        self.in_features = linear.in_features
++        self.out_features = linear.out_features
++        self.bias_flag = linear.bias is not None
++        # Copy weight and bias parameters
++        self.weight = linear.weight
++        if self.bias_flag:
++            self.bias = linear.bias
++        else:
++            self.register_parameter("bias", None)
++        # threshold is a small positive scalar (learnable)
++        self.threshold = nn.Parameter(torch.tensor(float(threshold_init)))
++        # placeholders to store last ternary & scale
++        self.last_tern = None
++        self.last_scale = None
++
++    def forward(self, x):
++        # compute ternary and scale from current weight
++        tern, scale = ternarize_tensor(self.weight, threshold=self.threshold.abs())
++        # straight-through estimator: use tern*scale as forward, but pass grad to weight
++        recon = scale * tern + (self.weight - self.weight.detach())
++        # save for checkpointing
++        self.last_tern = tern.detach().cpu().numpy()
++        self.last_scale = float(scale.detach().cpu().item())
++        return nn.functional.linear(x, recon, bias=self.bias)
++
++    def get_quant_metadata(self):
++        return {"ternary": self.last_tern.tolist() if self.last_tern is not None else None,
++                "scale": self.last_scale}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/training/quantization/ternary_qat.py
++"""
++Ternary QAT trainer (PoC).
++- loads a small pretrained model (distilgpt2 / gpt2-small)
++- replaces nn.Linear layers with TernaryLinear wrappers
++- fine-tunes for a few steps and saves a ternary checkpoint with quant metadata
++
++Usage:
++  python ops/training/quantization/ternary_qat.py --out ./out
++"""
++import argparse, json, os
++import torch
++from transformers import AutoModelForCausalLM, AutoTokenizer
++from torch.utils.data import DataLoader, Dataset
++from tqdm import tqdm
++from ops.training.quantization.utils import TernaryLinear
++
++class DummyTextDataset(Dataset):
++    def __init__(self, tokenizer, size=256, seq_len=64):
++        self.size = size
++        self.seq_len = seq_len
++        self.tokenizer = tokenizer
++    def __len__(self): return self.size
++    def __getitem__(self, idx):
++        # random tokens for PoC; replace with real dataset/loader
++        ids = torch.randint(0, self.tokenizer.vocab_size, (self.seq_len,), dtype=torch.long)
++        return ids
++
++def replace_linears(module):
++    """
++    Recursively replace nn.Linear modules with TernaryLinear wrappers in-place.
++    Returns count of replaced modules.
++    """
++    replaced = 0
++    for name, child in module.named_children():
++        if isinstance(child, torch.nn.Linear):
++            setattr(module, name, TernaryLinear(child))
++            replaced += 1
++        else:
++            replaced += replace_linears(child)
++    return replaced
++
++def save_ternary_checkpoint(model, out_dir, prov_meta):
++    os.makedirs(out_dir, exist_ok=True)
++    # collect per-layer metadata
++    quant_meta = {}
++    for n, m in model.named_modules():
++        if hasattr(m, "get_quant_metadata"):
++            quant_meta[n] = m.get_quant_metadata()
++    # save model state dict
++    torch.save(model.state_dict(), os.path.join(out_dir, "ternary_model.pt"))
++    # save quant metadata + provenance
++    prov = {"quant_type":"ternary", "quant_metadata": quant_meta}
++    prov.update(prov_meta or {})
++    open(os.path.join(out_dir, "ternary_model.prov.json"), "w").write(json.dumps(prov, indent=2))
++    print("Saved ternary checkpoint and provenance to", out_dir)
++
++def train(args):
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    tokenizer = AutoTokenizer.from_pretrained("distilgpt2")
++    model = AutoModelForCausalLM.from_pretrained("distilgpt2").to(device)
++    # replace linears
++    nrep = replace_linears(model)
++    print(f"Replaced {nrep} Linear layers with TernaryLinear")
++    ds = DummyTextDataset(tokenizer, size=200, seq_len=32)
++    dl = DataLoader(ds, batch_size=8)
++    optim = torch.optim.AdamW(model.parameters(), lr=1e-4)
++    model.train()
++    for epoch in range(1):
++        for batch in tqdm(dl, desc="train"):
++            batch = batch.to(device)
++            outputs = model(input_ids=batch, labels=batch)
++            loss = outputs.loss
++            loss.backward()
++            optim.step()
++            optim.zero_grad()
++    # save
++    prov_meta = {"base_model":"distilgpt2", "qat_steps": len(dl), "commit":"<git-sha>"}
++    save_ternary_checkpoint(model, args.out_dir, prov_meta)
++
++if __name__=="__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--out-dir", default="./out/ternary")
++    args = p.parse_args()
++    train(args)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/serving/ternary_fallback.py
++"""
++Ternary fallback inference:
++ - Loads a 'ternary_model.pt' state dict where Linear layers were trained via TernaryLinear
++ - Reconstructs float weights from stored ternary + scale metadata (if present), or falls back to stored weight params
++ - Runs inference with standard PyTorch kernels (no custom ternary kernels required)
++
++This gives immediate storage savings (if you store ternary arrays separately) and a quick deploy path
++while custom kernels are being developed.
++"""
++import torch, os, json
++from transformers import AutoModelForCausalLM, AutoTokenizer
++
++def load_ternary_model(model_class_name="distilgpt2", checkpoint_dir="./out/ternary"):
++    tokenizer = AutoTokenizer.from_pretrained(model_class_name)
++    model = AutoModelForCausalLM.from_pretrained(model_class_name)
++    # load state dict if present
++    state_path = os.path.join(checkpoint_dir, "ternary_model.pt")
++    prov_path = os.path.join(checkpoint_dir, "ternary_model.prov.json")
++    if os.path.exists(state_path):
++        sd = torch.load(state_path, map_location="cpu")
++        # attempt to read quant metadata
++        quant_meta = {}
++        if os.path.exists(prov_path):
++            prov = json.load(open(prov_path))
++            quant_meta = prov.get("quant_metadata", {})
++        # reconstruct parameters: if quant_meta contains module path, set weight to scale*tern
++        for name, param in list(sd.items()):
++            # param names like "transformer.h.0.attn.c_attn.weight" - we look for matching quant key
++            mod_name = name.rsplit(".", 1)[0]  # approximate module path
++            qmeta = quant_meta.get(mod_name)
++            if qmeta and qmeta.get("ternary") is not None:
++                tern = torch.tensor(qmeta["ternary"], dtype=param.dtype)
++                scale = float(qmeta.get("scale", 1.0))
++                new_w = scale * tern
++                sd[name] = new_w
++        model.load_state_dict(sd, strict=False)
++    else:
++        raise FileNotFoundError("ternary checkpoint not found")
++    return model, tokenizer
++
++def generate_sample(prompt="Hello world", checkpoint_dir="./out/ternary", max_length=32):
++    model, tokenizer = load_ternary_model(checkpoint_dir=checkpoint_dir)
++    model.eval()
++    inputs = tokenizer(prompt, return_tensors="pt")
++    with torch.no_grad():
++        out = model.generate(**inputs, max_length=max_length)
++    text = tokenizer.decode(out[0], skip_special_tokens=True)
++    return text
++
++if __name__=="__main__":
++    print(generate_sample("Testing ternary model", checkpoint_dir="./out/ternary"))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/serving/triton/ternary_backend/README.md
++Triton ternary backend (skeleton)
++
++This folder contains guidance and minimal stubs for implementing a custom Triton backend
++or ONNXRuntime custom op that can perform efficient ternary arithmetic (bitpacked ternary).
++
++Paths:
++- ternary_backend_backend.cc   : C++ Triton backend skeleton (operator must implement)
++- build/                       : Build instructions for the backend (Dockerfile, Makefile)
++- tests/                       : unit tests for custom kernel
++
++Notes:
++- Implementing a performant ternary backend requires C++ kernels that decode bitpacked ternary
++  and perform low-precision arithmetic. For initial rollout you can:
++  1) Implement an ONNX custom op that unpacks ternary into float/FP16 and calls existing GEMM.
++  2) Or implement full ternary GEMM to reduce compute and memory bandwidth.
++- The following files provide minimal entry points and placeholders.
++
++See also:
++- Triton backend API docs: https://github.com/triton-inference-server/backend
++- ONNX custom ops: https://onnxruntime.ai/docs/how-to/add-custom-op
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/serving/triton/ternary_backend/ternary_custom_op_stub.py
++"""
++ONNXRuntime custom op stub (python) - placeholder to illustrate how a custom op might be authored.
++Production: implement as C++ custom op for performance, with proper operator registration.
++"""
++import numpy as np
++
++def ternary_decompress(ternary_array, scale):
++    """
++    Expand ternary values (-1,0,1) with a scalar to float array.
++    ternary_array: numpy array with values -1,0,1
++    scale: float
++    """
++    return (ternary_array.astype(np.float32)) * float(scale)
++
++def run_stub(ternary_weights, scales, input_vec):
++    # decompress weights for GEMM
++    W = ternary_decompress(ternary_weights, scales)
++    return input_vec.dot(W.T)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/quant/compare_quant_methods.py
++"""
++Compare quantization methods (PoC helper).
++- Runs simple PTQ/QAT flows and compares results on a small sample corpus.
++- Integrates AWQ/GPTQ commands if those tools are available in environment.
++
++Usage:
++  python ops/quant/compare_quant_methods.py --model distilgpt2
++"""
++import argparse, subprocess, json, os
++from ops.serving.ternary_fallback import generate_sample
++
++def run_awq(model):
++    # placeholder: AWQ toolchain invocation (operator must install AWQ)
++    cmd = f"python -m awq.convert --model {model} --out ./out/awq_model"
++    print("AWQ cmd:", cmd)
++    # subprocess.run(cmd, shell=True, check=True)
++    return "./out/awq_model"
++
++def run_gptq(model):
++    cmd = f"python -m gptq.convert --model {model} --out ./out/gptq_model"
++    print("GPTQ cmd:", cmd)
++    # subprocess.run(cmd, shell=True, check=True)
++    return "./out/gptq_model"
++
++def run_ternary_qat():
++    cmd = "python ops/training/quantization/ternary_qat.py --out-dir ./out/ternary"
++    print("Running ternary QAT (PoC):", cmd)
++    subprocess.run(cmd, shell=True, check=True)
++    return "./out/ternary"
++
++def evaluate_sample(model_dir):
++    # runs the fallback generate_sample if possible
++    try:
++        txt = generate_sample("The quick brown fox", checkpoint_dir=model_dir)
++        return txt
++    except Exception as e:
++        return f"error: {e}"
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--model", default="distilgpt2")
++    args = p.parse_args()
++    print("Starting quant comparison for", args.model)
++    # run AWQ (if present)
++    awq_dir = run_awq(args.model)
++    gptq_dir = run_gptq(args.model)
++    tern_dir = run_ternary_qat()
++    print("Evaluate AWQ:", evaluate_sample(awq_dir))
++    print("Evaluate GPTQ:", evaluate_sample(gptq_dir))
++    print("Evaluate Ternary:", evaluate_sample(tern_dir))
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/ternary_ci.yml
++name: Ternary QAT & Fallback CI (PoC smoke)
++on:
++  workflow_dispatch:
++
++jobs:
++  ternary-poc:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: "3.11"
++      - name: Install deps
++        run: |
++          python -m pip install --upgrade pip
++          pip install torch transformers sentence-transformers faiss-cpu tqdm
++      - name: Run ternary QAT PoC (small)
++        run: |
++          python ops/training/quantization/ternary_qat.py --out-dir ./out/ternary
++      - name: Run ternary fallback generate smoke
++        run: |
++          python - <<'PY'
++from ops.serving.ternary_fallback import generate_sample
++print(generate_sample("Hello from ternary", checkpoint_dir="./out/ternary"))
++PY
++      - name: Run compare quant methods (dry)
++        run: |
++          python ops/quant/compare_quant_methods.py --model distilgpt2
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/dataset/quant_prov_schema.md
++# Quantization provenance schema (extend model .prov.json)
++
++Add fields under "quantization" key:
++
++- quant_type: "ternary" | "awq" | "gptq" | "bnb" | "none"
++- quant_date: ISO8601
++- quant_method: "QAT" | "PTQ" | "calibration"
++- quant_metadata: object mapping layer/module name -> { "scale": float, "ternary": optional array / encoded string, "notes":"" }
++- calibration_data_manifest: URI or dataset id used for calibration
++- baseline_metrics: { perplexity: float, ppl_delta_pct: float, downstream_task: {...} }
++- hardware_target: "cpu" | "gpu" | "custom-accel"
++- signed_by: "cosign" info (signature metadata)
++
++Example:
++{
++  "quantization": {
++    "quant_type":"ternary",
++    "quant_date":"2026-01-20T12:00:00Z",
++    "quant_method":"QAT",
++    "quant_metadata":{
++      "transformer.h.0.attn.c_attn": {"scale":0.123, "ternary": null}
++    },
++    "baseline_metrics":{"perplexity": 12.3, "ppl_delta_pct": 1.2},
++    "hardware_target":"gpu",
++    "signed_by":{"cosign":"kms://..."}
++  }
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:examples/run_ternary_poc.sh
++#!/usr/bin/env bash
++set -euo pipefail
++echo "Run ternary QAT PoC: trains a tiny QAT finetune and runs fallback generation"
++python ops/training/quantization/ternary_qat.py --out-dir ./out/ternary
++python - <<'PY'
++from ops.serving.ternary_fallback import generate_sample
++print("Ternary sample:", generate_sample("This is a test", checkpoint_dir="./out/ternary"))
++PY
++
+*** End Patch
+*** End Patch

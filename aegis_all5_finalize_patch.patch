@@ -1,0 +1,557 @@
+*** Begin Patch
+*** Add File:terraform/aws/kms_prod_full.tf
++// Production-ready AWS KMS + GitHub OIDC role for cosign signing (example).
++// Fill variables in terraform.tfvars before running.
++terraform {
++  required_providers {
++    aws = { source = "hashicorp/aws", version = ">= 4.0" }
++  }
++}
++
++provider "aws" {
++  region = var.aws_region
++}
++
++variable "aws_region" { type = string }
++variable "github_org" { type = string }
++variable "github_repo" { type = string }
++variable "oidc_provider_arn" { type = string }
++variable "oidc_provider_url" { type = string }
++variable "use_cloudhsm" { type = bool, default = false }
++
++resource "aws_kms_key" "cosign_prod" {
++  description             = "Production KMS key for cosign signing (Rotate enabled)"
++  deletion_window_in_days = 30
++  enable_key_rotation     = true
++  customer_master_key_spec = "RSA_3072"
++  key_usage               = "SIGN_VERIFY"
++
++  dynamic "multi_region" {
++    for_each = []
++    content {}
++  }
++
++  lifecycle {
++    prevent_destroy = true
++  }
++}
++
++resource "aws_kms_alias" "cosign_alias" {
++  name          = "alias/aegis-cosign-prod"
++  target_key_id = aws_kms_key.cosign_prod.key_id
++}
++
++data "aws_iam_policy_document" "github_oidc_assume" {
++  statement {
++    effect = "Allow"
++    principals {
++      type        = "Federated"
++      identifiers = [var.oidc_provider_arn]
++    }
++    actions = ["sts:AssumeRoleWithWebIdentity"]
++    condition {
++      test     = "StringEquals"
++      variable = "${replace(var.oidc_provider_url, "https://", "")}:sub"
++      values   = ["repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main"]
++    }
++  }
++}
++
++resource "aws_iam_role" "github_oidc_role_prod" {
++  name               = "aegis-github-oidc-role-prod"
++  assume_role_policy = data.aws_iam_policy_document.github_oidc_assume.json
++}
++
++resource "aws_iam_role_policy" "allow_kms_sign_prod" {
++  name = "allow-kms-sign-prod"
++  role = aws_iam_role.github_oidc_role_prod.id
++  policy = jsonencode({
++    Version = "2012-10-17"
++    Statement = [
++      {
++        Sid = "AllowCosignSign"
++        Effect = "Allow"
++        Action = [
++          "kms:Sign",
++          "kms:GetPublicKey",
++          "kms:DescribeKey"
++        ]
++        Resource = aws_kms_key.cosign_prod.arn
++      }
++    ]
++  })
++}
++
++output "aws_kms_key_arn_prod" { value = aws_kms_key.cosign_prod.arn }
++output "github_oidc_role_arn_prod" { value = aws_iam_role.github_oidc_role_prod.arn }
++
+*** End Patch
+*** Begin Patch
+*** Add File:scripts/set_github_secrets_from_tf.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Read terraform outputs (json) and set GitHub secrets via gh CLI.
++#
++REPO=${1:-}
++TF_DIR=${2:-terraform/aws}
++if [ -z "$REPO" ]; then
++  echo "Usage: $0 <owner/repo> [terraform_dir]"
++  exit 2
++fi
++
++OUT=$(cd "$TF_DIR" && terraform output -json)
++AWS_KMS_ARN=$(echo "$OUT" | jq -r '.aws_kms_key_arn_prod.value')
++OIDC_ROLE_ARN=$(echo "$OUT" | jq -r '.github_oidc_role_arn_prod.value')
++
++echo "Setting GitHub secrets in $REPO"
++gh secret set AWS_KMS_KEY_ARN --repo "$REPO" --body "$AWS_KMS_ARN"
++gh secret set GITHUB_OIDC_ROLE_ARN --repo "$REPO" --body "$OIDC_ROLE_ARN"
++gh secret set CLOUD_PROVIDER --repo "$REPO" --body "aws"
++echo "Done. Please set REKOR_URL, REGISTRY_HOST, REGISTRY_USER, REGISTRY_TOKEN manually."
++
+*** End Patch
+*** Begin Patch
+*** Add File:helm/vault/values-prod-aws-kms.yaml
++server:
++  ha:
++    enabled: true
++  dataStorage:
++    enabled: true
++  extraEnvironmentVars:
++    VAULT_LOCAL_CONFIG: |
++      ui = true
++      listener "tcp" {
++        address = "0.0.0.0:8200"
++        tls_disable = 0
++      }
++      storage "raft" {
++        path = "/vault/data"
++      }
++      seal "awskms" {
++        region = "${AWS_REGION}"
++        kms_key_id = "${AWS_KMS_KEY_ARN}"
++      }
++  service:
++    type: ClusterIP
++serverAffinity:
++  enabled: true
++injector:
++  enabled: true
++
+*** End Patch
+*** Begin Patch
+*** Add File:scripts/bootstrap_vault_prod_complete.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Bootstrap Vault in production after Helm install. Requires vault CLI and kubectl.
++#
++VAULT_ADDR=${VAULT_ADDR:-http://vault.ops.svc.cluster.local:8200}
++ROOT_TOKEN=${1:-}
++if [ -z "$ROOT_TOKEN" ]; then
++  echo "Usage: $0 <VAULT_ROOT_TOKEN>"
++  exit 2
++fi
++export VAULT_ADDR
++vault login "$ROOT_TOKEN"
++vault status
++vault secrets enable -path=secret kv-v2 || true
++vault auth enable kubernetes || true
++
++# Create a training read policy and role bound to a Kubernetes service account (training-vault-sa)
++vault policy write training-read - <<EOF
++path "secret/data/training/*" {
++  capabilities = ["read","list"]
++}
++EOF
++
++vault write auth/kubernetes/role/training-role \
++    bound_service_account_names=training-vault-sa \
++    bound_service_account_namespaces=staging \
++    policies=training-read \
++    ttl=1h
++
++echo "Vault bootstrap complete. Created training-read policy and kubernetes role 'training-role'."
++
+*** End Patch
+*** Begin Patch
+*** Add File:dgx/playbooks/dgx_validation_playbook.md
++# DGX Validation Playbook (smoke → scale → resilience)
++
++This playbook walks through validating DGX multi-node training and checkpoint/resume behavior.
++
++Prereqs
++- Kubernetes cluster with DGX nodes labeled: kubectl label node <node> aegis/worker-type=dgx
++- NVIDIA device plugin installed (k8s/dgx/nvidia-device-plugin-daemonset.yaml)
++- Docker image pushed: ${REGISTRY}/deepspeed-fsdp:latest
++- PVC deepspeed-data-pvc bound to fast storage (NVMe or high IOPS)
++
++Steps
++1) Apply NCCL tuning config:
++   kubectl apply -f k8s/nccl-configmap.yaml
++2) Submit validation workflow:
++   kubectl apply -f argo/deepspeed_dgx_validation.yaml
++3) Monitor:
++   argo get -n staging deepspeed-dgx-validation --watch
++4) Inject failure (simulate preemption):
++   kubectl delete pod <trainer-pod> -n staging --grace-period=0 --force
++5) Re-run resume job:
++   kubectl apply -f argo/deepspeed_dgx_validation_resume.yaml
++6) Collect artifacts:
++   ./scripts/scale_validation/submit_and_validate.py --workflow argo/deepspeed_dgx_validation.yaml --workflow-name deepspeed-dgx-validation --s3-bucket <COMPLIANCE_BUCKET> --s3-prefix deepspeed/dgx
++
+*** End Patch
+*** Begin Patch
+*** Add File:dgx/argo/deepspeed_dgx_validation.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  name: deepspeed-dgx-validation
++  namespace: staging
++spec:
++  entrypoint: validate
++  templates:
++  - name: validate
++    steps:
++    - - name: run-train
++        template: deepspeed-job
++
++  - name: deepspeed-job
++    container:
++      image: ${DEEPSPEED_IMAGE:-ghcr.io/yourorg/deepspeed-fsdp:latest}
++      command: ["/bin/bash","-lc"]
++      args:
++        - |
++          set -euxo pipefail
++          export NCCL_DEBUG=INFO
++          export MASTER_ADDR=$(hostname -i)
++          export MASTER_PORT=29500
++          mkdir -p /data/checkpoints
++          deepspeed --num_nodes 2 --num_gpus 8 train_fsdp.py --ckpt_dir /data/checkpoints --epochs 1
++      resources:
++        requests:
++          cpu: "32"
++          memory: "200Gi"
++        limits:
++          nvidia.com/gpu: 8
++    nodeSelector:
++      aegis/worker-type: dgx
++    volumeMounts:
++    - name: data
++      mountPath: /data
++    volumes:
++    - name: data
++      persistentVolumeClaim:
++        claimName: deepspeed-data-pvc
++
+*** End Patch
+*** Begin Patch
+*** Add File:dgx/scripts/dgx_run_validation.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Submit DGX validation, wait, simulate preemption, then resubmit resume run.
++kubectl apply -f dgx/argo/deepspeed_dgx_validation.yaml
++echo "Waiting 60s for tasks to start..."
++sleep 60
++POD=$(kubectl get pods -n staging -l app=deepspeed -o jsonpath='{.items[0].metadata.name}' || true)
++if [ -n "$POD" ]; then
++  echo "Simulating preemption: deleting pod $POD"
++  kubectl delete pod "$POD" -n staging --grace-period=0 --force || true
++fi
++echo "Resubmitting resume workflow..."
++kubectl apply -f argo/deepspeed_zeo_workflow_poc.yaml
++echo "Monitoring workflow: argo get -n staging deepspeed-dgx-validation --watch"
++
+*** End Patch
+*** Begin Patch
+*** Add File:gcp/tpu/setup_tpu_service_account.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Create GCP service account for CI and enable required APIs.
++# Usage: ./setup_tpu_service_account.sh <project-id> <sa-name> <repo>
++
++PROJECT=${1:-}
++SA_NAME=${2:-aegis-ci-tpu}
++REPO=${3:-}
++if [ -z "$PROJECT" ]; then
++  echo "Usage: $0 <gcp-project> [sa-name] [gh-owner/repo]"
++  exit 2
++fi
++gcloud config set project "$PROJECT"
++gcloud services enable compute.googleapis.com tpu.googleapis.com iam.googleapis.com
++gcloud iam service-accounts create "$SA_NAME" --display-name "Aegis CI TPU SA"
++SA_EMAIL="${SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
++gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:${SA_EMAIL}" --role "roles/compute.admin"
++gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:${SA_EMAIL}" --role "roles/tpu.admin"
++gcloud iam service-accounts keys create /tmp/${SA_NAME}-key.json --iam-account "$SA_EMAIL"
++echo "Service account key written to /tmp/${SA_NAME}-key.json"
++if [ -n "$REPO" ]; then
++  echo "Please add /tmp/${SA_NAME}-key.json contents as secret GCP_SA_KEY_JSON in GitHub repo $REPO"
++fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:gcp/argo/gcp_tpu_validation.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  name: gcp-tpu-validation
++  namespace: staging
++spec:
++  entrypoint: tpu-validate
++  templates:
++  - name: tpu-validate
++    container:
++      image: ghcr.io/yourorg/tf-tpu:latest
++      command: ["/bin/bash","-lc"]
++      args:
++        - |
++          echo "Running TPU smoke job"
++          python train_tpu.py --iterations 200 --ckpt /data/checkpoints
++      resources:
++        requests:
++          cpu: "16"
++          memory: "64Gi"
++    nodeSelector:
++      cloud.google.com/gke-accelerator: "tpu-v4"
++    tolerations:
++    - key: "cloud.google.com/gke-accelerator"
++      operator: Exists
++
+*** End Patch
+*** Begin Patch
+*** Add File:gcp/scripts/gke_submit_tpu_workflow.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Submit the TPU workflow via kubectl/argo.
++kubectl apply -f gcp/argo/gcp_tpu_validation.yaml
++echo "TPU workflow submitted. Monitor: argo get -n staging gcp-tpu-validation --watch"
++
+*** End Patch
+*** Begin Patch
+*** Add File:iot/production/enrollment_server_mtls.py
++#!/usr/bin/env python3
++"""
++Enrollment server with mTLS support (Flask + Werkzeug).
++ - POST /enroll (client presents CSR over mTLS) -> server signs device cert, issues JWT token
++ - GET /devices -> list
++Requires cert files provided via env: CA_CERT, CA_KEY (for signing), SERVER_CERT, SERVER_KEY, and CLIENT_CA_CERT to validate client TLS if used.
++"""
++from flask import Flask, request, jsonify
++import sqlite3, os, time, jwt, subprocess, tempfile
++
++DB_PATH = os.environ.get("REG_DB", "registry.db")
++JWT_SECRET = os.environ.get("ENROLL_SECRET", "change-me")
++CA_CERT = os.environ.get("CA_CERT", "ca.crt")
++CA_KEY = os.environ.get("CA_KEY", "ca.key")
++
++app = Flask("enroll_mtls")
++
++def init_db():
++    conn = sqlite3.connect(DB_PATH)
++    cur = conn.cursor()
++    cur.execute("CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, cert TEXT, enrolled_at INTEGER, token TEXT)")
++    conn.commit()
++    conn.close()
++
++@app.route("/enroll", methods=["POST"])
++def enroll():
++    body = request.get_json() or {}
++    device_id = body.get("device_id")
++    csr_pem = body.get("csr")
++    if not device_id or not csr_pem:
++        return jsonify({"error":"missing device_id or csr"}), 400
++    # sign CSR using openssl (not production-grade; use proper CA)
++    tf = tempfile.NamedTemporaryFile(delete=False)
++    tf.write(csr_pem.encode()); tf.flush()
++    cert_out = tempfile.NamedTemporaryFile(delete=False)
++    cmd = ["openssl","x509","-req","-in",tf.name,"-CA",CA_CERT,"-CAkey",CA_KEY,"-CAcreateserial","-days","365","-out",cert_out.name]
++    subprocess.check_call(cmd)
++    cert_pem = open(cert_out.name).read()
++    token = jwt.encode({"device_id": device_id, "iat": int(time.time())}, JWT_SECRET, algorithm="HS256")
++    conn = sqlite3.connect(DB_PATH)
++    cur = conn.cursor()
++    cur.execute("INSERT OR REPLACE INTO devices (device_id, cert, enrolled_at, token) VALUES (?,?,?,?)", (device_id, cert_pem, int(time.time()), token))
++    conn.commit(); conn.close()
++    return jsonify({"token": token, "cert": cert_pem})
++
++@app.route("/devices", methods=["GET"])
++def list_devices():
++    conn = sqlite3.connect(DB_PATH)
++    cur = conn.cursor()
++    cur.execute("SELECT device_id, enrolled_at FROM devices")
++    rows = cur.fetchall(); conn.close()
++    out = [{"device_id": r[0], "enrolled_at": r[1]} for r in rows]
++    return jsonify(out)
++
++if __name__ == "__main__":
++    init_db()
++    # For mTLS, run behind a TLS-terminating proxy that enforces client certs OR use waitress/gunicorn with SSL wrappers
++    app.run(host="0.0.0.0", port=8443, ssl_context=(os.environ.get("SERVER_CERT","server.crt"), os.environ.get("SERVER_KEY","server.key")))
++
+*** End Patch
+*** Begin Patch
+*** Add File:iot/production/scripts/generate_device_certs.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Generate a simple CA and server certs for demo enrollment mTLS flows (openssl)
++OUT_DIR=${1:-./iot/certs}
++mkdir -p "$OUT_DIR"
++openssl genrsa -out "$OUT_DIR/ca.key" 4096
++openssl req -x509 -new -nodes -key "$OUT_DIR/ca.key" -sha256 -days 3650 -subj "/CN=aegis-ca" -out "$OUT_DIR/ca.crt"
++openssl genrsa -out "$OUT_DIR/server.key" 4096
++openssl req -new -key "$OUT_DIR/server.key" -subj "/CN=enroll.local" -out "$OUT_DIR/server.csr"
++openssl x509 -req -in "$OUT_DIR/server.csr" -CA "$OUT_DIR/ca.crt" -CAkey "$OUT_DIR/ca.key" -CAcreateserial -out "$OUT_DIR/server.crt" -days 365
++echo "Generated CA and server certs in $OUT_DIR"
++
+*** End Patch
+*** Begin Patch
+*** Add File:iot/production/ota/server_signed_urls.py
++#!/usr/bin/env python3
++"""
++OTA server with signed URL capability (HMAC-based signed tokens for downloads).
++ - Admin uploads firmware; server provides signed download URLs valid for a limited time.
++ - Supports Range/resume; still uses local storage or can be backed by object storage.
++"""
++from flask import Flask, request, jsonify, send_file
++import os, time, hmac, hashlib
++STORAGE = os.environ.get("OTA_STORAGE","ota_storage")
++os.makedirs(STORAGE, exist_ok=True)
++SECRET = os.environ.get("OTA_SIGN_SECRET","change-me")
++app = Flask("ota_signed")
++
++def sign_token(path, expires):
++    msg = f"{path}|{expires}".encode()
++    sig = hmac.new(SECRET.encode(), msg, hashlib.sha256).hexdigest()
++    return f"{expires}:{sig}"
++
++def verify_token(token, path):
++    try:
++        expires_str, sig = token.split(":",1)
++        expires = int(expires_str)
++        if time.time() > expires:
++            return False
++        expected = hmac.new(SECRET.encode(), f"{path}|{expires}".encode(), hashlib.sha256).hexdigest()
++        return hmac.compare_digest(expected, sig)
++    except Exception:
++        return False
++
++@app.route("/firmware/upload", methods=["POST"])
++def upload():
++    f = request.files.get("file")
++    if not f:
++        return jsonify({"error":"no file"}), 400
++    dest = os.path.join(STORAGE, f.filename)
++    f.save(dest)
++    return jsonify({"ok": True, "file": f.filename})
++
++@app.route("/firmware/signed-url/<filename>", methods=["GET"])
++def signed_url(filename):
++    ttl = int(request.args.get("ttl", "600"))
++    expires = int(time.time()) + ttl
++    token = sign_token(filename, expires)
++    return jsonify({"url": f"/firmware/download/{filename}?token={token}", "expires": expires})
++
++@app.route("/firmware/download/<filename>", methods=["GET"])
++def download(filename):
++    token = request.args.get("token","")
++    if not verify_token(token, filename):
++        return jsonify({"error":"invalid_or_expired_token"}), 403
++    p = os.path.join(STORAGE, filename)
++    if not os.path.exists(p):
++        return jsonify({"error":"not found"}), 404
++    # send file with support for range handled by send_file
++    return send_file(p, as_attachment=True)
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=8090)
++
+*** End Patch
+*** Begin Patch
+*** Add File:iot/production/scripts/rekor_bundle_generator.py
++#!/usr/bin/env python3
++"""
++Generate an offline Rekor bundle: fetch Rekor entries for a list of digests and write a signed JSON bundle
++that devices can use offline. Optionally sign the bundle with a signing key the device trusts.
++"""
++import requests, json, sys, time, os
++
++REKOR_URL = os.environ.get("REKOR_URL", "https://rekor.sigstore.dev")
++
++def fetch_entries(digests):
++    out = {}
++    for d in digests:
++        if "@" in d:
++            d = d.split("@",1)[1]
++        r = requests.get(f"{REKOR_URL}/api/v1/log/entries?hash={d}", timeout=10)
++        out[d] = r.json() if r.status_code==200 else {"error": r.text}
++    return out
++
++if __name__ == "__main__":
++    if len(sys.argv) < 3:
++        print("Usage: rekor_bundle_generator.py <out.json> <digest1> [digest2...]")
++        sys.exit(2)
++    out_file = sys.argv[1]
++    digests = sys.argv[2:]
++    bundle = {"created": int(time.time()), "entries": fetch_entries(digests)}
++    open(out_file,"w").write(json.dumps(bundle, indent=2))
++    print("Wrote offline bundle to", out_file)
++
+*** End Patch
+*** Begin Patch
+*** Add File:iot/production/scripts/deploy_iot_prod.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Deploy simple IoT production stack locally or in Kubernetes (demo).
++# - enrollment_server_mtls.py (run as Deployment)
++# - ota/server_signed_urls.py (run as Deployment)
++# - registry/ui_app.py (device registry)
++#
++kubectl apply -f k8s/ (if you have k8s manifests for these services)
++echo "For local quickstart, run:"
++echo "  python3 iot/production/enrollment_server_mtls.py &"
++echo "  python3 iot/production/ota/server_signed_urls.py &"
++echo "  python3 registry/ui_app.py &"
++echo "Ensure CA certs exist (iot/production/scripts/generate_device_certs.sh)."
++
+*** End Patch
+*** Begin Patch
+*** Add File:README_all5_finalize.md
++# All-five Finalization Bundle
++
++This patch implements the five deliverables you requested:
++1) AWS KMS Terraform + GitHub secret helper
++2) Vault Helm values + production bootstrap script
++3) DGX validation playbook, Argo workflow and orchestration script
++4) GCP TPU service account setup script and Argo TPU validation workflow
++5) IoT productionization package (mTLS enrollment, signed-URL OTA, offline Rekor bundle generator, revocation/offline flows)
++
++Next steps (apply in order)
++1. Provision AWS KMS:
++   - Edit terraform/aws/terraform.tfvars with aws_region, github_org, github_repo, oidc_provider_arn, oidc_provider_url
++   - cd terraform/aws && terraform init && terraform apply -auto-approve
++   - ./scripts/set_github_secrets_from_tf.sh <owner/repo>
++2. Install Vault Helm with values in helm/vault/values-prod-aws-kms.yaml (replace placeholders) and run:
++   ./scripts/bootstrap_vault_prod_complete.sh <VAULT_ROOT_TOKEN>
++3. DGX validation:
++   - Label nodes, ensure NVIDIA device plugin installed, push image, then:
++     ./dgx/scripts/dgx_run_validation.sh
++4. GCP TPU:
++   - ./gcp/tpu/setup_tpu_service_account.sh <project> aegis-ci-tpu <owner/repo>
++   - kubectl apply -f gcp/argo/gcp_tpu_validation.yaml
++5. IoT production:
++   - Generate CA certs: ./iot/production/scripts/generate_device_certs.sh
++   - Run enrollment server (mTLS), OTA server with signed URLs, and the registry
++   - Generate offline Rekor bundles when needed using the rekor bundle script
++
++Security notes
++- Replace all placeholder secrets before production, run external pen-tests, and deploy services behind TLS & authenticated ingress.
++
+*** End Patch
+*** End Patch

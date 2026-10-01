@@ -1,0 +1,474 @@
+*** Begin Patch
+*** Add File:ops/llm/sharded_train_launcher.py
++#!/usr/bin/env python3
++"""
++Sharded training launcher for large generative models
++ - Launches distributed training (torchrun) with dataset shard manifest
++ - Integrates simple cost quota checks and optional spot preemption/backoff
++ - Records run manifest via ops.sdk.evidence_sdk.record_manifest
++
++Usage:
++  python3 sharded_train_launcher.py --shard-manifest /path/shards/shard_manifest.json --train-script train.py --gpus-per-node 8 --nodes 4 --out /tmp/train_run --cost-slo 500
++"""
++import argparse, json, os, subprocess, time
++from datetime import datetime
++
++def load_manifest(path):
++    return json.load(open(path))
++
++def estimate_cost(nodes, gpus_per_node, hours, cost_per_gpu_hour=0.5):
++    return nodes * gpus_per_node * hours * cost_per_gpu_hour
++
++def run_distributed(train_script, node_rank, nnodes, nproc_per_node, args_env):
++    # Build torchrun command
++    cmd = ["torchrun", "--nnodes", str(nnodes), "--nproc_per_node", str(nproc_per_node), train_script]
++    print("Launching:", " ".join(cmd))
++    env = os.environ.copy()
++    env.update(args_env)
++    return subprocess.call(cmd, env=env)
++
++def record_manifest_safe(key, meta):
++    try:
++        from ops.sdk.evidence_sdk import record_manifest
++        record_manifest(key, meta)
++    except Exception:
++        pass
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--shard-manifest", required=True)
++    p.add_argument("--train-script", required=True)
++    p.add_argument("--out", default=f"/tmp/train_{int(time.time())}")
++    p.add_argument("--gpus-per-node", type=int, default=8)
++    p.add_argument("--nodes", type=int, default=1)
++    p.add_argument("--hours", type=float, default=1.0)
++    p.add_argument("--cost-slo", type=float, default=1000.0, help="Max $ estimate for this run")
++    p.add_argument("--spot", action="store_true", help="Allow spot/preemptible instances")
++    args = p.parse_args()
++    os.makedirs(args.out, exist_ok=True)
++    manifest = load_manifest(args.shard_manifest)
++    est = estimate_cost(args.nodes, args.gpus_per_node, args.hours)
++    if est > args.cost_slo:
++        print(f"Estimated cost ${est:.2f} exceeds cost_slo ${args.cost_slo:.2f}. Aborting.")
++        raise SystemExit(2)
++    # Best-effort: set environment for distributed run
++    env = {"AEGIS_TRAIN_OUT": args.out, "AEGIS_SPOT_ALLOWED": str(bool(args.spot))}
++    rc = run_distributed(args.train_script, 0, args.nodes, args.gpus_per_node, env)
++    manifest_path = os.path.join(args.out, "run_manifest.json")
++    run_meta = {"started_at": datetime.utcnow().isoformat()+"Z", "rc": rc, "shard_count": len(manifest.get("shards",[]))}
++    with open(manifest_path, "w") as fh:
++        json.dump(run_meta, fh, indent=2)
++    record_manifest_safe("llm_train_run", {"out": args.out, "manifest": manifest_path})
++    print("Training finished. Manifest:", manifest_path)
++
++if __name__ == "__main__":
++    import json, time
++    main()
++
+*** End File
+*** Add File:ops/llm/latency_slo_exporter.py
++#!/usr/bin/env python3
++"""
++Prometheus exporter for LLM/diffusion inference latency & SLOs
++ - Polls model endpoints (inference /metrics or `/health`) and exports p50/p95/p99 and error rate
++"""
++from prometheus_client import start_http_server, Gauge, Counter
++import requests, time, argparse, threading
++
++P50 = Gauge("aegis_llm_p50_ms", "LLM p50 latency ms", ["service"])
++P95 = Gauge("aegis_llm_p95_ms", "LLM p95 latency ms", ["service"])
++P99 = Gauge("aegis_llm_p99_ms", "LLM p99 latency ms", ["service"])
++ERR = Counter("aegis_llm_inference_errors_total", "LLM inference errors", ["service"])
++
++def probe_loop(endpoint, service, interval):
++    while True:
++        try:
++            r = requests.get(endpoint, timeout=5)
++            if r.status_code==200:
++                j = r.json()
++                if "latencies" in j:
++                    P50.labels(service=service).set(j["latencies"].get("p50_ms",0))
++                    P95.labels(service=service).set(j["latencies"].get("p95_ms",0))
++                    P99.labels(service=service).set(j["latencies"].get("p99_ms",0))
++            else:
++                ERR.labels(service=service).inc()
++        except Exception:
++            ERR.labels(service=service).inc()
++        time.sleep(interval)
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--listen", default="0.0.0.0:9202")
++    p.add_argument("--probe", action="append", help="endpoint,service,interval")
++    args = p.parse_args()
++    host, port = args.listen.split(":")
++    start_http_server(int(port), addr=host)
++    for pr in args.probe or []:
++        endpoint, service, interval = pr.split(",",2)
++        t = threading.Thread(target=probe_loop, args=(endpoint,service,int(interval)), daemon=True)
++        t.start()
++    print("Exporter running on", args.listen)
++    while True:
++        time.sleep(60)
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:ops/agent/executor_with_retries.py
++#!/usr/bin/env python3
++"""
++Agent executor with retries, logged action trace and runtime constraints
++ - Executes actions via an adapter, retries on failure with backoff, logs to action log (NDJSON)
++ - Enforces per-action runtime constraint (deadline). Integrates with E-STOP adapter.
++"""
++import argparse, time, json, os, threading
++from datetime import datetime, timedelta
++
++class ActionAdapter:
++    def execute(self, action, timeout_s):
++        # Placeholder: actual adapter should call controller/HIL API
++        time.sleep(min(0.2, timeout_s))
++        return {"status":"ok", "action": action}
++
++class EStop:
++    def __init__(self, estop_endpoint=None):
++        self.endpoint = estop_endpoint
++    def engaged(self):
++        # Best-effort: query endpoint
++        return False
++
++def execute_action(adapter, action, retries, backoff, timeout_s, estop):
++    attempt = 0
++    while attempt <= retries:
++        if estop and estop.engaged():
++            return {"status":"estop", "attempt": attempt}
++        start = datetime.utcnow()
++        try:
++            res = adapter.execute(action, timeout_s)
++            if res.get("status") == "ok":
++                return {"status":"ok", "attempt": attempt, "result": res}
++            else:
++                attempt += 1
++                time.sleep(backoff * attempt)
++        except Exception as e:
++            attempt += 1
++            time.sleep(backoff * attempt)
++    return {"status":"failed", "attempts": attempt}
++
++def log_action(log_path, entry):
++    with open(log_path, "a") as fh:
++        fh.write(json.dumps(entry)+"\n")
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--actions-file", required=True, help="NDJSON list of actions")
++    p.add_argument("--out-log", default="/tmp/action_log.ndjson")
++    p.add_argument("--retries", type=int, default=3)
++    p.add_argument("--backoff", type=float, default=1.0)
++    p.add_argument("--timeout", type=float, default=5.0)
++    args = p.parse_args()
++    adapter = ActionAdapter()
++    estop = EStop()
++    with open(args.actions_file) as fh:
++        for l in fh:
++            action = json.loads(l)
++            start = datetime.utcnow().isoformat()+"Z"
++            result = execute_action(adapter, action, args.retries, args.backoff, args.timeout, estop)
++            entry = {"action": action, "started_at": start, "result": result}
++            log_action(args.out_log, entry)
++            if result.get("status") != "ok":
++                print("Action failed or aborted:", action, result)
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:ops/rag/index_builder.py
++#!/usr/bin/env python3
++"""
++RAG index builder
++ - Build embeddings for documents and persist a FAISS index (or disk-backed vector store)
++ - Records index manifest and optional upload to S3
++"""
++import argparse, json, os
++from datetime import datetime
++import numpy as np
++
++def embed_texts(texts, model="text-embedding-ada-002"):
++    # Placeholder: call embedding service / model; here we use random vectors
++    return np.random.randn(len(texts), 768).astype("float32")
++
++def build_faiss_index(embs, out_path):
++    try:
++        import faiss
++    except Exception:
++        with open(out_path+".json","w") as fh:
++            json.dump({"note":"faiss_missing","count": len(embs.tolist())}, fh)
++        return False
++    d = embs.shape[1]
++    index = faiss.IndexFlatL2(d)
++    index.add(embs)
++    faiss.write_index(index, out_path)
++    return True
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--docs", required=True, help="JSONL of documents with 'text' field")
++    p.add_argument("--out-index", required=True)
++    p.add_argument("--s3", default="")
++    args = p.parse_args()
++    texts=[]
++    with open(args.docs) as fh:
++        for l in fh:
++            j=json.loads(l)
++            texts.append(j.get("text",""))
++    embs = embed_texts(texts)
++    ok = build_faiss_index(embs, args.out_index)
++    manifest = {"index": args.out_index, "count": len(texts), "built_at": datetime.utcnow().isoformat()+"Z", "ok": ok}
++    manifest_path = args.out_index + ".manifest.json"
++    with open(manifest_path, "w") as fh:
++        json.dump(manifest, fh, indent=2)
++    if args.s3:
++        try:
++            subprocess.check_call(["aws","s3","cp",args.out_index, args.s3])
++        except Exception:
++            pass
++    print("Index built. Manifest:", manifest_path)
++
++if __name__ == "__main__":
++    import subprocess, json
++    main()
++
+*** End File
+*** Add File:ops/rag/rag_service.py
++#!/usr/bin/env python3
++"""
++Simple RAG service (Flask)
++ - Loads a vector index, retrieves top-k documents, then calls a local LLM inference endpoint
++ - Implements a simple hallucination/confidence filter based on LLM-provided score or fallback heuristics
++"""
++from flask import Flask, request, jsonify
++import argparse, json, requests, os
++
++app = Flask(__name__)
++
++def retrieve(query, index_path, k=4):
++    # Placeholder: call FAISS or vector DB; here we return empty contexts
++    return [{"text": "context for query", "score": 0.9}]
++
++def call_llm(prompt, llm_endpoint):
++    try:
++        r = requests.post(llm_endpoint, json={"prompt": prompt}, timeout=30)
++        return r.json()
++    except Exception as e:
++        return {"error": str(e)}
++
++def hallucination_check(llm_resp, threshold=0.3):
++    # Placeholder: prefer LLM to return a 'confidence' float; otherwise fallback to heuristics
++    conf = llm_resp.get("confidence", None)
++    if conf is None:
++        # fallback: if 'unknown' token or 'I don't know' in text, treat low confidence
++        txt = llm_resp.get("text","").lower()
++        if "i don't know" in txt or "i'm not sure" in txt:
++            return False
++        return True
++    return conf >= threshold
++
++@app.route("/query", methods=["POST"])
++def query():
++    data = request.get_json() or {}
++    query = data.get("query","")
++    idx = data.get("index_path","./index.faiss")
++    llm = data.get("llm_endpoint","http://localhost:8000/infer")
++    ctxs = retrieve(query, idx)
++    prompt = query + "\n\nCONTEXT:\n" + "\n\n".join([c["text"] for c in ctxs])
++    resp = call_llm(prompt, llm)
++    ok = hallucination_check(resp)
++    return jsonify({"ok": ok, "response": resp, "contexts": ctxs})
++
++if __name__ == "__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--host", default="0.0.0.0")
++    p.add_argument("--port", type=int, default=8100)
++    args = p.parse_args()
++    app.run(host=args.host, port=args.port)
++
+*** End File
+*** Add File:ops/data/synthetic/multimodal_generator.py
++#!/usr/bin/env python3
++"""
++Multimodal synthetic dataset generator
++ - Extends scenario generation to emit paired modalities (camera frames + lidar + labels + metadata)
++ - Supports domain randomization parameters and outputs TFRecord/JSONL shards
++"""
++import argparse, json, os, random
++from datetime import datetime
++
++def generate_sample(out_dir, idx, domain_params):
++    sample = {
++        "id": idx,
++        "timestamp": datetime.utcnow().timestamp(),
++        "camera": f"camera_{idx:06d}.jpg",
++        "lidar": f"lidar_{idx:06d}.pcd",
++        "labels": [{"class":"person","bbox":[10,10,50,100]}],
++        "domain": domain_params
++    }
++    # write metadata JSON (operator to populate actual sensor files via CARLA)
++    with open(os.path.join(out_dir, f"{idx:06d}.json"), "w") as fh:
++        json.dump(sample, fh)
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--out", required=True)
++    p.add_argument("--count", type=int, default=1000)
++    p.add_argument("--domains", type=int, default=5, help="domain randomization variants")
++    args = p.parse_args()
++    os.makedirs(args.out, exist_ok=True)
++    for i in range(args.count):
++        dp = {"weather": random.choice(["sunny","rain","fog"]), "time": random.choice(["day","dusk","night"]), "variant": random.randint(0,args.domains-1)}
++        generate_sample(args.out, i, dp)
++    manifest = {"count": args.count, "generated_at": datetime.utcnow().isoformat()+"Z"}
++    with open(os.path.join(args.out,"manifest.json"), "w") as fh:
++        json.dump(manifest, fh, indent=2)
++    print("Generated synthetic multimodal dataset in", args.out)
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:ops/cost/quota_enforcer.py
++#!/usr/bin/env python3
++"""
++Quota and cost SLO enforcer
++ - Enforces team/tenant GPU quotas and a run-level cost SLO by querying cluster scheduler (Kubernetes) and optionally preempting jobs
++ - Example: set per-namespace GPU quota and prevent new runs if quota exceeded
++"""
++import argparse, subprocess, json, os
++
++def current_gpu_usage(namespace=None):
++    # Best-effort: query kubectl top or custom metric; placeholder returns zero
++    return 0
++
++def preempt_job(job_name, namespace):
++    # Placeholder - in k8s, would evict/delete pod with --grace-period=0
++    try:
++        subprocess.check_call(["kubectl","delete","pod",job_name,"-n",namespace,"--grace-period=0","--force"])
++        return True
++    except Exception as e:
++        print("Preempt failed:", e)
++        return False
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--namespace", default="default")
++    p.add_argument("--gpu-quota", type=int, default=16)
++    p.add_argument("--dry-run", action="store_true")
++    args = p.parse_args()
++    usage = current_gpu_usage(args.namespace)
++    print(f"Current GPU usage for {args.namespace}: {usage}")
++    if usage > args.gpu_quota:
++        print("Quota exceeded:", usage, ">", args.gpu_quota)
++        if not args.dry_run:
++            # find candidate jobs to preempt (placeholder)
++            preempt_job("example-job", args.namespace)
++    else:
++        print("Quota OK")
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:ops/cost/spot_manager.py
++#!/usr/bin/env python3
++"""
++Spot instance manager (placeholder)
++ - Maintains a pool of spot/preemptible nodes for large training/sim runs
++ - Integrates with cloud provider API (operator must implement provider-specific calls)
++"""
++import argparse, time, json
++
++def provision_spot_pool(count, instance_type, region):
++    print(f"Pretend to provision {count} spot instances of type {instance_type} in {region}")
++    # operator: integrate with AWS/GCP/Azure SDK to provision
++    return [{"id": f"spot-{i}"} for i in range(count)]
++
++def deprovision(pool):
++    print("Deprovision pool:", pool)
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--count", type=int, default=4)
++    p.add_argument("--instance-type", default="p4d.24xlarge")
++    p.add_argument("--region", default="us-west-2")
++    args = p.parse_args()
++    pool = provision_spot_pool(args.count, args.instance_type, args.region)
++    print("Pool:", pool)
++    time.sleep(1)
++    deprovision(pool)
++
++if __name__ == "__main__":
++    main()
++
+*** End File
+*** Add File:.github/workflows/llm_training_slo.yml
++name: LLM Training (cost-aware)
++on:
++  workflow_dispatch:
++    inputs:
++      shard_manifest:
++        required: true
++      train_script:
++        required: true
++jobs:
++  train:
++    runs-on: [self-hosted, linux]
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run sharded training launcher (cost SLO enforcement)
++        env:
++          COSIGN_KMS_URI: ${{ secrets.COSIGN_KMS_URI }}
++        run: |
++          python3 ops/llm/sharded_train_launcher.py --shard-manifest "${{ github.event.inputs.shard_manifest }}" --train-script "${{ github.event.inputs.train_script }}" --nodes 4 --gpus-per-node 8 --hours 12 --cost-slo 2000 --out /tmp/llm_train_run
++
+*** End File
+*** Add File:ops/monitoring/llm_slo_alerts.yml
++groups:
++- name: aegis-llm-slos
++  rules:
++  - alert: LLMInferenceLatencyHigh
++    expr: aegis_llm_p99_ms > 500
++    for: 5m
++    labels:
++      severity: critical
++    annotations:
++      summary: "LLM p99 latency high (>500ms)"
++      description: "p99 latency > 500ms for more than 5m"
++  - alert: LLMInferenceErrorRateHigh
++    expr: increase(aegis_llm_inference_errors_total[5m]) > 10
++    for: 5m
++    labels:
++      severity: high
++    annotations:
++      summary: "LLM inference error rate high"
++      description: "More than 10 inference errors in 5m"
++
+*** End File
+*** Add File:ops/ci/cost_slo_policy.md
++# Cost SLO Policy for Large Training & Generative Jobs
++
++Overview
++- Define cost SLO per run and quota per team/namespace. Training jobs must provide a shard manifest and an estimated wall-clock hours before launching.
++
++Enforcement
++- ops/llm/sharded_train_launcher.py performs an estimate and aborts runs exceeding provided cost_slo.
++- Quota checks performed by ops/cost/quota_enforcer.py before large runs; CI workflows call the quota enforcer in pre-step.
++
++Preemption / spot usage
++- Use spot nodes for non-critical runs. ops/cost/spot_manager.py is a placeholder; operator must integrate with cloud provider.
++
++Monitoring & billing
++- Record run manifests via ops.sdk.evidence_sdk.record_manifest for billing reconciliation. Tag workloads with cost center.
++
+*** End File
+*** End Patch

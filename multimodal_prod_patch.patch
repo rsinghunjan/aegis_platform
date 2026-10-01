@@ -1,0 +1,790 @@
+*** Begin Patch
+*** Add File:multimodal/ingest/media_ingest.py
++#!/usr/bin/env python3
++"""
++Media ingestion pipeline:
++ - Discover media files in S3 (images/audio/video)
++ - Download, preprocess (resize, normalize, transcode), thumbnail, chunk long signals
++ - Extract metadata (mime, dimensions, duration, fps, timestamp)
++ - Upload processed artifacts and metadata back to S3 under an indexed prefix
++ - Emit a JSON manifest per media asset for downstream embedding & indexing
++
++Usage: run as a CronJob or ad-hoc job. Configure via environment variables.
++"""
++import os
++import json
++import tempfile
++import subprocess
++import time
++import math
++from pathlib import Path
++import boto3
++
++from multimodal.ingest.chunkers import chunk_audio, chunk_video_frames
++from multimodal.ingest.utils import make_thumbnail, probe_media
++from embeddings.multimodal.embed_multimodal import embed_and_upsert_multimodal
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "REPLACE_WITH_EVIDENCE_BUCKET")
++S3_PREFIX = os.environ.get("MEDIA_S3_PREFIX", "evidence/media/")
++PROCESSED_PREFIX = os.environ.get("PROCESSED_PREFIX", "evidence/media/processed/")
++AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
++
++s3 = boto3.client("s3", region_name=AWS_REGION)
++
++def list_media(prefix=S3_PREFIX):
++    paginator = s3.get_paginator("list_objects_v2")
++    for page in paginator.paginate(Bucket=EVIDENCE_BUCKET, Prefix=prefix):
++        for obj in page.get("Contents", []):
++            key = obj["Key"]
++            if key.endswith("/"):
++                continue
++            yield key
++
++def download_key(key):
++    tmp = tempfile.mktemp(suffix=Path(key).suffix)
++    s3.download_file(EVIDENCE_BUCKET, key, tmp)
++    return tmp
++
++def upload_file(local_path, dest_key):
++    s3.upload_file(local_path, EVIDENCE_BUCKET, dest_key)
++    return f"s3://{EVIDENCE_BUCKET}/{dest_key}"
++
++def process_media_key(key):
++    print("Processing", key)
++    local = download_key(key)
++    meta = probe_media(local)
++    base = Path(key).stem
++    timestamp = int(time.time())
++    manifest = {"source_key": key, "processed_at": timestamp, "meta": meta, "artifacts": []}
++
++    # Image path: generate thumbnail and run image embedder
++    if meta.get("type") == "image":
++        thumb = make_thumbnail(local, size=(512,512))
++        thumb_key = f"{PROCESSED_PREFIX}{base}/thumbnail_{timestamp}.jpg"
++        upload_file(thumb, thumb_key)
++        manifest["artifacts"].append({"type":"thumbnail","s3":thumb_key})
++        # call embed + upsert (image)
++        embed_and_upsert_multimodal(local_path=local, source_key=key, meta=meta)
++
++    # Audio: chunk and extract embeddings per chunk (Whisper/Audio embedder)
++    elif meta.get("type") == "audio":
++        chunks = chunk_audio(local, chunk_length_s=30, overlap_s=5)
++        for i,cpath in enumerate(chunks):
++            keyout = f"{PROCESSED_PREFIX}{base}/audio_chunk_{i}_{timestamp}.wav"
++            upload_file(cpath, keyout)
++            manifest["artifacts"].append({"type":"audio_chunk","index":i,"s3":keyout})
++            embed_and_upsert_multimodal(local_path=cpath, source_key=key, meta={**meta,"chunk_index":i})
++
++    # Video: extract frames, thumbnail, chunk, index by timestamp
++    elif meta.get("type") == "video":
++        frames = chunk_video_frames(local, fps=1)  # keyframes per second by default
++        for i, frame in enumerate(frames):
++            frame_key = f"{PROCESSED_PREFIX}{base}/frame_{i}_{timestamp}.jpg"
++            upload_file(frame, frame_key)
++            manifest["artifacts"].append({"type":"frame","index":i,"s3":frame_key})
++            embed_and_upsert_multimodal(local_path=frame, source_key=key, meta={**meta,"frame_index":i})
++
++    # write manifest to s3
++    manifest_key = f"{PROCESSED_PREFIX}{base}/manifest_{timestamp}.json"
++    s3.put_object(Bucket=EVIDENCE_BUCKET, Key=manifest_key, Body=json.dumps(manifest).encode())
++    print("Wrote manifest", manifest_key)
++    return manifest_key
++
++def main():
++    for key in list_media():
++        try:
++            process_media_key(key)
++        except Exception as e:
++            print("Failed processing", key, e)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:multimodal/ingest/chunkers.py
++#!/usr/bin/env python3
++"""
++Helpers to chunk audio and video.
++ - chunk_audio: split audio into overlapping chunks (wav)
++ - chunk_video_frames: extract frames at desired fps (return local file paths)
++"""
++import os, tempfile, subprocess
++from pathlib import Path
++
++def chunk_audio(path, chunk_length_s=30, overlap_s=5):
++    """
++    Use ffmpeg to split audio into chunks with overlap.
++    Returns list of local file paths.
++    """
++    out = []
++    duration_cmd = ["ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1", path]
++    duration = float(subprocess.check_output(duration_cmd).decode().strip())
++    step = chunk_length_s - overlap_s
++    start = 0.0
++    idx = 0
++    while start < duration:
++        out_path = tempfile.mktemp(suffix=".wav")
++        cmd = ["ffmpeg","-y","-ss",str(start),"-t",str(chunk_length_s),"-i",path,"-ar","16000","-ac","1","-f","wav",out_path]
++        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++        out.append(out_path)
++        idx += 1
++        start += step
++    return out
++
++def chunk_video_frames(path, fps=1):
++    """
++    Extract frames using ffmpeg at a given fps. Returns list of image file paths.
++    """
++    tmpdir = tempfile.mkdtemp()
++    out_pattern = os.path.join(tmpdir, "frame_%06d.jpg")
++    cmd = ["ffmpeg","-y","-i",path,"-vf",f"fps={fps}", out_pattern]
++    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++    files = sorted([str(p) for p in Path(tmpdir).glob("frame_*.jpg")])
++    return files
++
+*** End Patch
+*** Begin Patch
+*** Add File:multimodal/ingest/utils.py
++#!/usr/bin/env python3
++"""
++Utility functions for media ingestion: probing metadata and thumbnails.
++"""
++import subprocess, json, tempfile
++from PIL import Image
++
++def probe_media(path):
++    """
++    Return a dict with type: image|audio|video and metadata (width,height,duration,fps,mime)
++    """
++    try:
++        out = subprocess.check_output(["ffprobe","-v","quiet","-print_format","json","-show_format","-show_streams", path])
++        j = json.loads(out)
++        fmt = j.get("format",{})
++        streams = j.get("streams",[])
++        meta = {"mime": fmt.get("format_name")}
++        for s in streams:
++            if s.get("codec_type") == "video":
++                meta.update({"type":"video","width": s.get("width"), "height": s.get("height"), "fps": eval(s.get("avg_frame_rate","0/1"))})
++                break
++            if s.get("codec_type") == "audio":
++                meta.update({"type":"audio","duration": float(fmt.get("duration",0.0))})
++        if not meta.get("type"):
++            # assume image
++            with Image.open(path) as im:
++                meta.update({"type":"image","width": im.width, "height": im.height})
++        return meta
++    except Exception:
++        return {"type":"unknown"}
++
++def make_thumbnail(path, size=(256,256)):
++    from PIL import Image
++    img = Image.open(path)
++    img.thumbnail(size)
++    tmp = tempfile.mktemp(suffix=".jpg")
++    img.save(tmp, format="JPEG", quality=85)
++    return tmp
++
+*** End Patch
+*** Begin Patch
+*** Add File:embeddings/multimodal/embed_multimodal.py
++#!/usr/bin/env python3
++"""
++Multimodal embedding extraction:
++ - CLIP (vision+text) using transformers / OpenAI CLIP model as fallback
++ - Whisper for audio -> text embeddings or use an audio encoder
++ - Batch inference helper with GPU batching
++ - Upserts to Milvus via existing embed_and_upsert pattern (reuses embeddings.ingest.embed_and_upsert)
++"""
++import os, time
++from typing import List
++import numpy as np
++
++try:
++    from transformers import CLIPProcessor, CLIPModel
++    HF_CLIP_AVAILABLE = True
++except Exception:
++    HF_CLIP_AVAILABLE = False
++
++try:
++    import openai
++    OPENAI_AVAILABLE = True
++except Exception:
++    OPENAI_AVAILABLE = False
++
++from embeddings.ingest.embed_and_upsert import upsert_milvus  # reuse earlier helper
++
++BATCH_SIZE = int(os.environ.get("EMBED_BATCH", "16"))
++
++def embed_images_clip(paths: List[str], model_name: str = "openai/clip-vit-base-patch32"):
++    """
++    Return list of vectors for images.
++    """
++    if HF_CLIP_AVAILABLE:
++        processor = CLIPProcessor.from_pretrained(model_name)
++        model = CLIPModel.from_pretrained(model_name).to("cuda" if os.environ.get("USE_CUDA","1")=="1" else "cpu")
++        images = [processor(images=path, return_tensors="pt") for path in paths]
++        # Simple batching (user should optimize)
++        vectors = []
++        for img in images:
++            inputs = processor(images=img, return_tensors="pt")
++            with torch.no_grad():
++                out = model.get_image_features(**inputs)
++            vectors.append(out.cpu().numpy().reshape(-1).tolist())
++        return vectors
++    elif OPENAI_AVAILABLE:
++        # openai image embeddings API (if available)
++        res = []
++        for p in paths:
++            emb = openai.Image.create_embeddings(image=open(p, "rb"))
++            res.append(emb["data"][0]["embedding"])
++        return res
++    else:
++        raise RuntimeError("No CLIP backend available")
++
++def embed_texts(texts: List[str], model_name: str = "all-MiniLM-L6-v2"):
++    # fallback to sentence-transformers for text
++    from sentence_transformers import SentenceTransformer
++    model = SentenceTransformer(model_name, device="cuda" if os.environ.get("USE_CUDA","1")=="1" else "cpu")
++    vecs = model.encode(texts, batch_size=BATCH_SIZE, show_progress_bar=False)
++    return [v.tolist() for v in vecs]
++
++def embed_audio_whisper_transcribe(path: str):
++    """
++    Use Whisper to transcribe; then embed the resulting text via text embedder.
++    For heavy audio embedding, replace with an audio encoder.
++    """
++    try:
++        import whisper
++        model = whisper.load_model("small").to("cuda" if os.environ.get("USE_CUDA","1")=="1" else "cpu")
++        res = model.transcribe(path)
++        text = res["text"]
++        vec = embed_texts([text])[0]
++        return vec, text
++    except Exception as e:
++        raise
++
++def embed_and_upsert_multimodal(local_path: str, source_key: str, meta: dict):
++    """
++    Dispatch based on modality in meta and upsert to Milvus.
++    """
++    modality = meta.get("type","image")
++    if modality == "image":
++        vecs = embed_images_clip([local_path])
++        upsert_milvus([source_key], vecs, [meta])
++    elif modality == "audio":
++        vec, text = embed_audio_whisper_transcribe(local_path)
++        upsert_milvus([source_key], [vec], [{"transcript": text, **meta}])
++    elif modality == "video":
++        # callers send frames individually; treat as images
++        vecs = embed_images_clip([local_path])
++        upsert_milvus([source_key], vecs, [meta])
++    else:
++        # fallback: text embedding if available
++        vecs = embed_texts([meta.get("text","")])
++        upsert_milvus([source_key], vecs, [meta])
++
+*** End Patch
+*** Begin Patch
+*** Add File:embeddings/milvus/multimodal_collection.py
++#!/usr/bin/env python3
++"""
++Milvus collection helper for multimodal data.
++ - Creates a collection with fields:
++     id (varchar primary), modality (varchar), embedding (float_vector), dim (int), mime, timestamp, source, bbox (optional JSON)
++ - Index creation for HNSW and IVF+PQ strategies
++ - Versioned manifest stored in S3 when changes occur
++"""
++import os, json
++from pymilvus import connections, FieldSchema, CollectionSchema, DataType, Collection, utility
++import boto3
++
++MILVUS_HOST = os.environ.get("MILVUS_HOST", "milvus.milvus.svc.cluster.local")
++MILVUS_PORT = os.environ.get("MILVUS_PORT", "19530")
++COLLECTION_NAME = os.environ.get("MULTI_COLLECTION", "aegis_multimodal")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "REPLACE_WITH_EVIDENCE_BUCKET")
++AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
++
++connections.connect(host=MILVUS_HOST, port=str(MILVUS_PORT))
++s3 = boto3.client("s3", region_name=AWS_REGION)
++
++def create_collection(dim=512):
++    if utility.has_collection(COLLECTION_NAME):
++        print("Collection exists")
++        return Collection(COLLECTION_NAME)
++    fields = [
++        FieldSchema(name="id", dtype=DataType.VARCHAR, is_primary=True, max_length=128),
++        FieldSchema(name="modality", dtype=DataType.VARCHAR, max_length=32),
++        FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=dim),
++        FieldSchema(name="mime", dtype=DataType.VARCHAR, max_length=64),
++        FieldSchema(name="ts", dtype=DataType.INT64),
++        FieldSchema(name="source", dtype=DataType.VARCHAR, max_length=1024),
++        FieldSchema(name="meta", dtype=DataType.VARCHAR, max_length=2048)
++    ]
++    schema = CollectionSchema(fields, description="Multimodal collection")
++    coll = Collection(name=COLLECTION_NAME, schema=schema)
++    return coll
++
++def create_index(index_type="HNSW", dim=512, m=16, efConstruction=200):
++    coll = Collection(COLLECTION_NAME)
++    index_params = None
++    if index_type == "HNSW":
++        index_params = {"index_type":"HNSW","metric_type":"L2","params":{"M":m,"efConstruction":efConstruction}}
++    elif index_type == "IVF_PQ":
++        index_params = {"index_type":"IVF_PQ","metric_type":"L2","params":{"nlist":1024,"m":16,"nbits":8}}
++    coll.create_index(field_name="embedding", index_params=index_params)
++    coll.load()
++    # write manifest to S3
++    manifest = {"collection": COLLECTION_NAME, "index_type": index_type, "params": index_params, "ts": int(time.time())}
++    s3.put_object(Bucket=EVIDENCE_BUCKET, Key=f"milvus/{COLLECTION_NAME}/index_manifest_{int(time.time())}.json", Body=json.dumps(manifest).encode())
++    return manifest
++
+*** End Patch
+*** Begin Patch
+*** Add File:embeddings/milvus/index_maintenance.py
++#!/usr/bin/env python3
++"""
++Index maintenance tasks:
++ - Compact / optimize index (best-effort)
++ - Backup index metadata and optionally export collection snapshot to S3
++ - Run periodic versioning manifest updates
++"""
++import os, json, time
++from pymilvus import utility, connections
++import boto3
++
++MILVUS_HOST = os.environ.get("MILVUS_HOST", "milvus.milvus.svc.cluster.local")
++MILVUS_PORT = os.environ.get("MILVUS_PORT", "19530")
++COLLECTION_NAME = os.environ.get("MULTI_COLLECTION", "aegis_multimodal")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "REPLACE_WITH_EVIDENCE_BUCKET")
++AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
++
++connections.connect(host=MILVUS_HOST, port=str(MILVUS_PORT))
++s3 = boto3.client("s3", region_name=AWS_REGION)
++
++def compact_collection():
++    try:
++        utility.compact(COLLECTION_NAME)
++        # Wait or poll compact progress in production
++        manifest = {"action":"compact","collection":COLLECTION_NAME,"ts":int(time.time())}
++        s3.put_object(Bucket=EVIDENCE_BUCKET, Key=f"milvus/{COLLECTION_NAME}/maintenance_{int(time.time())}.json", Body=json.dumps(manifest).encode())
++        return True
++    except Exception as e:
++        print("Compact failed", e)
++        return False
++
++def snapshot_manifest():
++    # Record current collection stats and save manifest
++    stats = utility.command("{" + f'"collections":["{COLLECTION_NAME}"]' + "}")
++    key = f"milvus/{COLLECTION_NAME}/snapshot_{int(time.time())}.json"
++    s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(stats).encode())
++    return key
++
+*** End Patch
+*** Begin Patch
+*** Add File:rag/multimodal_rag_service.py
++#!/usr/bin/env python3
++"""
++Multimodal RAG FastAPI service:
++ - Accepts queries with optional image (url or base64)
++ - Embeds both modalities, searches Milvus for mixed candidates
++ - Reranks candidates with a simple fusion (score-weighted) and constructs a multimodal prompt
++ - Calls an LLM (OpenAI/HF) and returns answer along with cited image/frame references
++"""
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++import os, json
++from embeddings.multimodal.embed_multimodal import embed_images_clip, embed_texts
++from pymilvus import connections, Collection
++from llm.connectors.openai_wrapper import chat_completion
++import numpy as np
++
++MILVUS_HOST = os.environ.get("MILVUS_HOST", "milvus.milvus.svc.cluster.local")
++MILVUS_PORT = os.environ.get("MILVUS_PORT", "19530")
++COLLECTION = os.environ.get("MULTI_COLLECTION", "aegis_multimodal")
++LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai")
++
++connections.connect(host=MILVUS_HOST, port=str(MILVUS_PORT))
++coll = Collection(COLLECTION)
++
++app = FastAPI()
++
++class Query(BaseModel):
++    q: str
++    image_url: str = None
++    top_k_text: int = 5
++    top_k_image: int = 5
++
++def search_vectors(vec, top_k=5):
++    res = coll.search([vec], "embedding", params={"metric_type":"L2"}, limit=top_k)
++    docs = []
++    for hits in res:
++        for h in hits:
++            meta = json.loads(h.entity.get("meta"))
++            docs.append({"id": h.entity.get("id"), "score": float(h.distance), "meta": meta})
++    return docs
++
++def fuse_candidates(text_docs, image_docs, alpha=0.5):
++    """
++    Naive fusion: normalize scores and combine top candidates. alpha weights text vs image.
++    """
++    combined = []
++    for d in text_docs:
++        combined.append({"source":"text","score":d["score"],"meta":d["meta"]})
++    for d in image_docs:
++        combined.append({"source":"image","score":d["score"],"meta":d["meta"]})
++    # lower score better; transform to similarity
++    scores = np.array([1.0/(1.0+s["score"]) for s in combined])
++    norm = scores / scores.sum()
++    for i,s in enumerate(combined):
++        s["combined_score"] = float(norm[i])
++    combined_sorted = sorted(combined, key=lambda x: -x["combined_score"])
++    return combined_sorted[:10]
++
++@app.post("/query")
++def query(payload: Query):
++    text_vec = embed_texts([payload.q])[0]
++    text_docs = search_vectors(text_vec, top_k=payload.top_k_text)
++    image_docs = []
++    if payload.image_url:
++        # download & embed image (lightweight approach)
++        try:
++            # accept remote URL and temporary download
++            import requests, tempfile
++            r = requests.get(payload.image_url, timeout=5)
++            tmp = tempfile.mktemp(suffix=".jpg")
++            open(tmp,"wb").write(r.content)
++            image_vec = embed_images_clip([tmp])[0]
++            image_docs = search_vectors(image_vec, top_k=payload.top_k_image)
++        except Exception as e:
++            raise HTTPException(status_code=400, detail="image embed failed")
++    fused = fuse_candidates(text_docs, image_docs)
++    # build context: include text snippets + image references (S3 keys) as grounding
++    context_parts = []
++    for c in fused:
++        m = c["meta"]
++        if c["source"] == "text":
++            context_parts.append(m.get("text",""))
++        else:
++            context_parts.append(f"[image: {m.get('source')}]")
++    prompt = f"Answer from the following context (include citations):\n\n{chr(10).join(context_parts)}\n\nQuestion: {payload.q}"
++    if LLM_PROVIDER == "openai":
++        ans, tokens, cost = chat_completion([{"role":"user","content":prompt}])
++    else:
++        from transformers import pipeline
++        p = pipeline("text-generation", model=os.environ.get("HF_MODEL","gpt2"))
++        ans = p(prompt, max_length=512)[0]["generated_text"]
++        tokens = 0; cost = 0.0
++    return {"answer": ans, "candidates": fused, "tokens": tokens, "cost": cost}
++
+*** End Patch
+*** Begin Patch
+*** Add File:training/multimodal_finetune_blip.py
++#!/usr/bin/env python3
++"""
++Multimodal finetune example using a BLIP-like vision-language model with PEFT/LoRA support.
++ - Dataset loader expects JSONL lines: {"image_s3":"s3://...","caption":"..."}
++ - Downloads images into local cache, builds dataset, and trains using Accelerate/Deepspeed
++ - Logs to MLflow and signs checkpoints with cosign (best-effort)
++"""
++import os, json, tempfile, time, subprocess
++from datasets import Dataset
++from PIL import Image
++from io import BytesIO
++import boto3
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "REPLACE_WITH_EVIDENCE_BUCKET")
++AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
++MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "")
++COSIGN_KMS = os.environ.get("COSIGN_KMS_KEY_ARN", "")
++
++s3 = boto3.client("s3", region_name=AWS_REGION)
++
++def download_s3(s3uri, dest):
++    # s3://bucket/key
++    assert s3uri.startswith("s3://")
++    parts = s3uri[5:].split("/",1)
++    bucket = parts[0]; key = parts[1]
++    s3.download_file(bucket, key, dest)
++    return dest
++
++def build_dataset(jsonl_path):
++    rows = []
++    with open(jsonl_path) as f:
++        for l in f:
++            rows.append(json.loads(l))
++    return Dataset.from_list(rows)
++
++def image_loader(example):
++    img_s3 = example["image_s3"]
++    tmp = tempfile.mktemp(suffix=".jpg")
++    download_s3(img_s3, tmp)
++    # basic validation/resizing done in collator
++    example["image_local"] = tmp
++    return example
++
++def main():
++    import argparse
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--jsonl", required=True)
++    args = parser.parse_args()
++    ds = build_dataset(args.jsonl)
++    ds = ds.map(image_loader)
++    # training script uses existing BLIP-style collator & model; here we call an external training launcher
++    # For brevity, delegate to a shell script that invokes accelerate/deepspeed with a prepared training recipe
++    subprocess.check_call(["/bin/sh","-c","accelerate launch train_blip_recipe.py"])
++    # On completion, optionally tar artifacts and sign
++    ckpt = "outputs/checkpoint"
++    if os.path.exists(ckpt):
++        tar = f"{ckpt}.tar.gz"
++        subprocess.check_call(["tar","-czf", tar, "-C", "outputs", "checkpoint"])
++        if COSIGN_KMS:
++            try:
++                subprocess.check_call(["cosign","sign","--key",f"awskms://{COSIGN_KMS}", tar])
++            except Exception as e:
++                print("cosign sign failed", e)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:serving/triton/multimodal_kserve_inference.yaml
++apiVersion: "serving.kserve.io/v1beta1"
++kind: "InferenceService"
++metadata:
++  name: "aegis-multimodal"
++  namespace: "aegis"
++spec:
++  predictor:
++    custom:
++      container:
++        image: "ghcr.io/yourorg/aegis-multimodal-server:latest"
++        args: ["--model-repo=/models","--preprocess=/opt/preproc.py","--postprocess=/opt/postproc.py"]
++        resources:
++          limits:
++            nvidia.com/gpu: 1
++            cpu: "4"
++            memory: "16Gi"
++
++---
++# Note: the custom server should accept image bytes + text and return embeddings or final outputs.
++
+*** End Patch
+*** Begin Patch
+*** Add File:serving/session/session_store_image_text.py
++#!/usr/bin/env python3
++"""
++Session store for multimodal chat: holds image references + text context per session.
++ - Uses Redis for session state and S3 for persisted artifacts
++ - Sessions include: list of image_s3 refs, text history, timestamps
++"""
++import os, json, time
++try:
++    import redis
++except Exception:
++    redis = None
++
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
++
++class MultiModalSessionStore:
++    def __init__(self):
++        self.r = redis.from_url(REDIS_URL) if redis else None
++
++    def create(self, session_id, meta=None):
++        key = f"mm:session:{session_id}"
++        obj = {"images": [], "history": [], "meta": meta or {}, "created": int(time.time())}
++        if self.r:
++            self.r.set(key, json.dumps(obj))
++        return obj
++
++    def add_image(self, session_id, s3_path):
++        key = f"mm:session:{session_id}"
++        raw = self.r.get(key)
++        if not raw:
++            obj = self.create(session_id)
++        else:
++            obj = json.loads(raw)
++        obj["images"].append({"s3": s3_path, "ts": int(time.time())})
++        self.r.set(key, json.dumps(obj))
++
++    def append_text(self, session_id, text, role="user"):
++        key = f"mm:session:{session_id}"
++        raw = self.r.get(key)
++        obj = json.loads(raw) if raw else self.create(session_id)
++        obj["history"].append({"role": role, "text": text, "ts": int(time.time())})
++        self.r.set(key, json.dumps(obj))
++
++    def get(self, session_id):
++        key = f"mm:session:{session_id}"
++        raw = self.r.get(key)
++        return json.loads(raw) if raw else None
++
+*** End Patch
+*** Begin Patch
+*** Add File:eval/multimodal_metrics.py
++#!/usr/bin/env python3
++"""
++Multimodal evaluation metrics:
++ - Recall@K for retrieval
++ - BLEU / CIDEr placeholders for captioning
++ - IoU computation helper for bounding boxes
++ - WER (Word Error Rate) for audio transcription
++"""
++import numpy as np
++from sklearn.metrics import precision_recall_fscore_support
++import math
++
++def recall_at_k(pred_lists, gold_sets, k=10):
++    """
++    pred_lists: list of lists of candidate ids
++    gold_sets: list of sets of ground truth ids
++    """
++    hits = 0
++    for preds, gold in zip(pred_lists, gold_sets):
++        topk = set(preds[:k])
++        if len(gold & topk) > 0:
++            hits += 1
++    return hits / len(pred_lists)
++
++def iou(boxA, boxB):
++    # boxes are [x1,y1,x2,y2]
++    xA = max(boxA[0], boxB[0])
++    yA = max(boxA[1], boxB[1])
++    xB = min(boxA[2], boxB[2])
++    yB = min(boxA[3], boxB[3])
++    interArea = max(0, xB - xA) * max(0, yB - yA)
++    boxAArea = (boxA[2]-boxA[0])*(boxA[3]-boxA[1])
++    boxBArea = (boxB[2]-boxB[0])*(boxB[3]-boxB[1])
++    iou = interArea / float(boxAArea + boxBArea - interArea + 1e-12)
++    return iou
++
++def wer(ref, hyp):
++    r = ref.split()
++    h = hyp.split()
++    # simple DP
++    d = [[0]*(len(h)+1) for _ in range(len(r)+1)]
++    for i in range(len(r)+1):
++        d[i][0] = i
++    for j in range(len(h)+1):
++        d[0][j] = j
++    for i in range(1,len(r)+1):
++        for j in range(1,len(h)+1):
++            if r[i-1]==h[j-1]:
++                d[i][j]=d[i-1][j-1]
++            else:
++                d[i][j]=1+min(d[i-1][j], d[i][j-1], d[i-1][j-1])
++    return d[len(r)][len(h)]/float(len(r))
++
+*** End Patch
+*** Begin Patch
+*** Add File:safety/image_privacy.py
++#!/usr/bin/env python3
++"""
++Safety & privacy utilities for images:
++ - NSFW detection (placeholder integration)
++ - Face detection & redaction (OpenCV)
++ - Image hashing for provenance
++"""
++import cv2
++import hashlib
++from PIL import Image
++import numpy as np
++import tempfile
++
++def image_hash(path):
++    h = hashlib.sha256(open(path,"rb").read()).hexdigest()
++    return h
++
++def detect_faces_and_redact(path, out_path=None):
++    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
++    img = cv2.imread(path)
++    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
++    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
++    for (x,y,w,h) in faces:
++        cv2.rectangle(img,(x,y),(x+w,y+h),(0,0,0),-1)  # blackout
++    out_path = out_path or tempfile.mktemp(suffix=".jpg")
++    cv2.imwrite(out_path, img)
++    return out_path, len(faces)
++
++def nsfw_check_placeholder(path):
++    # Placeholder: integrate with a real NSFW model (e.g., Yahoo Open NSFW or CLIP-based classifier)
++    return {"nsfw_score": 0.01, "is_nsfw": False}
++
+*** End Patch
+*** Begin Patch
+*** Add File:labeling/labelstudio_sync.py
++#!/usr/bin/env python3
++"""
++Lightweight Label Studio integration:
++ - Poll Label Studio project exports (or webhook) and ingest annotations
++ - Convert annotations to manifest and upsert embeddings for newly labeled items
++ - Example usage: run periodically or as a webhook receiver
++"""
++import os, requests, json, tempfile
++from urllib.parse import urljoin
++from embeddings.multimodal.embed_multimodal import embed_and_upsert_multimodal
++
++LABEL_STUDIO_URL = os.environ.get("LABEL_STUDIO_URL", "http://labelstudio:8080")
++LABEL_STUDIO_API_KEY = os.environ.get("LABEL_STUDIO_API_KEY", "")
++PROJECT_ID = os.environ.get("LABEL_PROJECT_ID", "1")
++
++def fetch_annotations(project_id=PROJECT_ID):
++    headers = {"Authorization": f"Token {LABEL_STUDIO_API_KEY}"}
++    url = urljoin(LABEL_STUDIO_URL, f"/api/projects/{project_id}/export")
++    r = requests.get(url, headers=headers, timeout=10)
++    r.raise_for_status()
++    return r.json()
++
++def ingest_annotations():
++    ann = fetch_annotations()
++    for a in ann:
++        # minimal: find image_url and annotation text
++        image_url = a.get("data",{}).get("image")
++        labels = a.get("annotations",[])
++        # download image locally (labelstudio may return direct URL)
++        # delegate to embed_and_upsert_multimodal for embedding
++        # for brevity, assume image_url is accessible locally
++        embed_and_upsert_multimodal(local_path=image_url, source_key=f"labelstudio/{a.get('id')}", meta={"labels": labels})
++
++if __name__ == "__main__":
++    ingest_annotations()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/multimodal_profiling.md
++# Multimodal GPU & Serving Profiling Guide (operational notes)
++
++This short guidance outlines steps to profile and tune multimodal embedding & serving pipelines.
++
++1) Batch sizing for embedding extraction (CLIP / image encoders)
++ - Start with per-GPU batch sizes until GPU memory approaches ~80% utilization.
++ - Use mixed precision (fp16) to roughly double effective batch sizes.
++ - Example with PyTorch:
++   - CUDA_VISIBLE_DEVICES=0 python -c "import torch; print(torch.cuda.get_device_properties(0))"
++   - Use torch.cuda.memory_reserved() during dry-run to observe peak usage.
++
++2) Throughput tuning
++ - Profile with pv (payload volume) and concurrency.
++ - Measure embedding latency per item and compute effective throughput = batch_size / latency.
++ - Tune batch_size to maximize throughput while keeping p95 latency under SLO.
++
++3) Mixed precision & tensor parallelism
++ - Enable AMP (autocast) in training/inference.
++ - For large models, use model parallelism libraries (Deepspeed ZeRO stage 3 + tensor parallel frameworks).
++
++4) Triton / KServe serving optimizations
++ - Use Triton model repository with multiple model instances and set dynamic batching parameters.
++ - Provide model config (max_batch_size, preferred_batch_size) and optimize CUDA memory usage per instance.
++
++5) Monitoring & profiling tools
++ - NVIDIA Nsight Systems / dcgm-exporter for GPU metrics.
++ - Use Prometheus exporters for latency, batch size, GPU memory utilization and token counts.
++ - Collect perf traces during load testing and iterate.
++
++6) Cost estimation
++ - Capture GPU hours and token counts per request; compute per-tenant cost with COST accounting primitives in Aegis.
++ - Use sample runs to extrapolate full-scale costs.
++
+*** End Patch
+*** End Patch

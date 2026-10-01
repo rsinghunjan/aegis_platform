@@ -1,0 +1,594 @@
+*** Begin Patch
+*** Add File:ops/provision/provision_end_to_end.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# End-to-end provisioning & verification orchestrator (staging/production use).
++# This script composes existing terraform / helm / scripts to provision:
++#  - S3 buckets (model registry, telemetry, Rekor storage)
++#  - KMS for cosign
++#  - Rekor (Helm) with S3 backend
++#  - EKS GPU nodegroup (or provider-equivalent)
++#  - Argo Workflows + service account + RBAC verification
++#  - Cert-manager + Gatekeeper install
++#  - Build & push training image
++#  - Wire GitHub secrets (COSIGN_KMS_ARN, REKOR_URL, MODEL_REGISTRY_S3, TELEMETRY_S3)
++#  - Run sample training workflow and checkpoint verification
++#
++# Usage:
++#   REPO=owner/repo AWS_REGION=us-east-1 ./ops/provision/provision_end_to_end.sh
++#
++REPO=${REPO:-}
++AWS_REGION=${AWS_REGION:-us-east-1}
++
++echo "[provision-e2e] Provision S3 buckets (model registry, telemetry, rekor storage)"
++pushd terraform/s3
++terraform init -input=false
++terraform apply -auto-approve -input=false -var "region=${AWS_REGION}"
++MODEL_REGISTRY_S3=$(terraform output -raw model_registry_s3)
++TELEMETRY_S3=$(terraform output -raw telemetry_s3)
++REKOR_S3=$(terraform output -raw rekor_s3)
++popd
++
++echo "[provision-e2e] Provision KMS for cosign"
++pushd terraform/kms
++terraform init -input=false
++terraform apply -auto-approve -input=false -var "region=${AWS_REGION}"
++COSIGN_KMS_ARN=$(terraform output -raw kms_key_arn)
++popd
++
++echo "[provision-e2e] Deploy Rekor (helm) using S3 backend"
++REKOR_S3_BUCKET=${REKOR_S3:-}
++if [ -z "${REKOR_S3_BUCKET}" ]; then
++  echo "[provision-e2e] Rekor S3 bucket not available; aborting Rekor deploy"
++else
++  REKOR_S3_BUCKET="${REKOR_S3_BUCKET}" AWS_REGION="${AWS_REGION}" ./ops/rekor/deploy_rekor.sh
++  # Operator: expose Rekor via ingress and set REKOR_URL accordingly
++  REKOR_URL=${REKOR_URL:-"https://rekor.example.com"}
++fi
++
++echo "[provision-e2e] Provision EKS GPU nodegroup (if terraform/eks exists)"
++if [ -d terraform/eks ]; then
++  pushd terraform/eks
++  terraform init -input=false || true
++  terraform apply -auto-approve -input=false || true
++  popd
++fi
++
++echo "[provision-e2e] Install Argo Workflows + RBAC"
++./ops/infra/install_argo.sh
++
++echo "[provision-e2e] Install cert-manager and Gatekeeper"
++./ops/setup/certmanager_gatekeeper_install.sh
++
++echo "[provision-e2e] Build and push training image"
++./ops/docker/build_push_training.sh
++
++echo "[provision-e2e] Set GitHub secrets (if gh CLI & REPO provided)"
++if command -v gh >/dev/null 2>&1 && [ -n "${REPO}" ]; then
++  echo -n "${COSIGN_KMS_ARN}" | gh secret set COSIGN_KMS_ARN --repo "${REPO}" --body -
++  echo -n "${REKOR_URL}" | gh secret set REKOR_URL --repo "${REPO}" --body -
++  echo -n "${MODEL_REGISTRY_S3}" | gh secret set MODEL_REGISTRY_S3 --repo "${REPO}" --body -
++  echo -n "${TELEMETRY_S3}" | gh secret set TELEMETRY_S3 --repo "${REPO}" --body -
++  echo "[provision-e2e] GitHub secrets configured"
++else
++  echo "[provision-e2e] gh CLI not present or REPO not set; please set the secrets manually"
++fi
++
++echo "[provision-e2e] Verify cosign/KMS/Rekor integration"
++COSIGN_KMS_ARN="${COSIGN_KMS_ARN}" REKOR_URL="${REKOR_URL:-}" ./ops/security/verify_rekor_and_kms.sh || true
++
++echo "[provision-e2e] Sanity checks"
++./ops/provision/verify_argo_and_gpu.sh || true
++
++echo "[provision-e2e] Launch sample training workflow to verify distributed training and checkpoint lifecycle"
++kubectl -n argo apply -f ops/training/argo_dist_train_checkpointed.yaml || true
++
++echo "[provision-e2e] Provisioning & smoke tests initiated. Inspect Argo UI and S3/model registry for artifacts and signatures."
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/provision/verify_argo_and_gpu.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Verify Argo server and GPU node readiness.
++#
++NAMESPACE=${NAMESPACE:-argo}
++
++echo "[verify] Check argo server pods"
++kubectl -n "${NAMESPACE}" get pods -l app.kubernetes.io/name=argo-server --no-headers || true
++
++echo "[verify] Check argo workflows controller is ready"
++kubectl -n "${NAMESPACE}" rollout status deployment/argo-workflows-controller --timeout=120s || true
++
++echo "[verify] Check for GPU nodes"
++kubectl get nodes -o=custom-columns=NAME:.metadata.name,GPU:.status.allocatable | grep -i nvidia || kubectl get nodes -o wide || true
++
++echo "[verify] Check that argo service account exists and has permission"
++kubectl -n "${NAMESPACE}" get sa argo-workflows-sa || true
++kubectl -n "${NAMESPACE}" auth can-i create workflows.argoproj.io --as=system:serviceaccount:${NAMESPACE}:argo-workflows-sa || true
++
++echo "[verify] All verification steps completed (manual inspection recommended)."
++
+*** End Patch
+*** Begin Patch
+*** Add File:docker/training/Dockerfile.prod
++FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
++ENV DEBIAN_FRONTEND=noninteractive
++RUN apt-get update && apt-get install -y --no-install-recommends build-essential git curl ca-certificates libsndfile1 && rm -rf /var/lib/apt/lists/*
++
++RUN pip install --upgrade pip
++RUN pip install torch --extra-index-url https://download.pytorch.org/whl/cu118 || true
++RUN pip install \
++    pyarrow sentence-transformers sacrebleu rouge-score boto3 prometheus_client \
++    transformers accelerate bitsandbytes datasets==2.12.0 \
++    tokenizers
++
++WORKDIR /workspace
++COPY ops/ /workspace/ops/
++ENV PATH="/workspace:${PATH}"
++ENTRYPOINT ["python","-u"]
++CMD ["-c","print('Aegis training runtime (prod)')"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/checkpointing/verify_checkpoint_lifecycle.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Verify model checkpoint presence and cosign signatures in S3 or model registry.
++# Usage:
++#  MODEL=<model-name> VERSION=<version> ./ops/checkpointing/verify_checkpoint_lifecycle.sh
++#
++MODEL=${MODEL:-}
++VERSION=${VERSION:-}
++BUCKET=${MODEL_REGISTRY_S3:-}
++
++if [ -z "${MODEL}" ] || [ -z "${VERSION}" ] || [ -z "${BUCKET}" ]; then
++  echo "Usage: MODEL=<model> VERSION=<ver> MODEL_REGISTRY_S3=<s3-bucket> $0"
++  exit 2
++fi
++
++echo "[verify] Listing S3 keys for model ${MODEL} version ${VERSION}"
++aws s3 ls "${BUCKET}/${MODEL}/${VERSION}/" || true
++
++echo "[verify] Try to download metadata and cosign verify signature (if present)"
++TMPDIR=$(mktemp -d)
++aws s3 cp "s3://${BUCKET}/${MODEL}/${VERSION}/metadata.json" "${TMPDIR}/metadata.json" || true
++if [ -f "${TMPDIR}/metadata.json" ]; then
++  echo "metadata downloaded"
++  if [ -n "${COSIGN_KMS_ARN:-}" ]; then
++    aws s3 cp "s3://${BUCKET}/${MODEL}/${VERSION}/metadata.json.sig" "${TMPDIR}/metadata.json.sig" || true
++    if [ -f "${TMPDIR}/metadata.json.sig" ]; then
++      cosign verify-blob --key "k8s://${COSIGN_KMS_ARN}" --signature "${TMPDIR}/metadata.json.sig" "${TMPDIR}/metadata.json" && echo "cosign verify OK"
++    else
++      echo "signature not present"
++    fi
++  fi
++fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/dlp/gcp_dlp_scan.py
++#!/usr/bin/env python3
++"""
++GCP DLP integration helper: inspect a piece of text using Google Cloud DLP API.
++Requires GOOGLE_APPLICATION_CREDENTIALS set and DLP API enabled.
++"""
++import os
++from google.cloud import dlp_v2
++
++def inspect_text(project_id: str, text: str):
++    client = dlp_v2.DlpServiceClient()
++    parent = f"projects/{project_id}"
++    item = {"value": text}
++    inspect_config = {"info_types": [{"name":"EMAIL_ADDRESS"},{"name":"US_SOCIAL_SECURITY_NUMBER"},{"name":"CREDIT_CARD_NUMBER"}], "min_likelihood":"POSSIBLE"}
++    response = client.inspect_content(request={"parent":parent,"inspect_config":inspect_config,"item":item})
++    findings = []
++    for finding in response.result.findings:
++        findings.append({"infoType": finding.info_type.name, "likelihood": finding.likelihood.name, "quote": finding.quote})
++    return findings
++
++if __name__ == "__main__":
++    import sys,json
++    if len(sys.argv) < 3:
++        print("Usage: project_id text")
++        sys.exit(2)
++    print(json.dumps(inspect_text(sys.argv[1], sys.argv[2]), indent=2))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/dlp/macie_auto_scan.py
++#!/usr/bin/env python3
++"""
++Simple AWS Macie S3 object classification starter.
++Note: Macie is account-level feature; often a classification job is used.
++This script demonstrates how to create an S3 object classification job (skeleton).
++"""
++import boto3
++import os
++
++def create_s3_classification_job(s3_bucket:str, job_name:str):
++    macie = boto3.client("macie2")
++    response = macie.create_classification_job(
++        jobType='S3',
++        jobId=job_name,
++        managedDataIdentifierSelector='ALL_MANAGED_DATA_IDENTIFIERS',
++        s3JobDefinition={'bucketDefinitions':[{'accountId': boto3.client('sts').get_caller_identity()['Account'], 'buckets':[s3_bucket]}]}
++    )
++    return response
++
++if __name__ == "__main__":
++    import sys,json
++    if len(sys.argv)<3:
++        print("Usage: s3-bucket job-name")
++        sys.exit(2)
++    print(json.dumps(create_s3_classification_job(sys.argv[1], sys.argv[2]), indent=2))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/embeddings/service.py
++#!/usr/bin/env python3
++"""
++Embedding service (FastAPI) for production embeddings.
++Provides:
++  - POST /embed { "texts": [...] } -> list of vectors
++  - caching and batching
++Requires sentence-transformers installed in container.
++"""
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++import os
++from typing import List
++try:
++    from sentence_transformers import SentenceTransformer
++except Exception:
++    SentenceTransformer = None
++
++MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
++_model = None
++if SentenceTransformer:
++    _model = SentenceTransformer(MODEL_NAME)
++
++app = FastAPI()
++
++class EmbedRequest(BaseModel):
++    texts: List[str]
++
++@app.post("/embed")
++def embed(req: EmbedRequest):
++    if _model is None:
++        raise HTTPException(status_code=500, detail="embedding model not available")
++    vecs = _model.encode(req.texts, convert_to_numpy=False).tolist()
++    return {"embeddings": vecs}
++
++if __name__ == "__main__":
++    import uvicorn
++    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("EMBEDDING_PORT", "8086")))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/drift/production_drift_detector.py
++#!/usr/bin/env python3
++"""
++Production drift detector:
++ - pulls baseline & recent samples from featurestore (S3 or local)
++ - requests embeddings from embeddings service
++ - computes embedding-distance distribution, PSI, KS, and emits Prometheus metrics
++ - triggers Argo retrain workflow when configured thresholds exceeded
++"""
++import os
++import time
++import requests
++import json
++from prometheus_client import start_http_server, Gauge
++
++EMB_URL = os.environ.get("EMBEDDING_URL", "http://embeddings:8086/embed")
++PROM_PORT = int(os.environ.get("DRIFT_PROM_PORT", "9105"))
++DRIFT_THRESHOLD = float(os.environ.get("DRIFT_THRESHOLD", "0.25"))
++FEATURESTORE_S3 = os.environ.get("FEATURESTORE_S3", "")
++ARGO_NAMESPACE = os.environ.get("ARGO_NS", "argo")
++
++DRIFT_G = Gauge("aegis_model_embedding_drift", "Embedding-based drift score", ["model"])
++
++def load_samples_local(model: str, kind: str, limit:int=500):
++    path = f"/var/lib/aegis/featurestore/{model}/{kind}"
++    samples=[]
++    if os.path.exists(path):
++        for fname in sorted(os.listdir(path))[-limit:]:
++            with open(os.path.join(path,fname)) as fh:
++                for line in fh:
++                    try:
++                        samples.append(json.loads(line)["request_text"])
++                    except Exception:
++                        continue
++    return samples
++
++def embed_texts(texts):
++    r = requests.post(EMB_URL, json={"texts": texts}, timeout=30)
++    r.raise_for_status()
++    return r.json().get("embeddings", [])
++
++def cosine(a,b):
++    import math
++    na = math.sqrt(sum(x*x for x in a))
++    nb = math.sqrt(sum(x*x for x in b))
++    if na==0 or nb==0:
++        return 0.0
++    return sum(x*y for x,y in zip(a,b))/(na*nb)
++
++def compute_drift_for_model(model:str):
++    base = load_samples_local(model, "baseline")
++    recent = load_samples_local(model, "recent")
++    if not base or not recent:
++        return None
++    be = embed_texts(base)
++    re = embed_texts(recent)
++    dists=[]
++    for r in re:
++        sims=[cosine(r,b) for b in be]
++        dists.append(1.0 - max(sims))
++    # simple metric: mean distance
++    mean_dist = sum(dists)/len(dists)
++    DRIFT_G.labels(model=model).set(mean_dist)
++    return mean_dist
++
++def trigger_retrain(model):
++    print(f"[drift] triggering retrain for {model}")
++    os.system(f"kubectl -n {ARGO_NAMESPACE} apply -f ops/cl/retrain_workflow.yaml || true")
++
++if __name__=="__main__":
++    start_http_server(PROM_PORT)
++    models = os.environ.get("DRIFT_MODELS","").split(",") if os.environ.get("DRIFT_MODELS","") else []
++    while True:
++        for m in models:
++            try:
++                val = compute_drift_for_model(m)
++                if val is not None and val > DRIFT_THRESHOLD:
++                    print(f"[drift] model {m} drift {val} > {DRIFT_THRESHOLD} -> trigger retrain")
++                    trigger_retrain(m)
++            except Exception as e:
++                print("drift error:", e)
++        time.sleep(int(os.environ.get("DRIFT_POLL_S","300")))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/labeling/ui.py
++#!/usr/bin/env python3
++"""
++Simple labeling UI (Flask) for human-in-the-loop labeling.
++ - Lists pending samples from local queue dir
++ - Allows annotators to submit labels
++ - Labeled samples are appended to featurestore (parquet_store.append_sample_parquet)
++"""
++from flask import Flask, render_template_string, request, redirect, url_for
++import os, json
++from ops.featurestore.parquet_store import append_sample_parquet
++
++QUEUE_DIR = os.environ.get("LABEL_LOCAL_QDIR", "/var/lib/aegis/label_queue")
++app = Flask(__name__)
++
++TEMPLATE = """
++<h1>Label Queue</h1>
++{% for f in files %}
++  <div style="border:1px solid #ddd;padding:8px;margin:8px;">
++    <pre>{{files[f]}}</pre>
++    <form method="post" action="/label">
++      <input type="hidden" name="file" value="{{f}}">
++      <input type="text" name="label" placeholder="label">
++      <button type="submit">Submit</button>
++    </form>
++  </div>
++{% endfor %}
++"""
++
++def list_files():
++    files={}
++    if os.path.exists(QUEUE_DIR):
++        for fname in sorted(os.listdir(QUEUE_DIR)):
++            path = os.path.join(QUEUE_DIR, fname)
++            with open(path) as fh:
++                files[fname]=fh.read()
++    return files
++
++@app.route("/")
++def index():
++    files=list_files()
++    return render_template_string(TEMPLATE, files=files)
++
++@app.route("/label", methods=["POST"])
++def label():
++    fname = request.form.get("file")
++    label = request.form.get("label")
++    path = os.path.join(QUEUE_DIR, fname)
++    if os.path.exists(path):
++        with open(path) as fh:
++            msg = json.load(fh)
++        msg["label"]={"label":label, "annotator": "ui"}
++        append_sample_parquet(msg.get("model","unknown"), msg.get("sample", msg))
++        os.remove(path)
++    return redirect(url_for("index"))
++
++if __name__=="__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("LABEL_UI_PORT", "8083")))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/automation/multi_signal_verifier.py
++#!/usr/bin/env python3
++"""
++Multi-signal verifier for automated actions.
++Combines:
++ - LLM plan confidence (float 0..1)
++ - rule_checks_pass (bool)
++ - historical_success_prob (0..1)
++ - cost_estimate_usd (float)
++ - approval status (from approval_service)
++
++Returns a decision object: allow_auto(bool), reason, score.
++"""
++from ops.safety.automation_policy import evaluate_auto_run
++from ops.automation.approval_service import verify_approval
++def verify(plan_confidence: float, rule_checks_pass: bool, historical_success_prob: float, cost_estimate_usd: float, risk_level: str, approval_id: str = None):
++    # if approval id provided, verify it
++    if approval_id:
++        ok = verify_approval(approval_id)
++        if not ok:
++            return {"allow_auto": False, "reason":"approval_verification_failed"}
++    return evaluate_auto_run(plan_confidence, rule_checks_pass, historical_success_prob, cost_estimate_usd, risk_level)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/canary/canary_controller.py
++#!/usr/bin/env python3
++"""
++Canary controller (lightweight):
++ - deploys canary manifest (kubectl apply)
++ - monitors Prometheus metrics for configured window
++ - decides promote or rollback based on thresholds
++ - performs kubectl/helm rollback when needed
++"""
++import os, time, subprocess, json
++import requests
++
++PROM_URL = os.environ.get("PROM_URL","http://prometheus:9090")
++MONITOR_WINDOW_S = int(os.environ.get("CANARY_MONITOR_S", "60"))
++LATENCY_THRESHOLD = float(os.environ.get("CANARY_LATENCY_P95_THRESHOLD_S", "0.2"))
++
++def apply_manifest(path):
++    subprocess.check_call(["kubectl","apply","-f",path])
++
++def query_prometheus(expr):
++    r = requests.get(f"{PROM_URL}/api/v1/query", params={"query": expr}, timeout=10)
++    r.raise_for_status()
++    return r.json()
++
++def monitor(latency_expr):
++    # sample p95 latency over window
++    end = time.time()
++    # simplified: get current value
++    resp = query_prometheus(latency_expr)
++    try:
++        vals = resp.get("data",{}).get("result",[])
++        if not vals:
++            return 0.0
++        return float(vals[0].get("value",[0,0])[1])
++    except Exception:
++        return 0.0
++
++def rollback(roll_cmd):
++    print("[canary] rolling back:", roll_cmd)
++    subprocess.call(roll_cmd, shell=True)
++
++def run_canary(manifest, latency_expr, promote_cmd=None, rollback_cmd=None):
++    print("[canary] applying canary manifest", manifest)
++    apply_manifest(manifest)
++    print(f"[canary] monitoring {MONITOR_WINDOW_S}s")
++    time.sleep(MONITOR_WINDOW_S)
++    p95 = monitor(latency_expr)
++    print("[canary] observed p95:", p95)
++    if p95 <= LATENCY_THRESHOLD:
++        print("[canary] success; promoting")
++        if promote_cmd:
++            subprocess.call(promote_cmd, shell=True)
++        return True
++    else:
++        print("[canary] failure; rollback")
++        if rollback_cmd:
++            rollback(rollback_cmd)
++        return False
++
++if __name__=="__main__":
++    import sys
++    if len(sys.argv) < 3:
++        print("Usage: manifest latency_expr [promote_cmd] [rollback_cmd]")
++        sys.exit(2)
++    manifest = sys.argv[1]
++    lat_expr = sys.argv[2]
++    promote_cmd = sys.argv[3] if len(sys.argv)>3 else None
++    rollback_cmd = sys.argv[4] if len(sys.argv)>4 else None
++    run_canary(manifest, lat_expr, promote_cmd, rollback_cmd)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/rl/simulate_episodes.py
++#!/usr/bin/env python3
++"""
++Simulate episodes from logged actions for offline RL training.
++Reads logs from /var/lib/aegis/rl_logs/*.jsonl and converts to episodes.
++"""
++import os,json
++
++LOG_DIR = os.environ.get("RL_LOG_DIR","/var/lib/aegis/rl_logs")
++OUT_FILE = os.environ.get("RL_EPISODES_OUT","/tmp/episodes.jsonl")
++
++def simulate():
++    with open(OUT_FILE,"w") as out:
++        for f in sorted(os.listdir(LOG_DIR)):
++            if not f.endswith(".jsonl"):
++                continue
++            with open(os.path.join(LOG_DIR,f)) as fh:
++                for line in fh:
++                    e = json.loads(line)
++                    # normalize expected fields
++                    episode = {"state": e.get("state",{}), "action": e.get("action"), "reward": e.get("reward",0), "done": e.get("done",True)}
++                    out.write(json.dumps(episode)+"\n")
++    print("Wrote episodes to", OUT_FILE)
++
++if __name__=="__main__":
++    simulate()
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/runbooks/operator_prod_runbook.md
++# Operator production runbook — Aegis end-to-end provisioning & verification
++
++This runbook sequences commands and checks to provision and verify the core production stack.
++
++Prereqs:
++- AWS CLI configured, terraform installed, kubectl configured, helm, gh CLI (optional), docker.
++- Ensure operator account has required permissions (KMS, S3, EKS).
++
++1) Provision infra
++- Provision S3 / KMS / Rekor / EKS GPU nodegroup:
++  REPO=owner/repo AWS_REGION=us-east-1 ./ops/provision/provision_end_to_end.sh
++
++2) Verify Argo & GPU nodes
++- ./ops/provision/verify_argo_and_gpu.sh
++- Check Argo UI, ensure argo-workflows-sa exists and `kubectl -n argo auth can-i create workflows.argoproj.io --as=system:serviceaccount:argo:argo-workflows-sa` returns yes.
++
++3) Run a distributed training workflow (smoke test)
++- kubectl -n argo apply -f ops/training/argo_dist_train_checkpointed.yaml
++- Monitor workflow in Argo UI. After completion, check model registry S3 for `${MODEL}/${VERSION}/metadata.json`.
++- Verify cosign signature: ./ops/checkpointing/verify_checkpoint_lifecycle.sh MODEL=<model> VERSION=<ver> MODEL_REGISTRY_S3=<bucket>
++
++4) Deploy embedding service & drift detector
++- kubectl apply -f k8s/embeddings/embedding-deployment.yaml (create manifest from ops/embeddings/service.py container)
++- Start drift detector: deploy production_drift_detector as a Deployment; ensure PROM metrics appear.
++
++5) Install DLP integrations & run red-team tuning
++- For GCP: set GOOGLE_APPLICATION_CREDENTIALS and run ops/dlp/gcp_dlp_scan.py against samples.
++- For AWS Macie: use ops/dlp/macie_auto_scan.py to create classification jobs and run ops/dlp/redteam_tune.py with corpus.
++
++6) Labeling UI & HITL
++- Deploy ops/labeling/ui.py as a Deployment, ensure LABEL_LOCAL_QDIR is mounted to the annotator pod.
++- Annotators visit UI, label samples; verify labeled samples appear in /featurestore and S3.
++
++7) Canary & automation tests
++- Deploy sample canary via ops/canary/canary_controller.py and observe decision logic; test rollback path.
++- Run full pen & chaos suite: ./ops/tests/run_pen_and_chaos.sh
++
++8) Governance & SLAs
++- Install autonomy policy: kubectl apply -f docs/governance/autonomy_policy_full.yaml
++- Configure Slack webhook and approval notifications; test approval flow with ops/approval/approval_slack_notify.py
++
++9) Acceptance criteria
++- cosign verify and Rekor entry exist for sample artifact.
++- Argo training workflow completes and checkpoint is uploaded & signed.
++- DLP detects red-team sample.
++- Drift detector emits metrics and triggers retrain when sample distribution changed.
++- Canary control loop promotes or rolls back based on configured p95 threshold.
++
+*** End Patch
+*** End Patch

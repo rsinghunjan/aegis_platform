@@ -1,0 +1,478 @@
+*** Begin Patch
+*** Add File:services/carbon/optimizer.py
++#!/usr/bin/env python3
++"""
++Closed-loop Carbon Optimizer (PoC)
++
++Purpose:
++- Provide a lightweight service that recommends placement/deferral decisions for training/inference
++  jobs based on Prometheus-scraped GPU power metrics, regional intensity, and latency SLAs.
++- Intended as a PoC optimizer to be invoked by Tekton interceptors, Tekton Tasks, or the inference gateway.
++
++API:
++- POST /optimize
++  payload:
++    {
++      "job_id": "abc123",
++      "model_name": "vision_encoder",
++      "latency_sla_ms": 200,
++      "candidates": { "us-east": "https://us.example/generate", "eu-west": "https://eu.example/generate" },
++      "metadata": { ... }
++    }
++  returns:
++    {
++      "choice": "eu-west",
++      "reason": "lowest_estimated_carbon_within_latency",
++      "estimates": { "us-east": {"kg":0.45, "latency_ms":120}, "eu-west": {...} }
++    }
++
++Notes:
++- This PoC uses simple heuristics: estimated energy = recent average power * expected_duration; carbon = kWh * intensity.
++- For production, replace heuristics with an ML optimizer or ILP using real latency profiling and historical telemetry.
++"""
++import os
++import time
++import json
++import logging
++from typing import Dict, Any
++
++import requests
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++
++logger = logging.getLogger("carbon-optimizer")
++logging.basicConfig(level=logging.INFO)
++
++PROM_HOST = os.environ.get("PROM_HOST", "http://prometheus.monitoring.svc:9090")
++INTENSITY_URL = os.environ.get("INTENSITY_URL", "http://carbon-intensity-service.monitoring.svc:8080")
++DEFAULT_JOB_DURATION_S = int(os.environ.get("DEFAULT_JOB_DURATION_S", "3600"))  # 1h default
++
++app = FastAPI(title="Aegis Carbon Optimizer (PoC)")
++
++
++class OptimizeRequest(BaseModel):
++    job_id: str
++    model_name: str
++    latency_sla_ms: int
++    candidates: Dict[str, str]
++    metadata: Dict[str, Any] = {}
++
++
++def query_prometheus_power(candidate_endpoint: str, lookback_s: int = 300) -> float:
++    """
++    Attempt to estimate recent average power (watts) for a candidate endpoint by matching region labels.
++    This is heuristic: in real deployments, candidate -> node/job mapping must be precise.
++    """
++    try:
++        # Example query: avg_over_time(dcgm_nvml_power_draw_watts[5m]) by (instance) - simplified demo
++        q = 'avg_over_time(dcgm_nvml_power_draw_watts[5m])'
++        r = requests.get(f"{PROM_HOST}/api/v1/query", params={"query": q}, timeout=8)
++        r.raise_for_status()
++        data = r.json().get("data", {}).get("result", [])
++        # pick the first numeric value as heuristic
++        if not data:
++            return 0.0
++        v = float(data[0].get("value", [])[1])
++        return v
++    except Exception as e:
++        logger.warning("prometheus query failed: %s", e)
++        return 0.0
++
++
++def query_region_intensity(region_hint: str) -> float:
++    """Query intensity service for recent gCO2e/kWh (heuristic by region)."""
++    try:
++        r = requests.get(f"{INTENSITY_URL}/intensity?region={region_hint}", timeout=5)
++        r.raise_for_status()
++        j = r.json()
++        return float(j.get("intensity_gCO2_per_kWh", j.get("gCO2_per_kWh", 400.0))) / 1000.0  # convert g -> kg
++    except Exception as e:
++        logger.warning("intensity query failed: %s", e)
++        return 0.4  # default 0.4 kgCO2e/kWh
++
++
++@app.post("/optimize")
++def optimize(req: OptimizeRequest):
++    # Simple heuristic: for each candidate compute estimated kgCO2e and check latency via optional probe
++    estimates = {}
++    for region, endpoint in req.candidates.items():
++        # estimate power (watts) from Prometheus (heuristic, not tied to endpoint)
++        power_w = query_prometheus_power(endpoint)
++        if power_w <= 0:
++            # fallback to conservative default
++            power_w = 300.0
++        # estimate energy (kWh) = power_w * hours
++        duration_h = (req.metadata.get("expected_duration_s") or DEFAULT_JOB_DURATION_S) / 3600.0
++        kwh = (power_w * duration_h) / 1000.0
++        intensity = query_region_intensity(region)
++        kgco2 = kwh * intensity
++        # optional quick latency probe (best-effort)
++        latency_ms = None
++        try:
++            t0 = time.time()
++            r = requests.options(endpoint, timeout=1)
++            latency_ms = int((time.time() - t0) * 1000)
++        except Exception:
++            latency_ms = 9999
++        estimates[region] = {"kg": round(kgco2, 6), "latency_ms": latency_ms, "power_w": round(power_w,1), "kwh": round(kwh,6)}
++
++    # Filter candidates that meet latency SLA
++    feasible = {r: v for r, v in estimates.items() if v["latency_ms"] <= req.latency_sla_ms}
++    if not feasible:
++        # If none feasible, choose lowest latency among all and flag deferral suggestion
++        choice = min(estimates.items(), key=lambda it: it[1]["latency_ms"])[0]
++        reason = "no_candidate_within_latency_sla; chose_lowest_latency (consider deferring or relaxing SLA)"
++    else:
++        # choose lowest kg among feasible
++        choice = min(feasible.items(), key=lambda it: it[1]["kg"])[0]
++        reason = "lowest_estimated_carbon_within_latency"
++
++    return {"choice": choice, "reason": reason, "estimates": estimates}
++
++
++if __name__ == "__main__":
++    import uvicorn
++    uvicorn.run("services.carbon.optimizer:app", host="0.0.0.0", port=int(os.environ.get("PORT", "8082")))
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/operator/ai_operator.py
++#!/usr/bin/env python3
++"""
++AI Operator (scaffold PoC)
++
++Purpose:
++- A lightweight "operator assistant" that monitors simple signals and proposes (and optionally executes)
++  safe operational actions such as scaling down a deployment, re-routing traffic, or triggering a rollback.
++- All proposals are stored and require approval before execution (policy gates).
++- Every action is recorded to the evidence bucket for audit.
++
++API:
++- GET  /proposals          -> list proposals
++- POST /proposals          -> create a proposal (propose action)
++- POST /proposals/{id}/approve -> approve & execute
++- GET  /health
++"""
++import os
++import time
++import uuid
++import json
++import logging
++from typing import Dict, Any
++
++import requests
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++
++logger = logging.getLogger("ai-operator")
++logging.basicConfig(level=logging.INFO)
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++REGION = os.environ.get("AEGIS_REGION", "control-plane")
++
++app = FastAPI(title="Aegis AI Operator (PoC)")
++
++# In-memory proposal store (demo). Replace with persistent DB in production.
++PROPOSALS: Dict[str, Dict[str, Any]] = {}
++
++
++class ProposalReq(BaseModel):
++    title: str
++    description: str
++    action: Dict[str, Any]  # e.g., {"type":"scale","target":"deployment/foo","replicas":1}
++    author: str = "ai-operator"
++
++
++def upload_evidence(key_prefix: str, payload: Dict[str, Any]):
++    if not EVIDENCE_BUCKET:
++        # fallback to local file
++        path = f"/tmp/ai_operator_evidence_{int(time.time())}.json"
++        with open(path, "w") as f:
++            json.dump(payload, f, indent=2)
++        logger.info("Wrote evidence locally: %s", path)
++        return path
++    try:
++        import boto3
++        s3 = boto3.client("s3")
++        key = f"{key_prefix}/{int(time.time())}.json"
++        s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(payload).encode("utf-8"))
++        uri = f"s3://{EVIDENCE_BUCKET}/{key}"
++        logger.info("Uploaded evidence to %s", uri)
++        return uri
++    except Exception as e:
++        logger.warning("Failed to upload evidence: %s", e)
++        return None
++
++
++@app.post("/proposals")
++def create_proposal(req: ProposalReq):
++    pid = str(uuid.uuid4())
++    p = {
++        "id": pid,
++        "title": req.title,
++        "description": req.description,
++        "action": req.action,
++        "author": req.author,
++        "state": "proposed",
++        "created_at": int(time.time()),
++    }
++    PROPOSALS[pid] = p
++    upload_evidence("operator/proposals", p)
++    return p
++
++
++@app.get("/proposals")
++def list_proposals():
++    return {"proposals": list(PROPOSALS.values())}
++
++
++def execute_action(act: Dict[str, Any]):
++    """
++    Execute the action. PoC supports a tiny set:
++      - scale: {"type":"scale","target":"deployment/<name>","replicas":N}
++      - annotate: {"type":"annotate","target":"model","name":"x","version":"v1","annotations":{...}}
++    """
++    t = act.get("type")
++    if t == "scale":
++        target = act.get("target")
++        replicas = int(act.get("replicas", 1))
++        # basic kubectl patch (best-effort)
++        try:
++            cmd = ["kubectl", "scale", "--replicas=%d" % replicas, act.get("target")]
++            logger.info("Executing scale command: %s", " ".join(cmd))
++            import subprocess
++            subprocess.check_call(cmd)
++            return {"ok": True, "detail": "scaled"}
++        except Exception as e:
++            return {"ok": False, "error": str(e)}
++    elif t == "annotate":
++        # annotate model in registry via API
++        try:
++            reg = os.environ.get("MODEL_REGISTRY_URL", "http://aegis-model-registry.monitoring.svc:8081")
++            name = act.get("name"); ver = act.get("version"); anns = act.get("annotations", {})
++            r = requests.post(f"{reg}/models/{name}/versions/{ver}/annotations", json={"annotations": anns}, timeout=10)
++            r.raise_for_status()
++            return {"ok": True, "detail": "annotated"}
++        except Exception as e:
++            return {"ok": False, "error": str(e)}
++    else:
++        return {"ok": False, "error": "unsupported action type"}
++
++
++@app.post("/proposals/{pid}/approve")
++def approve_and_execute(pid: str, approver: str = "operator-admin"):
++    p = PROPOSALS.get(pid)
++    if not p:
++        raise HTTPException(status_code=404, detail="proposal not found")
++    if p["state"] != "proposed":
++        raise HTTPException(status_code=400, detail="proposal not in proposed state")
++    p["state"] = "approved"
++    p["approver"] = approver
++    p["approved_at"] = int(time.time())
++    upload_evidence("operator/proposals", {"event": "approved", "proposal": p})
++
++    # Execute action (synchronously for PoC)
++    res = execute_action(p["action"])
++    p["execution"] = res
++    p["executed_at"] = int(time.time())
++    upload_evidence("operator/executions", {"proposal": p, "result": res})
++    return {"proposal": p, "result": res}
++
++
++@app.get("/health")
++def health():
++    return {"status": "ok", "region": REGION}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/explainability/service.py
++#!/usr/bin/env python3
++"""
++Explainability & counterfactual PoC service
++
++Purpose:
++- Provide a small REST API to compute feature attributions (SHAP style) and simple counterfactual perturbations.
++- For PoC we include a lightweight stub that can be replaced with real model-backed explainers.
++
++API:
++- POST /explain
++  { "model_uri": "...", "input": { ... } } -> { "attributions": { "feature": value, ... } }
++- POST /counterfactual
++  { "model_uri": "...", "input": {...}, "target": 1 } -> { "cf": {...}, "changes": {...} }
++"""
++import os
++import json
++import logging
++from typing import Dict, Any
++
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++
++logger = logging.getLogger("explainability")
++logging.basicConfig(level=logging.INFO)
++
++app = FastAPI(title="Aegis Explainability PoC")
++
++
++class ExplainReq(BaseModel):
++    model_uri: str
++    input: Dict[str, Any]
++
++
++class CFReq(ExplainReq):
++    target: Any
++
++
++@app.post("/explain")
++def explain(req: ExplainReq):
++    # PoC: return symmetric dummy attributions proportional to value magnitudes
++    inp = req.input
++    atts = {}
++    total = 0.0
++    for k, v in inp.items():
++        try:
++            mag = abs(float(v))
++        except Exception:
++            mag = 1.0
++        atts[k] = mag
++        total += mag
++    # normalize and sign-preserve (simple)
++    for k in atts:
++        atts[k] = round(atts[k] / (total or 1.0), 4)
++    return {"model": req.model_uri, "attributions": atts}
++
++
++@app.post("/counterfactual")
++def counterfactual(req: CFReq):
++    # PoC: flip smallest-magnitude numeric feature to push prediction toward target
++    inp = req.input.copy()
++    numeric = [(k, float(v)) for k, v in inp.items() if isinstance(v, (int, float))]
++    if not numeric:
++        raise HTTPException(status_code=400, detail="no numeric features for PoC counterfactual")
++    numeric.sort(key=lambda it: abs(it[1]))
++    key, val = numeric[0]
++    cf = inp.copy()
++    cf[key] = val + (1.0 if req.target else -1.0)
++    changes = {key: {"from": val, "to": cf[key]}}
++    return {"model": req.model_uri, "cf": cf, "changes": changes}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tekton/optimizer-interceptor.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: tekton-optimizer-interceptor-config
++  namespace: cicd
++data:
++  # This is a conceptual example showing how a Tekton interceptor could call the carbon optimizer
++  # and use its response to mutate a PipelineRun / TaskRun (e.g., set nodeSelector or preferred region).
++  # Implementation of a real interceptor requires deploying a webhook or Tekton interceptor container.
++  optimizer_endpoint: "http://carbon-optimizer.monitoring.svc:8082/optimize"
++  explanation: |
++    The Tekton interceptor should:
++      1) Inspect incoming PipelineRun payload to extract model_name, expected duration, candidates, latency SLA.
++      2) Call the optimizer_endpoint with the JSON payload.
++      3) Receive the chosen 'choice' region and mutate the PipelineRun's spec.template.spec.nodeSelector
++         or add an annotation 'aegis/placement: <choice>'.
++    Example mutation (pseudo):
++      spec.template.spec.nodeSelector['aegis.region'] = '<choice>'
++    For Kubernetes clusters use a validating/mutating webhook or Tekton interceptor that supports external callouts.
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/scripts/run_carbon_optimizer.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Simple operator wrapper that calls the optimizer service and applies a nodeSelector to a Tekton PipelineRun (best-effort).
++#
++PIPELINERUN=${1:-}
++OPT_URL=${OPT_URL:-http://carbon-optimizer.monitoring.svc:8082/optimize}
++if [ -z "$PIPELINERUN" ]; then
++  echo "Usage: $0 <pipelinerun-name> (will read namespace 'cicd' by default)"
++  exit 2
++fi
++NS=${NAMESPACE:-cicd}
++
++echo "Fetching PipelineRun $PIPELINERUN in namespace $NS"
++pr=$(kubectl -n "$NS" get pipelinerun "$PIPELINERUN" -o json)
++model_name=$(echo "$pr" | jq -r '.metadata.annotations["aegis.model_name"] // empty')
++job_id=$(echo "$pr" | jq -r '.metadata.annotations["aegis.job_id"] // empty')
++latency=$(echo "$pr" | jq -r '.metadata.annotations["aegis.latency_sla_ms"] // "200"')
++
++if [ -z "$model_name" ]; then
++  echo "PipelineRun missing aegis.model_name annotation; aborting"
++  exit 3
++fi
++
++echo "Calling optimizer for model=$model_name job_id=$job_id"
++payload=$(jq -n --arg jid "$job_id" --arg mn "$model_name" --argjson candidates '{"us-east":"https://us.example","eu-west":"https://eu.example"}' --argjson meta '{}' --arg lat "$latency" '{job_id:$jid, model_name:$mn, latency_sla_ms:(($lat|tonumber)), candidates:$candidates, metadata:$meta}')
++
++resp=$(curl -sS -X POST -H "Content-Type: application/json" -d "$payload" "$OPT_URL")
++choice=$(echo "$resp" | jq -r .choice)
++echo "Optimizer chose: $choice"
++
++if [ -n "$choice" ] && [ "$choice" != "null" ]; then
++  echo "Patching PipelineRun to add annotation aegis.placement=$choice"
++  kubectl -n "$NS" patch pipelinerun "$PIPELINERUN" --type='merge' -p "{\"metadata\": {\"annotations\": {\"aegis.placement\": \"$choice\"}}}"
++  echo "Patch applied"
++else
++  echo "No placement choice returned"
++fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/advanced_poc.yml
++name: Advanced Platform PoC smoke
++on:
++  workflow_dispatch:
++jobs:
++  poc-check:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Call Carbon Optimizer (smoke)
++        env:
++          OPT_URL: http://carbon-optimizer.monitoring.svc:8082/optimize
++        run: |
++          echo "This workflow is a placeholder to validate packaging and simple HTTP checks in your environment."
++          echo "{\"job_id\":\"poc\",\"model_name\":\"demo\",\"latency_sla_ms\":200,\"candidates\":{\"us-east\":\"http://example.com\"},\"metadata\":{}}" > /tmp/payload.json
++          echo "Payload:"
++          cat /tmp/payload.json
++          echo "Note: To call the in-cluster service, run this workflow from a runner with network access to cluster or port-forward the service."
++
+*** End Patch
+*** Begin Patch
+*** Add File:README_ADVANCED.md
++Aegis Advanced PoC: Carbon Optimizer, AI Operator & Explainability
++---------------------------------------------------------------
++
++This patch adds a set of PoC components intended to push Aegis forward:
++
++- services/carbon/optimizer.py : a heuristic carbon-aware optimizer service (HTTP API) that recommends placement choices.
++- services/operator/ai_operator.py : an "AI Operator" scaffold that proposes and executes safe ops actions with audit evidence.
++- services/explainability/service.py : a minimal explainability/counterfactual PoC service.
++- ops/tekton/optimizer-interceptor.yaml : example config & notes for integrating the optimizer with Tekton interceptors.
++- ops/scripts/run_carbon_optimizer.sh : helper script to call optimizer and patch a Tekton PipelineRun with an aegis.placement annotation.
++- .github/workflows/advanced_poc.yml : workflow stub for PoC validation + packaging.
++
++How these components make Aegis "ahead of its time"
++- Introduces closed-loop decision-making (optimizer) that can actively trade latency vs carbon and integrate with Tekton/interceptor hooks.
++- Provides an operator assistant that can suggest and automate routine but auditable operational changes.
++- Adds explainability surfaces (attributions & counterfactuals) to support debugging & SME review.
++- All actions are evidence-forward: operator and optimizer include evidence upload hooks for auditability.
++
++Next steps (recommended)
++1. Build and containerize the new services, push images to your registry, and deploy to the monitoring namespace.
++2. Wire Prometheus (PROM_HOST) and intensity service endpoints (INTENSITY_URL) via env vars or K8s secrets.
++3. Deploy the Tekton interceptor / webhook that calls the optimizer or configure Tekton Trigger to call ops/scripts/run_carbon_optimizer.sh as a step.
++4. Integrate AI Operator proposals into your runbooks and require human approval for unsafe actions during early rollout.
++5. Replace heuristic estimators with ML/optimization components and perform A/B tests to demonstrate carbon/latency tradeoffs.
++
++Notes & limitations
++- These components are PoCs and intentionally small. They need to be hardened (authn/authz, retries, rate-limiting),
++  replaced with production-grade telemetry mappings (candidate -> node mapping), and extended with unit+integration tests before production use.
++
+*** End Patch
+*** End Patch

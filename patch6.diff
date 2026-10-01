@@ -1,0 +1,716 @@
+diff --git a/api/golden_models.py b/api/golden_models.py
+index f2c09b9..a3e79d0 100644
+--- a/api/golden_models.py
++++ b/api/golden_models.py
+@@ -1,7 +1,7 @@
+ """
+ Golden-path unified schema (minimal, tenant-scoped).
+ 
+ Covers the golden path:
+@@ -89,6 +89,8 @@ class ModelVersion(Base):
+     signature = Column(Text, nullable=True)
+     signed = Column(Boolean, nullable=False, default=False)
+ 
++    signature_type = Column(String(50), nullable=True)  # hmac|vault_transit|noop
++
+     eval_status = Column(String(50), nullable=False, default="unknown")  # pass|fail|unknown
+     approved = Column(Boolean, nullable=False, default=False)
+diff --git a/api/golden_signing.py b/api/golden_signing.py
+index 0bd6f60..92df3af 100644
+--- a/api/golden_signing.py
++++ b/api/golden_signing.py
+@@ -1,22 +1,34 @@
+ """
+ Golden-path artifact signing.
+ 
+ Dev/test:
+   - HMAC signature of sha256
+ 
+ Production:
+   - replace with Vault Transit/KMS signing (your repo already has Vault OIDC/Transit docs/scripts).
+ """
+ 
+ from __future__ import annotations
+ 
+ import os
+ import hmac
+ import hashlib
++import base64
++import json
++import requests
+ from typing import Optional
+ 
+ 
+-SIGN_MODE = os.environ.get("AEGIS_SIGN_MODE", "hmac")  # noop|hmac
++SIGN_MODE = os.environ.get("AEGIS_SIGN_MODE", "hmac")  # noop|hmac|vault_transit
+ HMAC_SECRET = os.environ.get("AEGIS_SIGN_HMAC_SECRET", "dev-sign-secret-change-me")
+ 
++# Vault Transit config (SIGN_MODE=vault_transit)
++VAULT_ADDR = os.environ.get("VAULT_ADDR", "")
++VAULT_TOKEN = os.environ.get("VAULT_TOKEN", "")
++VAULT_TRANSIT_MOUNT = os.environ.get("AEGIS_VAULT_TRANSIT_MOUNT", "transit")
++VAULT_TRANSIT_KEY = os.environ.get("AEGIS_VAULT_TRANSIT_KEY", "aegis-model-sign")
++
+ 
+ def sign_sha256(hex_sha256: str) -> str:
+     if SIGN_MODE == "noop":
+         return ""
+-    return hmac.new(HMAC_SECRET.encode("utf-8"), hex_sha256.encode("utf-8"), hashlib.sha256).hexdigest()
++    if SIGN_MODE == "hmac":
++        return hmac.new(HMAC_SECRET.encode("utf-8"), hex_sha256.encode("utf-8"), hashlib.sha256).hexdigest()
++    if SIGN_MODE == "vault_transit":
++        if not (VAULT_ADDR and VAULT_TOKEN):
++            raise RuntimeError("VAULT_ADDR and VAULT_TOKEN required for SIGN_MODE=vault_transit")
++        # Transit sign expects base64 input
++        payload_b64 = base64.b64encode(hex_sha256.encode("utf-8")).decode("utf-8")
++        url = f"{VAULT_ADDR}/v1/{VAULT_TRANSIT_MOUNT}/sign/{VAULT_TRANSIT_KEY}"
++        r = requests.post(url, headers={"X-Vault-Token": VAULT_TOKEN}, json={"input": payload_b64}, timeout=10)
++        r.raise_for_status()
++        sig = r.json()["data"]["signature"]
++        return sig
++    raise RuntimeError(f"Unknown SIGN_MODE={SIGN_MODE}")
+ 
+ 
+ def verify_sha256(hex_sha256: str, signature: Optional[str]) -> bool:
+     if SIGN_MODE == "noop":
+         return True
+     if not signature:
+         return False
+-    expected = sign_sha256(hex_sha256)
+-    return hmac.compare_digest(expected, signature)
++    if SIGN_MODE == "hmac":
++        expected = sign_sha256(hex_sha256)
++        return hmac.compare_digest(expected, signature)
++    if SIGN_MODE == "vault_transit":
++        if not (VAULT_ADDR and VAULT_TOKEN):
++            raise RuntimeError("VAULT_ADDR and VAULT_TOKEN required for SIGN_MODE=vault_transit")
++        payload_b64 = base64.b64encode(hex_sha256.encode("utf-8")).decode("utf-8")
++        url = f"{VAULT_ADDR}/v1/{VAULT_TRANSIT_MOUNT}/verify/{VAULT_TRANSIT_KEY}"
++        r = requests.post(url, headers={"X-Vault-Token": VAULT_TOKEN}, json={"input": payload_b64, "signature": signature}, timeout=10)
++        r.raise_for_status()
++        return bool(r.json()["data"]["valid"])
++    raise RuntimeError(f"Unknown SIGN_MODE={SIGN_MODE}")
+diff --git a/api/golden_policy.py b/api/golden_policy.py
+index b15c4aa..f51ec3a 100644
+--- a/api/golden_policy.py
++++ b/api/golden_policy.py
+@@ -1,17 +1,30 @@
+ from __future__ import annotations
+ 
+ from fastapi import HTTPException
+ 
+ from api.golden_models import ModelVersion
+-from api.golden_signing import verify_sha256
++from api.golden_signing import verify_sha256, SIGN_MODE
+ 
+ 
+ def require_signature_valid(mv: ModelVersion) -> None:
+     if not mv.artifact_sha256:
+         raise HTTPException(status_code=400, detail="model version missing artifact_sha256")
+     if not verify_sha256(mv.artifact_sha256, mv.signature):
+         raise HTTPException(status_code=403, detail="signature verification failed")
++    # if present, enforce signature_type consistency
++    if mv.signature_type and mv.signature_type != SIGN_MODE:
++        # Example: prevent mixing modes if you want strictness.
++        # You can relax this later (e.g., allow legacy hmac signatures) by changing this rule.
++        raise HTTPException(
++            status_code=403,
++            detail=f"signature mode mismatch: stored={mv.signature_type} runtime={SIGN_MODE}",
++        )
+ 
+ 
+ def require_deploy_allowed(mv: ModelVersion) -> None:
+     if not mv.signed:
+         raise HTTPException(status_code=403, detail="deployment blocked: model artifact is not signed")
+diff --git a/api/golden_k8s.py b/api/golden_k8s.py
+index b5c7b84..8c0d584 100644
+--- a/api/golden_k8s.py
++++ b/api/golden_k8s.py
+@@ -1,10 +1,12 @@
+ from __future__ import annotations
+ 
+ import os
++import re
+ from typing import Dict, Optional, Tuple
+ 
+ from kubernetes import client, config
+ from kubernetes.client.rest import ApiException
+ 
+@@ -61,6 +63,41 @@ def ensure_tenant_namespace(tenant_id: str) -> str:
+     core.create_namespace(body=body)
+     return ns
+ 
+ 
++def _parse_s3_uri(uri: str) -> Tuple[str, str]:
++    """
++    Parse s3://bucket/key -> (bucket, key)
++    """
++    if not uri.startswith("s3://"):
++        raise ValueError(f"Expected s3:// URI, got: {uri}")
++    rest = uri[len("s3://") :]
++    parts = rest.split("/", 1)
++    if len(parts) != 2 or not parts[0] or not parts[1]:
++        raise ValueError(f"Invalid s3 uri: {uri}")
++    return parts[0], parts[1]
++
++
++def _sanitize_name(s: str) -> str:
++    s = s.lower()
++    s = re.sub(r"[^a-z0-9-]+", "-", s)
++    s = re.sub(r"-+", "-", s).strip("-")
++    return s[:50] if len(s) > 50 else s
++
++
++def _artifact_init_container(
++    name: str,
++    artifact_uri: str,
++    artifact_sha256: str,
++    signature: str,
++    signature_type: str,
++    mount_path: str = "/models",
++) -> client.V1Container:
++    """
++    Init container:
++      - downloads artifact from S3/MinIO to /work/artifact
++      - verifies sha256
++      - verifies signature (HMAC or Vault Transit via env)
++      - extracts into mount_path if tar.gz, else copies as single file
++    """
++    bucket, key = _parse_s3_uri(artifact_uri)
++    image = os.environ.get("AEGIS_ARTIFACT_INIT_IMAGE", "python:3.11-slim")
++    # Uses boto3 + requests in a tiny inline script to keep this patch self-contained.
++    # In production, replace with a hardened image.
++    cmd = r"""
++set -euo pipefail
++python - <<'PY'
++import os,sys,hashlib,base64,tarfile,shutil
++import boto3
++import requests
++
++artifact_path="/work/artifact"
++bucket=os.environ["AEGIS_S3_BUCKET"]
++key=os.environ["AEGIS_S3_KEY"]
++endpoint=os.environ.get("AEGIS_S3_ENDPOINT_URL") or None
++region=os.environ.get("AEGIS_S3_REGION","us-east-1")
++expected_sha=os.environ["AEGIS_ARTIFACT_SHA256"]
++sig=os.environ.get("AEGIS_ARTIFACT_SIGNATURE","")
++sig_type=os.environ.get("AEGIS_SIGNATURE_TYPE","hmac")
++
++def sha256_file(p):
++    h=hashlib.sha256()
++    with open(p,"rb") as f:
++        for ch in iter(lambda: f.read(1024*1024), b""):
++            h.update(ch)
++    return h.hexdigest()
++
++def verify_hmac(hex_sha, signature):
++    import hmac
++    secret=os.environ.get("AEGIS_SIGN_HMAC_SECRET","")
++    mac=hmac.new(secret.encode(), hex_sha.encode(), hashlib.sha256).hexdigest()
++    return hmac.compare_digest(mac, signature)
++
++def verify_vault_transit(hex_sha, signature):
++    vault_addr=os.environ.get("VAULT_ADDR","")
++    vault_token=os.environ.get("VAULT_TOKEN","")
++    mount=os.environ.get("AEGIS_VAULT_TRANSIT_MOUNT","transit")
++    keyname=os.environ.get("AEGIS_VAULT_TRANSIT_KEY","aegis-model-sign")
++    if not (vault_addr and vault_token):
++        raise RuntimeError("VAULT_ADDR and VAULT_TOKEN required for vault_transit verification")
++    payload_b64=base64.b64encode(hex_sha.encode()).decode()
++    url=f"{vault_addr}/v1/{mount}/verify/{keyname}"
++    r=requests.post(url, headers={"X-Vault-Token": vault_token}, json={"input": payload_b64, "signature": signature}, timeout=10)
++    r.raise_for_status()
++    return bool(r.json()["data"]["valid"])
++
++print("Downloading s3://%s/%s" % (bucket,key))
++c=boto3.client("s3", region_name=region, endpoint_url=endpoint)
++c.download_file(bucket, key, artifact_path)
++
++actual=sha256_file(artifact_path)
++if actual != expected_sha:
++    raise SystemExit(f"sha256 mismatch expected={expected_sha} actual={actual}")
++
++if sig_type != "noop":
++    if not sig:
++        raise SystemExit("missing signature")
++    if sig_type == "hmac":
++        if not verify_hmac(expected_sha, sig):
++            raise SystemExit("HMAC signature invalid")
++    elif sig_type == "vault_transit":
++        if not verify_vault_transit(expected_sha, sig):
++            raise SystemExit("Vault Transit signature invalid")
++    else:
++        raise SystemExit(f"unknown signature type: {sig_type}")
++
++outdir=os.environ.get("AEGIS_MODELS_DIR","/models")
++os.makedirs(outdir, exist_ok=True)
++
++if artifact_path.endswith(".tar.gz") or artifact_path.endswith(".tgz"):
++    with tarfile.open(artifact_path, "r:gz") as tf:
++        tf.extractall(outdir)
++else:
++    # fallback: copy single file to /models/artifact
++    shutil.copyfile(artifact_path, os.path.join(outdir, "artifact"))
++
++print("Artifact ready in", outdir)
++PY
++"""
++    return client.V1Container(
++        name=name,
++        image=image,
++        command=["/bin/sh", "-lc", cmd],
++        env=[
++            client.V1EnvVar(name="AEGIS_S3_BUCKET", value=bucket),
++            client.V1EnvVar(name="AEGIS_S3_KEY", value=key),
++            client.V1EnvVar(name="AEGIS_S3_ENDPOINT_URL", value=os.environ.get("AEGIS_S3_ENDPOINT_URL", "")),
++            client.V1EnvVar(name="AEGIS_S3_REGION", value=os.environ.get("AEGIS_S3_REGION", "us-east-1")),
++            client.V1EnvVar(name="AEGIS_ARTIFACT_SHA256", value=artifact_sha256),
++            client.V1EnvVar(name="AEGIS_ARTIFACT_SIGNATURE", value=signature or ""),
++            client.V1EnvVar(name="AEGIS_SIGNATURE_TYPE", value=signature_type or "hmac"),
++            client.V1EnvVar(name="AEGIS_MODELS_DIR", value=mount_path),
++            # Vault vars (only used if signature_type=vault_transit)
++            client.V1EnvVar(name="VAULT_ADDR", value=os.environ.get("VAULT_ADDR", "")),
++            client.V1EnvVar(name="VAULT_TOKEN", value=os.environ.get("VAULT_TOKEN", "")),
++            client.V1EnvVar(name="AEGIS_VAULT_TRANSIT_MOUNT", value=os.environ.get("AEGIS_VAULT_TRANSIT_MOUNT", "transit")),
++            client.V1EnvVar(name="AEGIS_VAULT_TRANSIT_KEY", value=os.environ.get("AEGIS_VAULT_TRANSIT_KEY", "aegis-model-sign")),
++            client.V1EnvVar(name="AEGIS_SIGN_HMAC_SECRET", value=os.environ.get("AEGIS_SIGN_HMAC_SECRET", "")),
++        ],
++        volume_mounts=[
++            client.V1VolumeMount(name="workdir", mount_path="/work"),
++            client.V1VolumeMount(name="models", mount_path=mount_path),
++        ],
++    )
++
++
+ def _labels(tenant_id: str, project_id: str, model_version_id: str, deployment_id: str) -> Dict[str, str]:
+     return {
+         "app.kubernetes.io/name": "aegis-model",
+@@ -75,7 +112,10 @@ def deploy_vllm(
+     namespace: str,
+     name: str,
+     tenant_id: str,
+     project_id: str,
+     model_version_id: str,
+     deployment_id: str,
+     model_artifact_uri: str,
++    artifact_sha256: Optional[str] = None,
++    signature: Optional[str] = None,
++    signature_type: str = "hmac",
+     gpu: int = 1,
+     image: Optional[str] = None,
+ ) -> Tuple[str, str]:
+@@ -83,17 +123,34 @@ def deploy_vllm(
+     Golden template: vLLM deployment (GPU).
+     """
+     image = image or os.environ.get("AEGIS_VLLM_IMAGE", "vllm/vllm-openai:latest")
+     labels = _labels(tenant_id, project_id, model_version_id, deployment_id)
+     apps = _apps()
+     core = _core()
+ 
+-    env = [client.V1EnvVar(name="AEGIS_MODEL_ARTIFACT_URI", value=model_artifact_uri)]
++    # Shared volumes for initContainer -> main container handoff
++    volumes = [
++        client.V1Volume(name="workdir", empty_dir=client.V1EmptyDirVolumeSource()),
++        client.V1Volume(name="models", empty_dir=client.V1EmptyDirVolumeSource()),
++    ]
++
++    init_containers = []
++    if artifact_sha256 and signature is not None:
++        init_containers.append(
++            _artifact_init_container(
++                name="aegis-artifact-init",
++                artifact_uri=model_artifact_uri,
++                artifact_sha256=artifact_sha256,
++                signature=signature,
++                signature_type=signature_type,
++                mount_path="/models",
++            )
++        )
++
++    env = [
++        client.V1EnvVar(name="AEGIS_MODEL_ARTIFACT_URI", value=model_artifact_uri),
++        client.V1EnvVar(name="AEGIS_MODELS_DIR", value="/models"),
++    ]
+     container = client.V1Container(
+         name="vllm",
+         image=image,
+         ports=[client.V1ContainerPort(container_port=8000)],
+         env=env,
++        volume_mounts=[client.V1VolumeMount(name="models", mount_path="/models")],
+         resources=client.V1ResourceRequirements(
+             limits={"nvidia.com/gpu": str(gpu)} if gpu and gpu > 0 else None
+         ),
+     )
+-    pod_spec = client.V1PodSpec(containers=[container])
++    pod_spec = client.V1PodSpec(containers=[container], init_containers=init_containers or None, volumes=volumes)
+     template = client.V1PodTemplateSpec(metadata=client.V1ObjectMeta(labels=labels), spec=pod_spec)
+     spec = client.V1DeploymentSpec(
+         replicas=1,
+         selector=client.V1LabelSelector(match_labels={"aegis.io/deployment": deployment_id}),
+         template=template,
+@@ -114,7 +171,10 @@ def deploy_triton(
+     project_id: str,
+     model_version_id: str,
+     deployment_id: str,
+     model_artifact_uri: str,
++    artifact_sha256: Optional[str] = None,
++    signature: Optional[str] = None,
++    signature_type: str = "hmac",
+     gpu: int = 0,
+     image: Optional[str] = None,
+ ) -> Tuple[str, str]:
+@@ -122,16 +182,34 @@ def deploy_triton(
+     Golden template: Triton deployment (CPU/GPU).
+     """
+     image = image or os.environ.get("AEGIS_TRITON_IMAGE", "nvcr.io/nvidia/tritonserver:24.01-py3")
+     labels = _labels(tenant_id, project_id, model_version_id, deployment_id)
+     apps = _apps()
+     core = _core()
+ 
+-    env = [client.V1EnvVar(name="AEGIS_MODEL_ARTIFACT_URI", value=model_artifact_uri)]
++    volumes = [
++        client.V1Volume(name="workdir", empty_dir=client.V1EmptyDirVolumeSource()),
++        client.V1Volume(name="models", empty_dir=client.V1EmptyDirVolumeSource()),
++    ]
++    init_containers = []
++    if artifact_sha256 and signature is not None:
++        init_containers.append(
++            _artifact_init_container(
++                name="aegis-artifact-init",
++                artifact_uri=model_artifact_uri,
++                artifact_sha256=artifact_sha256,
++                signature=signature,
++                signature_type=signature_type,
++                mount_path="/models",
++            )
++        )
++
++    env = [
++        client.V1EnvVar(name="AEGIS_MODEL_ARTIFACT_URI", value=model_artifact_uri),
++        client.V1EnvVar(name="AEGIS_MODELS_DIR", value="/models"),
++    ]
+     container = client.V1Container(
+         name="triton",
+         image=image,
+         args=[
+             "tritonserver",
+@@ -146,12 +224,13 @@ def deploy_triton(
+         ],
+         env=env,
++        volume_mounts=[client.V1VolumeMount(name="models", mount_path="/models")],
+         resources=client.V1ResourceRequirements(
+             limits={"nvidia.com/gpu": str(gpu)} if gpu and gpu > 0 else None
+         ),
+     )
+-    pod_spec = client.V1PodSpec(containers=[container])
++    pod_spec = client.V1PodSpec(containers=[container], init_containers=init_containers or None, volumes=volumes)
+     template = client.V1PodTemplateSpec(metadata=client.V1ObjectMeta(labels=labels), spec=pod_spec)
+     spec = client.V1DeploymentSpec(
+         replicas=1,
+         selector=client.V1LabelSelector(match_labels={"aegis.io/deployment": deployment_id}),
+diff --git a/api/golden_app.py b/api/golden_app.py
+index cfad6dc..2edbc13 100644
+--- a/api/golden_app.py
++++ b/api/golden_app.py
+@@ -20,6 +20,7 @@ from __future__ import annotations
+ import os
+ import time
+ import uuid
+ import logging
++import re
+ from typing import Any, Dict, Optional
+ 
+ import httpx
+ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+@@ -34,12 +35,12 @@ from api.db import engine as sqlalchemy_engine, SessionLocal
+ 
+ from api.golden_auth import require_actor, Actor
+ from api.golden_audit import record_audit_event
+ from api.golden_models import Tenant, Project, Model, ModelVersion, Deployment, UsageRecord
+ from api.golden_store import put_artifact_bytes
+-from api.golden_signing import sign_sha256
++from api.golden_signing import sign_sha256, SIGN_MODE
+ from api.golden_policy import require_signature_valid, require_deploy_allowed
+-from api.golden_k8s import ensure_tenant_namespace, deploy_vllm, deploy_triton
++from api.golden_k8s import ensure_tenant_namespace, deploy_vllm, deploy_triton
+ from api.safety import enforce_and_maybe_block
+ 
+ configure_logging()
+ logger = logging.getLogger("aegis.golden")
+ logger.setLevel(logging.INFO)
+@@ -59,6 +60,12 @@ DEPLOY_TOTAL = Counter("aegis_deploy_total", "Deployments created", ["tenant", "backend"])
+ INFER_TOTAL = Counter("aegis_infer_total", "Inference calls", ["tenant", "model", "version", "backend"])
+ INFER_LAT_MS = Summary("aegis_infer_latency_ms", "Inference latency ms", ["tenant", "model", "version", "backend"])
+ 
++# Metering knobs (v1)
++DEFAULT_UNIT_PER_CALL = int(os.environ.get("AEGIS_DEFAULT_UNITS_PER_CALL", "1"))
++CHARS_PER_UNIT = int(os.environ.get("AEGIS_CHARS_PER_UNIT", "400"))  # crude heuristic if tokens not provided
++
+ 
+ @app.middleware("http")
+ async def enforce_tenant_auth(request: Request, call_next):
+@@ -214,6 +221,7 @@ async def register_model_artifact(
+         artifact_uri, sha256 = put_artifact_bytes(
+             tenant_id=actor.tenant_id,
+             project_id=project_id,
+             model_id=model_id,
+             version=version,
+             data=data,
+             content_type=artifact_file.content_type,
+         )
+         sig = sign_sha256(sha256)
+         signed = bool(sig)
+ 
+         mv_id = str(uuid.uuid4())
+         mv = ModelVersion(
+@@ -229,6 +237,7 @@ async def register_model_artifact(
+             artifact_sha256=sha256,
+             signature=sig,
+             signed=signed,
++            signature_type=SIGN_MODE,
+             eval_status="unknown",
+             approved=False,
+             metadata={"filename": artifact_file.filename, "content_type": artifact_file.content_type},
+         )
+@@ -347,6 +356,9 @@ async def deploy_model_version(
+         if backend == "vllm":
+             svc_name, url = deploy_vllm(
+                 namespace=namespace,
+                 name=k8s_name,
+                 tenant_id=actor.tenant_id,
+                 project_id=project_id,
+                 model_version_id=model_version_id,
+                 deployment_id=deployment_id,
+                 model_artifact_uri=mv.artifact_uri,
++                artifact_sha256=mv.artifact_sha256,
++                signature=mv.signature,
++                signature_type=mv.signature_type or SIGN_MODE,
+                 gpu=max(0, int(gpu or 0)),
+             )
+         else:
+             svc_name, url = deploy_triton(
+                 namespace=namespace,
+                 name=k8s_name,
+                 tenant_id=actor.tenant_id,
+                 project_id=project_id,
+                 model_version_id=model_version_id,
+                 deployment_id=deployment_id,
+                 model_artifact_uri=mv.artifact_uri,
++                artifact_sha256=mv.artifact_sha256,
++                signature=mv.signature,
++                signature_type=mv.signature_type or SIGN_MODE,
+                 gpu=max(0, int(gpu or 0)),
+             )
+@@ -395,6 +413,56 @@ async def deploy_model_version(
+         session.close()
+ 
+ 
++# ------------------------ inference routing adapters ------------------------
++
++def _estimate_units(payload: str, explicit_units: Optional[int] = None) -> int:
++    """
++    Golden-path metering:
++      - If caller provides explicit_units, use it.
++      - Else: heuristic based on characters.
++    """
++    if explicit_units is not None:
++        return max(1, int(explicit_units))
++    if not payload:
++        return DEFAULT_UNIT_PER_CALL
++    return max(1, int((len(payload) + CHARS_PER_UNIT - 1) / CHARS_PER_UNIT))
++
++
++def _vllm_route() -> str:
++    # vLLM commonly supports OpenAI-compatible endpoints.
++    # Default to chat completions; allow override.
++    return os.environ.get("AEGIS_VLLM_ROUTE", "/v1/chat/completions")
++
++
++def _triton_infer_route(model_name: str) -> str:
++    # Basic Triton inference API route
++    return f"/v2/models/{model_name}/infer"
++
++
+ @app.post("/v1/infer")
+ async def infer(
+     request: Request,
+     model_id: str = Form(...),
+     version: str = Form(...),
+     payload: str = Form(...),
++    units: Optional[int] = Form(None),
++    # Optional fields for vLLM OpenAI requests
++    prompt: Optional[str] = Form(None),
+ ):
+@@ -423,6 +491,8 @@ async def infer(
+ 
+     session = SessionLocal()
+     start = time.time()
+     backend = "unknown"
+     try:
+@@ -441,36 +511,69 @@ async def infer(
+         if not dep:
+             raise HTTPException(status_code=409, detail="no deployment for model version")
+ 
+         backend = dep.backend
+ 
+         timeout = float(os.environ.get("AEGIS_INFER_PROXY_TIMEOUT_S", "10"))
+-        proxy = os.environ.get("AEGIS_INFER_PROXY_ENABLED", "false").lower() == "true"
++        # Safer default: proxy off unless explicitly enabled
++        proxy = os.environ.get("AEGIS_INFER_PROXY_ENABLED", "false").lower() == "true"
+ 
+         # Golden path: route to deployment (optional proxy on/off for local dev)
+         result: Dict[str, Any]
+         if proxy:
+             async with httpx.AsyncClient(timeout=timeout) as client:
+-                r = await client.post(f"{dep.url}/infer", json={"payload": payload, "model_id": model_id, "version": version})
+-                r.raise_for_status()
+-                result = r.json()
++                if backend == "vllm":
++                    route = _vllm_route()
++                    # Minimal OpenAI chat payload if not provided:
++                    # You can replace this with a full OpenAI-compatible request body from your client.
++                    body = {
++                        "model": model_id,
++                        "messages": [{"role": "user", "content": prompt or payload}],
++                        "temperature": 0.0,
++                    }
++                    r = await client.post(f"{dep.url}{route}", json=body)
++                    r.raise_for_status()
++                    result = r.json()
++                elif backend == "triton":
++                    # Triton expects a specific JSON structure; this is a placeholder.
++                    # For real Triton usage, you must send proper inputs/outputs.
++                    route = _triton_infer_route(model_id)
++                    body = {"inputs": [{"name": "TEXT", "datatype": "BYTES", "shape": [1], "data": [payload]}]}
++                    r = await client.post(f"{dep.url}{route}", json=body)
++                    r.raise_for_status()
++                    result = r.json()
++                else:
++                    r = await client.post(f"{dep.url}/infer", json={"payload": payload})
++                    r.raise_for_status()
++                    result = r.json()
+         else:
+             result = {"deployment_url": dep.url, "note": "proxy disabled; set AEGIS_INFER_PROXY_ENABLED=true"}
+ 
+         elapsed_ms = (time.time() - start) * 1000.0
+         INFER_TOTAL.labels(tenant=actor.tenant_id, model=model_id, version=version, backend=backend).inc()
+         INFER_LAT_MS.labels(tenant=actor.tenant_id, model=model_id, version=version, backend=backend).observe(elapsed_ms)
+ 
+-        # Meter usage (v1: 1 unit per call)
++        # Meter usage (v2: heuristic units)
++        computed_units = _estimate_units(payload=payload, explicit_units=units)
+         ur = UsageRecord(
+             tenant_id=actor.tenant_id,
+             model_id=model_id,
+             version=version,
+             deployment_id=dep.id,
+             backend=backend,
+-            units=1,
++            units=computed_units,
+             inference_ms=elapsed_ms,
+-            extra={"request_id": infer_request_id},
++            extra={"request_id": infer_request_id, "proxy": proxy},
+         )
+         session.add(ur)
+         session.commit()
+ 
+         record_audit_event(
+             actor.tenant_id,
+             actor.sub,
+             "infer",
+             "deployment",
+             dep.id,
+             request_id=infer_request_id,
+             decision="allow",
+-            details={"backend": backend, "latency_ms": elapsed_ms},
++            details={"backend": backend, "latency_ms": elapsed_ms, "units": computed_units, "proxy": proxy},
+         )
+         return {"request_id": infer_request_id, "backend": backend, "result": result}
+     finally:
+         session.close()
+diff --git a/api/requirements-golden.txt b/api/requirements-golden.txt
+index c2cdb0a..c4d8421 100644
+--- a/api/requirements-golden.txt
++++ b/api/requirements-golden.txt
+@@ -1,6 +1,6 @@
+ # Golden-path dependencies
+ -r api/requirements-api2.txt
+ -r api/requirements-db.txt
+ 
+ prometheus-client==0.20.0
+ httpx==0.27.0
+ boto3==1.34.131
+ kubernetes==29.0.0
++requests==2.32.3
+ 
+ # OTel pins (api/otel.py uses these)
+ opentelemetry-api==1.26.0
+ opentelemetry-sdk==1.26.0
+ opentelemetry-exporter-otlp==1.26.0
+ opentelemetry-instrumentation-fastapi==0.47b0
+ opentelemetry-instrumentation-sqlalchemy==0.47b0
+diff --git a/README_GOLDEN_PATH.md b/README_GOLDEN_PATH.md
+index 1d2b0a1..f0f9f24 100644
+--- a/README_GOLDEN_PATH.md
++++ b/README_GOLDEN_PATH.md
+@@ -1,6 +1,6 @@
+ # Aegis Golden Path (v1)
+ 
+ Implements the minimal end-to-end platform loop:
+@@ -22,6 +22,34 @@ python -m api.bootstrap_golden_db
+ 
+ ## Required env vars
+ 
++### Signing (upgrade: Vault Transit)
++You can keep `hmac` for dev, but for production use Vault Transit:
++
++- `AEGIS_SIGN_MODE=vault_transit`
++- `VAULT_ADDR=https://vault.example.internal:8200`
++- `VAULT_TOKEN=...` (short-lived token is strongly recommended)
++- `AEGIS_VAULT_TRANSIT_MOUNT=transit`
++- `AEGIS_VAULT_TRANSIT_KEY=aegis-model-sign`
++
++If you run in Kubernetes, prefer Vault Agent/Kubernetes auth rather than injecting VAULT_TOKEN directly.
++
+ ### Auth (OIDC JWKS)
+ - `OIDC_JWKS_URI` (required)
+ - `OIDC_AUDIENCE` (recommended)
+ - `OIDC_ISSUER` (recommended)
+ - `AEGIS_TENANT_CLAIM` (default: `tenant`)
+ - `AEGIS_ROLES_CLAIM` (default: `roles`)
+@@ -39,12 +67,23 @@ Role suggestions:
+ - `tenant_user`
+ 
+ ### Storage (AWS S3 or MinIO)
+ - `AEGIS_ARTIFACTS_BUCKET` (required)
+ - `AEGIS_S3_REGION` (default `us-east-1`)
+ - `AEGIS_S3_ENDPOINT_URL` (optional)
+ 
+ AWS S3:
+ - do not set `AEGIS_S3_ENDPOINT_URL`
+ 
+ MinIO in-cluster:
+ - set `AEGIS_S3_ENDPOINT_URL=http://minio.<namespace>.svc:9000`
+ 
+-### Signing (dev/test)
+-- `AEGIS_SIGN_MODE=hmac|noop`
+-- `AEGIS_SIGN_HMAC_SECRET=...`
++### Runtime artifact fetch/verify (initContainer)
++Deployments now include an initContainer that:
++1) downloads the artifact from S3/MinIO
++2) verifies sha256 and signature
++3) extracts/copies into `/models` (emptyDir shared with Triton/vLLM)
++
++For MinIO, ensure the serving namespace has credentials available (IRSA/instance role for AWS, or MinIO access keys).
+ 
+ ## Kubernetes config
+ - `AEGIS_K8S_CONFIG=auto|incluster|kubeconfig`
+ 
+ ## Inference proxying
+ The gateway can optionally forward to the in-cluster service:
+ - `AEGIS_INFER_PROXY_ENABLED=true`
+ - `AEGIS_INFER_PROXY_TIMEOUT_S=10`
++
++Routing adapters:
++- vLLM: defaults to `/v1/chat/completions` (override with `AEGIS_VLLM_ROUTE`)
++- Triton: `/v2/models/{model_id}/infer` (placeholder inputs)

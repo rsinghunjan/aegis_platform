@@ -1,0 +1,512 @@
+*** Begin Patch
+*** Add File:deploy/vault/init_and_store.sh
++#!/usr/bin/env bash
++set -euo pipefail
++# Initialize Vault (if not already), enable KMS auto-unseal is assumed via Helm values,
++# enable file audit device writing to a PVC-backed path, store init bundle to S3 (EVIDENCE_BUCKET)
++#
++# Usage:
++#   VAULT_ADDR=https://vault.aegis.svc:8200 EVIDENCE_BUCKET=... KMS_ARN=... ./init_and_store.sh
++
++: "${VAULT_ADDR:?VAULT_ADDR required}"
++: "${EVIDENCE_BUCKET:?EVIDENCE_BUCKET required}"
++
++echo "Waiting for Vault to be reachable at $VAULT_ADDR..."
++until curl -sSf --insecure "${VAULT_ADDR}/v1/sys/health" >/dev/null 2>&1; do sleep 2; done
++
++if vault status -format=json | jq -e '.initialized' >/dev/null 2>&1; then
++  echo "Vault already initialized"
++  exit 0
++fi
++
++echo "Initializing Vault..."
++vault operator init -key-shares=1 -key-threshold=1 -format=json > /tmp/vault-init.json
++ROOT_TOKEN=$(jq -r '.root_token' /tmp/vault-init.json)
++UNSEAL_KEY=$(jq -r '.unseal_keys_b64[0]' /tmp/vault-init.json)
++
++echo "Archiving init bundle to s3://${EVIDENCE_BUCKET}/vault-init/"
++aws s3 cp /tmp/vault-init.json "s3://${EVIDENCE_BUCKET}/vault-init/vault-init-$(date +%s).json" --sse aws:kms --sse-kms-key-id "${KMS_ARN}"
++
++echo "Storing root token into AWS Secrets Manager (aegis/vault/root-token) - requires permissions"
++if aws secretsmanager describe-secret --secret-id aegis/vault/root-token >/dev/null 2>&1; then
++  aws secretsmanager put-secret-value --secret-id aegis/vault/root-token --secret-string "${ROOT_TOKEN}" >/dev/null
++else
++  aws secretsmanager create-secret --name aegis/vault/root-token --secret-string "${ROOT_TOKEN}" >/dev/null
++fi
++
++echo "Enabling Kubernetes auth (best run inside a pod with proper SA token mounted)"
++export VAULT_TOKEN="${ROOT_TOKEN}"
++vault auth enable kubernetes || true
++vault write auth/kubernetes/config \
++  token_reviewer_jwt="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" \
++  kubernetes_host="https://kubernetes.default.svc" \
++  kubernetes_ca_cert=@/var/run/secrets/kubernetes.io/serviceaccount/ca.crt || true
++
++echo "Enabling file audit device at /vault/logs/audit.log (ensure PVC mounted at /vault/logs in Vault deployment)"
++vault audit enable file file_path=/vault/logs/audit.log || true
++
++echo "Creating minimal signing-proxy policy"
++cat > /tmp/signing-proxy.hcl <<'HCL'
++path "transit/sign/aegis-signing" {
++  capabilities = ["create","read"]
++}
++path "pki/issue/ci-client" {
++  capabilities = ["create","read"]
++}
++HCL
++vault policy write signing-proxy /tmp/signing-proxy.hcl || true
++
++echo "Vault initialized and audit device enabled; init bundle archived and root token saved to AWS Secrets Manager."
++echo "NOTE: rotate Root token and unseal keys into your secure processes. Do not keep them in plaintext."
++
+*** End Patch
+*** Begin Patch
+*** Add File:deploy/vault/audit-pvc.yaml
++apiVersion: v1
++kind: PersistentVolumeClaim
++metadata:
++  name: vault-audit-pvc
++  namespace: aegis
++spec:
++  accessModes:
++    - ReadWriteOnce
++  resources:
++    requests:
++      storage: 5Gi
++
++---
++# Patch your Vault StatefulSet/Deployment to mount this PVC at /vault/logs so Vault's file audit device writes there.
++
+*** End Patch
+*** Begin Patch
+*** Add File:deploy/vault/audit-upload-cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: vault-audit-uploader
++  namespace: aegis
++spec:
++  schedule: "*/15 * * * *" # every 15 minutes
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          serviceAccountName: vault-audit-uploader
++          containers:
++            - name: uploader
++              image: amazon/aws-cli:2.11.25
++              command: ["/bin/sh","-c"]
++              env:
++                - name: EVIDENCE_BUCKET
++                  valueFrom:
++                    secretKeyRef:
++                      name: aegis-config
++                      key: EVIDENCE_BUCKET
++              args:
++                - |
++                  set -e
++                  src_dir="/vault/logs"
++                  if [ -d "$src_dir" ]; then
++                    for f in $(ls -1 $src_dir || true); do
++                      if [ -s "$src_dir/$f" ]; then
++                        ts=$(date +%s)
++                        aws s3 cp "$src_dir/$f" "s3://${EVIDENCE_BUCKET}/vault-audit/$f.$ts" --sse aws:kms || true
++                      fi
++                    done
++                  fi
++              volumeMounts:
++                - name: audit
++                  mountPath: /vault/logs
++          restartPolicy: OnFailure
++          volumes:
++            - name: audit
++              persistentVolumeClaim:
++                claimName: vault-audit-pvc
++
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: vault-audit-uploader
++  namespace: aegis
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/vault/pki_role_setup.sh
++#!/usr/bin/env bash
++set -euo pipefail
++# Requires VAULT_ADDR and VAULT_TOKEN exported
++echo "Enable PKI and create ci-client role for ephemeral cert issuance"
++vault secrets enable -path=pki pki || true
++vault secrets tune -max-lease-ttl=87600h pki || true
++vault write -field=certificate pki/root/generate/internal common_name="aegis.local" ttl=87600h > /tmp/ca.crt || true
++vault write pki/config/urls issuing_certificates="${VAULT_ADDR}/v1/pki/ca" crl_distribution_points="${VAULT_ADDR}/v1/pki/crl" || true
++vault write pki/roles/ci-client allowed_domains="aegis.svc" allow_subdomains=true max_ttl="24h" enforce_hostnames=false || true
++echo "PKI role ci-client ready. CI can request certificates via pki/issue/ci-client"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/vault/rotate_transit_key_cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: vault-rotate-transit-key
++  namespace: aegis
++spec:
++  schedule: "0 3 * * *" # daily at 03:00
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          serviceAccountName: vault-operator
++          containers:
++            - name: rotate
++              image: hashicorp/vault:1.14.0
++              env:
++                - name: VAULT_ADDR
++                  value: "https://vault.aegis.svc:8200"
++                - name: VAULT_TOKEN
++                  valueFrom:
++                    secretKeyRef:
++                      name: vault-root-token
++                      key: token
++              command: ["/bin/sh","-c"]
++              args:
++                - |
++                  set -e
++                  # rotate the transit key named aegis-signing (operator must create it beforehand)
++                  vault write -f transit/keys/aegis-signing || true
++                  echo "Rotated transit key aegis-signing"
++          restartPolicy: OnFailure
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/signing/sign_with_vault.py
++#!/usr/bin/env python3
++"""
++Example: Use Vault transit/sign endpoint to sign a blob (manifest) and record to Rekor.
++This is a simplified reference implementation for signing-proxy.
++Requires VAULT_ADDR and VAULT_TOKEN env variables and REKOR_URL
++"""
++import os, sys, base64, hashlib, json, requests
++
++VAULT_ADDR = os.environ.get("VAULT_ADDR", "https://vault.aegis.svc:8200")
++VAULT_TOKEN = os.environ.get("VAULT_TOKEN")
++TRANSIT_KEY = os.environ.get("TRANSIT_KEY", "aegis-signing")
++REKOR_URL = os.environ.get("REKOR_URL", "https://rekor.aegis.svc:3000")
++
++def sign_blob(data: bytes):
++    digest = hashlib.sha256(data).digest()
++    b64 = base64.b64encode(digest).decode()
++    url = f"{VAULT_ADDR}/v1/transit/sign/{TRANSIT_KEY}"
++    payload = {"input": b64, "prehashed": True, "algorithm": "sha2-256"}
++    headers = {"X-Vault-Token": VAULT_TOKEN}
++    r = requests.post(url, json=payload, headers=headers, timeout=10, verify=False)
++    r.raise_for_status()
++    sig = r.json()["data"]["signature"]
++    return sig
++
++def push_rekor_entry(manifest_bytes, signature):
++    # Minimal Rekor entry using API: create entry with body containing the manifest and signature
++    body = {
++        "apiVersion": "0.0.1",
++        "kind": "hashedrekord",
++        "spec": {
++            "data": {
++                "hash": {
++                    "algorithm": "sha256",
++                    "value": hashlib.sha256(manifest_bytes).hexdigest()
++                }
++            },
++            "signature": {
++                "content": signature
++            }
++        }
++    }
++    r = requests.post(f"{REKOR_URL}/api/v1/log", json=body, timeout=10, verify=False)
++    # Rekor API details may vary; adapt to your Rekor client
++    return r.status_code, r.text
++
++def main():
++    if len(sys.argv) < 2:
++        print("usage: sign_with_vault.py <manifest_file>")
++        sys.exit(2)
++    mfile = sys.argv[1]
++    data = open(mfile,"rb").read()
++    sig = sign_blob(data)
++    print("Vault signature:", sig)
++    if REKOR_URL:
++        code, text = push_rekor_entry(data, sig)
++        print("Rekor response:", code, text)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/ci_vault_ephemeral_sign.yml
++name: CI — request ephemeral cert and sign via signing-proxy (Vault)
++on:
++  workflow_dispatch:
++
++permissions:
++  id-token: write
++  contents: read
++
++jobs:
++  request_and_sign:
++    runs-on: ubuntu-latest
++    steps:
++      - name: Retrieve OIDC token
++        id: id_token
++        run: echo "::set-output name=token::$(curl -s -H 'Metadata: true' http://169.254.169.254/latest/meta-data/iam/security-credentials/ || true)"
++
++      - name: Login to Vault via GitHub OIDC
++        uses: hashicorp/vault-action@v2
++        with:
++          url: ${{ secrets.VAULT_ADDR }}
++          method: jwt
++          role: ${{ secrets.VAULT_OIDC_ROLE }}
++          jwt: ${{ secrets.GITHUB_OIDC_TOKEN }}
++        id: vault_login
++
++      - name: Request short-lived certificate from Vault PKI
++        env:
++          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
++          VAULT_TOKEN: ${{ steps.vault_login.outputs.client_token }}
++        run: |
++          # create a private key & CSR
++          openssl genrsa -out /tmp/client.key 2048
++          openssl req -new -key /tmp/client.key -subj "/CN=ci-runner-${{ github.run_id }}" -out /tmp/client.csr
++          # request cert from Vault PKI role ci-client
++          curl -s --header "X-Vault-Token: $VAULT_TOKEN" --request POST --data "{\"common_name\":\"ci-runner-${{ github.run_id }}\"}" $VAULT_ADDR/v1/pki/issue/ci-client | jq -r '.data.certificate' > /tmp/client.crt
++          echo "Wrote /tmp/client.crt"
++
++      - name: Use cert to call signing-proxy
++        env:
++          SIGNING_PROXY_URL: ${{ secrets.SIGNING_PROXY_URL }}
++        run: |
++          curl --cert /tmp/client.crt --key /tmp/client.key --cacert <(echo "${{ secrets.SIGNING_CLIENT_CA }}") \
++            -H "Content-Type: application/json" \
++            -d "{\"artifact\":\"dummy-artifact\"}" \
++            "${SIGNING_PROXY_URL}/sign" -o /tmp/sign_res.json -sS || (cat /tmp/sign_res.json && exit 1)
++          cat /tmp/sign_res.json
++
++      - name: Verify Rekor entry exists for artifact (optional)
++        env:
++          REKOR_URL: ${{ secrets.REKOR_URL }}
++        run: |
++          # Placeholder: Adjust verification to your Rekor usage, e.g. cosign or rekor-cli
++          echo "Verify Rekor entry via ${REKOR_URL} (manual step)"
++
+*** End Patch
+*** Begin Patch
+*** Add File:deploy/rekor/rekor-backup-cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: rekor-db-backup
++  namespace: aegis
++spec:
++  schedule: "0 2 * * *" # daily at 02:00
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          serviceAccountName: rekor-backup-sa
++          containers:
++            - name: pgdump
++              image: postgres:15
++              env:
++                - name: PGHOST
++                  valueFrom:
++                    secretKeyRef:
++                      name: rekor-db-secret
++                      key: REKOR_DB_HOST
++                - name: PGUSER
++                  valueFrom:
++                    secretKeyRef:
++                      name: rekor-db-secret
++                      key: REKOR_DB_USER
++                - name: PGPASSWORD
++                  valueFrom:
++                    secretKeyRef:
++                      name: rekor-db-secret
++                      key: REKOR_DB_PASS
++                - name: EVIDENCE_BUCKET
++                  valueFrom:
++                    secretKeyRef:
++                      name: aegis-config
++                      key: EVIDENCE_BUCKET
++              command: ["/bin/sh","-c"]
++              args:
++                - |
++                  set -e
++                  ts=$(date -u +%Y%m%dT%H%M%SZ)
++                  out="/tmp/rekor-backup-${ts}.dump"
++                  pg_dump -h "$PGHOST" -U "$PGUSER" -F c -f "$out"
++                  aws s3 cp "$out" "s3://${EVIDENCE_BUCKET}/rekor-backups/$(basename $out)" --sse aws:kms || true
++          restartPolicy: OnFailure
++
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: rekor-backup-sa
++  namespace: aegis
++
+*** End Patch
+*** Begin Patch
+*** Add File:velero/velero_backup_cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: velero-scheduled-backup
++  namespace: velero
++spec:
++  schedule: "0 */6 * * *" # every 6 hours
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          containers:
++            - name: velero-cli
++              image: vmware/velero:1.11.0
++              env:
++                - name: EVIDENCE_BUCKET
++                  valueFrom:
++                    secretKeyRef:
++                      name: aegis-config
++                      key: EVIDENCE_BUCKET
++                - name: COSIGN_KMS_KEY_ARN
++                  valueFrom:
++                    secretKeyRef:
++                      name: aegis-config
++                      key: COSIGN_KMS_KEY_ARN
++              command: ["/bin/sh","-c"]
++              args:
++                - |
++                  set -e
++                  name="backup-$(date -u +%Y%m%dT%H%M%SZ)"
++                  velero backup create ${name} --include-namespaces=aegis
++                  velero backup wait ${name} --for=complete --timeout 15m || true
++                  echo "Signing proof-of-backup..."
++                  proof="/tmp/${name}.proof.txt"
++                  echo "backup:${name} time:$(date -u --iso-8601=seconds)" > ${proof}
++                  if [ -n "${COSIGN_KMS_KEY_ARN}" ]; then cosign sign --key "awskms://${COSIGN_KMS_KEY_ARN}" ${proof} || true; fi
++                  if [ -n "${EVIDENCE_BUCKET}" ]; then aws s3 cp ${proof} s3://${EVIDENCE_BUCKET}/velero-proofs/ || true; fi
++          restartPolicy: OnFailure
++
+*** End Patch
+*** Begin Patch
+*** Add File:aria/verify_rekor_entry.py
++#!/usr/bin/env python3
++"""
++Small utility to check Rekor transparency log for an entry matching the SHA256 of a manifest.
++Usage: verify_rekor_entry.py --manifest out/manifest.json --rekor https://rekor.aegis.svc:3000
++"""
++import argparse, json, hashlib, requests, sys
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--manifest", required=True)
++    p.add_argument("--rekor", required=True)
++    args = p.parse_args()
++    data = open(args.manifest,"rb").read()
++    digest = hashlib.sha256(data).hexdigest()
++    # Query rekor API for entries by hash; API path may vary by Rekor version
++    url = f"{args.rekor}/api/v1/index/retrieve"
++    payload = {"hash": {"algorithm":"sha256", "hex": digest}}
++    try:
++        r = requests.post(url, json=payload, timeout=10)
++        r.raise_for_status()
++        js = r.json()
++        if js:
++            print("Found Rekor entries:", js)
++            sys.exit(0)
++        else:
++            print("No Rekor entries found for digest", digest)
++            sys.exit(2)
++    except Exception as e:
++        print("Error querying Rekor:", e)
++        sys.exit(3)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:scripts/ops/velero_restore_rto_test.sh
++#!/usr/bin/env bash
++set -euo pipefail
++# Run a restore drill and measure time-to-restore. Usage:
++# EVIDENCE_BUCKET=... ./velero_restore_rto_test.sh <backup-name>
++BACKUP="$1"
++: "${EVIDENCE_BUCKET:?EVIDENCE_BUCKET required}"
++START=$(date +%s)
++RESTORE_NS="aegis-restore-$(date +%s)"
++velero restore create --from-backup "${BACKUP}" --namespace-mappings "aegis:${RESTORE_NS}" "${BACKUP}-restore"
++velero restore wait "${BACKUP}-restore" --for=complete --timeout 30m
++END=$(date +%s)
++delta=$((END-START))
++echo "Restore completed in ${delta}s"
++PROOF="/tmp/restore-proof-${BACKUP}.txt"
++echo "restore:${BACKUP} restored_to:${RESTORE_NS} time_seconds:${delta} time:$(date -u --iso-8601=seconds)" > ${PROOF}
++if [ -n "${COSIGN_KMS_KEY_ARN:-}" ]; then
++  cosign sign --key "awskms://${COSIGN_KMS_KEY_ARN}" ${PROOF} || true
++fi
++aws s3 cp ${PROOF} s3://${EVIDENCE_BUCKET}/restore-proofs/ || true
++echo "Proof uploaded to s3://${EVIDENCE_BUCKET}/restore-proofs/"
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/HARDENED_SIGNING_AND_BACKUP_RUNBOOK.md
++# Runbook: Vault PKI + Signing + Rekor durability + Backup & Restore Drills
++
++Overview
++- This document explains how to use the artifacts provided to initialize Vault, enable PKI for ephemeral CI certs, rotate transit signing keys, have Vault write audit logs (and upload them to EVIDENCE_BUCKET), configure Rekor durability via RDS (use terraform/rekor_rds), schedule Rekor backups, and schedule Velero backups with signed proofs-of-backup and scheduled restore drills.
++
++Steps
++1) Vault initialization & PKI
++   - Ensure cert-manager & Helm install of Vault used ha-values-raft.yaml referencing your KMS ARN for auto-unseal.
++   - Create PVC for vault audit logs: kubectl apply -f deploy/vault/audit-pvc.yaml
++   - Deploy Vault and mount PVC at /vault/logs in Vault pod spec
++   - Run: VAULT_ADDR=https://vault.aegis.svc:8200 KMS_ARN=<kms-arn> EVIDENCE_BUCKET=<evidence-bucket> ./deploy/vault/init_and_store.sh
++   - Export VAULT_TOKEN or store in AWS Secrets Manager as created by script
++   - Run: VAULT_ADDR=... VAULT_TOKEN=... ./ops/vault/pki_role_setup.sh
++
++2) Signing-proxy & ephemeral CI certs
++   - Ensure signing-proxy is configured to accept mTLS client certs and to call Vault transit for signing.
++   - Use .github/workflows/ci_vault_ephemeral_sign.yml to test OIDC -> Vault login -> request short-lived client cert -> call signing-proxy
++   - Signing-proxy should call Vault transit/sign or HSM and then create a Rekor entry.
++   - Use ops/signing/sign_with_vault.py as example integration.
++
++3) Rekor durability
++   - Use terraform/rekor_rds (or your own RDS module) to provision RDS Postgres (multi_az, encrypted, backups enabled)
++   - Update Kubernetes secret rekor-db-secret with REKOR_DB_HOST, REKOR_DB_USER, REKOR_DB_PASS
++   - Deploy deploy/rekor/rekor-deployment-rds.yaml which reads REKOR_DATABASE_URL from that secret
++   - Apply deploy/rekor/rekor-backup-cronjob.yaml to schedule daily pg_dump -> S3 uploads
++
++4) Velero backup & restore drills
++   - Provision object-lock S3 bucket as in velero/terraform_s3_with_object_lock.tf
++   - Install Velero configured to use that bucket (see velero/install_and_restore_drill.sh)
++   - Apply velero/velero_backup_cronjob.yaml to schedule periodic backups and upload signed proof-of-backup to EVIDENCE_BUCKET
++   - Use scripts/ops/velero_restore_rto_test.sh <backup-name> to perform an RTO test and measure time; results are signed and uploaded
++
++5) Rotation automation
++   - The CronJob ops/vault/rotate_transit_key_cronjob.yaml rotates the transit key daily. Ensure vault-root-token secret is created with the token for job use (rotate with care).
++   - Periodically rotate Vault root/unseal via your secure key ceremonies; store rotation artifacts into EVIDENCE_BUCKET.
++
++6) Verification & acceptance
++   - CI run should request ephemeral cert and call signing-proxy; signing-proxy must create rekor entry and evidence saved to S3.
++   - Rekor RDS backups should appear in s3://<EVIDENCE_BUCKET>/rekor-backups/
++   - Velero backup proofs should appear in s3://<EVIDENCE_BUCKET>/velero-proofs/
++   - Run restore drill and confirm proof-of-restore visible in s3://<EVIDENCE_BUCKET>/restore-proofs/
++
++Security notes
++- Ensure IAM roles for CronJobs and pods have least privilege: upload to only required S3 prefixes; access to RDS via private networking only.
++- Keep Vault root token lifecycle offline and use AWS Secrets Manager only for ephemeral access by automation if required.
++- Keep rotation schedules and audit logs immutable (object-lock) for the evidence bucket.
++
+*** End Patch
+*** End Patch

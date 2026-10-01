@@ -1,0 +1,696 @@
+*** Begin Patch
+*** Add File:services/quantum/db_models.py
++"""
++SQLAlchemy models and DB helpers for persistent QPU queue and billing records.
++
++Usage:
++ - Configure DATABASE_URL env var (Postgres/Aurora)
++ - Run migrations or let SQLAlchemy create tables for PoC
++"""
++import os
++from sqlalchemy import (
++    create_engine, Column, Integer, String, JSON, DateTime, Float, Enum, Boolean
++)
++from sqlalchemy.ext.declarative import declarative_base
++from sqlalchemy.orm import sessionmaker
++import enum
++import datetime
++
++DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./qpu_queue.db")
++engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
++SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
++Base = declarative_base()
++
++
++class JobState(enum.Enum):
++    queued = "queued"
++    running = "running"
++    done = "done"
++    error = "error"
++    cancelled = "cancelled"
++
++
++class QPUJob(Base):
++    __tablename__ = "qpu_jobs"
++    id = Column(String, primary_key=True, index=True)
++    owner = Column(String, index=True)
++    provider = Column(String, index=True)
++    payload = Column(JSON)
++    priority = Column(Integer, default=10)
++    max_cost_usd = Column(Float, default=0.0)
++    timeout_s = Column(Integer, default=600)
++    state = Column(Enum(JobState), default=JobState.queued)
++    submitted_at = Column(DateTime, default=datetime.datetime.utcnow)
++    started_at = Column(DateTime, nullable=True)
++    finished_at = Column(DateTime, nullable=True)
++    result = Column(JSON, nullable=True)
++    error = Column(String, nullable=True)
++
++
++class BillingRecord(Base):
++    __tablename__ = "qpu_billing"
++    id = Column(Integer, primary_key=True, autoincrement=True)
++    job_id = Column(String, index=True)
++    owner = Column(String, index=True)
++    provider = Column(String)
++    estimated_cost = Column(Float)
++    actual_cost = Column(Float, nullable=True)
++    currency = Column(String, default="USD")
++    recorded_at = Column(DateTime, default=datetime.datetime.utcnow)
++
++
++def init_db():
++    Base.metadata.create_all(bind=engine)
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/quantum/qpu_queue_persistent.py
++#!/usr/bin/env python3
++"""
++Persistent QPU Queue Service (FastAPI)
++ - Uses SQLAlchemy-backed DB for job persistence and billing
++ - Has endpoints to submit, status, cancel, estimate
++ - Places provenance/evidence into EVIDENCE_BUCKET
++ - Enqueues work for worker processes via a simple work table; workers poll DB
++"""
++import os
++import uuid
++import json
++import time
++import logging
++from typing import Dict
++from fastapi import FastAPI, HTTPException, Depends
++from pydantic import BaseModel
++
++from services.quantum.db_models import SessionLocal, init_db, QPUJob, BillingRecord, JobState
++
++try:
++    from services.common.keycloak_auth import validate_token
++except Exception:
++    def validate_token(*a, **k):
++        return {"preferred_username": "dev"}
++
++import boto3
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++S3 = boto3.client("s3") if boto3 and EVIDENCE_BUCKET else None
++
++logger = logging.getLogger("qpu-queue-persistent")
++logging.basicConfig(level=logging.INFO)
++
++app = FastAPI(title="QPU Queue Persistent (PoC)")
++
++init_db()
++
++
++class QPUJobSubmit(BaseModel):
++    name: str
++    provider: str
++    payload: Dict
++    priority: int = 10
++    max_cost_usd: float = 10.0
++    timeout_s: int = 600
++
++
++def upload_evidence(prefix: str, payload: Dict):
++    if not S3:
++        p = f"/tmp/evidence_{prefix}_{int(time.time())}.json"
++        with open(p, "w") as f:
++            json.dump(payload, f, indent=2)
++        return p
++    key = f"{prefix}/{int(time.time())}-{uuid.uuid4().hex}.json"
++    S3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(payload).encode("utf-8"))
++    return f"s3://{EVIDENCE_BUCKET}/{key}"
++
++
++@app.post("/submit")
++def submit(job: QPUJobSubmit, user=Depends(validate_token)):
++    owner = user.get("preferred_username", "dev")
++    job_id = uuid.uuid4().hex
++    db = SessionLocal()
++    j = QPUJob(
++        id=job_id,
++        owner=owner,
++        provider=job.provider,
++        payload=job.payload,
++        priority=job.priority,
++        max_cost_usd=job.max_cost_usd,
++        timeout_s=job.timeout_s,
++        state=JobState.queued
++    )
++    db.add(j)
++    # billing estimate record
++    br = BillingRecord(job_id=job_id, owner=owner, provider=job.provider, estimated_cost=0.0)
++    db.add(br)
++    db.commit()
++    upload_evidence("qpu/submissions", {"job_id": job_id, "owner": owner, "job": job.dict()})
++    return {"job_id": job_id}
++
++
++@app.get("/status/{job_id}")
++def status(job_id: str, user=Depends(validate_token)):
++    db = SessionLocal()
++    j = db.query(QPUJob).get(job_id)
++    if not j:
++        raise HTTPException(status_code=404)
++    return {"id": j.id, "state": j.state.value, "owner": j.owner, "result": j.result, "error": j.error}
++
++
++@app.post("/cancel/{job_id}")
++def cancel(job_id: str, user=Depends(validate_token)):
++    db = SessionLocal()
++    j = db.query(QPUJob).get(job_id)
++    if not j:
++        raise HTTPException(status_code=404)
++    if j.state in (JobState.done, JobState.error):
++        return {"ok": False, "reason": "finished"}
++    j.state = JobState.cancelled
++    db.commit()
++    upload_evidence("qpu/cancel", {"job_id": job_id, "by": user.get("preferred_username")})
++    return {"ok": True}
++
++
++@app.get("/estimate")
++def estimate(provider: str = "local_sim", shots: int = 1024):
++    per_shot = {"local_sim": 0.0, "ibm": 0.0005, "aws_braket": 0.001}
++    latency = {"local_sim": 0.1, "ibm": 30, "aws_braket": 10}
++    return {"cost_est_usd": per_shot.get(provider, 0.01) * shots, "latency_s": latency.get(provider, 30)}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/quantum/worker.py
++#!/usr/bin/env python3
++"""
++Worker process that polls DB for queued QPU jobs and executes via adapters.
++ - Implements retries/backoff, updates job state, and records billing actual_cost.
++ - For PoC uses local qiskit_adapter; production adapters for AWS Braket / Pennylane are pluggable.
++"""
++import os
++import time
++import logging
++from services.quantum.db_models import SessionLocal, QPUJob, JobState, BillingRecord
++from sqlalchemy import select
++from datetime import datetime
++
++logger = logging.getLogger("qpu-worker")
++logging.basicConfig(level=logging.INFO)
++
++POLL_INTERVAL = int(os.environ.get("QPU_POLL_INTERVAL", "5"))
++
++def run_job_adapter(job_spec):
++    provider = job_spec["provider"]
++    if provider.startswith("aws") or provider == "aws_braket":
++        from services.quantum.adapters.aws_braket_adapter import run_braket_sync
++        return run_braket_sync(job_spec)
++    elif provider.startswith("pennylane"):
++        from services.quantum.adapters.pennylane_adapter import run_pennylane_sync
++        return run_pennylane_sync(job_spec)
++    else:
++        from services.quantum.qiskit_adapter import run_job_sync
++        return run_job_sync(job_spec)
++
++def worker_loop():
++    while True:
++        db = SessionLocal()
++        job = db.query(QPUJob).filter(QPUJob.state == JobState.queued).order_by(QPUJob.priority.asc()).first()
++        if job:
++            logger.info("Starting job %s", job.id)
++            job.state = JobState.running
++            job.started_at = datetime.utcnow()
++            db.commit()
++            try:
++                res = run_job_adapter({"provider": job.provider, "payload": job.payload})
++                job.result = res
++                job.state = JobState.done
++                # record billing (placeholder)
++                br = db.query(BillingRecord).filter(BillingRecord.job_id == job.id).first()
++                if br:
++                    br.actual_cost = float(res.get("estimated_cost", 0.0))
++                job.finished_at = datetime.utcnow()
++                db.commit()
++            except Exception as e:
++                logger.exception("Job failed")
++                job.state = JobState.error
++                job.error = str(e)
++                db.commit()
++        else:
++            time.sleep(POLL_INTERVAL)
++
++if __name__ == "__main__":
++    worker_loop()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/quantum/adapters/aws_braket_adapter.py
++#!/usr/bin/env python3
++"""
++AWS Braket adapter (PoC)
++ - Stub that demonstrates where to call AWS Braket SDK (boto3.braket) using IAM credentials/IRSA.
++ - Should implement cost estimation, job submission, status polling, and results retrieval.
++"""
++import os, time, logging
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++logger = logging.getLogger("braket-adapter")
++logging.basicConfig(level=logging.INFO)
++
++def run_braket_sync(job_spec):
++    # PoC: return synthetic result and an estimated cost
++    time.sleep(1)
++    return {"job_id": job_spec.get("job_id", "poc"), "provider": "aws_braket", "estimated_cost": 0.12, "result": {"counts": {"00": 512, "11": 512}}}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/quantum/adapters/pennylane_adapter.py
++#!/usr/bin/env python3
++"""
++Pennylane adapter (PoC)
++ - Integrate with PennyLane + plugin backends (Qulacs/Qiskit/etc.) for hybrid workflows
++ - Here we return a simple stub result
++"""
++import time
++def run_pennylane_sync(job_spec):
++    time.sleep(1)
++    return {"job_id": job_spec.get("job_id","poc"), "provider":"pennylane", "result": {"counts": {"00": 500, "11": 524}}}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/quantum/simulator_farm_runner.py
++#!/usr/bin/env python3
++"""
++Simulator farm runner: runs many noisy sims in parallel and uploads evidence to S3/HDFS.
++ - Designed to be run on an HPC or batch system; for Kubernetes, run as a Job with high parallelism.
++"""
++import os, json, time
++from concurrent.futures import ThreadPoolExecutor
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++S3 = boto3.client("s3") if boto3 and EVIDENCE_BUCKET else None
++
++def run_sim(i, noise_level=0.01):
++    # PoC: simulate and write counts
++    res = {"run": i, "noise": noise_level, "counts": {"00": 500, "11": 500}, "ts": int(time.time())}
++    key = f"simulations/noisy/run-{i}-{int(time.time())}.json"
++    if S3:
++        S3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(res).encode("utf-8"))
++        return f"s3://{EVIDENCE_BUCKET}/{key}"
++    else:
++        p = f"/tmp/{key.replace('/','_')}"
++        os.makedirs(os.path.dirname(p), exist_ok=True)
++        with open(p, "w") as f:
++            json.dump(res, f)
++        return p
++
++def run_many(n=1000, workers=32):
++    with ThreadPoolExecutor(max_workers=workers) as ex:
++        futures = [ex.submit(run_sim, i) for i in range(n)]
++        return [f.result() for f in futures]
++
++if __name__ == "__main__":
++    import sys
++    n = int(sys.argv[1]) if len(sys.argv) > 1 else 100
++    run_many(n=n, workers=int(os.environ.get("SIM_WORKERS","16")))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tekton/simulator-farm-pipeline.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Pipeline
++metadata:
++  name: simulator-farm-pipeline
++  namespace: cicd
++spec:
++  params:
++    - name: runs
++      type: string
++      default: "100"
++    - name: workers
++      type: string
++      default: "16"
++    - name: evidence_bucket
++      type: string
++  tasks:
++    - name: run-simulations
++      taskSpec:
++        params:
++          - name: runs
++          - name: workers
++        steps:
++          - name: run
++            image: us.gcr.io/aegis/sim-runner:latest
++            script: |
++              #!/bin/sh
++              set -euo pipefail
++              python services/quantum/simulator_farm_runner.py $(params.runs)
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/hpc/slurm_submitter_secure.py
++#!/usr/bin/env python3
++"""
++Secure Slurm submitter:
++ - Uses SSH key injected via Kubernetes Secret (mounted into pod)
++ - Copies script via scp and runs sbatch; polls sacct for status
++ - Supports secure key rotation by reloading secret and restarting job submitter pods
++"""
++import os, subprocess, logging, time
++
++SLURM_HEAD = os.environ.get("SLURM_HEAD", "slurm-head.cluster.local")
++SSH_USER = os.environ.get("SLURM_SSH_USER", "aegis")
++SSH_KEY_PATH = os.environ.get("SLURM_SSH_KEY_PATH", "/secrets/slurm_id_rsa")
++
++logger = logging.getLogger("slurm-submit-secure")
++logging.basicConfig(level=logging.INFO)
++
++def scp_to_head(local_path, remote_path):
++    cmd = ["scp", "-i", SSH_KEY_PATH, "-o", "StrictHostKeyChecking=no", local_path, f"{SSH_USER}@{SLURM_HEAD}:{remote_path}"]
++    subprocess.check_call(cmd)
++
++def ssh_run(cmd):
++    ssh = ["ssh", "-i", SSH_KEY_PATH, "-o", "StrictHostKeyChecking=no", f"{SSH_USER}@{SLURM_HEAD}", cmd]
++    return subprocess.check_output(ssh).decode("utf-8")
++
++def submit_script(script_path):
++    remote = f"/tmp/{os.path.basename(script_path)}-{int(time.time())}"
++    scp_to_head(script_path, remote)
++    out = ssh_run(f"sbatch {remote}")
++    import re
++    m = re.search(r"Submitted batch job (\d+)", out)
++    return m.group(1) if m else None
++
++def poll_job(job_id, interval=10):
++    while True:
++        out = ssh_run(f"sacct -j {job_id} --format=JobID,State,Elapsed -n")
++        logger.info("sacct: %s", out.strip())
++        if any(st in out for st in ("COMPLETED","FAILED","CANCELLED")):
++            return out
++        time.sleep(interval)
++
++if __name__=="__main__":
++    import sys
++    script = sys.argv[1] if len(sys.argv)>1 else "train.sh"
++    j = submit_script(script)
++    logger.info("Submitted job: %s", j)
++    poll_job(j)
++
+*** End Patch
+*** Begin Patch
+*** Add File:tekton/tasks/slurm-submit-secure.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: slurm-submit-secure
++  namespace: cicd
++spec:
++  params:
++    - name: script_path
++      type: string
++  steps:
++    - name: submit
++      image: us.gcr.io/aegis/slurm-submit-secure:latest
++      script: |
++        set -euo pipefail
++        python services/hpc/slurm_submitter_secure.py $(params.script_path)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/scripts/setup_slurm_ssh_keys.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Generate SSH keypair for slurm access and create k8s secret for mounting into submitter pods
++NAMESPACE=${1:-cicd}
++SECRET_NAME=${2:-slurm-ssh-key}
++
++if [ -f "./slurm_id_rsa" ]; then
++  echo "Using existing slurm_id_rsa in working dir"
++else
++  ssh-keygen -t rsa -b 4096 -f ./slurm_id_rsa -N "" -C "aegis-slurm-key"
++fi
++
++echo "Create k8s secret with private key"
++kubectl -n "$NAMESPACE" create secret generic "$SECRET_NAME" --from-file=id_rsa=./slurm_id_rsa --dry-run=client -o yaml | kubectl apply -f -
++
++echo "Public key (add to Slurm head authorized_keys):"
++cat ./slurm_id_rsa.pub
++
+*** End Patch
+*** Begin Patch
+*** Add File:tekton/tasks/distributed-training-horovod.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: horovod-distributed-train
++  namespace: cicd
++spec:
++  params:
++    - name: num_nodes
++      type: string
++      default: "2"
++    - name: gpus_per_node
++      type: string
++      default: "4"
++    - name: checkpoint_s3
++      type: string
++  steps:
++    - name: prepare
++      image: docker.io/library/python:3.10
++      script: |
++        set -euo pipefail
++        echo "Prepare environment for Horovod training"
++    - name: run
++      image: us.gcr.io/aegis/horovod-trainer:latest
++      script: |
++        set -euo pipefail
++        # trainer entrypoint handles torchrun/horovodrun across nodes; it must support checkpoint on USR1
++        python -u trainer_entrypoint.py --nodes $(params.num_nodes) --gpus $(params.gpus_per_node) --checkpoint-s3 $(params.checkpoint_s3)
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/hpc/checkpoint_handler.sh
++#!/usr/bin/env bash
++#
++# Example training wrapper to trap USR1 and persist a checkpoint to S3 before preemption.
++# Place in training container as entrypoint or signal handler.
++S3_BUCKET=${S3_BUCKET:-}
++CHECKPOINT_DIR=${CHECKPOINT_DIR:-/workspace/checkpoints}
++
++trap 'echo "USR1 received: saving checkpoint"; tar -czf /tmp/ckpt.tgz $CHECKPOINT_DIR; aws s3 cp /tmp/ckpt.tgz s3://$S3_BUCKET/checkpoints/ckpt-$(date +%s).tgz; exit 0' USR1
++
++echo "Starting training (placeholder)"
++while true; do
++  sleep 60
++done
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/scripts/perf_benchmark.py
++#!/usr/bin/env python3
++"""
++Simple performance benchmarking harness:
++ - Run a configurable number of concurrent optimizer requests to measure latency and throughput
++ - Can be used for capacity planning or CI smoke tests
++"""
++import os, time, requests
++from concurrent.futures import ThreadPoolExecutor
++
++URL = os.environ.get("OPTIMIZER_URL", "http://carbon-optimizer.monitoring.svc:8082/optimize")
++CONC = int(os.environ.get("PERF_CONCURRENCY", "20"))
++ITERS = int(os.environ.get("PERF_ITERS", "100"))
++
++def call_once(i):
++    payload = {"job_id": f"bench-{i}", "model_name": "bench", "latency_sla_ms":200, "candidates": {"us-east":"http://example"}}
++    t0 = time.time()
++    r = requests.post(URL, json=payload, timeout=10)
++    return time.time()-t0, r.status_code
++
++def run():
++    latencies = []
++    with ThreadPoolExecutor(max_workers=CONC) as ex:
++        futures = [ex.submit(call_once, i) for i in range(ITERS)]
++        for f in futures:
++            dt, status = f.result()
++            latencies.append(dt)
++    latencies.sort()
++    n = len(latencies)
++    print("Requests:", n, "p50:", latencies[int(n*0.5)], "p95:", latencies[int(n*0.95)], "p99:", latencies[int(n*0.99)])
++
++if __name__ == "__main__":
++    run()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/edge/device_ca_issuer.py
++#!/usr/bin/env python3
++"""
++Device CA Issuer (PoC)
++ - Issues short-lived device certificates signed by an internal CA for enrolled devices
++ - Stores issued certs metadata into registry (for revocation)
++ - In production, integrate with Keycloak or a proper PKI (step-ca, CFSSL) and automated rotation
++"""
++import os, time, json, uuid, logging
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++from cryptography import x509
++from cryptography.x509.oid import NameOID
++from cryptography.hazmat.primitives import serialization, hashes
++from cryptography.hazmat.primitives.asymmetric import rsa
++
++logger = logging.getLogger("device-ca")
++logging.basicConfig(level=logging.INFO)
++
++CA_KEY_PATH = os.environ.get("CA_KEY_PATH", "/etc/ca/ca.key.pem")
++CA_CERT_PATH = os.environ.get("CA_CERT_PATH", "/etc/ca/ca.crt.pem")
++
++app = FastAPI(title="Device CA Issuer (PoC)")
++
++class CSRRequest(BaseModel):
++    device_id: str
++    csr_pem: str
++
++def load_ca():
++    with open(CA_KEY_PATH, "rb") as f:
++        key = serialization.load_pem_private_key(f.read(), password=None)
++    with open(CA_CERT_PATH, "rb") as f:
++        cert = x509.load_pem_x509_certificate(f.read())
++    return key, cert
++
++@app.post("/issue")
++def issue(req: CSRRequest):
++    key, cert = load_ca()
++    # For PoC simply sign a CSR and return cert
++    csr = x509.load_pem_x509_csr(req.csr_pem.encode())
++    subject = csr.subject
++    builder = x509.CertificateBuilder().subject_name(
++        subject
++    ).issuer_name(
++        cert.subject
++    ).public_key(
++        csr.public_key()
++    ).serial_number(
++        int(uuid.uuid4().int & (1<<64)-1)
++    ).not_valid_before(
++        time.time()
++    ).not_valid_after(
++        time.time() + 3600*24  # 1 day
++    )
++    signed = builder.sign(private_key=key, algorithm=hashes.SHA256())
++    pem = signed.public_bytes(serialization.Encoding.PEM).decode()
++    return {"cert_pem": pem}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/edge/ota_controller.py
++#!/usr/bin/env python3
++"""
++OTA Controller (PoC)
++ - Manage OTA campaigns: create campaign, sign artifacts (cosign), stage rollout, and record evidence
++ - Uses S3 evidence bucket for artifacts and signatures
++"""
++import os, time, json, logging
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++import subprocess
++
++logger = logging.getLogger("ota-controller")
++logging.basicConfig(level=logging.INFO)
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++
++app = FastAPI(title="OTA Controller (PoC)")
++
++class Campaign(BaseModel):
++    name: str
++    artifact_s3: str
++    target_devices: list
++    batch_size: int = 10
++
++CAMPAIGNS = {}
++
++@app.post("/campaigns")
++def create_campaign(c: Campaign):
++    cid = f"camp-{int(time.time())}"
++    # sign artifact using cosign (requires cosign key in environment or mounted)
++    try:
++        subprocess.check_call(["cosign", "sign", "--key", os.environ.get("COSIGN_KEY","/secrets/cosign.key"), c.artifact_s3])
++    except Exception as e:
++        logger.warning("cosign sign failed: %s", e)
++    CAMPAIGNS[cid] = {"id": cid, "campaign": c.dict(), "created_at": int(time.time()), "state":"staged"}
++    # record evidence
++    # For PoC: just create a local metadata file
++    meta = {"id": cid, "artifact": c.artifact_s3, "targets": c.target_devices, "ts": int(time.time())}
++    if EVIDENCE_BUCKET:
++        import boto3
++        s3 = boto3.client("s3")
++        key = f"ota/campaigns/{cid}.json"
++        s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(meta).encode())
++    return CAMPAIGNS[cid]
++
++@app.post("/campaigns/{cid}/start")
++def start_campaign(cid: str):
++    c = CAMPAIGNS.get(cid)
++    if not c:
++        raise HTTPException(status_code=404)
++    c["state"]="running"
++    return c
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/scripts/manage_webhook_ca_bundle.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Create CA, issue server cert for webhook service, create k8s TLS secret and print base64 CA bundle
++# Usage: ./ops/scripts/manage_webhook_ca_bundle.sh <namespace> <service> <secret-name>
++NS=${1:-cicd}
++SVC=${2:-optimizer-mutating-webhook}
++SECRET=${3:-optimizer-webhook-tls}
++./ops/scripts/generate_webhook_cert.sh "$NS" "$SVC" "$SECRET"
++echo "Use the printed CA bundle in MutatingWebhookConfiguration cabundle field."
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/tekton/ci_qpu_provider_smoke.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Pipeline
++metadata:
++  name: qpu-provider-smoke
++  namespace: cicd
++spec:
++  params:
++    - name: provider
++      type: string
++      default: local_sim
++    - name: evidence_bucket
++      type: string
++  tasks:
++    - name: submit-qpu
++      taskSpec:
++        steps:
++          - name: submit
++            image: curlimages/curl:8.2.1
++            script: |
++              set -euo pipefail
++              PAYLOAD='{"name":"smoke","provider":"$(params.provider)","payload":{"shots":128}}'
++              curl -sS -X POST -H "Content-Type: application/json" -d "$PAYLOAD" http://qpu-queue.monitoring.svc:8085/submit
++          - name: wait
++            image: docker.io/library/bash:5.1
++            script: |
++              sleep 5
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/quantum/migrations/README.md
++Migration guidance:
++ - This directory contains SQL migration helpers. For production use a proper migration system (Alembic).
++ - For PoC, run services/quantum/db_models.init_db() to create tables.
++
+*** End Patch
+*** End Patch

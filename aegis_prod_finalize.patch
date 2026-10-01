@@ -1,0 +1,556 @@
+*** Begin Patch
+*** Add File:ci/telemetry_calibration_validate.yml
++name: Telemetry → Calibration → Validate (staging)
++
++on:
++  workflow_dispatch:
++  schedule:
++    - cron: '0 6 * * 1' # weekly Monday 06:00 UTC
++
++env:
++  EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++  KUBECONFIG: ${{ secrets.KUBECONFIG }}
++  AWS_REGION: ${{ secrets.AWS_REGION }}
++  MEDIAN_THRESHOLD: "0.10"
++  PUSHGATEWAY: ${{ secrets.PUSHGATEWAY }}
++
++jobs:
++  telemetry-and-validate:
++    runs-on: ubuntu-latest
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.11'
++
++      - name: Install deps
++        run: pip install boto3 requests kubernetes
++
++      - name: Configure kubeconfig
++        run: |
++          echo "${{ secrets.KUBECONFIG }}" > /tmp/kubeconfig
++          mkdir -p ~/.kube
++          cp /tmp/kubeconfig ~/.kube/config
++
++      - name: Run telemetry healthcheck
++        env:
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++          AWS_REGION: ${{ secrets.AWS_REGION }}
++        run: |
++          python3 accuracy/telemetry_healthcheck.py --prefix telemetry/ --days 7
++
++      - name: Trigger iterative calibration CronJob in staging (one-off job)
++        run: |
++          kubectl -n aegis create job --from=cronjob/aegis-iterative-calibration telemetry-calib-$(date -u +%s) || true
++          kubectl -n aegis wait --for=condition=complete job -l job-name=telemetry-calib-* --timeout=1800s || true
++
++      - name: Run validation gating and upload report
++        env:
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++          AWS_REGION: ${{ secrets.AWS_REGION }}
++          COSIGN_KMS_KEY_ARN: ${{ secrets.COSIGN_KMS_KEY_ARN }}
++        run: |
++          python3 ci/validate_model_gating.py --bucket "${EVIDENCE_BUCKET}" --prefix "reconciliations/" --threshold "${{ env.MEDIAN_THRESHOLD }}" --upload-report "true"
++
++      - name: Push median metric to Pushgateway (best-effort)
++        env:
++          PUSHGATEWAY: ${{ secrets.PUSHGATEWAY }}
++        run: |
++          python3 accuracy/median_prometheus_reporter.py || true
++
+*** End Patch
+*** Begin Patch
+*** Add File:accuracy/collect_telemetry_summary.py
++#!/usr/bin/env python3
++"""
++Summarize telemetry files in S3 for a window and produce a CSV/JSON report.
++Writes output to s3://<EVIDENCE_BUCKET>/telemetry/health/
++"""
++import os, json, argparse, boto3, datetime
++from collections import defaultdict
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET")
++AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
++
++def list_keys(s3, bucket, prefix, start_ts):
++    paginator = s3.get_paginator("list_objects_v2")
++    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
++        for obj in page.get("Contents", []):
++            if obj["LastModified"] >= start_ts:
++                yield obj["Key"]
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--prefix", default="telemetry/")
++    p.add_argument("--days", type=int, default=7)
++    args = p.parse_args()
++    if not EVIDENCE_BUCKET:
++        raise SystemExit("EVIDENCE_BUCKET env required")
++    s3 = boto3.client("s3", region_name=AWS_REGION)
++    start_ts = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=args.days)
++    counts = defaultdict(int)
++    total = 0
++    for key in list_keys(s3, EVIDENCE_BUCKET, args.prefix, start_ts):
++        total += 1
++        parts = key.split("/")
++        node_type = parts[1] if len(parts) > 1 else "unknown"
++        counts[node_type] += 1
++    report = {"window_days": args.days, "total_files": total, "counts_by_node": counts, "generated_at": datetime.datetime.utcnow().isoformat()+"Z"}
++    out_key = f"{args.prefix}health/telemetry_health_{int(datetime.datetime.utcnow().timestamp())}.json"
++    s3.put_object(Bucket=EVIDENCE_BUCKET, Key=out_key, Body=json.dumps(report).encode("utf-8"))
++    print("Wrote report to s3://%s/%s" % (EVIDENCE_BUCKET, out_key))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:calibration/iterative_calibration_validate.py
++#!/usr/bin/env python3
++"""
++Run iterative calibration in cluster and validate median relative error.
++Creates a validation report in S3 and exits non-zero if median > threshold.
++Intended to be run from CI or as a CronJob.
++"""
++import os, time, json, statistics, boto3, subprocess
++from datetime import datetime
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET")
++AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
++THRESH = float(os.environ.get("MEDIAN_THRESHOLD", "0.10"))
++
++def compute_median_from_s3(prefix="reconciliations/"):
++    s3 = boto3.client("s3", region_name=AWS_REGION)
++    vals = []
++    paginator = s3.get_paginator("list_objects_v2")
++    for page in paginator.paginate(Bucket=EVIDENCE_BUCKET, Prefix=prefix):
++        for o in page.get("Contents", []):
++            key = o["Key"]
++            if not key.endswith(".json"):
++                continue
++            try:
++                body = s3.get_object(Bucket=EVIDENCE_BUCKET, Key=key)["Body"].read().decode()
++                j = json.loads(body)
++                est = j.get("estimate", {}).get("estimated_emissions_kg")
++                meas = j.get("measured", {}).get("measured_emissions_kg")
++                if est is None or meas is None or meas == 0:
++                    continue
++                vals.append(abs(meas - est) / float(meas))
++            except Exception:
++                continue
++    return statistics.median(vals) if vals else None, len(vals)
++
++def upload_report(s3, report, key_prefix="calibration/validation_reports/"):
++    key = f"{key_prefix}validation_{int(time.time())}.json"
++    s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(report).encode())
++    return key
++
++def main():
++    if not EVIDENCE_BUCKET:
++        raise SystemExit("EVIDENCE_BUCKET env required")
++    s3 = boto3.client("s3", region_name=AWS_REGION)
++    # compute baseline median
++    median, count = compute_median_from_s3()
++    report = {"median_relative_error": median, "sample_count": count, "ts": datetime.utcnow().isoformat()+"Z"}
++    # If median above threshold, trigger calibration + training jobs in cluster (assumes K8s CronJob exists)
++    if median is None or median > THRESH:
++        report["action"] = "median_above_threshold"
++        # Trigger one-off calibration job (uses existing calibration_job.yaml)
++        subprocess.run(["kubectl","-n","aegis","create","job","--from=cronjob/aegis-iterative-calibration","ci-calib-"+str(int(time.time()))], check=False)
++        report["calibration_triggered"] = True
++    else:
++        report["action"] = "within_threshold"
++        report["calibration_triggered"] = False
++    key = upload_report(s3, report)
++    print("Uploaded validation report to", key)
++    # fail CI if median > threshold
++    if median is not None and median > THRESH:
++        raise SystemExit(3)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:enforcement/enforcement_coverage_harness.py
++#!/usr/bin/env python3
++"""
++End-to-end enforcement coverage harness.
++ - Submits synthetic Argo Workflows annotated with Aegis hints.
++ - Polls enforcement metrics from Pushgateway or Redis and computes coverage.
++ - Writes a JSON coverage report to S3 for audit.
++"""
++import os, time, json, boto3, requests
++from kubernetes import client, config
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET")
++AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
++PUSHGATEWAY = os.environ.get("PUSHGATEWAY", "pushgateway.monitoring.svc:9091")
++NAMESPACE = os.environ.get("TEST_NAMESPACE", "aegis-test")
++COUNT = int(os.environ.get("TEST_COUNT", "50"))
++
++def submit_workflows(count=10):
++    config.load_kube_config()
++    api = client.CustomObjectsApi()
++    template = {
++        "apiVersion":"argoproj.io/v1alpha1",
++        "kind":"Workflow",
++        "metadata":{"generateName":"enf-test-"},
++        "spec":{"entrypoint":"whalesay","templates":[{"name":"whalesay","container":{"image":"docker/whalesay","command":["cowsay","hello"]}}]}
++    }
++    for i in range(count):
++        wf = template.copy()
++        ann = {"aegis.carbon.hint": json.dumps({"action":"run","prefer_spot": i%2==0}), "aegis.team":"test-team"}
++        wf["metadata"] = {"generateName":"enf-test-","annotations":ann}
++        try:
++            api.create_namespaced_custom_object(group="argoproj.io", version="v1alpha1", namespace=NAMESPACE, plural="workflows", body=wf)
++        except Exception:
++            pass
++        time.sleep(0.2)
++
++def fetch_metrics():
++    # try Pushgateway first
++    try:
++        r = requests.get(f"http://{PUSHGATEWAY}/metrics", timeout=5)
++        text = r.text
++        # naive parse
++        def get_metric(name):
++            for line in text.splitlines():
++                if line.startswith(name+" "):
++                    return float(line.split(" ",1)[1])
++            return 0.0
++        triggered = get_metric("aegis_policy_triggered_total")
++        enforced = get_metric("aegis_enforcer_enforced_total")
++        failures = get_metric("aegis_enforcer_failures_total")
++        return {"triggered": triggered, "enforced": enforced, "failures": failures}
++    except Exception:
++        return {}
++
++def upload_report(s3, report, key_prefix="enforcement/coverage_reports/"):
++    key = f"{key_prefix}coverage_{int(time.time())}.json"
++    s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(report).encode())
++    return key
++
++def main():
++    if not EVIDENCE_BUCKET:
++        raise SystemExit("EVIDENCE_BUCKET required")
++    s3 = boto3.client("s3", region_name=AWS_REGION)
++    submit_workflows(COUNT)
++    time.sleep(30)
++    metrics = fetch_metrics()
++    triggered = metrics.get("triggered", 0)
++    enforced = metrics.get("enforced", 0)
++    failures = metrics.get("failures", 0)
++    coverage = (enforced / triggered) if triggered else None
++    report = {"triggered": triggered, "enforced": enforced, "failures": failures, "coverage": coverage, "ts": time.time()}
++    key = upload_report(s3, report)
++    print("Uploaded enforcement coverage report to s3://%s/%s" % (EVIDENCE_BUCKET, key))
++    print(json.dumps(report, indent=2))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:terraform/redshift/iam_redshift_copy.tf
++# IAM role and policy for Redshift COPY access to a limited S3 prefix
++variable "evidence_bucket" {}
++variable "parquet_prefix" { default = "parquet/evidence" }
++variable "allowed_arns" { type = list(string) }
++
++resource "aws_iam_role" "redshift_s3_access" {
++  name = "aegis-redshift-s3-access"
++  assume_role_policy = jsonencode({
++    Version = "2012-10-17"
++    Statement = [
++      {
++        Effect = "Allow"
++        Principal = {
++          Service = "redshift.amazonaws.com"
++        }
++        Action = "sts:AssumeRole"
++      }
++    ]
++  })
++}
++
++resource "aws_iam_policy" "redshift_s3_policy" {
++  name = "aegis-redshift-s3-policy"
++  policy = jsonencode({
++    Version = "2012-10-17"
++    Statement = [
++      {
++        Sid = "AllowListBucket",
++        Effect = "Allow",
++        Action = [
++          "s3:ListBucket"
++        ],
++        Resource = ["arn:aws:s3:::${var.evidence_bucket}"],
++        Condition = {
++          StringLike = {
++            "s3:prefix": ["${var.parquet_prefix}/*", "${var.parquet_prefix}"]
++          }
++        }
++      },
++      {
++        Sid = "AllowGetObjects",
++        Effect = "Allow",
++        Action = [
++          "s3:GetObject",
++          "s3:GetObjectAcl"
++        ],
++        Resource = [
++          "arn:aws:s3:::${var.evidence_bucket}/${var.parquet_prefix}/*"
++        ]
++      }
++    ]
++  })
++}
++
++resource "aws_iam_role_policy_attachment" "attach" {
++  role       = aws_iam_role.redshift_s3_access.name
++  policy_arn = aws_iam_policy.redshift_s3_policy.arn
++}
++
++output "redshift_s3_role_arn" {
++  value = aws_iam_role.redshift_s3_access.arn
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:security/cosign_rotate.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Rotate cosign KMS key: create a new KMS key and alias; operator must update CI secret COSIGN_KMS_KEY_ARN.
++#
++if [ -z "${1:-}" ]; then
++  echo "Usage: $0 <new-kms-alias>"
++  exit 2
++fi
++ALIAS="$1"
++DESC="${2:-Aegis cosign key rotation}"
++
++KEY_ID=$(aws kms create-key --description "$DESC" --query KeyMetadata.KeyId --output text)
++aws kms create-alias --alias-name "alias/${ALIAS}" --target-key-id "${KEY_ID}"
++ARN=$(aws kms describe-key --key-id "${KEY_ID}" --query KeyMetadata.Arn --output text)
++echo "Created new KMS key: ${ARN}"
++echo "Update CI secret COSIGN_KMS_KEY_ARN to awskms://${ARN}"
++echo "Important: ensure old key is not deleted until all signatures validated and Rekor entries confirmed."
++
+*** End Patch
+*** Begin Patch
+*** Add File:security/certmanager_clusterissuer_corporate.yaml
++apiVersion: cert-manager.io/v1
++kind: ClusterIssuer
++metadata:
++  name: corporate-ca-issuer
++spec:
++  ca:
++    secretName: corporate-ca-keypair
++
++# Operators: create secret `corporate-ca-keypair` in the cert-manager namespace with tls.crt/tls.key.
++
+*** End Patch
+*** Begin Patch
+*** Add File:security/rbac_audit_tool.sh
++#!/usr/bin/env bash
++set -euo pipefail
++# Lists service accounts in `aegis` namespace that have ClusterRoleBindings and prints their roles
++NS=${1:-aegis}
++echo "Scanning SA -> ClusterRoleBindings in namespace ${NS}"
++kubectl get clusterrolebinding -o json | jq -r '.items[] | {name:.metadata.name, subjects:.subjects, roleRef:.roleRef} | @json' | while read line; do
++  echo "$line"
++done
++echo "Review output for any broad roles (e.g., cluster-admin) and tighten accordingly."
++
+*** End Patch
+*** Begin Patch
+*** Add File:airflow/dags/etl_idempotent_with_alerts.py
++from datetime import datetime, timedelta
++from airflow import DAG
++from airflow.operators.python import PythonOperator
++from airflow.providers.cncf.kubernetes.operators.kubernetes_pod import KubernetesPodOperator
++import os, subprocess, requests
++from operational.airflow_idempotent_helper import already_done_marker, mark_done
++
++DEFAULT_ARGS = {
++    'owner': 'aegis',
++    'depends_on_past': False,
++    'email_on_failure': False,
++    'retries': 2,
++    'retry_delay': timedelta(minutes=10),
++}
++
++WAREHOUSE_DSN = os.environ.get("WAREHOUSE_DSN", "postgresql://user:pass@host:5432/aegis_dw")
++SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK_URL")
++
++def notify_slack(msg):
++    if SLACK_WEBHOOK:
++        try:
++            requests.post(SLACK_WEBHOOK, json={"text": msg}, timeout=5)
++        except Exception:
++            pass
++
++def parquet_task():
++    job_key = "parquet_pipeline_" + datetime.utcnow().strftime("%Y%m%d")
++    if already_done_marker(WAREHOUSE_DSN, job_key):
++        print("Parquet pipeline already completed; skipping")
++        return
++    ret = subprocess.run("python3 /opt/ingest/s3_parquet_pipeline_v3.py", shell=True)
++    if ret.returncode != 0:
++        notify_slack("Parquet pipeline failed")
++        raise RuntimeError("parquet pipeline failed")
++    mark_done(WAREHOUSE_DSN, job_key)
++
++def bulk_load_task():
++    ret = subprocess.run("/opt/etl/redshift_loader_wrapper.sh", shell=True)
++    if ret.returncode != 0:
++        notify_slack("Bulk loader failed")
++        raise RuntimeError("bulk loader failed")
++
++def on_failure(context):
++    ti = context.get('task_instance')
++    msg = f"Task {ti.task_id} failed in DAG {ti.dag_id}"
++    notify_slack(msg)
++
++with DAG(
++    dag_id="aegis_etl_idempotent_alerts",
++    default_args=DEFAULT_ARGS,
++    schedule_interval="@daily",
++    start_date=datetime(2025,1,1),
++    catchup=False,
++    max_active_runs=1,
++    on_failure_callback=on_failure
++) as dag:
++
++    t_parquet = PythonOperator(task_id="parquet_pipeline", python_callable=parquet_task)
++
++    t_manifest = PythonOperator(task_id="generate_manifest", python_callable=lambda: subprocess.check_call("python3 /opt/ingest/copy_manifest_generator.py", shell=True))
++
++    t_bulk = KubernetesPodOperator(
++        task_id="bulk_load",
++        name="bulk-load",
++        namespace="aegis",
++        image="ghcr.io/yourorg/aegis-redshift-loader:latest",
++        cmds=["/bin/sh","-c"],
++        arguments=["/opt/etl/redshift_loader_wrapper.sh"],
++        get_logs=True,
++        is_delete_operator_pod=True,
++        in_cluster=True
++    )
++
++    t_parquet >> t_manifest >> t_bulk
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/prometheus_rules_prod_slos.yaml
++groups:
++- name: aegis-prod-slos
++  rules:
++  - alert: MedianEstimatorErrorHigh
++    expr: aegis_reconciliation_median_rel_error > 0.10
++    for: 60m
++    labels:
++      severity: page
++    annotations:
++      summary: "Median relative error for estimates above 10% (audit risk)"
++
++  - alert: EnforcementCoverageBelowSLO
++    expr: aegis_enforcement_coverage < 0.95
++    for: 30m
++    labels:
++      severity: page
++    annotations:
++      summary: "Enforcement coverage below 95%"
++
++  - alert: ETLIngestionLagExceeded
++    expr: aegis_etl_ingestion_lag_seconds > 86400
++    for: 30m
++    labels:
++      severity: page
++    annotations:
++      summary: "ETL ingestion lag greater than 24 hours"
++
++  - alert: GEValidationFailing
++    expr: aegis_ge_latest_success == 0
++    for: 10m
++    labels:
++      severity: warning
++    annotations:
++      summary: "Great Expectations validations failing"
++
+*** End Patch
+*** Begin Patch
+*** Add File:runbooks/incident_playbook_extended.md
++# Incident Playbooks — Extended (DR / resume / ETL / enforcement / calibration)
++
++1) DR / Resume Drill (suspend/resume)
++- Purpose: validate controller resume behavior for suspended Argo workflows.
++- Steps:
++  - Run `python3 operational/dr_resume_test.py` in staging.
++  - Confirm controller created resume job and workflow resumed within expected window.
++  - If resume fails, collect controller logs: `kubectl -n aegis logs -l app=aegis-enforcer` and escalate.
++- Post-mortem actions: update resume job image, adjust timeouts, or add retries.
++
++2) ETL Parquet pipeline failure
++- Symptoms: Parquet task failed, ETL ingestion lag increases.
++- Immediate:
++  - Check Airflow task logs and S3 checkpoint: `${EVIDENCE_BUCKET}/${PREFIX}.parquet_checkpoint.json`.
++  - Run `python3 ingest/s3_parquet_pipeline_v3.py --prefix <prefix> --limit 100` locally to reproduce.
++  - Quarantine bad objects by moving suspect files to `${PREFIX}/quarantine/` and re-run.
++- Recovery:
++  - Re-run Airflow task after fix; monitor `aegis_etl_parquet_failed` and ingestion lag metric.
++
++3) Bulk loader / COPY failure
++- Check Redshift STL/ERROR logs and manifest file in S3.
++- Ensure IAM role previously provisioned (see terraform/redshift/iam_redshift_copy.tf) has access to the prefix.
++- Retry using `etl/redshift_loader_wrapper.sh` with increased verbosity.
++- If partial-load: run MERGE/upsert (staging.merge_tmp) or restore from last snapshot.
++
++4) Enforcement coverage dip
++- If `aegis_enforcement_coverage` < 0.95:
++  - Run enforcement harness: `python3 enforcement/enforcement_coverage_harness.py`
++  - Inspect enforcer logs and extender logs: `kubectl -n kube-system logs -l app=aegis-scheduler-extender` and `kubectl -n aegis logs -l app=aegis-argo-enforcer`.
++  - If admission webhook denies unexpectedly, check MutatingWebhookConfiguration CA bundle validity and cert expiry.
++
++5) Calibration validation failing
++- If median_relative_error > threshold:
++  - Inspect validation report under `s3://<EVIDENCE_BUCKET>/calibration/validation_reports/`
++  - Run `python3 calibration/iterative_calibration_validate.py` manually to trigger calibration and collect outputs.
++  - Do NOT auto-apply drafts; gather human review, sign artifacts with cosign and then apply ConfigMap if approved.
++
++6) Security incident (KMS / cosign)
++- Revoke or disable compromised KMS key, rotate cosign key via `security/cosign_rotate.sh`.
++- Re-run signing of critical artifacts with new key and push Rekor entries.
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/acceptance_criteria.md
++# Acceptance Criteria — Production readiness targets
++
++Data accuracy
++- Median(|measured − estimated| / measured) ≤ 0.10 for representative workloads across node types for 14 consecutive days.
++
++Enforcement
++- Enforcement coverage (enforced / triggered) ≥ 0.95 over a rolling 7-day window.
++
++ETL
++- Daily ETL run success rate ≥ 99% (measured over 30 days).
++- Ingestion lag for daily pipelines < 24 hours.
++- Bulk loader idempotency & MERGE/upsert validated on test runs.
++
++Security
++- Webhook certificates issued by corporate PKI (cert-manager ClusterIssuer) and rotated automatically.
++- Cosign KMS key policy restricted to named principals; rotation plan in place.
++- No service accounts with cluster-admin unless explicitly justified.
++
++Operational resilience
++- DR/resume drill executed at least monthly with documented results.
++- Incident playbooks exercised and updated after each drill.
++ 
+*** End Patch
+*** End Patch

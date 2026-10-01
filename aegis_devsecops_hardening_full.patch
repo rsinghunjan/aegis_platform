@@ -1,0 +1,598 @@
+*** Begin Patch
+*** Add File:.github/workflows/ci_security_pipeline.yml
++name: CI Security Pipeline (SBOM, SCA, Sign, Rekor)
++on:
++  push:
++    branches: [ main ]
++  workflow_dispatch:
++
++jobs:
++  sbom-and-scan:
++    runs-on: ubuntu-latest
++    env:
++      MODEL_ARTIFACT_BUCKET: ${{ secrets.MODEL_ARTIFACT_BUCKET }}
++      REKOR_URL: ${{ secrets.REKOR_URL }}
++      SIGNING_PROXY_URL: ${{ secrets.SIGNING_PROXY_URL }}
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: 3.10
++
++      - name: Generate SBOM (Syft)
++        run: |
++          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
++          syft packages dir:. -o spdx-json > sbom.spdx.json || true
++          if [ -n "${MODEL_ARTIFACT_BUCKET}" ]; then
++            aws s3 cp sbom.spdx.json s3://${MODEL_ARTIFACT_BUCKET}/sbom/$(date -u +%s)-sbom.spdx.json || true
++          fi
++
++      - name: Run SCA (Trivy)
++        run: |
++          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
++          trivy fs --exit-code 1 --severity CRITICAL,HIGH . || echo "Trivy scan failed (vulnerabilities found)" > /tmp/trivy_failed
++          if [ -f /tmp/trivy_failed ]; then
++            python3 scripts/ci/report_vuln.py --title "CI Trivy Scan Findings" --body "Trivy reported vulnerabilities. See sbom and trivy output." || true
++            exit 1
++          fi
++
++      - name: Build container image (example)
++        run: |
++          IMAGE="ghcr.io/${{ github.repository_owner }}/aegis-sample:${{ github.sha }}"
++          docker build -t $IMAGE . || true
++          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
++
++      - name: Cosign sign & Rekor log (via signing proxy)
++        run: |
++          python3 scripts/ci/cosign_sign_via_proxy.py --image "$IMAGE" --proxy "${SIGNING_PROXY_URL}" --rekor "${REKOR_URL}" --out /tmp/sign_res.json || true
++          cat /tmp/sign_res.json
++          if [ -n "${MODEL_ARTIFACT_BUCKET}" ]; then
++            aws s3 cp /tmp/sign_res.json s3://${MODEL_ARTIFACT_BUCKET}/signatures/ || true
++          fi
++
++      - name: Upload artifacts to evidence (optional)
++        if: success()
++        run: |
++          if [ -n "${MODEL_ARTIFACT_BUCKET}" ]; then
++            aws s3 cp sbom.spdx.json s3://${MODEL_ARTIFACT_BUCKET}/sbom/ || true
++          fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:scripts/ci/cosign_sign_via_proxy.py
++#!/usr/bin/env python3
++"""
++Call the signing proxy to cosign an image and optionally push attestation to Rekor.
++This is a CI-side helper that avoids direct HSM access from runners.
++"""
++import argparse, json, os, requests, sys, time
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--image", required=True)
++    p.add_argument("--proxy", required=True)
++    p.add_argument("--rekor", default="")
++    p.add_argument("--out", default="/tmp/sign_res.json")
++    args = p.parse_args()
++    payload = {"image": args.image, "rekor": args.rekor}
++    r = requests.post(args.proxy.rstrip("/") + "/sign-image", json=payload, timeout=60)
++    if r.status_code != 200:
++        print("Signing proxy failed", r.status_code, r.text, file=sys.stderr)
++        sys.exit(2)
++    open(args.out, "w").write(r.text)
++    print("Wrote", args.out)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:deploy/signing_proxy/deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: signing-proxy
++  namespace: aegis
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: signing-proxy
++  template:
++    metadata:
++      labels:
++        app: signing-proxy
++    spec:
++      containers:
++        - name: signing-proxy
++          image: registry.example.com/aegis/signing-proxy:latest
++          ports:
++            - containerPort: 8080
++          env:
++            - name: HSM_ENDPOINT
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-secrets
++                  key: hsm_endpoint
++            - name: HSM_TOKEN_SECRET
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-secrets
++                  key: hsm_token
++
+*** End Patch
+*** Begin Patch
+*** Add File:deploy/signing_proxy/service.yaml
++apiVersion: v1
++kind: Service
++metadata:
++  name: signing-proxy
++  namespace: aegis
++spec:
++  selector:
++    app: signing-proxy
++  ports:
++    - port: 8080
++      targetPort: 8080
++
+*** End Patch
+*** Begin Patch
+*** Add File:deploy/signing_proxy/app.py
++#!/usr/bin/env python3
++"""
++Simple signing proxy scaffold.
++- Accepts POST /sign-image with JSON {"image": "...", "rekor": "..."}
++- Calls local HSM signing helper (production.policy.signing.sign_with_retry) if available,
++  otherwise attempts to run cosign with a locally mounted key (not recommended).
++This proxy should run in a secure namespace and require mTLS in production.
++"""
++from flask import Flask, request, jsonify
++import subprocess, json, os, sys, tempfile
++
++app = Flask(__name__)
++
++@app.route("/sign-image", methods=["POST"])
++def sign_image():
++    body = request.get_json() or {}
++    image = body.get("image")
++    rekor = body.get("rekor","")
++    if not image:
++        return jsonify({"error":"image required"}), 400
++    # Try HSM helper
++    try:
++        from production.policy.signing.sign_with_retry import sign_payload
++        # In production you'd fetch image bytes or sign the digest/attestation structure
++        payload = image.encode()
++        sig, meta = sign_payload(payload, None)
++        res = {"image": image, "signature": sig.hex() if isinstance(sig, bytes) else str(sig), "meta": meta}
++        return jsonify(res)
++    except Exception as e:
++        # Fallback: attempt to call cosign if available (not ideal)
++        try:
++            # Create temporary note to sign
++            t = tempfile.NamedTemporaryFile(delete=False)
++            t.write(image.encode()); t.close()
++            cmd = ["cosign", "sign-blob", "-key", "/etc/cosign/cosign.key", t.name]
++            subprocess.run(cmd, check=True)
++            return jsonify({"image":image, "signed":"cosign-fallback"}), 200
++        except Exception as e2:
++            return jsonify({"error":"signing failed", "hsm_err": str(e), "cosign_err": str(e2)}), 500
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=8080)
++
+*** End Patch
+*** Begin Patch
+*** Add File:deploy/vault/csi_secret_provider_class.yaml
++apiVersion: secrets-store.csi.x-k8s.io/v1
++kind: SecretProviderClass
++metadata:
++  name: vault-secret-provider
++  namespace: aegis
++spec:
++  provider: "vault"
++  parameters:
++    vaultAddress: "https://vault.example.internal:8200"
++    roleName: "aegis-role"
++    objects: |
++      - objectName: "db-creds"
++        secretPath: "secret/data/aegis/db"
++        objectType: "secret"
++
++# NOTE: This SecretProviderClass requires the Vault CSI provider to be installed.
++
+*** End Patch
+*** Begin Patch
+*** Add File:deploy/vault/agent_injector_configmap.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: vault-agent-injector-config
++  namespace: kube-system
++data:
++  config: |
++    exit_after_auth: false
++    auto_auth:
++      method:
++        type: kubernetes
++        mount_path: auth/kubernetes
++        config:
++          role: aegis-role
++    sink:
++      type: file
++      config:
++        path: /vault/secrets
++
++# Operators: install Vault Agent Injector and configure RBAC and service account mappings.
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/sbom_trivy_cosign.yml
++name: SBOM + SCA + Cosign Attest (pull_request)
++on:
++  pull_request:
++    branches: [ main ]
++
++jobs:
++  security-checks:
++    runs-on: ubuntu-latest
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++      - name: Generate SBOM
++        run: |
++          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
++          syft packages dir:. -o cyclonedx-json > sbom.cyclonedx.json || true
++          cat sbom.cyclonedx.json
++      - name: Trivy scan (fail on high/critical)
++        run: |
++          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
++          trivy fs --exit-code 1 --severity HIGH,CRITICAL . || (echo "Trivy issues" && exit 1)
++      - name: Require cosign attestation (demo)
++        run: |
++          echo "Cosign attestation will be required on merge (enforce via Gatekeeper)."
++
+*** End Patch
+*** Begin Patch
+*** Add File:scripts/ci/report_vuln.py
++#!/usr/bin/env python3
++"""
++Create a GitHub issue when CI finds critical vulnerabilities.
++"""
++import argparse, os, requests, json
++
++def create_issue(title, body):
++    repo = os.environ.get("GITHUB_REPOSITORY")
++    token = os.environ.get("GITHUB_TOKEN")
++    if not repo or not token:
++        print("Missing env GITHUB_REPOSITORY or GITHUB_TOKEN")
++        return
++    url = f"https://api.github.com/repos/{repo}/issues"
++    headers = {"Authorization": f"token {token}"}
++    r = requests.post(url, headers=headers, json={"title": title, "body": body})
++    print("Created issue", r.status_code)
++    print(r.text)
++
++if __name__ == "__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--title", required=True)
++    p.add_argument("--body", default="")
++    args = p.parse_args()
++    create_issue(args.title, args.body)
++
+*** End Patch
+*** Begin Patch
+*** Add File:falco/falco_rules_aegis.yaml
++# Falco rules scaffold for Aegis
++- list: aegis_rules
++  items:
++    - rule: Write etc passwd
++      desc: Detect writes to /etc/passwd
++      condition: (evt.type = open) and fd.name = "/etc/passwd"
++      output: "etc/passwd modified (user=%user.name command=%proc.cmdline file=%fd.name)"
++      priority: WARNING
++
++    - rule: Shell in container
++      desc: Detect shell executed in container
++      condition: container and evt.type = execve and proc.name in (bash, sh, ash)
++      output: "shell in container (container=%container.id user=%user.name proc=%proc.name cmd=%proc.cmdline)"
++      priority: WARNING
++
+*** End Patch
+*** Begin Patch
+*** Add File:falco/daemonset.yaml
++apiVersion: apps/v1
++kind: DaemonSet
++metadata:
++  name: falco
++  namespace: kube-system
++spec:
++  selector:
++    matchLabels:
++      app: falco
++  template:
++    metadata:
++      labels:
++        app: falco
++    spec:
++      hostNetwork: true
++      containers:
++        - name: falco
++          image: falcosecurity/falco:latest
++          securityContext:
++            privileged: true
++          volumeMounts:
++            - mountPath: /host/var/run/docker.sock
++              name: docker-sock
++            - mountPath: /etc/falco
++              name: falco-rules
++      volumes:
++        - name: falco-rules
++          configMap:
++            name: falco-rules
++        - name: docker-sock
++          hostPath:
++            path: /var/run/docker.sock
++
+*** End Patch
+*** Begin Patch
+*** Add File:governance/opa_runtime/deny_suspicious_syscalls.rego
++package aegis.runtime
++
++deny[msg] {
++  input.proc and sys := input.proc.syscall
++  sys == "ptrace"  # example suspicious syscall in containers
++  msg = sprintf("suspicious syscall ptrace used by pid=%v exe=%v", [input.proc.pid, input.proc.exe])
++}
++
++# Note: OPA runtime integration requires an agent that feeds runtime events to OPA.
++
+*** End Patch
+*** Begin Patch
+*** Add File:argo/flagger/sample_canary.yaml
++apiVersion: flagger.app/v1beta1
++kind: Canary
++metadata:
++  name: sample-service
++  namespace: default
++spec:
++  targetRef:
++    apiVersion: apps/v1
++    kind: Deployment
++    name: sample-service
++  service:
++    port: 80
++    targetPort: 8080
++  analysis:
++    interval: 1m
++    threshold: 5
++    metrics:
++      - name: request-success-rate
++        threshold: 99
++        interval: 1m
++      - name: request-duration
++        threshold: 500
++        interval: 1m
++
+*** End Patch
+*** Begin Patch
+*** Add File:argo/workflows/vuln_patch_ticketing.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: vuln-patch-ticket-
++  namespace: aegis
++spec:
++  entrypoint: scan-and-ticket
++  templates:
++    - name: scan-and-ticket
++      steps:
++        - - name: run-cluster-trivy
++            template: run-trivy
++        - - name: create-issue
++            template: create-issue
++
++    - name: run-trivy
++      container:
++        image: aquasec/trivy:0.39.0
++        command: [sh, -c]
++        args:
++          - trivy image --format json --output /tmp/trivy_report.json ghcr.io/aegis/critical-image:latest || true
++            cat /tmp/trivy_report.json
++      outputs:
++        artifacts:
++          - name: report
++            path: /tmp/trivy_report.json
++
++    - name: create-issue
++      container:
++        image: python:3.10-slim
++        command: [sh, -c]
++        args:
++          - pip install requests || true
++            python3 scripts/ci/report_vuln.py --title "Automated Trivy findings" --body "Trivy report available in artifact" || true
++
+*** End Patch
+*** Begin Patch
+*** Add File:argo/workflows/drift_detect_and_remediate.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: drift-detect-
++  namespace: aegis
++spec:
++  entrypoint: drift-detect
++  templates:
++    - name: drift-detect
++      steps:
++        - - name: git-sync
++            template: git-sync
++        - - name: kube-diff
++            template: kube-diff
++        - - name: remediate
++            template: remediate
++
++    - name: git-sync
++      container:
++        image: alpine/git
++        command: [sh, -c]
++        args:
++          - git clone https://github.com/your-org/your-infra-repo /tmp/infra || true
++
++    - name: kube-diff
++      container:
++        image: bitnami/kubectl:1.27
++        command: [sh, -c]
++        args:
++          - kubectl diff -f /tmp/infra/manifests || true
++      outputs:
++        parameters:
++          - name: diff
++            valueFrom:
++              path: /tmp/kube_diff.txt
++
++    - name: remediate
++      container:
++        image: bitnami/kubectl:1.27
++        command: [sh, -c]
++        args:
++          - echo "Auto-remediation disabled by default. Operator can enable apply step." && exit 0
++
+*** End Patch
+*** Begin Patch
+*** Add File:logging/fluentbit/fluentbit-configmap.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: fluent-bit-config
++  namespace: logging
++data:
++  fluent-bit.conf: |
++    [SERVICE]
++        Flush        5
++        Daemon       Off
++        Log_Level    info
++    [INPUT]
++        Name    tail
++        Path    /var/log/containers/*.log
++        Parser  docker
++    [OUTPUT]
++        Name  s3
++        Match *
++        bucket ${EVIDENCE_BUCKET}
++        region us-west-2
++
++  parsers.conf: |
++    [PARSER]
++        Name        docker
++        Format      json
++
+*** End Patch
+*** Begin Patch
+*** Add File:scripts/forensics/collect_forensic_evidence.sh
++#!/usr/bin/env bash
++set -euo pipefail
++OUTDIR=${1:-/tmp/aegis_forensics}
++mkdir -p "$OUTDIR"
++echo "Collecting pod logs..."
++kubectl get pods --all-namespaces -o json > "$OUTDIR"/pods.json || true
++kubectl get nodes -o wide > "$OUTDIR"/nodes.txt || true
++kubectl get events --all-namespaces > "$OUTDIR"/events.txt || true
++kubectl logs -n kube-system -l app=kube-apiserver > "$OUTDIR"/apiserver.log || true
++echo "Archiving evidence..."
++tar -czf /tmp/aegis_forensics.tar.gz -C "$OUTDIR" .
++if [ -n "${EVIDENCE_BUCKET:-}" ]; then
++  aws s3 cp /tmp/aegis_forensics.tar.gz s3://${EVIDENCE_BUCKET}/forensics/ || true
++fi
++echo "Forensic collection complete. Archive: /tmp/aegis_forensics.tar.gz"
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/pre_merge_secret_scan.yml
++name: Pre-merge Secret Scan
++on:
++  pull_request:
++    types: [opened, synchronize, reopened]
++
++jobs:
++  secret-scan:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: trufflehog scan
++        uses: trufflesecurity/trufflehog@v2
++        with:
++          github_token: ${{ secrets.GITHUB_TOKEN }}
++          args: --entropy=False --regex=True .
++
+*** End Patch
+*** Begin Patch
+*** Add File:governance/gatekeeper_require_cosign.yaml
++apiVersion: templates.gatekeeper.sh/v1
++kind: ConstraintTemplate
++metadata:
++  name: requirecosign
++spec:
++  crd:
++    spec:
++      names:
++        kind: RequireCosignSignature
++  targets:
++    - target: admission.k8s.gatekeeper.sh
++      rego: |
++        package requirecosign
++        violation[{"msg": msg}] {
++          input.review.kind.kind == "Pod"
++          not input.review.object.metadata.annotations["cosign.sig"]
++          msg := "Pod missing cosign.sig annotation"
++        }
++
++---
++apiVersion: constraints.gatekeeper.sh/v1beta1
++kind: RequireCosignSignature
++metadata:
++  name: cosign-required
++spec:
++  match:
++    kinds:
++      - apiGroups: [""]
++        kinds: ["Pod"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/DEVSECOPS_PATCH_NOTES.md
++# Aegis DevSecOps Patch — Notes & Next Steps
++
++This patch scaffolds:
++- CI integrations for SBOM (Syft), SCA (Trivy), cosign signing via secure signing-proxy, and Rekor support.
++- Signing proxy deployment & simple app that calls HSM signing helper (or fallback).
++- Vault CSI SecretProviderClass example and Vault Agent Injector config scaffold.
++- Falco rules & DaemonSet for runtime alerting.
++- OPA runtime rule example and Gatekeeper templates for cosign enforcement.
++- Flagger Canary scaffold for automated canary promotion with Prometheus metrics.
++- Vulnerability ticketing Argo workflow that runs Trivy and opens GitHub issues.
++- Drift detection Argo workflow to detect rubicon diffs (dry-run).
++- Fluent Bit config to forward logs to S3 (evidence bucket) and forensic collection script.
++- Pre-merge secret scanning workflow using trufflehog.
++
++Operator tasks to complete (short)
++- Install & configure Vault (server & CSI provider), set up roles and secrets.
++- Deploy cosign & Rekor (or use signing-proxy with HSM endpoint).
++- Deploy Falco, configure rule tuning and Alertmanager integration.
++- Provide Prometheus endpoint & metric names to Flagger / Canary policies (replace placeholders).
++- Configure signing-proxy TLS/mTLS and restrict with NetworkPolicy & RBAC.
++- Wire EVIDENCE_BUCKET and MODEL_ARTIFACT_BUCKET secrets in CI and cluster.
++- Harden signing-proxy to use HSM or signing service; ensure audit logging and rotation.
++
++If you want, I can now:
++(A) Replace signing-proxy with a secure HSM-backed signer adapter for your HSM vendor (requires vendor CLI details).  
++(B) Implement Prometheus metric queries for automated canary rollback (provide metric names).  
++(C) Wire Vault CSI provider installation manifests and example policy & role (provide Vault deployment choice).
++
++Which of A/B/C should I implement next?
++
+*** End Patch
+*** End Patch

@@ -1,0 +1,601 @@
+*** Begin Patch
+*** Add File:edge/auth/keycloak_setup.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Keycloak realm/client setup (example). Requires Keycloak admin CLI (kcadm.sh) or REST calls.
++# Replace variables below with your Keycloak admin credentials and host.
++KC_HOST="${KC_HOST:-http://keycloak.local:8080}"
++KC_USER="${KC_USER:-admin}"
++KC_PASS="${KC_PASS:-admin}"
++REALM="${REALM:-aegis}"
++CLIENT_ID="${CLIENT_ID:-aegis-edge-client}"
++
++echo "This script shows example kcadm.sh calls. It does not attempt to install Keycloak."
++echo "Login (example):"
++echo "kcadm.sh config credentials --server ${KC_HOST} --realm master --user ${KC_USER} --password ${KC_PASS}"
++echo
++echo "Create realm:"
++echo "kcadm.sh create realms -s realm=${REALM} -s enabled=true"
++echo
++echo "Create client:"
++echo "kcadm.sh create clients -r ${REALM} -s clientId=${CLIENT_ID} -s enabled=true -s publicClient=false -s 'redirectUris=[\"*\"]'"
++echo
++echo "Configure client roles, service accounts, and create device users via API or admin console."
++echo
++echo "NOTE: Many orgs use a managed IDP. Use the above as documentation and adapt to your IDP."
++
+*** End Patch
+*** Begin Patch
+*** Add File:edge/agent/edge_agent.py
++#!/usr/bin/env python3
++from fastapi import FastAPI, UploadFile, File, HTTPException
++from starlette.responses import JSONResponse, FileResponse
++import os, subprocess, shutil, requests, tempfile
++from prometheus_client import start_http_server, Counter, Gauge
++import threading
++
++app = FastAPI()
++
++MODEL_DIR = os.environ.get("AEGIS_EDGE_MODEL_DIR", "/var/aegis/models")
++os.makedirs(MODEL_DIR, exist_ok=True)
++
++# Metrics
++MODEL_VERSION = Gauge("aegis_edge_model_version", "Current model version")
++LAST_UPDATE = Gauge("aegis_edge_last_update_unix", "Last update timestamp")
++UPDATE_ATTEMPTS = Counter("aegis_edge_update_attempts", "Number of update attempts")
++
++def metrics_server():
++    start_http_server(8001)
++
++threading.Thread(target=metrics_server, daemon=True).start()
++
++def verify_cosign_signature(artifact_path, signature_path, pubkey_path):
++    # Uses cosign to verify; cosign must be installed on device
++    try:
++        cmd = ["cosign", "verify-blob", "--key", pubkey_path, "--signature", signature_path, artifact_path]
++        subprocess.check_output(cmd, stderr=subprocess.STDOUT)
++        return True
++    except subprocess.CalledProcessError as e:
++        return False
++
++@app.get("/health")
++def health():
++    return {"status":"ok"}
++
++@app.post("/update")
++async def update(image_url: str, signature_url: str = None, pubkey_url: str = None, model_tag: str = "latest"):
++    """
++    Instruct device to fetch an image or model artifact, verify signature (cosign), and install.
++    image_url: URL to model artifact (tar.gz or single file)
++    signature_url & pubkey_url: required for cosign verification
++    """
++    UPDATE_ATTEMPTS.inc()
++    tmpdir = tempfile.mkdtemp(prefix="aegis_update_")
++    try:
++        artifact_path = os.path.join(tmpdir, "artifact.tar.gz")
++        r = requests.get(image_url, stream=True, timeout=60)
++        r.raise_for_status()
++        with open(artifact_path, "wb") as f:
++            for chunk in r.iter_content(8192):
++                f.write(chunk)
++        if signature_url and pubkey_url:
++            sig_path = os.path.join(tmpdir, "artifact.sig")
++            key_path = os.path.join(tmpdir, "pubkey.pem")
++            with open(sig_path, "wb") as f:
++                f.write(requests.get(signature_url, timeout=30).content)
++            with open(key_path, "wb") as f:
++                f.write(requests.get(pubkey_url, timeout=30).content)
++            ok = verify_cosign_signature(artifact_path, sig_path, key_path)
++            if not ok:
++                raise HTTPException(status_code=400, detail="Signature verification failed")
++        # install artifact: unpack model into MODEL_DIR/<model_tag>
++        dest = os.path.join(MODEL_DIR, model_tag)
++        if os.path.exists(dest):
++            shutil.rmtree(dest)
++        os.makedirs(dest, exist_ok=True)
++        subprocess.check_call(["tar","-xzf",artifact_path,"-C",dest])
++        MODEL_VERSION.set(hash(model_tag) % 100000)
++        import time
++        LAST_UPDATE.set(int(time.time()))
++        return {"status":"installed","model_dir": dest}
++    finally:
++        shutil.rmtree(tmpdir, ignore_errors=True)
++
++@app.get("/models/{model_tag}/predict")
++def predict(model_tag: str, q: str = ""):
++    """
++    Placeholder prediction endpoint: loads model artifact and executes a simple script or binary.
++    The model artifact must expose a 'predict.py' entrypoint.
++    """
++    model_path = os.path.join(MODEL_DIR, model_tag)
++    if not os.path.exists(model_path):
++        raise HTTPException(status_code=404, detail="model not found")
++    predict_script = os.path.join(model_path, "predict.py")
++    if not os.path.exists(predict_script):
++        return {"error":"no predict script"}
++    out = subprocess.check_output(["python3", predict_script, q], text=True)
++    return JSONResponse({"result": out})
++
+*** End Patch
+*** Begin Patch
+*** Add File:edge/agent/verify_update.sh
++#!/usr/bin/env bash
++# Local helper to verify cosign signature for an artifact on-device
++set -euo pipefail
++ARTIFACT="$1"
++SIGNATURE="$2"
++PUBKEY="$3"
++
++if ! command -v cosign >/dev/null 2>&1; then
++  echo "cosign not installed; please install cosign on device"
++  exit 2
++fi
++
++cosign verify-blob --key "${PUBKEY}" --signature "${SIGNATURE}" "${ARTIFACT}" && echo "OK" || (echo "verify failed"; exit 3)
++
+*** End Patch
+*** Begin Patch
+*** Add File:edge/ota/rollout_controller.py
++#!/usr/bin/env python3
++"""
++Simple rollout controller: manages OTA manifests, tracks device groups and canary policy.
++Stores state in Redis. Devices poll the controller for updates.
++"""
++from flask import Flask, request, jsonify
++import redis, os, json, time, threading
++
++app = Flask(__name__)
++REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
++r = redis.from_url(REDIS_URL)
++
++def set_manifest(name, manifest):
++    r.set(f"aegis:ota:manifest:{name}", json.dumps(manifest))
++
++def get_manifest(name):
++    v = r.get(f"aegis:ota:manifest:{name}")
++    return json.loads(v) if v else None
++
++@app.post("/manifests")
++def create_manifest():
++    m = request.json
++    name = m.get("name")
++    if not name:
++        return jsonify({"error":"name required"}), 400
++    set_manifest(name, m)
++    return jsonify({"status":"ok"})
++
++@app.get("/manifests/<name>")
++def read_manifest(name):
++    m = get_manifest(name)
++    if not m:
++        return jsonify({"error":"not found"}), 404
++    return jsonify(m)
++
++@app.post("/devices/<device_id>/poll")
++def device_poll(device_id):
++    # device sends current model version; controller decides if update needed based on manifest
++    payload = request.json or {}
++    manifest_name = payload.get("manifest","default")
++    manifest = get_manifest(manifest_name)
++    if not manifest:
++        return jsonify({"update": False})
++    # simple canary: update if device group in rollout or percent
++    target_tag = manifest.get("model_tag")
++    return jsonify({"update": True, "image_url": manifest.get("image_url"), "signature_url": manifest.get("signature_url"), "pubkey_url": manifest.get("pubkey_url"), "model_tag": target_tag})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8082)))
++
+*** End Patch
+*** Begin Patch
+*** Add File:edge/runtime/runner.py
++#!/usr/bin/env python3
++"""
++Resource-aware inference runner for edge:
++ - Detects hardware (CPU/GPU)
++ - Selects quantized or full model variant if present
++ - Caches models locally and serves via local predict.py
++"""
++import os, subprocess, shutil, sys
++
++MODEL_BASE = os.environ.get("AEGIS_EDGE_MODEL_DIR","/var/aegis/models")
++
++def has_gpu():
++    try:
++        subprocess.check_output(["nvidia-smi"], stderr=subprocess.DEVNULL)
++        return True
++    except Exception:
++        return False
++
++def choose_model_variant(model_tag):
++    model_dir = os.path.join(MODEL_BASE, model_tag)
++    if has_gpu():
++        # prefer fp32 GPU model
++        candidate = os.path.join(model_dir, "gpu", "model.pt")
++        if os.path.exists(candidate):
++            return candidate
++    # CPU/quantized fallback
++    q = os.path.join(model_dir, "quantized", "model.pt")
++    if os.path.exists(q):
++        return q
++    # fallback to default
++    default = os.path.join(model_dir, "model.pt")
++    if os.path.exists(default):
++        return default
++    raise FileNotFoundError("No model found for tag " + model_tag)
++
++def serve(model_tag, input_data):
++    model_file = choose_model_variant(model_tag)
++    # Simplified: call predict.py with model path and input
++    predict_script = os.path.join(os.path.dirname(model_file), "..", "predict.py")
++    if not os.path.exists(predict_script):
++        raise FileNotFoundError("predict.py not found for model")
++    out = subprocess.check_output(["python3", predict_script, model_file, input_data], text=True)
++    return out
++
++if __name__ == "__main__":
++    if len(sys.argv) < 3:
++        print("usage: runner.py <model_tag> <input>")
++        sys.exit(2)
++    print(serve(sys.argv[1], sys.argv[2]))
++
+*** End Patch
+*** Begin Patch
+*** Add File:edge/mqtt/gateway.py
++#!/usr/bin/env python3
++"""
++Lightweight MQTT gateway to bridge devices in constrained networks to backend via MQTT.
++Uses paho-mqtt to subscribe to device topics and forward messages to HTTP backend.
++"""
++import paho.mqtt.client as mqtt
++import os, requests, json
++
++MQTT_BROKER = os.environ.get("MQTT_BROKER","mqtt.local")
++MQTT_PORT = int(os.environ.get("MQTT_PORT","1883"))
++BACKEND_URL = os.environ.get("AEGIS_BACKEND","http://aegis-backend:8081/api/devices")
++
++def on_connect(client, userdata, flags, rc):
++    client.subscribe("aegis/devices/+/telemetry")
++
++def on_message(client, userdata, msg):
++    try:
++        data = json.loads(msg.payload.decode())
++    except Exception:
++        data = {"raw": msg.payload.decode()}
++    # forward to backend
++    requests.post(BACKEND_URL, json={"topic": msg.topic, "payload": data}, timeout=5)
++
++client = mqtt.Client()
++client.on_connect = on_connect
++client.on_message = on_message
++client.connect(MQTT_BROKER, MQTT_PORT, 60)
++client.loop_forever()
++
+*** End Patch
+*** Begin Patch
+*** Add File:hpc/slurm/torchrun_job.sh
++#!/bin/bash
++#SBATCH --job-name=aegis-torchrun
++#SBATCH --nodes=4
++#SBATCH --ntasks-per-node=8
++#SBATCH --gres=gpu:1
++#SBATCH --time=4:00:00
++#SBATCH --output=slurm-%j.log
++
++module load python/3.8
++source /path/to/venv/bin/activate
++# pre-stage data (example)
++python3 hpc/staging/s3_prefetch.py --bucket my-bucket --prefix datasets/mydataset --out /scratch/dataset
++
++# run distributed training with torchrun
++torchrun --nnodes=$SLURM_JOB_NUM_NODES --nproc_per_node=$SLURM_NTASKS_PER_NODE train.py --data /scratch/dataset --epochs 10
++
+*** End Patch
+*** Begin Patch
+*** Add File:hpc/staging/s3_prefetch.py
++#!/usr/bin/env python3
++"""
++Parallel S3 prefetcher to stage dataset to local disk (uses multithreading).
++"""
++import boto3, os, argparse, concurrent.futures
++
++def download_object(s3, bucket, key, outdir):
++    os.makedirs(outdir, exist_ok=True)
++    dest = os.path.join(outdir, key.replace("/","__"))
++    s3.download_file(bucket, key, dest)
++    return dest
++
++def list_keys(s3, bucket, prefix):
++    paginator = s3.get_paginator("list_objects_v2")
++    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
++        for obj in page.get("Contents", []):
++            yield obj["Key"]
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--bucket", required=True)
++    p.add_argument("--prefix", required=True)
++    p.add_argument("--out", required=True)
++    p.add_argument("--workers", type=int, default=8)
++    args = p.parse_args()
++    s3 = boto3.client("s3")
++    keys = list(list_keys(s3, args.bucket, args.prefix))
++    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
++        futures = [ex.submit(download_object, s3, args.bucket, k, args.out) for k in keys]
++        for f in concurrent.futures.as_completed(futures):
++            try:
++                print("downloaded", f.result())
++            except Exception as e:
++                print("error:", e)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:hpc/checkpoint/coordinator.py
++#!/usr/bin/env python3
++"""
++Simple checkpoint coordinator:
++ - workers push checkpoint markers to S3 (or put a small file)
++ - coordinator waits for expected nodes and then writes a manifest signaling next step
++"""
++import boto3, time, os
++
++S3_BUCKET = os.environ.get("CHECKPOINT_BUCKET","aegis-checkpoints")
++PREFIX = os.environ.get("CHECKPOINT_PREFIX","checkpoints")
++EXPECTED = int(os.environ.get("EXPECTED_NODES","4"))
++
++s3 = boto3.client("s3")
++
++def list_checkpoints(run_id):
++    p = f"{PREFIX}/{run_id}/"
++    resp = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=p)
++    return [o["Key"] for o in resp.get("Contents",[])]
++
++def wait_for_all(run_id, timeout=1800):
++    start = time.time()
++    while time.time() - start < timeout:
++        keys = list_checkpoints(run_id)
++        if len(keys) >= EXPECTED:
++            # write manifest
++            manifest_key = f"{PREFIX}/{run_id}/manifest.json"
++            s3.put_object(Bucket=S3_BUCKET, Key=manifest_key, Body=b'{"ready":true}')
++            return True
++        time.sleep(5)
++    return False
++
++if __name__ == "__main__":
++    import sys
++    run_id = sys.argv[1]
++    ok = wait_for_all(run_id)
++    print("ready:", ok)
++
+*** End Patch
+*** Begin Patch
+*** Add File:hpc/vault/vault_agent_config.hcl
++vault {
++  address = "https://vault.example.com:8200"
++}
++
++auto_auth {
++  method "kubernetes" {
++    mount_path = "auth/kubernetes"
++    config = {
++      role = "aegis-node-role"
++    }
++  }
++}
++
++cache {
++  use_auto_auth_token = true
++}
++
++listener "tcp" {
++  address = "127.0.0.1:8200"
++  tls_disable = true
++}
++
++sink "file" {
++  config = {
++    path = "/etc/secrets/job_database_url"
++  }
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:observability/edge_prometheus_exporter.py
++#!/usr/bin/env python3
++from prometheus_client import start_http_server, Gauge
++import psutil, time, os
++
++MODEL_GAUGE = Gauge("aegis_edge_model_loaded", "1 if model loaded, 0 otherwise")
++CPU_GAUGE = Gauge("aegis_edge_cpu_percent", "CPU percent")
++MEM_GAUGE = Gauge("aegis_edge_mem_percent", "Memory percent")
++
++def run_exporter(port=9100):
++    start_http_server(port)
++    while True:
++        MODEL_GAUGE.set(1 if os.path.exists("/var/aegis/models") else 0)
++        CPU_GAUGE.set(psutil.cpu_percent())
++        MEM_GAUGE.set(psutil.virtual_memory().percent)
++        time.sleep(5)
++
++if __name__ == "__main__":
++    run_exporter(int(os.environ.get("EXPORTER_PORT", "9100")))
++
+*** End Patch
+*** Begin Patch
+*** Add File:observability/fleet_ingest/collector.py
++#!/usr/bin/env python3
++"""
++Aggregator service that receives device telemetry (via HTTP) and stores metrics for chargeback and alerting.
++Stores summarized metrics in Postgres and emits simplified billing CSV for chargeback connector.
++"""
++from flask import Flask, request, jsonify
++import psycopg2, os, csv, tempfile, time
++
++app = Flask(__name__)
++DBURL = os.environ.get("BILLING_DBURL", "postgresql://feast:feastpass@postgres:5432/feast")
++
++def insert_metric(conn, device_id, cpu, mem, cost_estimate):
++    with conn.cursor() as cur:
++        cur.execute("CREATE TABLE IF NOT EXISTS device_metrics (device_id text, cpu real, mem real, cost numeric, ts timestamptz DEFAULT now())")
++        cur.execute("INSERT INTO device_metrics (device_id,cpu,mem,cost) VALUES (%s,%s,%s,%s)", (device_id, cpu, mem, cost_estimate))
++    conn.commit()
++
++@app.post("/telemetry")
++def telemetry():
++    payload = request.json or {}
++    device = payload.get("device_id","unknown")
++    cpu = payload.get("cpu",0.0)
++    mem = payload.get("mem",0.0)
++    # simple cost approximation: cpu%*0.01 + mem%*0.001
++    cost = float(cpu)*0.01 + float(mem)*0.001
++    conn = psycopg2.connect(DBURL)
++    insert_metric(conn, device, cpu, mem, cost)
++    return jsonify({"status":"ok"})
++
++@app.get("/export_billing")
++def export_billing():
++    out = tempfile.mktemp(suffix=".csv")
++    conn = psycopg2.connect(DBURL)
++    with conn.cursor() as cur:
++        cur.execute("SELECT device_id, SUM(cost) FROM device_metrics GROUP BY device_id")
++        rows = cur.fetchall()
++    with open(out,"w",newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["job","cost"])
++        for r in rows:
++            w.writerow([r[0], float(r[1])])
++    return jsonify({"csv":out})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",8083)))
++
+*** End Patch
+*** Begin Patch
+*** Add File:billing/chargeback/from_device_metrics.py
++#!/usr/bin/env python3
++"""
++Consume exported device billing CSV and insert into billing DB or call chargeback connector.
++Usage: python3 from_device_metrics.py /tmp/device_billing.csv --dburl postgresql://...
++"""
++import csv, argparse, requests
++
++def main():
++    p=argparse.ArgumentParser()
++    p.add_argument("csv")
++    p.add_argument("--dburl", required=False)
++    p.add_argument("--chargeback-url", required=False)
++    args = p.parse_args()
++    with open(args.csv) as f:
++        rdr = csv.DictReader(f)
++        for row in rdr:
++            job=row.get("job")
++            cost=row.get("cost")
++            print("record", job, cost)
++            if args.chargeback_url:
++                requests.post(args.chargeback_url, json={"job":job,"cost":cost}, timeout=5)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:edge/k8s/deployments.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-ota-controller
++  namespace: aegis
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-ota
++  template:
++    metadata:
++      labels:
++        app: aegis-ota
++    spec:
++      containers:
++      - name: ota
++        image: aegis/ota-controller:latest
++        env:
++        - name: REDIS_URL
++          value: redis://redis:6379/0
++        ports:
++        - containerPort: 8082
++
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: aegis-fleet-collector
++  namespace: aegis
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: aegis-collector
++  template:
++    metadata:
++      labels:
++        app: aegis-collector
++    spec:
++      containers:
++      - name: collector
++        image: aegis/fleet-collector:latest
++        env:
++        - name: BILLING_DBURL
++          value: postgresql://feast:feastpass@postgres:5432/feast
++        ports:
++        - containerPort: 8083
++
+*** End Patch
+*** Begin Patch
+*** Add File:edge/README_EDGE_PRODUCTION.md
++Edge/IoT Productionization Guide (summary)
++-----------------------------------------
++What this patch added:
++- Device identity & onboarding guidance (Keycloak examples).
++- Device-side image verification with cosign (edge/agent/verify_update.sh + edge_agent verifies).
++- OTA rollout controller (edge/ota/rollout_controller.py) with Redis-backed state and canary support.
++- Resource-aware inference runner (edge/runtime/runner.py) with quantized model fallback and caching.
++- MQTT gateway for constrained networks (edge/mqtt/gateway.py).
++- Prometheus exporter and Fleet collector to aggregate telemetry.
++
++Acceptance checklist (short)
++1. Deploy Keycloak or configure IDP and create device service accounts.
++2. Generate cosign keys; publish public key URL reachable by devices.
++3. Build model artifact tar.gz with predict.py and sign with cosign.
++4. Create OTA manifest in rollout_controller and point devices to it.
++5. Verify device can download, validate signature and unpack model.
++6. Validate metrics appear in Prometheus and fleet collector.
++
++Notes:
++- All scripts use placeholders; adapt to your org IDP and CI/CD pipeline.
++- Devices must have cosign installed or container image with cosign binary.
++
+*** End Patch
+*** Begin Patch
+*** Add File:hpc/README_HPC_INTEGRATION.md
++HPC integration guide (summary)
++--------------------------------
++What this patch added:
++- Slurm job template for multi-node torchrun (hpc/slurm/torchrun_job.sh)
++- Data prefetcher (hpc/staging/s3_prefetch.py) to stage datasets efficiently to local disks
++- Checkpoint coordinator (hpc/checkpoint/coordinator.py) to coordinate multi-node checkpoints via S3
++- Vault agent config sample (hpc/vault/vault_agent_config.hcl) for secrets delivery to nodes
++
++Acceptance checklist
++1. Ensure compute cluster nodes have boto3, Python runtime and Vault agent.
++2. Deploy Vault agent config and confirm secrets are written to /etc/secrets on nodes.
++3. Run s3_prefetch to stage datasets before sbatch.
++4. Launch sbatch with torchrun_job.sh and confirm checkpoint manifest appears in S3.
++5. Monitor Slurm logs and integrate with broker if needed.
++
+*** End Patch
+*** End Patch

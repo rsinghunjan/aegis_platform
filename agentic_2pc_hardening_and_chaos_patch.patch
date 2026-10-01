@@ -1,0 +1,485 @@
+*** Begin Patch
+*** Add File: participant/participant_sdk.py
++#!/usr/bin/env python3
++"""
++Participant SDK for 2PC (prepare/commit/abort) hardening.
++Provides:
++ - idempotent endpoint decorators
++ - durable local sqlite store for participant state to survive restarts
++ - automatic retries with exponential backoff when calling coordinator
++ - helper to validate prepare/commit/abort semantics and emit Prometheus metrics
++
++Usage:
++ - Import Participant class and implement prepare_action/commit_action/abort_action.
++ - Run participant app using FastAPI/uvicorn as usual.
++"""
++import os
++import sqlite3
++import json
++import time
++import threading
++import requests
++from functools import wraps
++
++DB = os.environ.get("PART_DB", "/data/participant_state.sqlite")
++METRICS_PUSHGATEWAY = os.environ.get("PUSHGATEWAY", None)
++
++def ensure_db(path=DB):
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    c = sqlite3.connect(path, check_same_thread=False)
++    cur = c.cursor()
++    cur.execute("""CREATE TABLE IF NOT EXISTS participant_state (
++        tx_id TEXT PRIMARY KEY,
++        state TEXT,
++        payload TEXT,
++        updated_at INTEGER
++    )""")
++    c.commit()
++    return c
++
++class Participant:
++    def __init__(self, name, coordinator_url=None):
++        self.name = name
++        self.coordinator = coordinator_url or os.environ.get("TX_COORDINATOR", "http://transaction-manager.aegis.svc:8301")
++        self.db = ensure_db()
++
++    def _write_state(self, tx_id, state, payload=None):
++        now = int(time.time())
++        cur = self.db.cursor()
++        cur.execute("INSERT OR REPLACE INTO participant_state (tx_id,state,payload,updated_at) VALUES (?,?,?,?)",
++                    (tx_id, state, json.dumps(payload or {}), now))
++        self.db.commit()
++
++    def _read_state(self, tx_id):
++        cur = self.db.cursor()
++        cur.execute("SELECT state, payload, updated_at FROM participant_state WHERE tx_id=?", (tx_id,))
++        r = cur.fetchone()
++        if not r:
++            return None
++        return {"state": r[0], "payload": json.loads(r[1] or "{}"), "updated_at": r[2]}
++
++    def idempotent_handler(self, func):
++        """
++        Decorator to make prepare/commit/abort idempotent.
++        func must accept (tx_id, payload) and return (ok:bool, details:str)
++        """
++        @wraps(func)
++        def wrapper(tx_id, payload):
++            st = self._read_state(tx_id)
++            # if already committed/aborted, return current status
++            if st and st["state"] in ("committed","aborted"):
++                return True, f"already_{st['state']}"
++            # if prepared and this is prepare call, return prepared
++            # Note: caller should ensure correct mapping
++            ok, details = func(tx_id, payload)
++            if ok:
++                # update prepared/committed state accordingly - func should indicate desired next state in details?
++                # Assume func sets state via self._write_state
++                return True, details
++            else:
++                # record failure state
++                self._write_state(tx_id, "failed", {"reason": details})
++                return False, details
++        return wrapper
++
++    def call_coordinator(self, endpoint, tx_id, timeout=10, max_retries=3):
++        url = f"{self.coordinator}/tx/{tx_id}/{endpoint}"
++        delay = 1
++        for attempt in range(1, max_retries + 1):
++            try:
++                r = requests.post(url, json={"participant": self.name}, timeout=timeout)
++                if 200 <= r.status_code < 300:
++                    return True, r.text
++                # transient server errors may be retried
++                if 500 <= r.status_code < 600:
++                    time.sleep(delay)
++                    delay *= 2
++                    continue
++                return False, r.text
++            except requests.RequestException as e:
++                time.sleep(delay)
++                delay *= 2
++        return False, "max_retries_exceeded"
++
++    # helper metrics push (optional)
++    def push_metric(self, name, value, labels=None):
++        if not METRICS_PUSHGATEWAY:
++            return
++        try:
++            payload = f"# TYPE {name} gauge\n{name}{('{' + ','.join([f'{k}=\"{v}\"' for k,v in (labels or {}).items()]) + '}') if labels else ''} {value}\n"
++            requests.post(f"{METRICS_PUSHGATEWAY}/metrics/job/participant/name/{self.name}", data=payload, timeout=5)
++        except Exception:
++            pass
++
+*** End Patch
+*** Begin Patch
+*** Add File: participants/example_tool_adapter.py
++#!/usr/bin/env python3
++"""
++Example participant implementing a tool adapter that follows 2PC using Participant SDK.
++ - Exposes /prepare, /commit, /abort endpoints as expected by Transaction Manager
++ - Demonstrates durable state, idempotency and retries
++"""
++import os, json
++from fastapi import FastAPI, Request
++from pydantic import BaseModel
++from participant.participant_sdk import Participant
++
++app = FastAPI(title="Example Tool Adapter")
++PART = Participant(name=os.environ.get("PART_NAME","tool-adapter-1"))
++
++class TxPayload(BaseModel):
++    action: str = None
++    data: dict = {}
++    tx_id: str = None
++
++@app.post("/prepare")
++async def prepare(p: TxPayload):
++    tx_id = p.tx_id or p.data.get("tx_id")
++    # check idempotency / current state
++    st = PART._read_state(tx_id)
++    if st and st["state"] == "prepared":
++        return {"ok": True, "status": "already_prepared"}
++    try:
++        # actual prepare work: validate resources, reserve resources, etc.
++        # Example: create a placeholder reservation file/durable record
++        PART._write_state(tx_id, "prepared", {"reserved": True, "data": p.data})
++        PART.push_metric("participant_prepares_total", 1, labels={"participant": PART.name})
++        return {"ok": True, "status": "prepared"}
++    except Exception as e:
++        PART._write_state(tx_id, "failed_prepare", {"error": str(e)})
++        PART.push_metric("participant_prepare_failures_total", 1, labels={"participant": PART.name})
++        return {"ok": False, "error": str(e)}
++
++@app.post("/commit")
++async def commit(p: TxPayload):
++    tx_id = p.tx_id or p.data.get("tx_id")
++    st = PART._read_state(tx_id)
++    if st and st["state"] == "committed":
++        return {"ok": True, "status": "already_committed"}
++    try:
++        # commit: perform durable action (e.g., actually run tool, persist final state)
++        # Simulate commit action
++        PART._write_state(tx_id, "committed", {"committed": True})
++        PART.push_metric("participant_commits_total", 1, labels={"participant": PART.name})
++        return {"ok": True, "status": "committed"}
++    except Exception as e:
++        PART._write_state(tx_id, "failed_commit", {"error": str(e)})
++        PART.push_metric("participant_commit_failures_total", 1, labels={"participant": PART.name})
++        return {"ok": False, "error": str(e)}
++
++@app.post("/abort")
++async def abort(p: TxPayload):
++    tx_id = p.tx_id or p.data.get("tx_id")
++    # Compensation/cleanup logic
++    PART._write_state(tx_id, "aborted", {"aborted": True})
++    PART.push_metric("participant_aborts_total", 1, labels={"participant": PART.name})
++    return {"ok": True, "status": "aborted"}
++
++@app.get("/health")
++def health():
++    return {"ok": True}
++
+*** End Patch
+*** Begin Patch
+*** Add File: tests/participant_hardening_test.sh
++#!/usr/bin/env bash
++#
++# Run this script locally or in CI to exercise participant hardening:
++# - Launch example_tool_adapter via uvicorn
++# - Start transaction-manager (assumed running) and run 2PC flows
++#
++set -euo pipefail
++
++PART_PORT=8102
++PART_URL="http://127.0.0.1:${PART_PORT}"
++
++echo "Starting participant..."
++uvicorn participants.example_tool_adapter:app --host 127.0.0.1 --port ${PART_PORT} >/tmp/participant.log 2>&1 &
++PPID=$!
++sleep 1
++echo "Participant PID: $PPID"
++
++TXMGR="${TXMGR:-http://localhost:8301}"
++
++echo "Starting transaction (success path)..."
++TX_ID=$(curl -s -X POST "${TXMGR}/tx/start" | jq -r '.tx_id')
++echo "TX_ID=${TX_ID}"
++curl -s -X POST "${TXMGR}/tx/${TX_ID}/participant" -H "Content-Type: application/json" -d "{\"name\":\"example\",\"prepare_url\":\"${PART_URL}/prepare\",\"commit_url\":\"${PART_URL}/commit\",\"abort_url\":\"${PART_URL}/abort\"}" | jq .
++echo "Prepare -> commit"
++curl -s -X POST "${TXMGR}/tx/${TX_ID}/prepare" | jq .
++curl -s -X POST "${TXMGR}/tx/${TX_ID}/commit" | jq .
++curl -s "${TXMGR}/tx/${TX_ID}" | jq .
++
++echo "Starting transaction (prepare failure -> abort)..."
++# simulate prepare failure by toggling environment in a second participant instance
++kill ${PPID} || true
++FAIL_PREPARE=1 uvicorn participants.example_tool_adapter:app --host 127.0.0.1 --port ${PART_PORT} >/tmp/participant_fail.log 2>&1 &
++PPID=$!
++sleep 1
++TX_ID2=$(curl -s -X POST "${TXMGR}/tx/start" | jq -r '.tx_id')
++curl -s -X POST "${TXMGR}/tx/${TX_ID2}/participant" -H "Content-Type: application/json" -d "{\"name\":\"example\",\"prepare_url\":\"${PART_URL}/prepare\",\"commit_url\":\"${PART_URL}/commit\",\"abort_url\":\"${PART_URL}/abort\"}" | jq .
++set +e
++curl -s -X POST "${TXMGR}/tx/${TX_ID2}/prepare" | jq .
++set -e
++curl -s "${TXMGR}/tx/${TX_ID2}" | jq .
++
++echo "Cleaning up participant..."
++kill ${PPID} || true
++echo "Participant hardening tests complete. Check /tmp/participant.log and /tmp/participant_fail.log for details."
++
+*** End Patch
+*** Begin Patch
+*** Add File: chaos/chaos_killer.py
++#!/usr/bin/env python3
++"""
++Simple chaos tool for Kubernetes:
++ - random pod killer in target namespace and label selector
++ - used to simulate crashes during 2PC transactions and agent orchestration
++ - requires kubectl config in environment
++
++Usage: python chaos/chaos_killer.py --namespace aegis --label app=transaction-manager --count 1 --interval 10 --duration 60
++"""
++import argparse, random, subprocess, time
++
++def kubectl(cmd):
++    p = subprocess.run(["kubectl"] + cmd, capture_output=True, text=True)
++    if p.returncode != 0:
++        raise RuntimeError(p.stderr)
++    return p.stdout.strip()
++
++def list_pods(namespace, selector=None):
++    cmd = ["get", "pods", "-n", namespace, "-o", "jsonpath={.items[*].metadata.name}"]
++    if selector:
++        cmd.insert(1, f'-l{selector}')
++    out = kubectl(cmd)
++    return out.split() if out else []
++
++def delete_pod(name, namespace):
++    print("Deleting pod", name)
++    try:
++        kubectl(["delete","pod", name, "-n", namespace, "--grace-period=0", "--force"])
++    except Exception as e:
++        print("delete failed:", e)
++
++def run(namespace, selector, count, interval, duration):
++    end = time.time() + duration
++    while time.time() < end:
++        pods = list_pods(namespace, selector)
++        if not pods:
++            print("No pods found")
++            time.sleep(interval); continue
++        targets = random.sample(pods, min(count, len(pods)))
++        for t in targets:
++            delete_pod(t, namespace)
++        time.sleep(interval)
++
++if __name__=="__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--namespace", required=True)
++    p.add_argument("--label", required=False)
++    p.add_argument("--count", type=int, default=1)
++    p.add_argument("--interval", type=int, default=10)
++    p.add_argument("--duration", type=int, default=60)
++    args = p.parse_args()
++    run(args.namespace, args.label, args.count, args.interval, args.duration)
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/chaos/chaos-job.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: chaos-killer
++  namespace: aegis
++spec:
++  template:
++    spec:
++      containers:
++        - name: chaos
++          image: bitnami/kubectl:latest
++          command: ["/bin/sh","-c"]
++          args:
++            - /chaos/chaos_killer.sh
++          env:
++            - name: NAMESPACE
++              value: "aegis"
++            - name: LABEL
++              value: ""
++            - name: DURATION
++              value: "120"
++      restartPolicy: Never
++      volumes:
++        - name: chaos-scripts
++          configMap:
++            name: chaos-scripts
++  backoffLimit: 0
++
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: chaos-scripts
++  namespace: aegis
++data:
++  chaos_killer.sh: |
++    #!/bin/sh
++    set -e
++    python /opt/chaos/chaos_killer.py --namespace ${NAMESPACE} --label "${LABEL}" --count 1 --interval 5 --duration ${DURATION}
++  chaos_killer.py: |
++    # Inserted by operator; mount full script in image or container
++    echo "Please build an image with chaos_killer.py or mount it via configmap"
++
+*** End Patch
+*** Begin Patch
+*** Add File: operator/operator_rotation_script.sh
++#!/usr/bin/env bash
++#
++# Rotate operator webhook secret stored in Vault and notify operator channel.
++# Requires: VAULT_ADDR, VAULT_TOKEN with appropriate rights, OPERATOR_NOTIFY_WEBHOOK (HTTP endpoint)
++set -euo pipefail
++VAULT_ADDR=${VAULT_ADDR:-}
++VAULT_TOKEN=${VAULT_TOKEN:-}
++SECRET_PATH=${SECRET_PATH:-"secret/data/aegis/operator/webhook"}
++WEBHOOK_FIELD=${WEBHOOK_FIELD:-"webhook_secret"}
++
++if [ -z "$VAULT_ADDR" ] || [ -z "$VAULT_TOKEN" ]; then
++  echo "VAULT_ADDR and VAULT_TOKEN must be set"
++  exit 2
++fi
++
++NEW_SECRET=$(head -c32 /dev/urandom | base64)
++echo "Rotating operator webhook secret..."
++vault login "$VAULT_TOKEN" >/dev/null
++vault kv put "$SECRET_PATH" ${WEBHOOK_FIELD}="$NEW_SECRET"
++echo "Secret rotated in Vault at $SECRET_PATH"
++
++if [ -n "${OPERATOR_NOTIFY_WEBHOOK:-}" ]; then
++  curl -s -X POST "${OPERATOR_NOTIFY_WEBHOOK}" -H "Content-Type: application/json" -d "{\"event\":\"operator_secret_rotated\",\"path\":\"${SECRET_PATH}\"}"
++  echo "Operator notified"
++fi
++
++echo "Operator rotation complete. Make sure operator UIs / services reload secret from Vault (or be restarted if necessary)."
++
+*** End Patch
+*** Begin Patch
+*** Add File: sla/agent_sla_tester.py
++#!/usr/bin/env python3
++"""
++Agent SLA tester:
++ - Submits many synthetic agent plans to orchestrator and measures end-to-end completion latency
++ - Emits a report (JSON) and optionally pushes to a Prometheus Pushgateway
++
++Usage:
++  python sla/agent_sla_tester.py --count 100 --concurrency 10 --orchestrator http://orchestrator.aegis.svc:8200
++"""
++import time, requests, json, argparse, concurrent.futures
++
++def submit_plan(orchestrator, plan):
++    try:
++        r = requests.post(f"{orchestrator}/plans/submit", json=plan, timeout=10)
++        r.raise_for_status()
++        return r.json().get("plan_id")
++    except Exception as e:
++        return {"error": str(e)}
++
++def poll_plan(orchestrator, plan_id, timeout=600):
++    start = time.time()
++    while time.time() - start < timeout:
++        try:
++            r = requests.get(f"{orchestrator}/plans/{plan_id}", timeout=5)
++            if r.ok:
++                s = r.json().get("status")
++                if s in ("completed","failed","aborted"):
++                    return s, time.time() - start
++        except Exception:
++            pass
++        time.sleep(1)
++    return "timeout", time.time() - start
++
++def run_test(orchestrator, count=100, concurrency=10):
++    results = []
++    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
++        futures = []
++        for i in range(count):
++            plan = {"tenant":"test","steps":[{"action":"echo","args":{"msg":f"hello-{i}"}}], "requires_approval": False}
++            futures.append(ex.submit(submit_plan, orchestrator, plan))
++        plan_ids = [f.result() for f in futures]
++        # poll them
++        poll_futures = [ex.submit(poll_plan, orchestrator, pid) for pid in plan_ids if isinstance(pid,str)]
++        for f in poll_futures:
++            res = f.result()
++            results.append(res)
++    return results
++
++if __name__=="__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--count", type=int, default=50)
++    p.add_argument("--concurrency", type=int, default=10)
++    p.add_argument("--orchestrator", required=True)
++    args = p.parse_args()
++    res = run_test(args.orchestrator, count=args.count, concurrency=args.concurrency)
++    out = {"count": args.count, "concurrency": args.concurrency, "results": res}
++    print(json.dumps(out, indent=2))
++    open("/tmp/agent_sla_report.json","w").write(json.dumps(out))
++
+*** End Patch
+*** Begin Patch
+*** Add File: prometheus/alerts-agent-slo.rules.yaml
++groups:
++- name: aegis-agent-slo
++  rules:
++  - alert: AgentPlanLatencySLOViolation
++    expr: histogram_quantile(0.95, sum(rate(agent_plan_duration_seconds_bucket[5m])) by (le)) > 600
++    for: 15m
++    labels:
++      severity: page
++    annotations:
++      summary: "Agent plan latency SLO breach (95th > 10m)"
++      description: "Agent plans are taking too long to complete. Investigate orchestrator backlog or participant failures."
++
++  - alert: AgentPlanFailureSpike
++    expr: increase(agent_plan_failures_total[10m]) > 5
++    for: 5m
++    labels:
++      severity: critical
++    annotations:
++      summary: "Agent plan failure spike"
++      description: "More than 5 agent plan failures in 10m. Check participants and transaction manager."
++
+*** End Patch
+*** Begin Patch
+*** Add File: runbooks/agent_chaos_runbook.md
++# Agentic Chaos Runbook
++
++Purpose:
++- Run controlled chaos experiments to validate 2PC robustness, sandbox isolation, agent recovery, and SLO adherence.
++
++Prereqs:
++- k8s cluster with kata nodes and orchestrator deployed
++- transaction-manager and participant adapters deployed
++- Prometheus, Pushgateway and alerting configured
++
++Experiment:
++1. Baseline: run sla/agent_sla_tester.py with count=100 and concurrency=20. Record baseline latencies and failures.
++2. Start chaos job:
++   - kubectl apply -f k8s/chaos/chaos-job.yaml
++   - Or run locally: python chaos/chaos_killer.py --namespace aegis --label app=transaction-manager --count 1 --interval 10 --duration 120
++3. Observe:
++   - Prometheus alerts (prometheus/alerts-agent-slo.rules.yaml)
++   - transaction-manager / participant logs. Use kubectl logs -l app=transaction-manager
++   - Audit entries in OpenSearch (aegis-audit index) for tx prepare/commit/abort
++4. Verify:
++   - All transactions either commit or abort cleanly (no stuck transactions older than threshold)
++   - No resource leaks on participants (temporary reservations cleaned)
++   - SLOs for agent plan latency remain acceptable or degrade gracefully
++
++Remediation:
++- If many stuck transactions, abort them via transaction-manager API: POST /tx/{tx_id}/abort
++- If participant resources leaked, run participant cleanup script or restart controlled pods and re-run participant_hardening_test.sh
++
++Schedule:
++- Run chaos experiments weekly in staging. Record results and tune timeouts/retry/backoff parameters in participant SDK.
++
+*** End Patch
+*** End Patch

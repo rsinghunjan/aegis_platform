@@ -1,0 +1,516 @@
+*** Begin Patch
+*** Add File:ops/quantum/provider_manager.py
++#!/usr/bin/env python3
++"""
++ProviderManager: robust submission/queueing/retry/batching and fallback for QPU adapters.
++ - Selects adapter by requested provider (or allowed providers list)
++ - Estimates cost and enforces per-job cost limits
++ - Submits job with retry/backoff, optional batching when adapter supports it
++ - Falls back to simulator adapter when provider unavailable or cost exceeds budget (configurable)
++ - Captures provider-specific provenance and signs artifact via sign_with_kms_or_vault.py
++
++Usage:
++  pm = ProviderManager()
++  job = pm.submit_job(adapter_name="aws_braket", circuit_spec=..., shots=1024, metadata={...})
++
++This is intentionally synchronous/blocking for clarity; production queuing should use a message queue (SQS/Redis/etc).
++"""
++import os
++import time
++import json
++import traceback
++from importlib import import_module
++from datetime import datetime
++from typing import Dict, Any
++
++# Config from env
++ALLOWED_PROVIDERS = os.environ.get("ALLOWED_QPU_PROVIDERS", "stub,pennylane,qiskit,aws_braket,ibm").split(",")
++MAX_JOB_COST_USD = float(os.environ.get("MAX_QPU_JOB_COST_USD", "50.0"))
++FALLBACK_TO_SIMULATOR = os.environ.get("QPU_FALLBACK_TO_SIMULATOR", "true").lower() in ("1","true","yes")
++VERBOSE = os.environ.get("QPU_MANAGER_VERBOSE", "1") != "0"
++
++ADAPTER_MODULE_MAP = {
++    "pennylane": "ops.quantum.pennylane_adapter",
++    "qiskit": "ops.quantum.qiskit_adapter",
++    "aws_braket": "ops.quantum.providers.aws_braket_adapter",
++    "ibm": "ops.quantum.providers.ibm_adapter",
++    "stub": "ops.quantum.pennylane_adapter"
++}
++
++def _log(*a, **k):
++    if VERBOSE:
++        print(*a, **k)
++
++class ProviderError(RuntimeError):
++    pass
++
++class ProviderManager:
++    def __init__(self):
++        self.adapters = {}
++
++    def _load_adapter(self, name: str):
++        if name in self.adapters:
++            return self.adapters[name]
++        if name not in ADAPTER_MODULE_MAP:
++            raise ProviderError(f"unknown adapter {name}")
++        modname = ADAPTER_MODULE_MAP[name]
++        try:
++            mod = import_module(modname)
++            # adapter class name convention: CamelCase from module basename
++            cls = None
++            for attr in dir(mod):
++                if attr.lower().startswith(name.replace("_","")) and attr.lower().endswith("adapter"):
++                    cls = getattr(mod, attr)
++                    break
++            # fallback: look for common classes
++            if not cls:
++                cls = getattr(mod, "PennyLaneAdapter", None) or getattr(mod, "QiskitAdapter", None) or getattr(mod, "ExampleVendor", None)
++            inst = cls()
++            self.adapters[name] = inst
++            return inst
++        except Exception as e:
++            raise ProviderError(f"failed to load adapter {name}: {e}")
++
++    def is_allowed(self, name: str):
++        return name in ALLOWED_PROVIDERS
++
++    def estimate_cost(self, adapter_name: str, circuit_spec: Dict[str,Any], shots: int) -> float:
++        """
++        Ask adapter for cost estimate if implemented; otherwise use rough default.
++        Adapter may expose estimate_cost(circuit_spec, shots) method.
++        """
++        try:
++            adapter = self._load_adapter(adapter_name)
++            if hasattr(adapter, "estimate_cost"):
++                return float(adapter.estimate_cost(circuit_spec, shots))
++        except Exception:
++            pass
++        # default heuristic: $0.0001 per shot
++        return shots * 0.0001
++
++    def _capture_provenance(self, adapter_name: str, job_meta: Dict[str,Any], out_path: str):
++        """
++        Build a provenance JSON from adapter-specific metadata and common fields.
++        Attempt to sign the provenance artifact using ops/evidence/sign_with_kms_or_vault.py
++        """
++        prov = {
++            "adapter": adapter_name,
++            "job_meta": job_meta,
++            "manager_ts": datetime.utcnow().isoformat()+"Z"
++        }
++        with open(out_path, "w") as fh:
++            json.dump(prov, fh, indent=2)
++        # try signing
++        try:
++            import subprocess
++            if os.environ.get("EVIDENCE_SIGN_BACKEND"):
++                _log("Signing provenance", out_path)
++                subprocess.check_call(["python", "ops/evidence/sign_with_kms_or_vault.py", out_path])
++                return out_path + ".sig"
++        except Exception:
++            _log("Provenance signing failed:", traceback.format_exc())
++        return None
++
++    def submit_job(self, adapter_name: str, circuit_spec: Dict[str,Any], shots: int = 1024, metadata: Dict[str,Any] = None, timeout_s: int = 600):
++        metadata = metadata or {}
++        if not self.is_allowed(adapter_name):
++            raise ProviderError(f"adapter {adapter_name} not allowed by configuration")
++
++        # cost check
++        est_cost = self.estimate_cost(adapter_name, circuit_spec, shots)
++        if est_cost > MAX_JOB_COST_USD:
++            msg = f"estimated cost ${est_cost:.2f} exceeds allowed MAX ${MAX_JOB_COST_USD:.2f}"
++            _log(msg)
++            if FALLBACK_TO_SIMULATOR:
++                _log("Falling back to simulator adapter (stub)")
++                adapter_name = "stub"
++            else:
++                raise ProviderError(msg)
++
++        # attempt submission with retry/backoff
++        attempts = 0
++        max_attempts = int(os.environ.get("QPU_MAX_RETRY", "4"))
++        backoff_base = float(os.environ.get("QPU_RETRY_BACKOFF_BASE", "2.0"))
++        last_exc = None
++        adapter = None
++        job_id = None
++        adapter_meta = {}
++        while attempts < max_attempts:
++            try:
++                adapter = self._load_adapter(adapter_name)
++                # support batching if adapter has submit_batch
++                if hasattr(adapter, "submit_batch") and metadata.get("batch_group"):
++                    _log("Submitting to adapter.submit_batch")
++                    job_info = adapter.submit_batch([{"circuit": circuit_spec, "shots": shots, "metadata": metadata}])
++                    job_id = job_info.get("job_id")
++                else:
++                    job_id = adapter.submit_circuit(circuit_spec, shots=shots)
++                adapter_meta = {"adapter_name": adapter_name, "job_id": job_id}
++                _log("Submitted job", job_id, "via", adapter_name)
++                break
++            except Exception as e:
++                last_exc = e
++                attempts += 1
++                wait = (backoff_base ** attempts)
++                _log(f"Submit attempt {attempts} failed: {e}; retrying in {wait:.1f}s")
++                time.sleep(wait)
++                # If adapter-specific error indicates billing/permission, break
++                if "AccessDenied" in str(e) or "Auth" in str(e) or "Billing" in str(e):
++                    _log("Fatal provider error (Auth/Billing); aborting submission")
++                    break
++
++        if not job_id:
++            # fallback if configured
++            if FALLBACK_TO_SIMULATOR and adapter_name != "stub":
++                _log("Primary adapter failed; attempting simulator fallback")
++                try:
++                    adapter = self._load_adapter("stub")
++                    job_id = adapter.submit_circuit(circuit_spec, shots=shots)
++                    adapter_meta = {"adapter_name": "stub", "job_id": job_id}
++                except Exception as e:
++                    raise ProviderError(f"All adapters failed: {e}")
++            else:
++                raise ProviderError(f"Submission failed: {last_exc}")
++
++        # poll for completion until timeout
++        start = time.time()
++        status = None
++        result = None
++        try:
++            while time.time() - start < timeout_s:
++                st = adapter.poll_status(job_id)
++                status = st.get("state") or st.get("status") or "unknown"
++                if status in ("done","succeeded","completed"):
++                    result = adapter.fetch_result(job_id)
++                    break
++                if status in ("error","failed"):
++                    raise ProviderError(f"remote job failed state={status} meta={st}")
++                time.sleep(1)
++        except Exception as e:
++            _log("Polling error:", e)
++            # attempt to fetch partial artifacts if available
++            try:
++                result = adapter.fetch_result(job_id)
++            except Exception:
++                result = {"error": str(e)}
++
++        # collect provenance from adapter if supported
++        job_meta = {"job_id": job_id, "adapter": adapter_name, "est_cost_usd": est_cost, "shots": shots, "submit_ts": datetime.utcnow().isoformat()+"Z"}
++        # adapter may provide extra provenance
++        try:
++            if hasattr(adapter, "get_provenance"):
++                job_meta["adapter_provenance"] = adapter.get_provenance(job_id)
++        except Exception:
++            _log("adapter.get_provenance failed:", traceback.format_exc())
++
++        # write provenance artifact and sign
++        prov_path = metadata.get("provenance_out", f"/tmp/qprov_{job_id}.json")
++        sig = self._capture_provenance(adapter_name, job_meta, prov_path)
++
++        return {"job_id": job_id, "status": status, "result": result, "provenance": prov_path, "signature": sig}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/quantum/providers/aws_braket_adapter.py
++#!/usr/bin/env python3
++"""
++AWS Braket adapter (best-effort).
++ - Requires boto3 and AWS credentials with braket:CreateQuantumTask, GetQuantumTask, SearchDevices permissions.
++ - Provides: submit_circuit, poll_status, fetch_result, estimate_cost, get_provenance
++ - This adapter is a pragmatic wrapper and simplifies many details; adapt for your production needs.
++"""
++import os
++import json
++import time
++import base64
++from datetime import datetime
++try:
++    import boto3
++    from botocore.exceptions import ClientError
++    BOTO_AVAILABLE = True
++except Exception:
++    BOTO_AVAILABLE = False
++
++from ops.quantum.qpu_adapter import QPUAdapter
++
++class AwsBraketAdapter(QPUAdapter):
++    def __init__(self, region_name=None):
++        if not BOTO_AVAILABLE:
++            raise RuntimeError("boto3 required for AwsBraketAdapter")
++        self.region = region_name or os.environ.get("AWS_REGION", "us-west-2")
++        self.client = boto3.client("braket", region_name=self.region)
++
++    def list_backends(self):
++        # list available devices (simplified)
++        resp = self.client.search_devices()
++        return [d["deviceArn"] for d in resp.get("devices", [])]
++
++    def estimate_cost(self, circuit_spec, shots: int = 1024):
++        # AWS Braket pricing is complex; use a rough placeholder or mapping by backend
++        price_per_shot_usd = float(os.environ.get("BRAKET_PRICE_PER_SHOT_USD", "0.0005"))
++        return shots * price_per_shot_usd
++
++    def _build_task(self, circuit_spec, shots):
++        # Convert a very small subset of circuit_spec into Braket task (placeholder)
++        # Real implementation should produce a proper Braket-compatible script (Amazon Braket SDK / IR)
++        return {"circuit": circuit_spec, "shots": shots}
++
++    def submit_circuit(self, circuit_spec, shots: int = 1024):
++        # CreateQuantumTask expects various params; here we use a simplified "simulator" approach via Braket managed simulators
++        try:
++            payload = self._build_task(circuit_spec, shots)
++            resp = self.client.create_quantum_task(
++                action="braket.ir.openqasm.program",  # placeholder
++                deviceArn=os.environ.get("BRAKET_DEVICE_ARN", "arn:aws:braket:::device/quantum-simulator/amazon/sv1"),
++                shots=shots,
++                outputS3Bucket=os.environ.get("BRAKET_OUTPUT_BUCKET"),
++                # source is highly simplified here
++                )
++            task_arn = resp.get("quantumTaskArn")
++            return task_arn
++        except ClientError as e:
++            raise RuntimeError(f"Braket submit failed: {e}")
++
++    def poll_status(self, job_id):
++        try:
++            resp = self.client.get_quantum_task(quantumTaskArn=job_id)
++            sts = resp.get("status")
++            return {"state": sts.lower(), "raw": resp}
++        except ClientError as e:
++            return {"state": "error", "error": str(e)}
++
++    def fetch_result(self, job_id):
++        # Braket writes results to S3 by default; attempt to fetch result metadata via get_quantum_task
++        resp = self.client.get_quantum_task(quantumTaskArn=job_id)
++        # simplified: return the raw response as result
++        return {"raw": resp}
++
++    def get_provenance(self, job_id):
++        # Return some device metadata and task metadata as provenance
++        try:
++            task = self.client.get_quantum_task(quantumTaskArn=job_id)
++            prov = {
++                "deviceArn": task.get("deviceArn"),
++                "deviceTaskMetadata": task.get("deviceTaskMetadata"),
++                "shots": task.get("shots"),
++                "createdAt": task.get("createdAt"),
++                "status": task.get("status")
++            }
++            return prov
++        except Exception as e:
++            return {"error": str(e)}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/quantum/providers/ibm_adapter.py
++#!/usr/bin/env python3
++"""
++IBM adapter (best-effort).
++ - Uses qiskit-ibmq if available; otherwise raises.
++ - Provides submit_circuit, poll_status, fetch_result, get_provenance, estimate_cost (stub).
++"""
++import os
++import time
++try:
++    from qiskit_ibm_runtime import IBMRuntimeService, QiskitRuntimeService  # newer SDK
++    from qiskit import QuantumCircuit
++    IBM_AVAILABLE = True
++except Exception:
++    IBM_AVAILABLE = False
++
++from ops.quantum.qpu_adapter import QPUAdapter
++
++class IbmAdapter(QPUAdapter):
++    def __init__(self, instance: str = None):
++        if not IBM_AVAILABLE:
++            raise RuntimeError("qiskit-ibm-runtime required for IbmAdapter")
++        self.instance = instance or os.environ.get("IBM_INSTANCE")
++        # The service must be configured in environment (QISKIT_XX envs) or via login process
++        self.service = IBMRuntimeService()
++
++    def list_backends(self):
++        # list available backends for the instance
++        return self.service.backends()
++
++    def estimate_cost(self, circuit_spec, shots: int = 1024):
++        # IBM pricing varies; use small fixed cost
++        return shots * float(os.environ.get("IBM_PRICE_PER_SHOT_USD", "0.0004"))
++
++    def submit_circuit(self, circuit_spec, shots: int = 1024):
++        # Convert simple circuit spec to a QuantumCircuit for demo; real conversion required
++        n = circuit_spec.get("n_qubits", 1)
++        qc = QuantumCircuit(n)
++        for op in circuit_spec.get("ops", []):
++            if op.get("name") == "h":
++                qc.h(op.get("qubit", 0))
++        # submit via runtime (simplified sync job)
++        job = self.service.run(program=qc, options={"shots": shots})
++        return job.job_id
++
++    def poll_status(self, job_id):
++        job = self.service.get_job(job_id)
++        return {"state": job.status().name.lower(), "raw": {}}
++
++    def fetch_result(self, job_id):
++        job = self.service.get_job(job_id)
++        return {"counts": job.result().get_counts()}
++
++    def get_provenance(self, job_id):
++        # include backend name and job metadata
++        job = self.service.get_job(job_id)
++        return {"backend": job.backend_name(), "job_id": job.job_id, "shots": job.shots}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/quantum/provenance_manager.py
++#!/usr/bin/env python3
++"""
++Helpers to assemble provenance metadata for quantum runs and persist & sign them.
++ - Builds a schema containing backend config, noise profile (if provided), shots, seed, submitter and timestamps.
++ - Writes provenance JSON and attempts to sign it using sign_with_kms_or_vault.py
++"""
++import os
++import json
++import subprocess
++from datetime import datetime
++
++PROV_DIR = os.environ.get("QPU_PROV_DIR", "/tmp/qpu_provenance")
++os.makedirs(PROV_DIR, exist_ok=True)
++
++def make_provenance(adapter_name, job_id, adapter_prov: dict, circuit_spec: dict, shots: int, seed: int = None, submitter: str = None):
++    prov = {
++        "adapter": adapter_name,
++        "job_id": job_id,
++        "adapter_provenance": adapter_prov or {},
++        "circuit_spec": circuit_spec,
++        "shots": shots,
++        "seed": seed,
++        "submitter": submitter or os.environ.get("USER"),
++        "ts": datetime.utcnow().isoformat()+"Z"
++    }
++    fname = os.path.join(PROV_DIR, f"qprov_{adapter_name}_{job_id}.json")
++    with open(fname, "w") as fh:
++        json.dump(prov, fh, indent=2)
++    sig = None
++    try:
++        if os.environ.get("EVIDENCE_SIGN_BACKEND"):
++            subprocess.check_call(["python", "ops/evidence/sign_with_kms_or_vault.py", fname])
++            sig = fname + ".sig"
++    except Exception:
++        # signing best-effort; surface failure in logs but keep provenance file
++        pass
++    return fname, sig
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/quantum/billing_guard.py
++#!/usr/bin/env python3
++"""
++Simple billing guard for QPU jobs.
++ - Verifies that cost estimate for job is under per-job budget and optionally under account budget.
++ - For demo purposes account budget is read from env or a local file; production should integrate with cloud billing APIs.
++"""
++import os
++import json
++
++PER_JOB_LIMIT = float(os.environ.get("MAX_QPU_JOB_COST_USD", "50.0"))
++ACCOUNT_MONTHLY_LIMIT = float(os.environ.get("QPU_ACCOUNT_MONTHLY_LIMIT_USD", "1000.0"))
++ACCOUNT_USAGE_FILE = os.environ.get("QPU_ACCOUNT_USAGE_FILE", "/tmp/qpu_account_usage.json")
++
++def check_per_job(cost_usd: float):
++    if cost_usd > PER_JOB_LIMIT:
++        return False, f"cost ${cost_usd:.2f} exceeds per-job limit ${PER_JOB_LIMIT:.2f}"
++    return True, ""
++
++def get_account_usage():
++    try:
++        if os.path.exists(ACCOUNT_USAGE_FILE):
++            return json.load(open(ACCOUNT_USAGE_FILE))
++    except Exception:
++        pass
++    return {"month": None, "used_usd": 0.0}
++
++def check_account_budget(additional_cost=0.0):
++    usage = get_account_usage()
++    used = usage.get("used_usd", 0.0)
++    if used + additional_cost > ACCOUNT_MONTHLY_LIMIT:
++        return False, f"account monthly limit {ACCOUNT_MONTHLY_LIMIT} exceeded by projected cost {used + additional_cost:.2f}"
++    return True, ""
++
++def record_usage(amount):
++    usage = get_account_usage()
++    usage["used_usd"] = usage.get("used_usd", 0.0) + amount
++    with open(ACCOUNT_USAGE_FILE, "w") as fh:
++        json.dump(usage, fh)
++    return usage
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/quantum/hybrid_job_runner_v2.py
++#!/usr/bin/env python3
++"""
++Hybrid job runner (v2) that uses ProviderManager, provenance capture and billing guard.
++ - Handles provider selection, cost checks, fallback, prov signing, and persists signed provenance and result
++"""
++import os
++import json
++import subprocess
++from ops.quantum.provider_manager import ProviderManager, ProviderError
++from ops.quantum.provenance_manager import make_provenance
++from ops.quantum.billing_guard import check_per_job, check_account_budget, record_usage
++
++OUT_DIR = os.environ.get("QPU_JOB_OUT", "/tmp/qpu_jobs")
++os.makedirs(OUT_DIR, exist_ok=True)
++
++def run_hybrid(adapter_name, circuit_spec, shots=1024, pre_cmd=None, post_cmd=None, seed=None, submitter=None, timeout_s=600):
++    pm = ProviderManager()
++    # optional preprocessing
++    if pre_cmd:
++        subprocess.check_call(pre_cmd, shell=True)
++
++    est_cost = pm.estimate_cost(adapter_name, circuit_spec, shots)
++    ok, msg = check_per_job(est_cost)
++    if not ok:
++        raise RuntimeError("Per-job cost guard: " + msg)
++    ok2, msg2 = check_account_budget(est_cost)
++    if not ok2:
++        raise RuntimeError("Account budget guard: " + msg2)
++
++    # submit and capture result
++    try:
++        res = pm.submit_job(adapter_name, circuit_spec, shots=shots, metadata={"seed": seed})
++    except ProviderError as e:
++        raise
++
++    # update billing usage
++    record_usage(est_cost)
++
++    # collect provenance and sign
++    prov_file, prov_sig = make_provenance(adapter_name, res["job_id"], res.get("provenance", {}), circuit_spec, shots, seed=seed, submitter=submitter)
++
++    # optional postprocessing
++    if post_cmd:
++        subprocess.check_call(post_cmd, shell=True)
++
++    out = {"job": res, "provenance_file": prov_file, "provenance_sig": prov_sig}
++    out_path = os.path.join(OUT_DIR, f"qjob_{res['job_id'].replace('/','_')}.json")
++    with open(out_path, "w") as fh:
++        json.dump(out, fh, indent=2)
++    return out_path
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--adapter", default="stub")
++    p.add_argument("--circuit", required=True)
++    p.add_argument("--shots", type=int, default=1024)
++    p.add_argument("--pre", default=None)
++    p.add_argument("--post", default=None)
++    p.add_argument("--seed", type=int, default=None)
++    args = p.parse_args()
++    circuit = json.load(open(args.circuit))
++    path = run_hybrid(args.adapter, circuit, shots=args.shots, pre_cmd=args.pre, post_cmd=args.post, seed=args.seed)
++    print("Wrote job output to", path)
++
+*** End Patch
+*** End Patch

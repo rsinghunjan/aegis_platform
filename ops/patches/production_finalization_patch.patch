@@ -1,0 +1,660 @@
+*** Begin Patch
+*** Add File:ops/validation/scale_hpo_longshadow_runner.py
++#!/usr/bin/env python3
++"""
++Orchestrator to run:
++ - Large distributed HPO runs (many PipelineRuns or RayJobs)
++ - Long‑shadow accelerated runs (collect KPI samples for extended duration)
++ - 2k dry-run simulator farm executions
++Collects evidence, uploads bundles to evidence S3 and returns a JSON report.
++
++Usage:
++  EVIDENCE_BUCKET=s3://... python ops/validation/scale_hpo_longshadow_runner.py
++"""
++import os
++import time
++import json
++import tempfile
++import subprocess
++import logging
++from datetime import datetime, timedelta
++
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger("scale-runner")
++
++TEKTON_NS = os.environ.get("TEKTON_NAMESPACE", "cicd")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++HPO_SAMPLES = int(os.environ.get("HPO_SAMPLES", "128"))
++HPO_PARALLEL = int(os.environ.get("HPO_PARALLEL", "4"))
++SIM_RUNS = int(os.environ.get("SIM_RUNS", "2000"))
++LONG_SHADOW_ACCEL_HOURS = float(os.environ.get("LONG_SHADOW_ACCEL_HOURS", "24"))  # accelerated hours
++
++def apply_manifest(manifest_yaml):
++    p = tempfile.NamedTemporaryFile(delete=False, suffix=".yaml")
++    p.write(manifest_yaml.encode()); p.flush(); p.close()
++    subprocess.check_call(["kubectl", "apply", "-f", p.name])
++    return p.name
++
++def trigger_pipeline(name, params):
++    pr = {
++        "apiVersion": "tekton.dev/v1beta1",
++        "kind": "PipelineRun",
++        "metadata": {"generateName": f"{name}-run-"},
++        "spec": {"pipelineRef": {"name": name}, "params": [{"name": k, "value": str(v)} for k, v in params.items()]}
++    }
++    import yaml, tempfile
++    f = tempfile.NamedTemporaryFile(delete=False, suffix=".yaml")
++    f.write(yaml.safe_dump(pr).encode()); f.close()
++    out = subprocess.check_output(["kubectl", "apply", "-n", TEKTON_NS, "-f", f.name]).decode()
++    logger.info("Triggered PipelineRun: %s", out)
++    # extract name
++    for l in out.splitlines():
++        if "pipelinerun.tekton.dev/" in l:
++            return l.split()[0].split("/")[1]
++    return None
++
++def wait_for_pipelinerun(pr_name, timeout=3600):
++    end = time.time() + timeout
++    while time.time() < end:
++        out = subprocess.check_output(["kubectl", "-n", TEKTON_NS, "get", "pipelinerun", pr_name, "-o", "json"]).decode()
++        st = json.loads(out).get("status", {})
++        conds = st.get("conditions", [])
++        if conds:
++            s = conds[0].get("status")
++            if s == "True":
++                return True, st
++            if s == "False":
++                return False, st
++        time.sleep(10)
++    return False, {}
++
++def collect_evidence(pr_name):
++    tmp = tempfile.mkdtemp(prefix=f"evidence-{pr_name}-")
++    try:
++        subprocess.check_call(["kubectl", "-n", TEKTON_NS, "get", "pipelinerun", pr_name, "-o", "json"], stdout=open(f"{tmp}/pipelinerun.json","w"))
++    except Exception:
++        pass
++    # collect logs for pods belonging to this run
++    pods = json.loads(subprocess.check_output(["kubectl", "-n", TEKTON_NS, "get", "pods", "-o", "json"]).decode()).get("items", [])
++    for p in pods:
++        owners = p.get("metadata", {}).get("ownerReferences", [])
++        if any(o.get("name","").startswith(pr_name) for o in owners):
++            podname = p["metadata"]["name"]
++            try:
++                logs = subprocess.check_output(["kubectl", "-n", TEKTON_NS, "logs", podname], stderr=subprocess.STDOUT).decode()
++            except Exception as e:
++                logs = f"error: {e}"
++            open(f"{tmp}/{podname}.log","w").write(logs)
++    # bundle and upload
++    bundle = f"/tmp/{pr_name}-{int(time.time())}.tar.gz"
++    subprocess.check_call(["tar","-czf", bundle, "-C", tmp, "."])
++    if EVIDENCE_BUCKET:
++        import boto3
++        s3=boto3.client("s3")
++        key=f"scale_validation/{pr_name}/{os.path.basename(bundle)}"
++        s3.upload_file(bundle, EVIDENCE_BUCKET.replace("s3://",""), key)
++        return f"s3://{EVIDENCE_BUCKET.replace('s3://','')}/{key}"
++    return bundle
++
++def run_large_hpo_parallel():
++    prs=[]
++    for i in range(HPO_PARALLEL):
++        pr = trigger_pipeline("large-hpo-pipeline", {"samples": HPO_SAMPLES, "evidence_bucket": EVIDENCE_BUCKET, "team": f"stress-{i}"})
++        if pr:
++            prs.append(pr)
++    results=[]
++    for pr in prs:
++        ok, st = wait_for_pipelinerun(pr, timeout=4*3600)
++        evidence = collect_evidence(pr)
++        results.append({"pr": pr, "ok": ok, "evidence": evidence})
++    return results
++
++def run_simulator_farm():
++    pr = trigger_pipeline("long-shadow-2k-pipeline", {"sim_runs": SIM_RUNS, "evidence_bucket": EVIDENCE_BUCKET})
++    if not pr:
++        return {"ok": False}
++    ok, st = wait_for_pipelinerun(pr, timeout=6*3600)
++    ev = collect_evidence(pr)
++    return {"pr": pr, "ok": ok, "evidence": ev}
++
++def run_long_shadow_accelerated(hours=LONG_SHADOW_ACCEL_HOURS):
++    # Run an accelerated KPI sampler for `hours` and collect KPI timeseries snapshots
++    tmp = tempfile.mkdtemp(prefix="longshadow-")
++    # sample Prometheus metrics periodically for `hours` worth of accelerated sampling (step=10s)
++    prom = os.environ.get("PROM_URL", "http://prometheus.monitoring.svc:9090")
++    end = time.time() + hours * 3600
++    samples=[]
++    while time.time() < end:
++        try:
++            r = subprocess.check_output(["curl","-s", f"{prom}/api/v1/query", "--data-urlencode", "query=sum(rate(business_metric[1m]))"]).decode()
++            samples.append({"ts": int(time.time()), "val": json.loads(r)})
++        except Exception:
++            samples.append({"ts": int(time.time()), "val": None})
++        time.sleep(10)
++    path = f"{tmp}/longshadow_samples.json"
++    open(path,"w").write(json.dumps(samples))
++    if EVIDENCE_BUCKET:
++        import boto3
++        s3=boto3.client("s3")
++        key=f"longshadow/{int(time.time())}.json"
++        s3.upload_file(path, EVIDENCE_BUCKET.replace("s3://",""), key)
++        return f"s3://{EVIDENCE_BUCKET.replace('s3://','')}/{key}"
++    return path
++
++def main():
++    report = {"started": datetime.utcnow().isoformat(), "hpo_results": None, "sim_results": None, "longshadow": None}
++    logger.info("Starting large HPO parallel runs")
++    report["hpo_results"] = run_large_hpo_parallel()
++    logger.info("Starting simulator farm run")
++    report["sim_results"] = run_simulator_farm()
++    logger.info("Starting long-shadow accelerated run")
++    report["longshadow"] = run_long_shadow_accelerated()
++    report["finished"] = datetime.utcnow().isoformat()
++    out = "/tmp/scale_validation_report.json"
++    open(out,"w").write(json.dumps(report, indent=2))
++    if EVIDENCE_BUCKET:
++        import boto3
++        s3=boto3.client("s3")
++        key=f"scale_validation/report-{int(time.time())}.json"
++        s3.upload_file(out, EVIDENCE_BUCKET.replace("s3://",""), key)
++        logger.info("Uploaded report to s3://%s/%s", EVIDENCE_BUCKET.replace("s3://",""), key)
++    print(json.dumps(report, indent=2))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/images/Dockerfile.habana
++FROM ubuntu:22.04
++LABEL maintainer="aegis-ops@example.com"
++RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl python3 python3-pip && rm -rf /var/lib/apt/lists/*
++# Placeholder: install Habana drivers & libs. In production replace with vendor-provided install steps.
++# Example: copy .deb packages or run vendor installer.
++COPY requirements.txt /tmp/
++RUN pip3 install -r /tmp/requirements.txt
++ENV HPU_VISIBLE_DEVICES=0
++WORKDIR /app
++COPY . /app
++CMD ["python3", "/app/train.py"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/images/Dockerfile.graphcore
++FROM ubuntu:22.04
++LABEL maintainer="aegis-ops@example.com"
++RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl python3 python3-pip && rm -rf /var/lib/apt/lists/*
++# NOTE: Graphcore container runtime (Poplar) must be installed per Graphcore instructions.
++COPY requirements.txt /tmp/
++RUN pip3 install -r /tmp/requirements.txt
++WORKDIR /app
++COPY . /app
++CMD ["python3", "/app/train.py"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/images/build_and_push_accel_images.sh
++#!/usr/bin/env bash
++set -euo pipefail
++REGISTRY=${REGISTRY:-us.gcr.io/aegis}
++TAG=${TAG:-latest}
++echo "Building Habana image..."
++docker build -t ${REGISTRY}/hpo-habana:${TAG} -f ops/images/Dockerfile.habana .
++docker push ${REGISTRY}/hpo-habana:${TAG}
++echo "Building Graphcore image..."
++docker build -t ${REGISTRY}/hpo-graphcore:${TAG} -f ops/images/Dockerfile.graphcore .
++docker push ${REGISTRY}/hpo-graphcore:${TAG}
++echo "Images pushed"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/security/pen_test_and_terraform_apply.yml
++name: PenTest, Plan and Manual Apply
++on:
++  workflow_dispatch:
++    inputs:
++      evidence_bucket:
++        required: true
++
++jobs:
++  pentest:
++    runs-on: ubuntu-latest
++    outputs:
++      plan-path: ${{ steps.plan.outputs.path }}
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run pen-test scripts
++        run: |
++          ./ops/security/pen_test_suite.sh || true
++      - name: Upload pen-test report
++        env:
++          EVIDENCE_BUCKET: ${{ github.event.inputs.evidence_bucket }}
++        run: |
++          if [ -d /tmp/pen-reports ]; then
++            aws s3 cp /tmp/pen-reports s3://${EVIDENCE_BUCKET}/security/ --recursive || true
++          fi
++  terraform-plan:
++    runs-on: ubuntu-latest
++    needs: pentest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Terraform init and plan
++        id: plan
++        run: |
++          cd terraform/aws || exit 0
++          terraform init -input=false
++          terraform plan -out=tfplan || true
++          echo "::set-output name=path::terraform/aws/tfplan"
++  terraform-apply:
++    runs-on: ubuntu-latest
++    needs: terraform-plan
++    environment:
++      name: manual-approval
++      url: https://example-approval
++    steps:
++      - name: Manual approval required
++        run: echo "This job requires manual approval via the GitHub environment protection rules."
++      - name: Apply Terraform (manual)
++        if: ${{ github.event.inputs.evidence_bucket }}
++        run: |
++          cd terraform/aws
++          echo "Manual step: run 'terraform apply tfplan' locally or in a controlled step with proper reviewers."
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/telemetry/otel_endtoend_check.py
++#!/usr/bin/env python3
++"""
++Verify OTEL end-to-end:
++ - Query Prometheus for traces/metrics with run_id within a time window
++ - Query Jaeger or OTEL collector for traces that include span attribute run_id and business_kpi
++ - Report missing instrumentation
++"""
++import os, time, requests, logging, json
++from datetime import datetime, timedelta
++
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger("otel-check")
++
++PROM = os.environ.get("PROM_URL", "http://prometheus.monitoring.svc:9090")
++JAEGER = os.environ.get("JAEGER_QUERY", "http://jaeger-query.monitoring.svc:16686/api/traces")
++WINDOW_MIN = int(os.environ.get("WINDOW_MIN", "30"))
++
++def query_prom_run_ids():
++    q = 'label_values(run_id)'
++    r = requests.get(f"{PROM}/api/v1/label/{q.replace('label_values(','').replace(')','')}")
++    if r.status_code != 200:
++        return []
++    return r.json().get("data",[])
++
++def check_traces_for_run(run_id):
++    # Query Jaeger traces for traces that include attribute run_id
++    params = {"query": f"json.attributes.run_id:{run_id}", "limit": 20}
++    try:
++        r = requests.get(JAEGER, params=params, timeout=10)
++        if r.status_code != 200:
++            return False, "jaeger query failed"
++        traces = r.json().get("data", [])
++        for t in traces:
++            # check spans for business_kpi attribute
++            for s in t.get("spans", []):
++                attrs = s.get("tags", [])
++                for a in attrs:
++                    if a.get("key") == "business_kpi":
++                        return True, "ok"
++        return False, "no business_kpi attribute in traces"
++    except Exception as e:
++        return False, str(e)
++
++def main():
++    run_ids = query_prom_run_ids()
++    recent = run_ids[-10:]
++    report = {}
++    for rid in recent:
++        ok, msg = check_traces_for_run(rid)
++        report[rid] = {"ok": ok, "msg": msg}
++    out = "/tmp/otel_e2e_check.json"
++    open(out,"w").write(json.dumps(report, indent=2))
++    print(json.dumps(report, indent=2))
++    if os.environ.get("EVIDENCE_BUCKET"):
++        import boto3
++        s3=boto3.client("s3")
++        key=f"otel_checks/{int(time.time())}.json"
++        s3.upload_file(out, os.environ["EVIDENCE_BUCKET"].replace("s3://",""), key)
++        logger.info("Uploaded check to s3://%s/%s", os.environ["EVIDENCE_BUCKET"].replace("s3://",""), key)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/stress/multi_tenant_stress.py
++#!/usr/bin/env python3
++"""
++Multi-tenant stress tester:
++ - Simulate many tenants submitting HPO jobs rapidly
++ - Use quota-enforcer and submission endpoints (Tekton or HPO submit service)
++ - Monitor Redis quota counters and produce a report of rejections vs accepted
++"""
++import os, time, random, requests, logging, json, threading
++
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger("multi-stress")
++
++SUBMIT_URL = os.environ.get("HPO_SUBMIT_URL", "http://hpo-submit.monitoring.svc:8080/submit")
++QUOTA_API = os.environ.get("QUOTA_API", "http://quota-enforcer.monitoring.svc:8080")
++TENANTS = int(os.environ.get("TENANTS", "20"))
++CONC = int(os.environ.get("CONC", "200"))
++DURATION = int(os.environ.get("DURATION", "300"))
++
++results = {"accepted":0, "rejected":0}
++
++def submit_loop(tenant):
++    end = time.time() + DURATION
++    while time.time() < end:
++        try:
++            resp = requests.post(SUBMIT_URL, json={"team": tenant, "config": {"est_usd": random.random()*10}}, timeout=5)
++            if resp.status_code == 200:
++                results["accepted"] += 1
++            else:
++                results["rejected"] += 1
++        except Exception:
++            results["rejected"] += 1
++        time.sleep(random.random()*0.5)
++
++def main():
++    tenants = [f"team-{i}" for i in range(TENANTS)]
++    threads=[]
++    for i in range(CONC):
++        t = threading.Thread(target=submit_loop, args=(random.choice(tenants),))
++        t.start(); threads.append(t)
++    for t in threads:
++        t.join()
++    out = "/tmp/multi_stress_report.json"
++    open(out,"w").write(json.dumps(results, indent=2))
++    print(json.dumps(results, indent=2))
++    if os.environ.get("EVIDENCE_BUCKET"):
++        import boto3
++        s3=boto3.client("s3")
++        key=f"stress_reports/{int(time.time())}.json"
++        s3.upload_file(out, os.environ["EVIDENCE_BUCKET"].replace("s3://",""), key)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/approval/approval_ui_hardened.py
++#!/usr/bin/env python3
++"""
++Hardened Approval UI:
++ - Keycloak introspection for approver identity
++ - HTTPS support (expect TLS terminated at ingress)
++ - Audit linking via audit-linker service on successful approvals
++"""
++from fastapi import FastAPI, Request, Form, Header, HTTPException
++from fastapi.responses import HTMLResponse, RedirectResponse
++import os, requests, logging
++
++app = FastAPI()
++logger = logging.getLogger("approval-ui-hardened")
++logging.basicConfig(level=logging.INFO)
++
++APPROVAL_API = os.environ.get("APPROVAL_SERVICE_URL","http://approval-service.monitoring.svc:8080")
++KEYCLOAK_USERINFO = os.environ.get("KEYCLOAK_USERINFO","http://keycloak.monitoring.svc:8080/realms/aegis/protocol/openid-connect/userinfo")
++AUDIT_LINKER = os.environ.get("AUDIT_LINKER_URL","http://audit-linker.monitoring.svc:8080/record")
++
++def introspect(token):
++    if not token:
++        return {}
++    try:
++        r = requests.get(KEYCLOAK_USERINFO, headers={"Authorization": token}, timeout=5)
++        r.raise_for_status()
++        return r.json()
++    except Exception:
++        logger.exception("introspect failed")
++        return {}
++
++@app.get("/", response_class=HTMLResponse)
++def index():
++    try:
++        r = requests.get(f"{APPROVAL_API}/pending", timeout=5)
++        pending = r.json()
++    except Exception:
++        pending = []
++    html = "<h1>Approval Requests</h1><ul>"
++    for p in pending:
++        html += f"<li>{p['id']} - {p.get('summary','')} - Evidence: {p.get('evidence','')} - <form method='post' action='/approve/{p['id']}' style='display:inline'><input name='token' placeholder='Bearer token' required><input name='note' placeholder='signed note'><button type='submit'>Approve</button></form></li>"
++    html += "</ul>"
++    return HTMLResponse(html)
++
++@app.post("/approve/{req_id}")
++def approve(req_id: str, token: str = Form(...), note: str = Form("")):
++    user = introspect(token)
++    if not user:
++        raise HTTPException(status_code=401, detail="invalid token")
++    headers = {"Authorization": f"Bearer {token}"}
++    payload = {"note": note}
++    r = requests.put(f"{APPROVAL_API}/approve/{req_id}", headers=headers, json=payload, timeout=10)
++    if r.status_code != 200:
++        raise HTTPException(status_code=400, detail="approve failed")
++    # call audit linker
++    try:
++        requests.post(AUDIT_LINKER, json={"req_id": req_id, "approver": user.get("preferred_username"), "evidence": r.json().get("evidence")}, timeout=5)
++    except Exception:
++        logger.exception("audit-link failed")
++    return RedirectResponse("/", status_code=303)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/webhook/cert-manager-clusterissuer.yaml
++apiVersion: cert-manager.io/v1
++kind: ClusterIssuer
++metadata:
++  name: aegis-ca-issuer
++spec:
++  selfSigned: {}
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/webhook/mutating_webhook_deploy.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: mutating-webhook
++  namespace: kube-system
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: mutating-webhook
++  template:
++    metadata:
++      labels:
++        app: mutating-webhook
++    spec:
++      containers:
++        - name: webhook
++          image: us.gcr.io/aegis/mutating-webhook:latest
++          ports:
++            - containerPort: 8443
++          volumeMounts:
++            - name: webhook-cert
++              mountPath: /tls
++              readOnly: true
++      volumes:
++        - name: webhook-cert
++          secret:
++            secretName: mutating-webhook-tls
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: mutating-webhook-svc
++  namespace: kube-system
++spec:
++  ports:
++    - port: 443
++      targetPort: 8443
++  selector:
++    app: mutating-webhook
++
++---
++# MutatingWebhookConfiguration should reference the CA bundle from the cert-manager signed secret.
++apiVersion: admissionregistration.k8s.io/v1
++kind: MutatingWebhookConfiguration
++metadata:
++  name: aegis-mutating-webhook
++webhooks:
++  - name: mutating.aegis.example.com
++    admissionReviewVersions: ["v1","v1beta1"]
++    sideEffects: None
++    clientConfig:
++      service:
++        name: mutating-webhook-svc
++        namespace: kube-system
++        path: "/mutate"
++      caBundle: ""
++    rules:
++      - apiGroups: [""]
++        apiVersions: ["v1"]
++        operations: ["CREATE"]
++        resources: ["pods"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/billing/calibrate_cost_estimator.py
++#!/usr/bin/env python3
++"""
++Calibrate cost estimator using historical invoices:
++ - Pull invoice records from S3 (or local path)
++ - Compute empirical cost per accelerator-hour and update a local JSON pricing file
++"""
++import os, json, logging, statistics
++import boto3
++
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger("calibrate-cost")
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++HIST_INVOICE_PREFIX = os.environ.get("HIST_INVOICE_PREFIX", "invoices/historical/")
++PRICES_FILE = os.environ.get("PRICES_FILE", "/tmp/accel_prices.json")
++
++def list_invoices():
++    s3=boto3.client("s3")
++    bucket=EVIDENCE_BUCKET.replace("s3://","")
++    resp = s3.list_objects_v2(Bucket=bucket, Prefix=HIST_INVOICE_PREFIX)
++    return [o["Key"] for o in resp.get("Contents",[])]
++
++def download(key, dest):
++    s3=boto3.client("s3")
++    bucket=EVIDENCE_BUCKET.replace("s3://","")
++    s3.download_file(bucket, key, dest)
++
++def process_csv(path):
++    import csv
++    records=[]
++    with open(path) as f:
++        r=csv.DictReader(f)
++        for row in r:
++            records.append(row)
++    return records
++
++def main():
++    if not EVIDENCE_BUCKET:
++        logger.error("EVIDENCE_BUCKET required")
++        return
++    keys = list_invoices()
++    samples={}
++    for k in keys:
++        tmp="/tmp/inv.csv"
++        download(k,tmp)
++        for r in process_csv(tmp):
++            accel = r.get("accelerator_type","unknown")
++            hours = float(r.get("hours",0.0))
++            cost = float(r.get("cost_usd",0.0))
++            if hours>0:
++                samples.setdefault(accel,[]).append(cost/hours)
++    prices = {}
++    for a, vals in samples.items():
++        prices[a] = round(statistics.median(vals),2)
++    open(PRICES_FILE,"w").write(json.dumps(prices, indent=2))
++    print("Wrote calibrated prices to", PRICES_FILE)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/billing/invoice_simulator.py
++#!/usr/bin/env python3
++"""
++Simulate many provider invoices and upload to S3 to stress test reconciliation.
++Produces CSVs with columns: provider, accelerator_type, hours, cost_usd, invoice_id
++"""
++import os, csv, random, boto3, time
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++BUCKET = EVIDENCE_BUCKET.replace("s3://","") if EVIDENCE_BUCKET else ""
++
++def generate_invoice(n_lines=1000, fname="/tmp/inv.csv"):
++    fields=["provider","accelerator_type","hours","cost_usd","invoice_id"]
++    rows=[]
++    for i in range(n_lines):
++        accel=random.choice(["habana-gaudi","graphcore-ipu","tpu-vm"])
++        hours=round(random.random()*10,2)
++        price={"habana-gaudi":1.5,"graphcore-ipu":3.0,"tpu-vm":4.0}[accel]
++        cost=round(price*hours,2)
++        rows.append({"provider":"provA","accelerator_type":accel,"hours":hours,"cost_usd":cost,"invoice_id":f"inv-{int(time.time())}-{i}"})
++    with open(fname,"w",newline="") as f:
++        w=csv.DictWriter(f, fieldnames=fields)
++        w.writeheader()
++        w.writerows(rows)
++    return fname
++
++def upload(fname, key_prefix="invoices/simulated/"):
++    s3=boto3.client("s3")
++    key = f"{key_prefix}{os.path.basename(fname)}"
++    s3.upload_file(fname, BUCKET, key)
++    return f"s3://{BUCKET}/{key}"
++
++if __name__ == "__main__":
++    f=generate_invoice(5000, "/tmp/inv.csv")
++    print(upload(f))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/ci/accelerator_smoke_and_validation.yml
++name: Accelerator Smoke & Validation
++on:
++  workflow_dispatch:
++    inputs:
++      accel_label:
++        required: true
++      evidence_bucket:
++        required: true
++
++jobs:
++  smoke:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run accelerator smoke test
++        env:
++          ACCEL_LABEL: ${{ github.event.inputs.accel_label }}
++        run: |
++          ./ops/scripts/accelerator_smoke_test.sh
++  scale-and-validate:
++    runs-on: ubuntu-latest
++    needs: smoke
++    steps:
++      - uses: actions/checkout@v4
++      - name: Trigger scale validation
++        env:
++          EVIDENCE_BUCKET: ${{ github.event.inputs.evidence_bucket }}
++        run: |
++          ./ops/scripts/trigger_scale_validation.sh
++
+*** End Patch
+*** End Patch

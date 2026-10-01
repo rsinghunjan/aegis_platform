@@ -1,0 +1,648 @@
+*** Begin Patch
+*** Add File:deploy/vault/values-prod.yaml
++# Helm values for HashiCorp Vault in production with KMS auto-unseal and audit enabled
++server:
++  image:
++    repository: "hashicorp/vault"
++    tag: "1.14.0"
++  ha:
++    enabled: true
++    replicas: 3
++  dataStorage:
++    enabled: true
++    size: 50Gi
++  extraEnvironmentVars:
++    VAULT_LOCAL_CONFIG: |
++      listener "tcp" {
++        address = "0.0.0.0:8200"
++        tls_disable = 0
++      }
++      ui = true
++      telemetry {
++        unauthenticated_metrics_access = true
++      }
++unsealer:
++  type: awskms
++  awsKmsKeyId: "REPLACE_WITH_KMS_KEY_ARN" # set via CI/CD from secret
++  awsRegion: "us-west-2"
++audit:
++  enabled: true
++  # configure file audit device; mount path must map to PVC
++  file:
++    enabled: true
++    path: /vault/logs/audit.log
++extraVolumes:
++  - name: vault-audit
++    persistentVolumeClaim:
++      claimName: vault-audit-pvc
++extraVolumeMounts:
++  - name: vault-audit
++    mountPath: /vault/logs
++serverService:
++  enabled: true
++  type: ClusterIP
++injector:
++  enabled: true
++rbac:
++  create: true
++  namespaced: false
++ui:
++  enabled: true
++resources:
++  requests:
++    cpu: 250m
++    memory: 512Mi
++  limits:
++    cpu: 1000m
++    memory: 2Gi
++
+*** End Patch
+*** Begin Patch
+*** Add File:deploy/vault/rbac-provision.yaml
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: vault
++---
++apiVersion: v1
++kind: PersistentVolumeClaim
++metadata:
++  name: vault-audit-pvc
++  namespace: vault
++spec:
++  accessModes: ["ReadWriteOnce"]
++  resources:
++    requests:
++      storage: 50Gi
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: vault-bootstrap
++  namespace: vault
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: vault-bootstrap-role
++  namespace: vault
++rules:
++  - apiGroups: [""]
++    resources: ["pods","secrets","configmaps"]
++    verbs: ["get","list","create","update","patch","delete"]
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: vault-bootstrap-rb
++  namespace: vault
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: Role
++  name: vault-bootstrap-role
++subjects:
++  - kind: ServiceAccount
++    name: vault-bootstrap
++    namespace: vault
++
+*** End Patch
+*** Begin Patch
+*** Add File:deploy/vault/auto_init_unseal_and_backup.sh
++#!/usr/bin/env bash
++set -euo pipefail
++# Run from a bastion or CI runner with AWS IAM permissions to write S3 and SecretsManager.
++# Expects VAULT_ADDR env var and values:
++#   EVIDENCE_BUCKET, KMS_ARN, AWS_REGION
++
++: "${VAULT_ADDR:?VAULT_ADDR required}"
++: "${EVIDENCE_BUCKET:?EVIDENCE_BUCKET required}"
++: "${KMS_ARN:?KMS_ARN required}"
++
++echo "Checking Vault status..."
++until curl -sSf --insecure "${VAULT_ADDR}/v1/sys/health" >/dev/null 2>&1; do sleep 3; done
++
++if vault status -format=json | jq -e '.initialized' >/dev/null 2>&1; then
++  echo "Vault already initialized; ensuring audit device enabled"
++  vault audit enable file file_path=/vault/logs/audit.log || true
++  exit 0
++fi
++
++echo "Initializing Vault..."
++vault operator init -key-shares=5 -key-threshold=3 -format=json > /tmp/vault-init.json
++ROOT_TOKEN=$(jq -r '.root_token' /tmp/vault-init.json)
++UNSEAL_KEYS=$(jq -r '.unseal_keys_b64[]' /tmp/vault-init.json)
++
++echo "Archiving init bundle to S3 (object-locked) and storing root token to Secrets Manager..."
++aws s3 cp /tmp/vault-init.json "s3://${EVIDENCE_BUCKET}/vault-init/vault-init-$(date +%s).json" --sse aws:kms --sse-kms-key-id "${KMS_ARN}"
++aws secretsmanager create-secret --name aegis/vault/root-token --secret-string "${ROOT_TOKEN}" --region ${AWS_REGION} >/dev/null || \
++  aws secretsmanager put-secret-value --secret-id aegis/vault/root-token --secret-string "${ROOT_TOKEN}" --region ${AWS_REGION} >/dev/null
++
++echo "Unsealing vault using KMS auto-unseal configured in helm (ensure helm values have unsealer.kmsKeyId)"
++# If using KMS auto-unseal the operator may not need to unseal; if manual unseal required:
++for key in ${UNSEAL_KEYS}; do
++  vault operator unseal "${key}" || true
++done
++
++echo "Enable Kubernetes auth and audit device"
++export VAULT_TOKEN="${ROOT_TOKEN}"
++vault auth enable kubernetes || true
++vault write auth/kubernetes/config token_reviewer_jwt="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" kubernetes_host="https://kubernetes.default.svc" kubernetes_ca_cert=@/var/run/secrets/kubernetes.io/serviceaccount/ca.crt || true
++vault audit enable file file_path=/vault/logs/audit.log || true
++
++echo "Bootstrap complete. Please rotate root token and manage unseal keys per security policy."
++
+*** End Patch
+*** Begin Patch
+*** Add File:terraform/rekor_rds/rekor_rds_tls.tf
++resource "aws_db_instance" "rekor" {
++  # (assumes other variables/resources defined in rekor_rds module)
++  # Ensures storage encrypted and public access disabled
++  publicly_accessible = false
++  storage_encrypted = true
++  multi_az = true
++  apply_immediately = true
++  # Enable deletion protection in prod
++  deletion_protection = true
++}
++
++resource "aws_db_parameter_group" "rekor_params" {
++  name   = "${var.name}-rekor-params"
++  family = "postgres15"
++  parameter {
++    name  = "ssl"
++    value = "on"
++  }
++}
++
++output "rekor_rds_endpoint" {
++  value = aws_db_instance.rekor.address
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:deploy/rekor/rotate_db_credentials_cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: rekor-rotate-db-creds
++  namespace: aegis
++spec:
++  schedule: "0 5 * * 0" # weekly rotation (tune per policy)
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          serviceAccountName: rekor-operator
++          containers:
++            - name: rotate
++              image: amazon/aws-cli:2.11.25
++              env:
++                - name: AWS_REGION
++                  value: "us-west-2"
++                - name: SECRET_NAME
++                  value: "aegis/rekor/db"
++              command: ["/bin/sh","-c"]
++              args:
++                - |
++                  set -e
++                  # generate a new strong password and store in Secrets Manager
++                  NEW_PASS=$(openssl rand -base64 32)
++                  aws secretsmanager put-secret-value --secret-id ${SECRET_NAME} --secret-string "{\"username\":\"${REKOR_DB_USER:-rekor}\",\"password\":\"${NEW_PASS}\"}" || true
++                  echo "Rotated Rekor DB password in Secrets Manager (operator must apply DB change during maintenance window)"
++          restartPolicy: OnFailure
++
+*** End Patch
+*** Begin Patch
+*** Add File:deploy/rekor/pg_backup_and_restore.sh
++#!/usr/bin/env bash
++set -euo pipefail
++# Backup script for Rekor RDS; requires psql client and AWS creds
++PGHOST=${PGHOST:-REPLACE_HOST}
++PGUSER=${PGUSER:-REPLACE_USER}
++PGDB=${PGDB:-rekordb}
++EVIDENCE_BUCKET=${EVIDENCE_BUCKET:-}
++OUT=/tmp/rekor_backup_$(date -u +%Y%m%dT%H%M%SZ).dump
++export PGPASSWORD="${PGPASSWORD:-}"
++pg_dump -h "${PGHOST}" -U "${PGUSER}" -d "${PGDB}" -F c -f "${OUT}"
++if [ -n "${EVIDENCE_BUCKET}" ]; then
++  aws s3 cp "${OUT}" "s3://${EVIDENCE_BUCKET}/rekor-backups/$(basename ${OUT})" --sse aws:kms || true
++  echo "Uploaded Rekor backup to s3://${EVIDENCE_BUCKET}/rekor-backups/"
++else
++  echo "Saved backup locally at ${OUT}"
++fi
++
++echo "To restore: pg_restore -h <host> -U <user> -d <db> -c <backupfile>"
++
+*** End Patch
+*** Begin Patch
+*** Add File:infra/triton/tuned_deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: triton
++  namespace: aegis
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: triton
++  template:
++    metadata:
++      labels:
++        app: triton
++    spec:
++      containers:
++        - name: triton
++          image: nvcr.io/nvidia/tritonserver:23.03-py3
++          args: ["tritonserver", "--model-repository=/models", "--exit-on-error=false"]
++          resources:
++            limits:
++              nvidia.com/gpu: 1
++            requests:
++              cpu: 2000m
++              memory: 8Gi
++          volumeMounts:
++            - name: models
++              mountPath: /models
++      volumes:
++        - name: models
++          persistentVolumeClaim:
++            claimName: triton-models-pvc
++---
++# Horizontal Pod Autoscaler using custom metrics (needs KEDA or custom metrics adaptor)
++apiVersion: autoscaling/v2
++kind: HorizontalPodAutoscaler
++metadata:
++  name: triton-hpa
++  namespace: aegis
++spec:
++  scaleTargetRef:
++    apiVersion: apps/v1
++    kind: Deployment
++    name: triton
++  minReplicas: 1
++  maxReplicas: 5
++  metrics:
++    - type: Resource
++      resource:
++        name: nvidia.com/gpu
++        target:
++          type: Utilization
++          averageUtilization: 60
++
+*** End Patch
+*** Begin Patch
+*** Add File:infra/seldon/seldon_deployment_gpu.yaml
++apiVersion: machinelearning.seldon.io/v1
++kind: SeldonDeployment
++metadata:
++  name: rag-seldon
++  namespace: aegis
++spec:
++  protocol: tensorflow-serving
++  predictors:
++    - name: predictor-1
++      graph:
++        children: []
++        implementation: TRITON_SERVER
++        modelUri: "s3://models/rag_reader"
++        name: rag-triton
++      componentSpecs:
++        - spec:
++            containers:
++              - name: triton
++                image: nvcr.io/nvidia/tritonserver:23.03-py3
++                resources:
++                  limits:
++                    nvidia.com/gpu: 1
++      replicas: 2
++
+*** End Patch
+*** Begin Patch
+*** Add File:infra/milvus/statefulset-prod.yaml
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: milvus
++---
++apiVersion: apps/v1
++kind: StatefulSet
++metadata:
++  name: milvus
++  namespace: milvus
++spec:
++  serviceName: "milvus"
++  replicas: 3
++  selector:
++    matchLabels:
++      app: milvus
++  template:
++    metadata:
++      labels:
++        app: milvus
++    spec:
++      containers:
++        - name: milvus
++          image: milvusdb/milvus:v2.2.9
++          ports:
++            - containerPort: 19530
++          resources:
++            requests:
++              cpu: 1000m
++              memory: 4Gi
++            limits:
++              cpu: 2000m
++              memory: 8Gi
++          env:
++            - name: "TZ"
++              value: "UTC"
++          volumeMounts:
++            - name: milvus-data
++              mountPath: /var/lib/milvus
++  volumeClaimTemplates:
++    - metadata:
++        name: milvus-data
++      spec:
++        accessModes: ["ReadWriteOnce"]
++        resources:
++          requests:
++            storage: 200Gi
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: milvus
++  namespace: milvus
++spec:
++  selector:
++    app: milvus
++  ports:
++    - port: 19530
++      targetPort: 19530
++
+*** End Patch
+*** Begin Patch
+*** Add File:infra/milvus/backup_cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: milvus-backup
++  namespace: milvus
++spec:
++  schedule: "0 3 * * *"
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          containers:
++            - name: milvus-backup
++              image: python:3.10-slim
++              command: ["/bin/sh","-c"]
++              args:
++                - |
++                  set -e
++                  TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
++                  # Use milvus client to export collection or rely on snapshot mechanism (operator dependent)
++                  echo "Backing up Milvus collections (placeholder) to S3"
++                  # operator should implement using milvusctl or client SDK, here we assume dump to /tmp/backup.tgz
++                  touch /tmp/milvus-backup-${TIMESTAMP}.tgz
++                  aws s3 cp /tmp/milvus-backup-${TIMESTAMP}.tgz s3://${EVIDENCE_BUCKET:-your-evidence-bucket}/milvus-backups/ || true
++          restartPolicy: OnFailure
++
+*** End Patch
+*** Begin Patch
+*** Add File:ml/cv/detectron2/production_train.py
++#!/usr/bin/env python3
++"""
++Production-ready Detectron2 training orchestration stub:
++- Uses COCO-format dataset from S3
++- Registers dataset in Detectron2
++- Uses Albumentations for augmentation
++- Checkpoints to S3 and produces SBOM/manifest
++"""
++import os
++from detectron2.data import DatasetCatalog, MetadataCatalog
++from detectron2.engine import DefaultTrainer
++from detectron2.config import get_cfg
++import json
++
++DATA_DIR = os.environ.get("DATA_DIR","/data/coco")
++OUT_DIR = os.environ.get("OUT_DIR","out/detectron2")
++S3_BUCKET = os.environ.get("S3_BUCKET","")
++
++def register_datasets():
++    # Implementation depends on dataset structure; operator must supply COCO json paths
++    train_json = os.path.join(DATA_DIR, "annotations", "instances_train.json")
++    val_json = os.path.join(DATA_DIR, "annotations", "instances_val.json")
++    DatasetCatalog.register("coco_train", lambda: json.load(open(train_json))["images"])
++    DatasetCatalog.register("coco_val", lambda: json.load(open(val_json))["images"])
++    MetadataCatalog.get("coco_train").set(thing_classes=["class1"])
++
++def main():
++    os.makedirs(OUT_DIR, exist_ok=True)
++    register_datasets()
++    cfg = get_cfg()
++    cfg.merge_from_file("configs/COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml")
++    cfg.DATASETS.TRAIN = ("coco_train",)
++    cfg.DATASETS.TEST = ("coco_val",)
++    cfg.OUTPUT_DIR = OUT_DIR
++    cfg.SOLVER.MAX_ITER = int(os.environ.get("MAX_ITER","5000"))
++    trainer = DefaultTrainer(cfg)
++    trainer.resume_or_load(resume=False)
++    trainer.train()
++    # checkpoint upload
++    if S3_BUCKET:
++        os.system(f"aws s3 cp {OUT_DIR} s3://{S3_BUCKET}/cv-models/ --recursive || true")
++    print("Training complete and artifacts uploaded")
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ml/patterns/kafka/producer_highthroughput.py
++#!/usr/bin/env python3
++"""
++High-throughput Kafka producer using confluent_kafka, partitioning and batching.
++"""
++from confluent_kafka import Producer
++import json, time, os, uuid
++
++BROKERS = os.environ.get("KAFKA_BOOTSTRAP","localhost:9092")
++TOPIC = os.environ.get("KAFKA_TOPIC","telemetry")
++
++conf = {
++    'bootstrap.servers': BROKERS,
++    'linger.ms': 100,
++    'batch.num.messages': 1000,
++}
++
++p = Producer(conf)
++
++def delivery(err, msg):
++    if err:
++        print("Delivery failed:", err)
++
++def main():
++    for i in range(10000):
++        payload = {"id": str(uuid.uuid4()), "ts": time.time(), "value": i % 100}
++        p.produce(TOPIC, json.dumps(payload).encode("utf-8"), callback=delivery)
++        if i % 1000 == 0:
++            p.flush()
++    p.flush()
++    print("Produced messages")
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ml/patterns/kafka/consumer_highthroughput.py
++#!/usr/bin/env python3
++"""
++High-throughput Kafka consumer with schema registry support and batch writes to MongoDB.
++"""
++from confluent_kafka import Consumer
++from pymongo import MongoClient, InsertOne
++import json, os, time
++
++BROKERS = os.environ.get("KAFKA_BOOTSTRAP","localhost:9092")
++TOPIC = os.environ.get("KAFKA_TOPIC","telemetry")
++GROUP = os.environ.get("KAFKA_GROUP","aegis-consumer")
++MONGO = os.environ.get("MONGO_URI","mongodb://localhost:27017")
++
++conf = {
++    'bootstrap.servers': BROKERS,
++    'group.id': GROUP,
++    'auto.offset.reset': 'earliest',
++    'enable.auto.commit': False,
++    'fetch.min.bytes': 1024,
++    'fetch.max.bytes': 5*1024*1024,
++}
++
++def main():
++    c = Consumer(conf)
++    c.subscribe([TOPIC])
++    client = MongoClient(MONGO)
++    db = client['aegis']
++    buffer = []
++    while True:
++        msg = c.poll(timeout=1.0)
++        if msg is None:
++            continue
++        if msg.error():
++            print("Consumer error:", msg.error())
++            continue
++        try:
++            payload = json.loads(msg.value().decode('utf-8'))
++            buffer.append(InsertOne(payload))
++        except Exception as e:
++            print("Parse error", e)
++        if len(buffer) >= 500:
++            db.telemetry.bulk_write(buffer)
++            c.commit()
++            buffer = []
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:security/pii/presidio_redact_example.py
++#!/usr/bin/env python3
++"""
++Example using Microsoft Presidio for PII detection and redaction.
++Install: pip install presidio-analyzer presidio-anonymizer
++"""
++from presidio_analyzer import AnalyzerEngine
++from presidio_anonymizer import AnonymizerEngine, AnonymizerRequest
++
++analyzer = AnalyzerEngine()
++anonymizer = AnonymizerEngine()
++
++def redact(text):
++    results = analyzer.analyze(text=text, language='en', return_decision_process=False)
++    if not results:
++        return text
++    # build anonymizer request
++    anonymize_request = AnonymizerRequest()
++    anonymize_request.text = text
++    anonymize_request.entities = [{'start': r.start, 'end': r.end, 'entity_type': r.entity_type, 'anonymizer_config': {'type': 'replace', 'replace_value': '[REDACTED]'}} for r in results]
++    return anonymizer.anonymize(anonymize_request).text
++
++if __name__=="__main__":
++    sample = "Contact Alice at alice@example.com or +1 555 123 4567. SSN 123-45-6789"
++    print(redact(sample))
++
+*** End Patch
+*** Begin Patch
+*** Add File:security/gatekeeper/tuning/flip_to_enforce.sh
++#!/usr/bin/env bash
++set -euo pipefail
++# Collect Gatekeeper audit reports and flip constraint from dryrun->deny after review
++NAMESPACE=${1:-aegis}
++CONSTRAINT_NAME=${2:-require-signed-graphs}
++REPORT_DIR=/tmp/gatekeeper_audit_$(date +%s)
++mkdir -p ${REPORT_DIR}
++echo "Collecting audit reports..."
++kubectl get audit -A -o json > ${REPORT_DIR}/gatekeeper_audit_all.json || true
++echo "Operator: review ${REPORT_DIR}/gatekeeper_audit_all.json for false positives. To flip enforcement run:"
++echo "kubectl patch constraint ${CONSTRAINT_NAME} -n ${NAMESPACE} --type='merge' -p '{\"spec\":{\"enforcementAction\":\"deny\"}}'"
++
+*** End Patch
+*** Begin Patch
+*** Add File:security/falco/suppression_prod.yaml
++# Tuned Falco suppressions for Aegis production (start with these and extend after staging tuning)
++suppressions:
++  - rule: Terminal shell in container
++    source: "container"
++    condition:
++      - namespace: "aegis-staging"
++  - rule: Outbound connection to suspicious IP
++    source: "kernel"
++    condition:
++      - output: "not_suspicious"
++  - rule: Container added capabilities
++    imageRepository: "registry.example.com/aegis"
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/PROD_HARDENING_APPLY.md
++# How to apply the production hardening patch (high level)
++
++1. Vault
++   - kubectl apply -f deploy/vault/rbac-provision.yaml
++   - helm repo add hashicorp https://helm.releases.hashicorp.com
++   - helm upgrade --install vault hashicorp/vault -f deploy/vault/values-prod.yaml --namespace vault
++   - Run deploy/vault/auto_init_unseal_and_backup.sh from a secure runner with AWS creds
++
++2. Rekor RDS
++   - Use terraform/rekor_rds to provision RDS; update deploy/rekor/rekor-rds-secret-template.yaml with endpoint/creds
++   - Apply deploy/rekor/rekor-backup-cronjob.yaml and deploy/rekor/rotate_db_credentials_cronjob.yaml
++   - Test pg backup/restore with deploy/rekor/pg_backup_and_restore.sh
++
++3. Triton / Seldon
++   - Run training Argo jobs (ml/nlp/rag/argo_train_rag_gpu.yaml) on GPU pool
++   - Export model ONNX via ml/nlp/rag/onnx_export.py
++   - Populate /models PVC and apply infra/triton/tuned_deployment.yaml
++   - Optionally deploy Seldon CRD (infra/seldon/seldon_deployment_gpu.yaml) for high-level serving
++
++4. Milvus
++   - Apply infra/milvus/statefulset-prod.yaml and infra/milvus/backup_cronjob.yaml
++   - Run infra/milvus/ingest.py as Argo job to populate embeddings
++
++5. CV & Pattern detection
++   - Replace stubs with real dataset paths and run detectron2 training ml/cv/detectron2/train_full.py or ml/cv/detectron2/production_train.py on GPU nodes (argo/ae_train_gpu.yaml or custom)
++   - Deploy high-throughput Kafka with managed MSK or Strimzi; deploy ml/patterns/kafka/consumer_highthroughput.py and producer_highthroughput.py
++
++6. Security & Governance
++   - Deploy Presidio redaction example and integrate into LangGraph / runtime redaction pipelines
++   - Run security/falco tuning in staging; use security/gatekeeper/tuning/flip_to_enforce.sh to review audits then flip constraints to 'deny'
++
++Notes:
++- Many manifests require secret values (KMS ARNs, DB passwords, EVIDENCE_BUCKET). Use Vault, AWS Secrets Manager or sealed-secrets to inject them.
++- Run all changes first in aegis-staging namespace with Gatekeeper dry-run offload to validate.
++
+*** End Patch
+*** End Patch

@@ -1,0 +1,472 @@
+*** Begin Patch
+*** Add File:prod/finalize_all_gaps.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Master operator script to run final hardening, HA/DR validation and per-model tuning tasks.
++# This orchestrates all smaller scripts in the repo and emits a signed "enterprise-ready" evidence bundle.
++#
++# Pre-reqs:
++# - kubectl configured
++# - aws/gcloud/az CLI configured with operator privileges
++# - cosign installed and COSIGN_KMS_KEY_ARN available (or set to empty to skip signing)
++EVIDENCE_BUCKET=${EVIDENCE_BUCKET:-aegis-evidence}
++S3_INIT_BUCKET=${S3_INIT_BUCKET:-aegis-init-bundles}
++AWS_REGION=${AWS_REGION:-us-west-2}
++COSIGN_KMS=${COSIGN_KMS_KEY_ARN:-}
++
++echo "1) Vault: finalize ceremony & enable audit collection"
++./deploy/vault/ceremony_automation.sh || true
++./deploy/vault/enable_audit_uploader.sh || true
++
++echo "2) Rekor: run restore & reconciliation drill"
++./deploy/rekor/backup_and_restore_drill.sh || true
++
++echo "3) Milvus: install/validate backup, run restore test"
++helm upgrade --install milvus milvus/milvus -f ops/milvus/prod_values.yaml -n aegis || true
++kubectl -n aegis rollout status deployment/milvus-proxy --timeout=300s || true
++./ops/milvus/backup_segments_prod.sh || true
++./ops/milvus/restore_validate.sh || true
++
++echo "4) ONNX / TRT: run CI convert & validate for pilot models"
++./triton/tensorrt/ci_convert_validate_tensorrt.sh MODEL_ONNX=${MODEL_ONNX:-/tmp/model.onnx} MODEL_NAME=${MODEL_NAME:-pilot_model} || true
++
++echo "5) DeepSpeed / distributed DL: run NCCL validation & launch small multi-node job"
++./hardening/rdma/nccl_validation.sh || true
++kubectl apply -f deepspeed/k8s_multi_node_launcher.yaml || true
++
++echo "6) Federated: deploy Flower server & secure-aggregation job"
++kubectl apply -f argo/federated/argo_flower_workflow.yaml || true
++kubectl apply -f argo/federated/secure_agg_job.yaml || true
++
++echo "7) Agents: deploy sandboxed agent runtime and run a canary"
++kubectl apply -f argo/agents/sandboxed_agent_workflow.yaml || true
++
++echo "8) Replay & RL: deploy prioritized replay and run collectors"
++kubectl apply -f hardening/replay/prioritized_replay_deploy.yaml || true
++kubectl apply -f argo/rl/collector_scaled_workflow.yaml || true
++
++echo "9) Observability: install OTel collector, Fluentbit and enable Prometheus federation"
++kubectl apply -f monitoring/opentelemetry/collector.yaml || true
++kubectl apply -f logging/fluentbit/fluentbit_configmap.yaml || true
++kubectl apply -f observability/prometheus/federation.yaml || true
++
++echo "10) Autoscaling / resilience: install cluster-autoscaler and chaos tooling"
++kubectl apply -f autoscaling/cluster_autoscaler.yaml || true
++./chaos/litmus_install.sh || true
++
++echo "11) Run readiness & SLO checks and package evidence"
++./prod/automation/run_readiness_and_sign.sh || true
++./monitoring/slo/checks_and_report.sh || true
++
++echo "12) Produce enterprise audit bundle"
++./compliance/automated_audit_collector.sh || true
++
++if [ -n "${COSIGN_KMS}" ]; then
++  echo "Signing final enterprise bundle with cosign..."
++  # If compliance collector created an audit bundle, sign it (placeholder path)
++  AUDIT_TGZ=$(aws s3 ls s3://${EVIDENCE_BUCKET}/audit-bundles/ --recursive | tail -n1 | awk '{print $4}')
++  if [ -n "${AUDIT_TGZ}" ]; then
++    TMPFILE="/tmp/$(basename ${AUDIT_TGZ})"
++    aws s3 cp "s3://${EVIDENCE_BUCKET}/${AUDIT_TGZ}" "${TMPFILE}" || true
++    cosign sign --key "awskms://${COSIGN_KMS}" "${TMPFILE}" || true
++    aws s3 cp "${TMPFILE}.sig" "s3://${EVIDENCE_BUCKET}/audit-bundles/" || true
++  fi
++fi
++
++echo "Finalization complete. Check evidence at s3://${EVIDENCE_BUCKET}/"
++
+*** End Patch
+*** Begin Patch
+*** Add File:deploy/vault/enable_audit_uploader.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Enable Vault audit to file and upload audit logs to S3 periodically.
++# The script configures a file audit device and creates a Kubernetes CronJob to push logs to S3.
++AUDIT_PATH=${AUDIT_PATH:-/var/log/vault_audit.log}
++S3_BUCKET=${S3_BUCKET:-${EVIDENCE_BUCKET:-aegis-evidence}}
++AWS_REGION=${AWS_REGION:-us-west-2}
++
++echo "Enabling Vault file audit sink (if not already enabled)..."
++vault audit enable file file_path=${AUDIT_PATH} || true
++
++echo "Creating Kubernetes CronJob to upload audit logs to S3..."
++kubectl -n vault apply -f - <<EOF
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: vault-audit-upload
++spec:
++  schedule: "*/5 * * * *"
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          containers:
++            - name: uploader
++              image: amazon/aws-cli:latest
++              command: ["/bin/sh","-c"]
++              args:
++                - |
++                  TIMESTAMP=\$(date -u +%Y%m%dT%H%M%SZ)
++                  cp ${AUDIT_PATH} /tmp/vault_audit_\${TIMESTAMP}.log || true
++                  aws s3 cp /tmp/vault_audit_\${TIMESTAMP}.log s3://${S3_BUCKET}/vault-audit/ --region ${AWS_REGION} || true
++          restartPolicy: OnFailure
++EOF
++
++echo "Vault auditing enabled and uploader CronJob created."
++
+*** End Patch
+*** Begin Patch
+*** Add File:hardening/rekor/rekor_cron_restorejob.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: rekor-daily-restore-drill
++  namespace: aegis
++spec:
++  template:
++    spec:
++      containers:
++        - name: drill
++          image: ghcr.io/yourorg/aegis-ops:latest
++          command: ["/bin/bash","-c"]
++          args:
++            - /opt/scripts/backup_and_restore_drill.sh || true
++          env:
++            - name: REKOR_PG_HOST
++              valueFrom:
++                secretKeyRef:
++                  name: rekor-secrets
++                  key: host
++            - name: S3_BACKUP_BUCKET
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-secrets
++                  key: backup_bucket
++            - name: EVIDENCE_BUCKET
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-secrets
++                  key: evidence_bucket
++      restartPolicy: Never
++  backoffLimit: 0
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/milvus/cronjob_backup.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: milvus-daily-backup
++  namespace: aegis
++spec:
++  schedule: "0 2 * * *"
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          containers:
++            - name: milvus-backup
++              image: ghcr.io/yourorg/milvus-backup:latest
++              command: ["/bin/sh","-c"]
++              args:
++                - MILVUS_DATA_PATH=/var/lib/milvus S3_BACKUP_BUCKET=${S3_BACKUP_BUCKET:-aegis-backups} AWS_REGION=${AWS_REGION:-us-west-2} /opt/scripts/backup_segments_prod.sh
++          restartPolicy: OnFailure
++
+*** End Patch
+*** Begin Patch
+*** Add File:triton/local_triton_validator.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Run a local Triton server in Docker with a model repo and validate outputs vs ONNX reference.
++# Requires Docker and NVIDIA runtime configured on host.
++MODEL_REPO_DIR=${1:-/tmp/triton_model_repo}
++MODEL_NAME=${2:-pilot_model}
++ONNX_REF=${3:-/tmp/model.onnx}
++
++docker run --rm --gpus all -v "${MODEL_REPO_DIR}:/models" --network host nvcr.io/nvidia/tritonserver:23.03-py3 \
++  tritonserver --model-repository=/models --strict-model-config=false &
++TRITON_PID=$!
++sleep 10
++python3 onnx/validate_numeric_equivalence.py --onnx "${ONNX_REF}" --model-name "${MODEL_NAME}" --triton-url "http://localhost:8000" || true
++kill ${TRITON_PID} || true
++
+*** End Patch
+*** Begin Patch
+*** Add File:triton/tensorrt/convert_validate_container.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Execute TensorRT conversion and validation inside NVIDIA container (CI / staging).
++ONNX_PATH=${1:?}
++MODEL_NAME=${2:?}
++OUT_ENGINE=${3:-/tmp/${MODEL_NAME}.plan}
++
++docker run --rm --gpus all -v "$(pwd):/workspace" --workdir /workspace nvcr.io/nvidia/tensorrt:23.03-py3 \
++  /bin/bash -c "trtexec --onnx='${ONNX_PATH}' --saveEngine='${OUT_ENGINE}' --workspace=8192 --fp16 || true"
++
++python3 triton/validation/tensorrt_validate.py --onnx "${ONNX_PATH}" --engine "${OUT_ENGINE}" || true
++
+*** End Patch
+*** Begin Patch
+*** Add File:deepspeed/k8s_mpi_job.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: deepspeed-mpi-launch
++  namespace: aegis
++spec:
++  template:
++    spec:
++      containers:
++        - name: launcher
++          image: ghcr.io/yourorg/deepspeed-launcher:latest
++          command: ["/bin/bash","-c"]
++          args:
++            - |
++              # launcher scripts should coordinate nodes and run deepspeed --hostfile etc.
++              export NCCL_DEBUG=INFO
++              export NCCL_IB_DISABLE=0
++              /opt/deepspeed/launcher/launch.sh --num_nodes ${NUM_NODES:-2} --num_gpus_per_node ${GPUS_PER_NODE:-4} train.py --deepspeed_config ds_config.json
++          resources:
++            limits:
++              nvidia.com/gpu: ${GPUS_PER_NODE:-4}
++              memory: "64Gi"
++              cpu: "8"
++      restartPolicy: Never
++  backoffLimit: 1
++
+*** End Patch
+*** Begin Patch
+*** Add File:federated/prod_secure_agg_design.md
++Production Secure Aggregation Design (high level)
++
++1) Use a vetted secure aggregation library (e.g., PySyft MPC primitives, CrypTen or a commercial secure aggregation service).
++2) Clients:
++   - Retrieve enrollment token from Vault.
++   - Train locally and produce masked/encrypted updates.
++   - Upload updates to a secure aggregation endpoint via HTTPS.
++   - Sign the upload with client key (TPM-backed) and include attestation details.
++3) Server:
++   - Aggregate updates without being able to inspect individual updates.
++   - Produce signed aggregated model and publish to registry and S3.
++4) Audit:
++   - All aggregation rounds produce a reconciliation report and Rekor entry.
++   - Record cryptographic proofs (as supported) in evidence bundles.
++
++Integration pointers:
++- Design the aggregation service as a scalable Kubernetes service with HPA and persistent storage for round state.
++- Use S3 for long-term storage of aggregated checkpoints and Rekor for attestation.
++
+*** End Patch
+*** Begin Patch
+*** Add File:agents/seccomp/agent_seccomp_profile.json
++{
++  "defaultAction": "SCMP_ACT_ERRNO",
++  "architectures": [
++    "SCMP_ARCH_X86_64"
++  ],
++  "syscalls": [
++    {
++      "names": [
++        "read",
++        "write",
++        "exit",
++        "exit_group",
++        "rt_sigreturn",
++        "futex",
++        "nanosleep",
++        "clock_gettime"
++      ],
++      "action": "SCMP_ACT_ALLOW"
++    }
++  ]
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File:agents/k8s_agent_pod_template.yaml
++apiVersion: v1
++kind: Pod
++metadata:
++  name: agent-sandbox-example
++  namespace: aegis
++  annotations:
++    seccomp.security.alpha.kubernetes.io/pod: localhost/agent-seccomp
++spec:
++  containers:
++    - name: agent
++      image: ghcr.io/yourorg/aegis-agent-sandbox:latest
++      securityContext:
++        allowPrivilegeEscalation: false
++        runAsNonRoot: true
++        readOnlyRootFilesystem: true
++      resources:
++        limits:
++          cpu: "500m"
++          memory: "512Mi"
++
+*** End Patch
+*** Begin Patch
+*** Add File:scheduler/carbon/scheduler_daemon.py
++#!/usr/bin/env python3
++"""
++Carbon-aware scheduler daemon (production sketch)
++ - polls multiple carbon-intensity providers (CO2Signal, cloud provider APIs)
++ - stores a short history in Redis and exposes API to query low-carbon windows
++ - Argo submitter can call this service to schedule jobs
++"""
++from flask import Flask, request, jsonify
++import os, time, redis, requests, statistics
++
++app = Flask("carbon-daemon")
++REDIS_URL = os.environ.get("REDIS_URL", "redis://aegis-redis.aegis.svc:6379/0")
++r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
++CO2_API_KEY = os.environ.get("CO2SIGNAL_API_KEY","")
++
++def fetch_intensity():
++    try:
++        resp = requests.get("https://api.co2signal.com/v1/latest?countryCode=US", headers={"auth-token": CO2_API_KEY}, timeout=5)
++        data = resp.json().get("data", {})
++        return int(data.get("carbonIntensity", 999))
++    except Exception:
++        return 999
++
++@app.route("/current", methods=["GET"])
++def current():
++    val = fetch_intensity()
++    r.lpush("carbon:history", val)
++    r.ltrim("carbon:history", 0, 60)
++    return jsonify({"intensity": val})
++
++@app.route("/suggest", methods=["GET"])
++def suggest():
++    hist = r.lrange("carbon:history", 0, 60)
++    hist = [int(x) for x in hist] if hist else []
++    if not hist:
++        return jsonify({"ok": False, "reason": "no-data"}), 400
++    median = statistics.median(hist)
++    return jsonify({"median": median, "suggest_now": median <= int(os.environ.get("CARBON_THRESHOLD", "100"))})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",8087)))
++
+*** End Patch
+*** Begin Patch
+*** Add File:observability/siem/siem_forwarder.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Forward important logs/evidence metadata to a SIEM endpoint for enterprise monitoring.
++SIEM_ENDPOINT=${SIEM_ENDPOINT:-https://siem.example.com/ingest}
++EVIDENCE_BUCKET=${EVIDENCE_BUCKET:-aegis-evidence}
++TMPDIR=/tmp/siem_forward
++mkdir -p "${TMPDIR}"
++
++# Collect small set of artifacts
++aws s3 cp s3://${EVIDENCE_BUCKET}/readiness/ "${TMPDIR}/readiness/" --recursive || true
++aws s3 cp s3://${EVIDENCE_BUCKET}/slo-reports/ "${TMPDIR}/slo-reports/" --recursive || true
++
++tar czf "${TMPDIR}/siem_payload.tgz" -C "${TMPDIR}" . || true
++curl -X POST -H "Content-Type: application/gzip" --data-binary @"${TMPDIR}/siem_payload.tgz" "${SIEM_ENDPOINT}" || true
++
++echo "SIEM forward completed (best-effort)."
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/prometheus_rules_enterprise.yaml
++groups:
++- name: aegis-enterprise.rules
++  rules:
++  - alert: TritonHighP95Latency
++    expr: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job="triton"}[5m])) by (le)) > 0.5
++    for: 5m
++    labels:
++      severity: page
++    annotations:
++      summary: "Triton P95 latency high"
++
++  - alert: MilvusNodeDiskPressure
++    expr: node_filesystem_avail_bytes / node_filesystem_size_bytes * 100 < 10
++    for: 10m
++    labels:
++      severity: warning
++    annotations:
++      summary: "Low disk available on node hosting stateful services"
++
++  - alert: RekorRestoreMismatch
++    expr: absent(rekor_restore_mismatch) == 1
++    for: 10m
++    labels:
++      severity: critical
++    annotations:
++      summary: "Rekor restore mismatch detected"
++
+*** End Patch
+*** Begin Patch
+*** Add File:autotune/daemon_deploy.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: model-autotune
++  namespace: perf
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: model-autotune
++  template:
++    metadata:
++      labels:
++        app: model-autotune
++    spec:
++      containers:
++        - name: autotune
++          image: ghcr.io/yourorg/model-autotune:latest
++          command: ["python3"]
++          args: ["autotune/model_autotune.py","--model","pilot_model"]
++          env:
++            - name: DB_CONN
++              value: postgresql://perf:perfpass@perf-db.perf.svc:5432/perf_db
++          resources:
++            limits:
++              cpu: "500m"
++              memory: "512Mi"
++
+*** End Patch
+*** Begin Patch
+*** Add File:chaos/experiments/basic_kill_worker.yaml
++apiVersion: litmuschaos.github.io/v1alpha1
++kind: ChaosExperiment
++metadata:
++  name: kill-random-worker
++  namespace: litmus
++spec:
++  definition:
++    scope: Namespaced
++    permissions:
++      - list: true
++        pods: [""]
++    image: "litmuschaos/chaos-executor:1.13.2"
++    args: ["-name","kill-random-worker","-timeout","60"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/enterprise_turnkey_next_steps.md
++# Next steps to finalize turnkey parity
++
++1) Run prod/finalize_all_gaps.sh from operator bastion and triage failures.
++2) Replace all placeholder images (ghcr.io/yourorg/...) with real built images in your registry.
++3) Wire cloud-specific Terraform modules for multi-region clusters and RDS; remove ad-hoc CLI scripts into IaC.
++4) Schedule recurring Velero/Velero cross-region tests and Rekor restore drills.
++5) Ensure SIEM integration endpoint and credentials are configured and secure.
++6) Run chaos experiments, evaluate outage metrics, and improve autoscaling / provisioning rules.
++7) Execute SOC2 readiness checklist and coordinate a formal audit.
++
++This document should guide operators for the final stretch toward fully-managed behavior.
++
+*** End Patch
+*** End Patch

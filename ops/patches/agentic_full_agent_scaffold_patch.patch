@@ -1,0 +1,375 @@
+*** Begin Patch
+*** Add File:services/agent/llm_planner.py
++#!/usr/bin/env python3
++"""
++LLM-based planner scaffold (LangChain-style prompt wrapper)
++- Given a high-level intent, produce a constrained step-by-step plan consisting of tool calls.
++- Uses either an external LLM API (OpenAI-compatible) or a local LLM adapter (pluggable).
++"""
++import os
++import json
++from typing import List, Dict, Any, Optional
++
++LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "local")  # "openai" or "local"
++OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
++
++PROMPT_TEMPLATE = """
++You are a constrained planner for the Aegis platform. Input: {intent}
++
++Constraints:
++- Only use the following tools: k8s.set_image, k8s.scale_deployment, policy.update_serving_policy, human.review
++- Each step must be JSON with keys: tool, action, params
++- params must include namespace and any required fields for the action
++- Keep plans short (<= 6 steps)
++- Annotate risk_level: low/medium/high as part of top-level response object.
++
++Produce output as pure JSON: {{ "risk_level": "<low|medium|high>", "plan": [ {{step}}, ... ] }}
++"""
++
++def call_openai(prompt: str) -> str:
++    import requests
++    url = "https://api.openai.com/v1/chat/completions"
++    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
++    data = {"model": "gpt-4o-mini", "messages": [{"role":"user","content":prompt}], "max_tokens": 512}
++    resp = requests.post(url, headers=headers, json=data, timeout=30)
++    resp.raise_for_status()
++    return resp.json()["choices"][0]["message"]["content"]
++
++def call_local_llm(prompt: str) -> str:
++    # placeholder for local LLM adapter (e.g., HF Inference API)
++    # For now we use simple heuristic fallback: convert known patterns to plan
++    if prompt.lower().find("scale verifier to") >= 0:
++        n = int(prompt.strip().split()[-1])
++        obj = {"risk_level":"low","plan":[{"tool":"k8s","action":"scale_deployment","params":{"namespace":"safety","deployment":"verifier","replicas":n}}]}
++        return json.dumps(obj)
++    # fallback empty plan
++    return json.dumps({"risk_level":"medium","plan":[{"tool":"human","action":"review","params":{"note":"LLM fallback: please author plan","namespace":"safety"}}]})
++
++def plan_for_intent_llm(intent: str, context: Optional[Dict[str,Any]]=None) -> Dict[str,Any]:
++    ctx = context or {}
++    prompt = PROMPT_TEMPLATE.format(intent=intent)
++    if LLM_PROVIDER == "openai" and OPENAI_API_KEY:
++        out = call_openai(prompt)
++    else:
++        out = call_local_llm(prompt)
++    try:
++        return json.loads(out)
++    except Exception:
++        # defensive fallback
++        return {"risk_level":"medium","plan":[{"tool":"human","action":"review","params":{"note":"planner parse failed","intent":intent,"namespace":"safety"}}]}
++
++if __name__=="__main__":
++    import sys
++    intent = " ".join(sys.argv[1:]) or "scale verifier to 2"
++    print(json.dumps(plan_for_intent_llm(intent), indent=2))
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/tool_registry.py
++#!/usr/bin/env python3
++"""
++Tool registry for agent executor
++- Register tool metadata, allowed roles, and a callable adapter reference
++This registry is in-memory for the scaffold; an operator can back it with a DB.
++"""
++from typing import Dict, Any, Callable
++import services.agent.tool_adapters.k8s_adapter as k8s_adapter
++
++_REGISTRY: Dict[str, Dict[str, Any]] = {}
++
++def register_tool(name: str, metadata: Dict[str, Any], func: Callable):
++    _REGISTRY[name] = {"meta": metadata, "func": func}
++
++def get_tool(name: str):
++    return _REGISTRY.get(name)
++
++# register builtin tools
++register_tool("k8s.set_image", {"description":"Set deployment image","roles":["sre","ml-lead"]}, k8s_adapter.set_image)
++register_tool("k8s.scale_deployment", {"description":"Scale deployment","roles":["sre"]}, k8s_adapter.scale_deployment)
++register_tool("k8s.create_configmap", {"description":"Create/patch configmap","roles":["sre"]}, k8s_adapter.create_or_patch_configmap)
++register_tool("human.review", {"description":"Manual approval step","roles":["sme","ml-lead"]}, None)
++register_tool("policy.update_serving_policy", {"description":"Update serving policy","roles":["ml-lead","sre"]}, None)
++
++def list_tools():
++    return {k:v["meta"] for k,v in _REGISTRY.items()}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/prepost_verifier.py
++#!/usr/bin/env python3
++"""
++Pre/post execution verifier checks for agent actions
++- Calls verifier scoring service to evaluate whether an action proposal is safe to execute
++- The verifier endpoint is expected to implement a lightweight check API
++"""
++import os, requests, json
++
++VERIFIER_URL = os.environ.get("VERIFIER_CHECK_URL", "http://verifier.safety.svc:8080/check_action")
++VERIFIER_TIMEOUT = int(os.environ.get("VERIFIER_CHECK_TIMEOUT_S", "5"))
++
++def pre_check(action: dict) -> (bool, dict):
++    """
++    Return (allowed, details). Posts action metadata to verifier service which returns {allow: bool, reason: str}
++    If verifier is unavailable, default to conservative deny (or allow based on policy).
++    """
++    try:
++        resp = requests.post(VERIFIER_URL, json={"action": action}, timeout=VERIFIER_TIMEOUT)
++        resp.raise_for_status()
++        j = resp.json()
++        return bool(j.get("allow", False)), j
++    except Exception as e:
++        # conservative: deny if verifier unreachable
++        return False, {"error": str(e)}
++
++def post_check(action: dict, result: dict) -> dict:
++    # record outcome to verifier for auditing; may return remediation suggestions
++    try:
++        resp = requests.post(VERIFIER_URL + "/record", json={"action": action, "result": result}, timeout=VERIFIER_TIMEOUT)
++        resp.raise_for_status()
++        return resp.json()
++    except Exception as e:
++        return {"error": str(e)}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/executor.py
++#!/usr/bin/env python3
++"""
++Executor for LLM plans.
++- For each step: perform policy_enforcer check, pre_check via verifier, take snapshot/backup, execute via registered tool adapter, then post_check and record audit.
++- On error, perform rollback of executed steps in reverse order using stored backups.
++"""
++import os, time, json
++from typing import List, Dict, Any
++from services.agent.tool_registry import get_tool
++from services.agent.policy_enforcer import check_step
++from services.agent.prepost_verifier import pre_check, post_check
++from services.agent.audit_logger import audit_log_action
++from services.agent.tool_adapters import k8s_adapter
++
++def take_backup_for_step(step: Dict[str,Any]) -> Dict[str,Any]:
++    """
++    Create simple backup info depending on tool/action. For k8s.set_image, record current image.
++    Returns a backup dict to be used during rollback.
++    """
++    try:
++        if step["tool"] == "k8s" and step["action"] == "set_image":
++            ns = step["params"]["namespace"]; dep = step["params"]["deployment"]
++            cur = k8s_adapter.run_cmd(["kubectl","-n",ns,"get","deployment",dep,"-o","json"])
++            return {"type":"deployment_snapshot","deployment":dep,"namespace":ns,"deployment_json": cur}
++        if step["tool"] == "k8s" and step["action"] == "scale_deployment":
++            ns = step["params"]["namespace"]; dep = step["params"]["deployment"]
++            cur = k8s_adapter.run_cmd(["kubectl","-n",ns,"get","deployment",dep,"-o","jsonpath={.spec.replicas}"])
++            return {"type":"scale_snapshot","deployment":dep,"namespace":ns,"replicas": int(cur)}
++    except Exception as e:
++        return {"error":"backup_failed","reason": str(e)}
++    return {}
++
++def rollback_backups(backups: List[Dict[str,Any]]):
++    # reverse order
++    for b in reversed(backups):
++        try:
++            if b.get("type") == "deployment_snapshot":
++                # restore image by re-applying previous deployment JSON
++                tmpfile = f"/tmp/deploy_restore_{int(time.time())}.json"
++                with open(tmpfile,"w") as f:
++                    f.write(b["deployment_json"])
++                k8s_adapter.run_cmd(["kubectl","apply","-f", tmpfile])
++            elif b.get("type") == "scale_snapshot":
++                k8s_adapter.scale_deployment(b["namespace"], b["deployment"], b["replicas"])
++        except Exception as e:
++            print("Rollback step failed:", e)
++
++def execute_plan(name: str, plan: List[Dict[str,Any]], requester: str):
++    backups=[]
++    results=[]
++    for i,step in enumerate(plan):
++        # policy check
++        ok, reason = check_step(step)
++        if not ok:
++            audit_log_action(name, requester, step, {"state":"rejected_policy","reason":reason})
++            return {"state":"rejected","reason":reason}
++        # pre-check via verifier
++        allowed, vinfo = pre_check(step)
++        if not allowed:
++            audit_log_action(name, requester, step, {"state":"rejected_verifier","verifier":vinfo})
++            return {"state":"rejected","reason":"verifier_rejected","details": vinfo}
++        # take backup
++        b = take_backup_for_step(step)
++        backups.append(b)
++        # execute via tool registry
++        tool_name = f"{step['tool']}.{step['action']}" if '.' not in step['tool'] else step['tool']
++        tool_meta = get_tool(tool_name) or get_tool(f"{step['tool']}.{step['action']}")
++        try:
++            if tool_meta is None or tool_meta.get("func") is None:
++                # handle special tools (human, policy) or unregistered
++                if step["tool"] == "human":
++                    audit_log_action(name, requester, step, {"state":"pending_human"})
++                    return {"state":"pending_human","step_index": i}
++                elif step["tool"] == "policy" and step["action"] == "update_serving_policy":
++                    # simulate policy update by storing configmap
++                    cfg = {"student_pct": str(step["params"].get("student_pct_increase",0))}
++                    res = k8s_adapter.create_or_patch_configmap(step["params"]["namespace"], "policy-temp-"+name, cfg)
++                    results.append({"step":i,"result":res})
++                else:
++                    raise RuntimeError("tool not available")
++            else:
++                func = tool_meta["func"]
++                # map common param names into call
++                if func == k8s_adapter.set_image:
++                    res = func(step["params"]["deployment"], step["params"]["image"]) if False else func(step["params"]["namespace"], step["params"]["deployment"], step["params"]["image"])
++                elif func == k8s_adapter.scale_deployment:
++                    res = func(step["params"]["namespace"], step["params"]["deployment"], step["params"]["replicas"])
++                else:
++                    # generic call
++                    res = func(**step.get("params",{}))
++                results.append({"step":i,"result":res})
++            # post check
++            post = post_check(step, {"result":"ok"})
++            audit_log_action(name, requester, step, {"state":"executed","post": post})
++        except Exception as e:
++            audit_log_action(name, requester, step, {"state":"failed","error": str(e)})
++            # rollback executed steps
++            rollback_backups(backups)
++            return {"state":"failed","error": str(e)}
++    return {"state":"succeeded","results": results}
++
++if __name__=="__main__":
++    import sys, json
++    name="agent_local_"+str(int(time.time()))
++    plan=json.loads(sys.argv[1])
++    print(execute_plan(name, plan.get("plan",[]), "local"))
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/circuit_breaker.py
++#!/usr/bin/env python3
++"""
++Simple circuit breaker service for agent execution
++- Allows disabling agent automation globally or per-namespace; tracks recent failures and trips when threshold exceeded.
++"""
++import os, time
++from typing import Dict
++
++BREAKER_STATE = {"global_disabled": False, "namespace": {}}
++FAIL_HISTORY = {}  # namespace -> list of timestamps
++FAIL_WINDOW_S = int(os.environ.get("CB_FAIL_WINDOW_S", "600"))
++FAIL_THRESHOLD = int(os.environ.get("CB_FAIL_THRESHOLD", "3"))
++
++def record_failure(namespace: str):
++    ts = int(time.time())
++    FAIL_HISTORY.setdefault(namespace, []).append(ts)
++    # purge old
++    FAIL_HISTORY[namespace] = [t for t in FAIL_HISTORY[namespace] if t >= ts - FAIL_WINDOW_S]
++    if len(FAIL_HISTORY[namespace]) >= FAIL_THRESHOLD:
++        BREAKER_STATE["namespace"][namespace] = True
++
++def clear_failures(namespace: str):
++    FAIL_HISTORY[namespace] = []
++    BREAKER_STATE["namespace"][namespace] = False
++
++def is_allowed(namespace: str) -> bool:
++    if BREAKER_STATE["global_disabled"]:
++        return False
++    if BREAKER_STATE["namespace"].get(namespace, False):
++        return False
++    return True
++
++def disable_global():
++    BREAKER_STATE["global_disabled"] = True
++
++def enable_global():
++    BREAKER_STATE["global_disabled"] = False
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/agent/simulator/trace_replayer_v2.py
++#!/usr/bin/env python3
++"""
++Enhanced trace replayer/simulator
++- Accepts structured event traces and given a plan returns simulated downstream metrics:
++  - estimated_reward, estimated_risk, estimated_divergence, suggested_mitigation
++- Uses simple heuristics now; pluggable ML model later.
++"""
++import json, argparse, random, statistics
++
++def simulate_step_on_trace(step, traces):
++    # heuristics: policy updates produce higher reward but higher risk proportional to pct change
++    reward = 0.0
++    risk = 0.0
++    divergence = 0.0
++    if step.get("tool") == "policy":
++        inc = step.get("params",{}).get("student_pct_increase", 0)
++        reward += min(0.5, inc/100.0)
++        risk += min(1.0, inc/50.0)
++    if step.get("tool") == "k8s" and step.get("action") == "set_image":
++        reward += 0.1
++        risk += 0.05
++    # simulate trace-based divergence
++    divergence = random.uniform(0, 0.2)
++    return {"reward": reward, "risk": risk, "divergence": divergence}
++
++def simulate_plan(plan, trace_file):
++    traces = json.load(open(trace_file)) if trace_file else []
++    res=[]
++    for s in plan:
++        r = simulate_step_on_trace(s, traces)
++        res.append({"step": s, "sim": r})
++    summary = {"total_reward": sum(x["sim"]["reward"] for x in res), "max_risk": max(x["sim"]["risk"] for x in res) if res else 0, "avg_divergence": statistics.mean([x["sim"]["divergence"] for x in res]) if res else 0}
++    return {"steps": res, "summary": summary}
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--plan", required=True)
++    p.add_argument("--trace", required=False, default=None)
++    args = p.parse_args()
++    plan = json.load(open(args.plan))
++    out = simulate_plan(plan.get("plan",[]), args.trace)
++    print(json.dumps(out, indent=2))
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:tests/agents/llm_agent_flow.sh
++#!/usr/bin/env bash
++#
++# Sample integration: propose plan via LLM planner, simulate, then execute against agent executor.
++#
++set -euo pipefail
++ORCH=${ORCH_URL:-http://localhost:8080}
++INTENT=${1:-"scale verifier to 2"}
++
++echo "Propose via LLM planner"
++PROPOSE=$(curl -s -X POST -H "Content-Type: application/json" -d "{\"requester\":\"ci\",\"intent\":\"$INTENT\"}" $ORCH/propose)
++echo "Planner output:"
++echo "$PROPOSE" | jq .
++
++PLAN=$(echo "$PROPOSE" | jq -c '{plan: .plan}')
++echo "Write plan to /tmp/plan.json"
++echo "$PLAN" > /tmp/plan.json
++
++echo "Simulate plan with trace (optional)..."
++python services/agent/simulator/trace_replayer_v2.py --plan /tmp/plan.json --trace ops/multimodal/sample_trace.json || true
++
++echo "Execute plan (this will create an AgentAction CR via orchestrator execute)"
++EXEC=$(curl -s -X POST -H "Content-Type: application/json" -d "{\"requester\":\"ci\",\"intent\":\"$INTENT\"}" $ORCH/execute)
++echo "Execute response: $EXEC" | jq .
++
++NAME=$(echo "$EXEC" | jq -r .name)
++echo "Polling status..."
++for i in $(seq 1 60); do
++  sleep 2
++  ST=$(curl -s $ORCH/status/$NAME | jq -r .state)
++  echo "state=$ST"
++  if [[ "$ST" == "succeeded" || "$ST" == "failed" || "$ST" == "rejected" || "$ST" == "pending_human" ]]; then
++    curl -s $ORCH/status/$NAME | jq .
++    exit 0
++  fi
++done
++echo "Timeout waiting for action"
++exit 2
++
+*** End Patch
+*** End Patch

@@ -1,0 +1,433 @@
+*** Begin Patch
+*** Add File:prod/runbook/operator_execute_priorities.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Operator-run orchestrator to execute prioritized hardening steps (A from user request)
++# Usage: sudo ./operator_execute_priorities.sh
++#
++EVIDENCE_BUCKET=${EVIDENCE_BUCKET:-aegis-evidence}
++S3_INIT_BUCKET=${S3_INIT_BUCKET:-aegis-init-bundles}
++SECRETSMANAGER_PREFIX=${SECRETSMANAGER_PREFIX:-aegis/vault}
++AWS_REGION=${AWS_REGION:-us-west-2}
++RESTORE_PG_CONN=${RESTORE_PG_CONN:-}
++
++echo "1) Finalize Vault ceremony and store init bundle"
++VAULT_ADDR=${VAULT_ADDR:-https://vault.aegis.svc:8200} \
++S3_INIT_BUCKET=${S3_INIT_BUCKET} SECRETSMANAGER_PREFIX=${SECRETSMANAGER_PREFIX} AWS_REGION=${AWS_REGION} \
++./prod/hardening/finalize_vault_ceremony.sh
++
++echo "2) Run Rekor full restore drill"
++REKOR_PG_HOST=${REKOR_PG_HOST:-reko-psql.aegis.svc} \
++REKOR_PG_USER=${REKOR_PG_USER:-rekor} \
++REKOR_PG_DB=${REKOR_PG_DB:-rekor} \
++S3_BACKUP_BUCKET=${S3_BACKUP_BUCKET:-aegis-backups} \
++EVIDENCE_BUCKET=${EVIDENCE_BUCKET} AWS_REGION=${AWS_REGION} COSIGN_KMS_KEY_ARN=${COSIGN_KMS_KEY_ARN:-} \
++RESTORE_PG_CONN=${RESTORE_PG_CONN} ./prod/hardening/rekor_full_restore_drill.sh
++
++echo "3) Deploy service mesh (Linkerd) for mTLS"
++./ops/mesh/install_linkerd.sh
++
++echo "4) Apply Gatekeeper templates (dry-run first)"
++kubectl apply -f opa/gatekeeper/constraints.yaml || true
++echo "Review Gatekeeper violations in dry-run; once validated flip enforcement using opa/gatekeeper/enforce_constraints.sh"
++
++echo "5) Deploy Milvus production values (helm) and run a backup test"
++helm upgrade --install milvus milvus/milvus -f ops/milvus/prod_helm_values.yaml -n aegis || true
++MILVUS_PVC_PATH=/var/lib/milvus S3_BACKUP_BUCKET=${S3_BACKUP_BUCKET:-aegis-backups} AWS_REGION=${AWS_REGION} ./ops/milvus/backup_segments_prod.sh || true
++
++echo "6) Run readiness & attestation checks and upload signed reports"
++EVIDENCE_BUCKET=${EVIDENCE_BUCKET} COSIGN_KMS_KEY_ARN=${COSIGN_KMS_KEY_ARN:-} AWS_REGION=${AWS_REGION} ./attestation/continuous_attestor.sh || true
++EVIDENCE_BUCKET=${EVIDENCE_BUCKET} COSIGN_KMS_KEY_ARN=${COSIGN_KMS_KEY_ARN:-} AWS_REGION=${AWS_REGION} ./prod/automation/run_readiness_and_sign.sh || true
++
++echo "Operator orchestration complete. Review uploaded artifacts in s3://${EVIDENCE_BUCKET}/readiness/ and /attestations/"
++
+*** End Patch
+*** Begin Patch
+*** Add File:per_model/produce_model_pipeline.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Per-model productionization helper (B)
++# Arguments:
++#   --type nlp|cv
++#   --model-path /path/to/local/model_or_cfg
++#   --model-name mymodel
++#   --out-repo /tmp/triton_repo
++# Example:
++#   ./per_model/produce_model_pipeline.sh --type nlp --model-path ./ml/myhf --model-name rag_reader --out-repo /tmp/triton_repo
++
++while [[ $# -gt 0 ]]; do
++  case $1 in
++    --type) TYPE="$2"; shift 2;;
++    --model-path) MODEL_PATH="$2"; shift 2;;
++    --model-name) MODEL_NAME="$2"; shift 2;;
++    --out-repo) OUT_REPO="$2"; shift 2;;
++    *) echo "Unknown $1"; exit 1;;
++  esac
++done
++
++: "${TYPE:?}" "${MODEL_PATH:?}" "${MODEL_NAME:?}" "${OUT_REPO:?}"
++
++mkdir -p "${OUT_REPO}/${MODEL_NAME}/1"
++ONNX_PATH="${OUT_REPO}/${MODEL_NAME}/1/model.onnx"
++
++if [ "${TYPE}" = "nlp" ]; then
++  echo "Exporting NLP model to ONNX..."
++  python3 onnx/advanced_exporters/export_decoder_with_cache_support.py --model-path "${MODEL_PATH}" --out "${ONNX_PATH}"
++else
++  echo "Exporting CV model to ONNX..."
++  # Expect MODEL_PATH to contain config.yaml and weights.pth
++  python3 triton/hardened_convert_detectron2.py --cfg "${MODEL_PATH}/config.yaml" --weights "${MODEL_PATH}/weights.pth" --out "${ONNX_PATH}"
++fi
++
++echo "Validating numeric equivalence (ONNX runtime)..."
++python3 onnx/validate_numeric_equivalence.py --onnx "${ONNX_PATH}" --model-name "${MODEL_NAME}" --input-shape "[1,8]"
++
++echo "Generate Triton config"
++python3 triton/generate_triton_config.py --model-name "${MODEL_NAME}" --out "${OUT_REPO}/${MODEL_NAME}" --gpu --max-batch 8 --memory-mb 16384 --tensorrt
++
++echo "Create load test client"
++python3 triton/write_triton_config_tuned.py --model-name "${MODEL_NAME}" --out "${OUT_REPO}/${MODEL_NAME}" --gpu true --max-batch 8 --memory-mb 16384 || true
++cat > "${OUT_REPO}/${MODEL_NAME}/load_test_client.py" <<'PY'
++#!/usr/bin/env python3
++import requests, sys
++MODEL='MODEL_NAME_PLACEHOLDER'
++TRITON='http://triton.aegis.svc:8000'
++payload={"inputs":[{"name":"input_ids","shape":[1,8],"datatype":"INT32","data":[[1,2,3,4,5,6,7,8]]}]}
++print(requests.post(f"{TRITON}/v2/models/{MODEL}/infer", json=payload).text[:500])
++PY
++sed -i "s/MODEL_NAME_PLACEHOLDER/${MODEL_NAME}/g" "${OUT_REPO}/${MODEL_NAME}/load_test_client.py"
++
++echo "Produce package manifest"
++cat > "${OUT_REPO}/${MODEL_NAME}/package_manifest.json" <<JSON
++{
++  "model_name": "${MODEL_NAME}",
++  "onnx": "${ONNX_PATH}",
++  "triton_config": "${OUT_REPO}/${MODEL_NAME}/config.pbtxt",
++  "timestamp": "$(date -u +%Y%m%dT%H%M%SZ)"
++}
++JSON
++
++echo "Per-model packaging complete. Upload ${OUT_REPO}/${MODEL_NAME} to a model repo (Triton PVC) and run load tests."
++
+*** End Patch
+*** Begin Patch
+*** Add File:per_model/.github_workflow_template.yml
++name: Model Convert, Validate & Promote
++on:
++  workflow_dispatch:
++  pull_request:
++jobs:
++  convert-validate:
++    runs-on: ubuntu-latest
++    env:
++      EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++      COSIGN_KMS_KEY_ARN: ${{ secrets.COSIGN_KMS_KEY_ARN }}
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: 3.10
++      - name: Install deps
++        run: pip install -r requirements-ci.txt
++      - name: Export & Validate ONNX
++        run: |
++          bash per_model/produce_model_pipeline.sh --type nlp --model-path ./ml/example_model --model-name ci_model --out-repo /tmp/triton_repo
++      - name: Upload evidence
++        run: |
++          tar czf /tmp/ci_model_evidence.tgz /tmp/triton_repo/ci_model
++          cosign sign --key "awskms://${{ secrets.COSIGN_KMS_KEY_ARN }}" /tmp/ci_model_evidence.tgz || true
++          aws s3 cp /tmp/ci_model_evidence.tgz s3://${{ secrets.EVIDENCE_BUCKET }}/ci-evidence/ || true
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/production_plan_timeline.md
++# Aegis Production Plan & Timeline (C)
++
++Overview
++- This document lists prioritized tasks, owners, and estimated effort to close gaps A..D.
++
++Phases (high-level)
++1) Critical Security & Recovery (Week 0-2)
++   - Tasks: finalize Vault ceremony, Rekor restore drill, enable Linkerd (mTLS), Gatekeeper policy review & enforce.
++   - Owners: Platform SRE, Security lead.
++   - Estimate: 3-10 days.
++
++2) Per-Model Productionization (Week 1-4)
++   - Tasks: pick 2 pilot models (NLP, CV). Run per_model/produce_model_pipeline.sh, TRT conversion, Triton staging, load tests.
++   - Owners: ML owners + Platform SRE.
++   - Estimate: 1-2 weeks per model.
++
++3) Federated & Agent Hardening (Week 2-6)
++   - Tasks: Flower server integration, secure aggregation design, agent sandboxing and monitoring, safety gating.
++   - Owners: ML infra, Security.
++   - Estimate: 2-6 weeks.
++
++4) Distributed DL & LLM (Week 3-10)
++   - Tasks: DeepSpeed multi-node, Ray cluster validation, NCCL/RDMA tuning, autoscaling policies.
++   - Owners: ML infra, HPC team.
++   - Estimate: 4-8+ weeks.
++
++5) RL & Replay Production (Week 3-8)
++   - Tasks: prioritize replay service, HPA, persistence, safety gate at scale.
++   - Owners: RL team, infra.
++   - Estimate: 2-6 weeks.
++
++6) Observability & Compliance (Week 1-6)
++   - Tasks: SIEM integration, SLO enforcement, SOC2 evidence packaging, scheduled drills.
++   - Owners: SRE, Compliance.
++   - Estimate: 2-6 weeks.
++
++Deliverables & Milestones
++- M1 (Week 2): Vault ceremony complete, Rekor drill signed report, Linkerd installed.
++- M2 (Week 4): Two pilot models deployed to Triton with CI and load tests passing.
++- M3 (Week 8): Federated & agent runbooks + hardened agent runtime.
++- M4 (Week 12): Production-ready distributed DL pilot with checkpointing & autoscaling.
++
++Notes: Adjust timeline based on resource availability, hardware provisioning windows, and audit dates.
++
+*** End Patch
+*** Begin Patch
+*** Add File:hardening/secure_aggregation/agg_service.py
++#!/usr/bin/env python3
++"""
++Secure Aggregation scaffold (PoC)
++ - Accepts per-client update POSTs (encrypted/masked blobs) and provides an aggregation endpoint.
++ - This is a scaffold. Replace with a production secure-aggregation (e.g., Crypten, PySyft, or server-side MPC).
++"""
++from flask import Flask, request, jsonify
++import os, json, tempfile
++
++app = Flask("secure-agg")
++UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/tmp/updates")
++os.makedirs(UPLOAD_DIR, exist_ok=True)
++
++@app.route("/upload", methods=["POST"])
++def upload():
++    j = request.get_json(force=True)
++    client_id = j.get("client_id")
++    update = j.get("update")
++    if not client_id or update is None:
++        return jsonify({"ok": False, "error": "client_id/update required"}), 400
++    fn = os.path.join(UPLOAD_DIR, f"{client_id}.json")
++    json.dump({"client": client_id, "update": update}, open(fn, "w"))
++    return jsonify({"ok": True})
++
++@app.route("/aggregate", methods=["POST"])
++def aggregate():
++    files = [os.path.join(UPLOAD_DIR, f) for f in os.listdir(UPLOAD_DIR) if f.endswith(".json")]
++    agg = None
++    count = 0
++    for f in files:
++        data = json.load(open(f))
++        arr = data["update"]
++        if agg is None:
++            agg = arr
++        else:
++            agg = [x + y for x,y in zip(agg, arr)]
++        count += 1
++    if agg is None:
++        return jsonify({"ok": False, "error": "no updates"}), 400
++    avg = [x / count for x in agg]
++    out = {"avg": avg, "count": count}
++    return jsonify({"ok": True, "aggregate": out})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",8085)))
++
+*** End Patch
+*** Begin Patch
+*** Add File:argo/federated/secure_agg_job.yaml
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: secure-agg-job
++  namespace: aegis
++spec:
++  template:
++    spec:
++      containers:
++        - name: agg
++          image: ghcr.io/yourorg/secure-agg:latest
++          command: ["python3","/opt/agg/agg_service.py"]
++          ports:
++            - containerPort: 8085
++      restartPolicy: Never
++  backoffLimit: 1
++
+*** End Patch
+*** Begin Patch
+*** Add File:hardening/agent_sandbox/sandbox_runner.py
++#!/usr/bin/env python3
++"""
++Lightweight agent tool sandbox runner:
++ - Runs a tool in an isolated process with resource/time limits (not container-level isolation).
++ - For production, use separate minimal containers, seccomp, and Kubernetes PodSecurityContext.
++"""
++import subprocess, shlex, sys, json, tempfile, os
++
++def run(cmd, timeout=5, mem_limit_mb=100):
++    # Use 'timeout' command and ulimit (shell) as a minimal sandbox
++    script = f"ulimit -v {mem_limit_mb*1024}; timeout {timeout}s {cmd}"
++    p = subprocess.run(script, shell=True, capture_output=True)
++    return {"rc": p.returncode, "stdout": p.stdout.decode()[:1000], "stderr": p.stderr.decode()[:1000]}
++
++if __name__ == "__main__":
++    cmd = sys.argv[1]
++    res = run(cmd)
++    print(json.dumps(res, indent=2))
++
+*** End Patch
+*** Begin Patch
+*** Add File:argo/agents/sandboxed_agent_workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: agent-sandbox-
++  namespace: aegis
++spec:
++  entrypoint: sandbox-agent
++  templates:
++    - name: sandbox-agent
++      container:
++        image: ghcr.io/yourorg/aegis-agent-sandbox:latest
++        command: ["sh","-c"]
++        args: ["python3 agents/agent_executor.py --task '{\"prompt\":\"hello\",\"tools\":[{\"cmd\":\"/opt/sandbox/tool.sh\"}] }'"]
++        securityContext:
++          runAsNonRoot: true
++          allowPrivilegeEscalation: false
++        resources:
++          limits:
++            cpu: "500m"
++            memory: "512Mi"
++
+*** End Patch
+*** Begin Patch
+*** Add File:hardening/replay/prioritized_replay_deploy.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: prioritized-replay
++  namespace: aegis
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: prioritized-replay
++  template:
++    metadata:
++      labels:
++        app: prioritized-replay
++    spec:
++      containers:
++        - name: prioritized-replay
++          image: ghcr.io/yourorg/priority-replay:latest
++          env:
++            - name: REDIS_URL
++              value: redis://aegis-redis.aegis.svc:6379/0
++          ports:
++            - containerPort: 8083
++          resources:
++            limits:
++              cpu: "500m"
++              memory: "512Mi"
++      securityContext:
++        runAsNonRoot: true
++
+*** End Patch
+*** Begin Patch
+*** Add File:hardening/rdma/nccl_validation.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Run NCCL tests (requires nccl-tests compiled and CUDA available)
++# This script runs a small allreduce to verify multi-GPU multi-node connectivity.
++#
++NUM_PROCS=${NUM_PROCS:-2}
++GPU_PER_NODE=${GPU_PER_NODE:-1}
++CMD="mpirun -np $((NUM_PROCS)) --allow-run-as-root /opt/nccl-tests/build/all_reduce_perf -b 8 -e 512M -f 2"
++echo "Running NCCL validation: ${CMD}"
++${CMD}
++
+*** End Patch
+*** Begin Patch
+*** Add File:scheduler/carbon/carbon_scheduler_service.py
++#!/usr/bin/env python3
++"""
++Simple carbon-aware scheduler service (MVP).
++ - Receives job submission requests, queries CO2 API, and either runs immediately or queues.
++ - This is a simple PoC; integrate with Argo via argo/events or call argo CLI.
++"""
++import os, time, json
++from flask import Flask, request, jsonify
++import subprocess
++
++app = Flask("carbon-scheduler")
++CO2_API_KEY = os.environ.get("CO2SIGNAL_API_KEY","")
++THRESHOLD = int(os.environ.get("CARBON_THRESHOLD","100"))
++
++def get_intensity(region="US"):
++    try:
++        import requests
++        r = requests.get(f"https://api.co2signal.com/v1/latest?countryCode=US", headers={"auth-token": CO2_API_KEY}, timeout=5)
++        return int(r.json()["data"]["carbonIntensity"])
++    except Exception:
++        return 999
++
++@app.route("/submit", methods=["POST"])
++def submit():
++    payload = request.json or {}
++    wf = payload.get("workflow_file")
++    region = payload.get("region","US")
++    intensity = get_intensity(region)
++    if intensity <= THRESHOLD:
++        # submit immediately
++        subprocess.run(["argo","submit", wf], check=False)
++        return jsonify({"ok": True, "submitted": True, "intensity": intensity})
++    else:
++        # queue (this PoC just returns scheduled)
++        return jsonify({"ok": True, "submitted": False, "intensity": intensity, "action": "defer"})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",8086)))
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/runbooks/operator_runbook.md
++# Operator Runbook: Close All Gaps (A..D)
++
++This runbook organizes steps and references scripts/manifests added in the repository to close remaining production gaps.
++
++High-level steps:
++1. Security & Recovery
++   - finalize Vault ceremony: prod/runbook/operator_execute_priorities.sh (step 1)
++   - run Rekor restore drill: prod/hardening/rekor_full_restore_drill.sh
++2. Service Mesh & Policy
++   - install Linkerd: ops/mesh/install_linkerd.sh
++   - apply Gatekeeper templates, review violations, then enforce: opa/gatekeeper/enforce_constraints.sh
++3. Per-model Productionization
++   - use per_model/produce_model_pipeline.sh to create ONNX, validate, generate Triton config, create package manifest.
++   - run TRT conversion & validation on GPU staging nodes: triton/tensorrt/convert_onnx_to_tensorrt.sh and triton/validation/tensorrt_validate.py
++4. Federated Learning
++   - deploy Flower server & client via argo/federated/argo_flower_workflow.yaml
++   - replace secure_aggregation_stub with production secure-aggregation library and integrate encryption and signing
++5. Agents
++   - deploy agent executor as Argo workflow: argo/agents/agent_workflow.yaml
++   - ensure agent containers use seccomp / PodSecurityContext (see argo/agents/sandboxed_agent_workflow.yaml)
++6. Replay & RL
++   - deploy prioritized replay service (hardening/replay/prioritized_replay_deploy.yaml)
++   - run collectors and replay builder; validate prioritized consumption
++7. Distributed DL & LLMs
++   - validate NCCL with hardening/rdma/nccl_validation.sh and run deepspeed multi-node job: deepspeed/k8s_multi_node_launcher.yaml
++8. Carbon & Scheduling
++   - optionally run scheduler/carbon/carbon_scheduler_service.py and use scheduler/carbon_aware_submit.sh wrapper
++9. Observability & SLOs
++   - run monitoring/metrics_coverage_check.py; add missing exporters
++   - schedule SLO drill via monitoring/slo/checks_and_report.sh
++
++For each step, collect evidence and sign results with cosign; upload to EVIDENCE_BUCKET for audit.
++
+*** End Patch
+*** End Patch

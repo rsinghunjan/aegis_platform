@@ -1,0 +1,723 @@
+*** Begin Patch
+*** Add File:feast/helm/values-production.yaml
++# Feast production values (staging -> prod)
++feast:
++  image:
++    repository: registry.example.com/aegis/feast
++    tag: latest
++  offlineStore:
++    s3:
++      bucket: ${MODEL_ARTIFACT_BUCKET:-"your-bucket"}
++      prefix: feast/offline
++  onlineStore:
++    redis:
++      host: redis-headless.aegis.svc
++      port: 6379
++      # Use Redis Cluster / Sentinel in production
++  job:
++    resources:
++      requests:
++        cpu: "500m"
++        memory: "1Gi"
++      limits:
++        cpu: "2"
++        memory: "4Gi"
++  serviceAccount:
++    create: true
++  prometheus:
++    enabled: true
++    serviceMonitor:
++      enabled: true
++      interval: "30s"
++  rbac:
++    create: true
++  cache:
++    enabled: false
++
+*** End Patch
+*** Begin Patch
+*** Add File:redis/redis-cluster-statefulset.yaml
++apiVersion: apps/v1
++kind: StatefulSet
++metadata:
++  name: redis-cluster
++  namespace: aegis
++spec:
++  serviceName: "redis-headless"
++  replicas: 3
++  selector:
++    matchLabels:
++      app: redis-cluster
++  template:
++    metadata:
++      labels:
++        app: redis-cluster
++    spec:
++      containers:
++        - name: redis
++          image: bitnami/redis-cluster:7.0
++          env:
++            - name: REDIS_PASSWORD
++              valueFrom:
++                secretKeyRef:
++                  name: redis-creds
++                  key: password
++          ports:
++            - containerPort: 6379
++          resources:
++            requests:
++              cpu: "200m"
++              memory: "512Mi"
++            limits:
++              cpu: "1"
++              memory: "1Gi"
++          readinessProbe:
++            exec:
++              command: ["redis-cli", "ping"]
++            initialDelaySeconds: 5
++            periodSeconds: 10
++  volumeClaimTemplates:
++    - metadata:
++        name: data
++      spec:
++        accessModes: ["ReadWriteOnce"]
++        resources:
++          requests:
++            storage: 10Gi
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: redis-headless
++  namespace: aegis
++  labels:
++    app: redis-cluster
++spec:
++  clusterIP: None
++  ports:
++    - port: 6379
++  selector:
++    app: redis-cluster
++
++---
++apiVersion: monitoring.coreos.com/v1
++kind: ServiceMonitor
++metadata:
++  name: redis-servicemonitor
++  namespace: aegis
++spec:
++  selector:
++    matchLabels:
++      app: redis-cluster
++  endpoints:
++    - port: 9121
++      interval: 15s
++      metricRelabelings:
++        - sourceLabels: [__name__]
++          regex: "redis_(.*)"
++          targetLabel: "redis_metric"
++
+*** End Patch
+*** Begin Patch
+*** Add File:streaming/feast_stream_processor.py
++#!/usr/bin/env python3
++"""
++Streaming processor that consumes Kafka events and writes to Feast online store (Redis).
++This is a resilient consumer intended for staging/prod PoC; production uses Feast streaming connector.
++
++ - Reads from KAFKA_TOPIC
++ - Parses entity_id and feature payload
++ - Writes to Redis online store (HSET for feature key)
++ - Exposes basic metrics via Prometheus
++"""
++import os, json, time
++from kafka import KafkaConsumer
++import redis
++from prometheus_client import start_http_server, Counter, Histogram
++
++KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP","kafka:9092")
++KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC","feast-features")
++REDIS_HOST = os.environ.get("REDIS_HOST","redis-headless.aegis.svc")
++REDIS_PORT = int(os.environ.get("REDIS_PORT","6379"))
++
++processed = Counter("feast_stream_processed_total", "Processed events")
++errors = Counter("feast_stream_errors_total", "Processing errors")
++proc_latency = Histogram("feast_stream_process_seconds", "Event processing latency")
++
++def main():
++    start_http_server(9100)
++    consumer = KafkaConsumer(KAFKA_TOPIC, bootstrap_servers=[KAFKA_BOOTSTRAP], auto_offset_reset='earliest', group_id='feast-stream-processor')
++    r = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
++    for msg in consumer:
++        t0 = time.time()
++        try:
++            payload = json.loads(msg.value.decode())
++            entity = payload.get("entity_id")
++            features = payload.get("features", {})
++            if entity is None:
++                errors.inc()
++                continue
++            key = f"feat:entity:{entity}"
++            # store features as JSON strings (Feast online store expects typed values; adapt as needed)
++            r.hset(key, mapping={k: json.dumps(v) for k,v in features.items()})
++            processed.inc()
++            proc_latency.observe(time.time() - t0)
++        except Exception:
++            errors.inc()
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:streaming/k8s/feast-stream-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: feast-stream-processor
++  namespace: aegis
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: feast-stream-processor
++  template:
++    metadata:
++      labels:
++        app: feast-stream-processor
++    spec:
++      serviceAccountName: aegis-agent
++      containers:
++        - name: feast-stream-processor
++          image: registry.example.com/aegis/feast-stream-processor:latest
++          ports:
++            - containerPort: 9100
++          env:
++            - name: KAFKA_BOOTSTRAP
++              value: kafka:9092
++            - name: REDIS_HOST
++              value: redis-headless.aegis.svc
++          resources:
++            requests:
++              cpu: "200m"
++              memory: "256Mi"
++            limits:
++              cpu: "1"
++              memory: "1Gi"
++
+*** End Patch
+*** Begin Patch
+*** Add File:catalog/marquez_connector.py
++#!/usr/bin/env python3
++"""
++Connector to push lineage records from local lineage store into Marquez.
++ - Polls /var/aegis/lineage or lineage service endpoint and submits jobs/datasets to Marquez REST API
++ - Maps simple lineage JSON => Marquez jobRun & dataset metadata
++"""
++import os, json, time, requests
++
++MARQUEZ_URL = os.environ.get("MARQUEZ_URL","http://marquez.aegis.svc:8080")
++LINEAGE_DIR = os.environ.get("LINEAGE_DIR","/var/aegis/lineage")
++
++def load_pending():
++    out = []
++    for fname in sorted(os.listdir(LINEAGE_DIR)):
++        path = os.path.join(LINEAGE_DIR, fname)
++        try:
++            j = json.load(open(path))
++            out.append((path, j))
++        except Exception:
++            continue
++    return out
++
++def push_to_marquez(record):
++    # Minimal mapping: record should contain job, inputs, outputs
++    job_name = record.get("job","unknown")
++    data = {
++        "name": job_name,
++        "type": "BATCH",
++        "location": "kubernetes",
++        "inputs": [{"name": f} for f in record.get("inputs", [])],
++        "outputs": [{"name": f} for f in record.get("outputs", [])],
++        "description": record.get("meta", {}).get("description", "")
++    }
++    # Upsert dataset metadata (basic)
++    try:
++        r = requests.post(f"{MARQUEZ_URL}/api/v1/namespaces/default/jobs", json=data, timeout=10)
++        r.raise_for_status()
++    except Exception as e:
++        print("Marquez push failed", e)
++        return False
++    return True
++
++if __name__ == "__main__":
++    import os
++    if not os.path.exists(LINEAGE_DIR):
++        print("No lineage dir", LINEAGE_DIR)
++        raise SystemExit(1)
++    pending = load_pending()
++    for path, rec in pending:
++        ok = push_to_marquez(rec)
++        if ok:
++            os.remove(path)
++            print("Pushed and removed", path)
++        else:
++            print("Failed to push", path)
++
+*** End Patch
+*** Begin Patch
+*** Add File:catalog/README_MARQUEZ.md
++# Marquez integration (quickstart)
++
++1. Install Marquez (Helm or k8s manifests) in the aegis namespace.
++2. Ensure Marquez API is reachable (MARQUEZ_URL).
++3. Run the connector to push lineage:
++   k run marquez-connector --image=registry.example.com/aegis/marquez-connector:latest --env=MARQUEZ_URL=... --restart=OnFailure
++4. Hook Spark jobs and ingestion pipelines to write lineage JSON to /var/aegis/lineage (via spark_hook.py).
++5. The connector will pick up files and create job/dataset entries in Marquez.
++
++Production: use Marquez with DB backends and RBAC, map dataset owners and lineages via a scheduled job.
++
+*** End Patch
+*** Begin Patch
+*** Add File:dq/great_expectations/suites/demo_suite.yml
++# Simple Great Expectations suite example (YAML)
++expectation_suite_name: demo_suite
++expectations:
++  - expectation_type: expect_table_row_count_to_be_between
++    kwargs:
++      min_value: 1
++      max_value: 10000000
++  - expectation_type: expect_column_values_to_not_be_null
++    kwargs:
++      column: id
++  - expectation_type: expect_column_values_to_be_in_type_list
++    kwargs:
++      column: feature_1
++      type_list: [ "FLOAT", "DOUBLE", "DECIMAL" ]
++
+*** End Patch
+*** Begin Patch
+*** Add File:dq/run_ge_check_blocking.py
++#!/usr/bin/env python3
++"""
++Run Great Expectations checkpoint in blocking (fail pipeline on violation) mode.
++This script is used in ingestion and CI to enforce data quality.
++"""
++import os, subprocess, sys, json
++
++DATA = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("DATA_URI","/tmp/data/sample_data.csv")
++SUITE = os.environ.get("GE_SUITE","dq/great_expectations/suites/demo_suite.yml")
++
++def main():
++    # Minimal enforcement: run GE CLI if available
++    try:
++        cmd = f"great_expectations checkpoint run --checkpoint-config {SUITE} --run-name demo_run --batch-request '{{\"path\":\"{DATA}\",\"datasource_name\":\"default_filesystem\"}}'"
++        print("Running:", cmd)
++        rc = subprocess.call(cmd, shell=True)
++        if rc != 0:
++            print("GE check failed, exiting non-zero")
++            sys.exit(rc)
++    except Exception as e:
++        print("GE runner not available or failed:", e)
++        sys.exit(2)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/dr/backup_and_restore.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Generic backup & restore script for Postgres (Patroni), MinIO and Redis
++# Configure env:
++#  - PG_HOST, PG_PORT, PG_DB, PG_USER, PG_PASS
++#  - MINIO_ENDPOINT, MINIO_ACCESS, MINIO_SECRET, MINIO_BUCKET
++#  - REDIS_HOST, REDIS_PORT
++
++OUT_DIR=${OUT_DIR:-/tmp/aegis_backups}
++mkdir -p "$OUT_DIR"
++
++echo "Backing up Postgres"
++if [ -n "${PG_HOST:-}" ]; then
++  PGPASSWORD="${PG_PASS:-}" pg_dump -h "$PG_HOST" -p "${PG_PORT:-5432}" -U "${PG_USER:-postgres}" -Fc -f "$OUT_DIR/mlflow_db.dump" "${PG_DB:-mlflow}"
++fi
++
++echo "Backing up MinIO (sync)"
++if [ -n "${MINIO_ENDPOINT:-}" ]; then
++  export AWS_ACCESS_KEY_ID="${MINIO_ACCESS:-}"
++  export AWS_SECRET_ACCESS_KEY="${MINIO_SECRET:-}"
++  aws --endpoint-url "${MINIO_ENDPOINT}" s3 sync "s3://${MINIO_BUCKET:-aegis-artifacts}" "$OUT_DIR/minio/"
++fi
++
++echo "Backing up Redis (rdb save)"
++if [ -n "${REDIS_HOST:-}" ]; then
++  echo "Triggering BGSAVE"
++  redis-cli -h "$REDIS_HOST" -p "${REDIS_PORT:-6379}" BGSAVE || true
++  # fetch dump.rdb from persistent path if accessible: left to operator
++fi
++
++tar czf "/tmp/aegis_backup_$(date +%s).tar.gz" -C "$OUT_DIR" .
++echo "Wrote backup to /tmp"
++
++echo "To restore: unpack and run appropriate restore commands per-service (see docs)"
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/dr/argo_dr_test.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: aegis-dr-test-
++  namespace: aegis
++spec:
++  entrypoint: dr-test
++  templates:
++    - name: dr-test
++      steps:
++        - - name: backup
++            template: run-backup
++        - - name: restore
++            template: run-restore
++
++    - name: run-backup
++      container:
++        image: python:3.10-slim
++        command: [sh, -c]
++        args:
++          - pip install boto3 redis psycopg2-binary && bash ops/dr/backup_and_restore.sh
++
++    - name: run-restore
++      container:
++        image: python:3.10-slim
++        command: [sh, -c]
++        args:
++          - echo "Restore step is operator-specific; validate backups stored in /tmp or S3 and follow restore playbook"
++
+*** End Patch
+*** Begin Patch
+*** Add File:zero_trust/vault/k8s_auth_setup.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Minimal helper to enable Kubernetes auth in Vault and create a role for Aegis apps.
++# Requires: VAULT_ADDR, VAULT_TOKEN, and kubectl with rights to read ServiceAccount JWT.
++
++ROLE_NAME=${1:-aegis-role}
++SA_NAME=${2:-aegis-agent}
++NAMESPACE=${3:-aegis}
++
++# enable k8s auth
++vault auth enable kubernetes || true
++
++# configure k8s auth with cluster's service account token issuer and CA. You need to fill these values per cluster.
++vault write auth/kubernetes/config \
++    token_reviewer_jwt="$(kubectl get secret $(kubectl get sa $SA_NAME -n $NAMESPACE -o jsonpath='{.secrets[0].name}') -n $NAMESPACE -o jsonpath='{.data.token}' | base64 --decode)" \
++    kubernetes_host="https://kubernetes.default.svc" \
++    kubernetes_ca_cert="$(kubectl get configmap -n kube-system extension-apiserver-authentication -o jsonpath='{.data.client-ca-file}' || true)"
++
++vault write auth/kubernetes/role/$ROLE_NAME \
++    bound_service_account_names="$SA_NAME" \
++    bound_service_account_namespaces="$NAMESPACE" \
++    policies="aegis-app" \
++    ttl="24h"
++
++echo "Created Vault k8s auth role $ROLE_NAME for $NAMESPACE:$SA_NAME (ensure policy aegis-app exists)"
++
+*** End Patch
+*** Begin Patch
+*** Add File:spire/spire_entries_example.yaml
++# Example SPIRE entries to register workloads; fill with your cluster's SPIRE server details
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: spire-entries
++  namespace: aegis
++data:
++  example_entry: |
++    spiffe://example.org/ns/aegis/sa/aegis-agent
++
+*** End Patch
+*** Begin Patch
+*** Add File:federated/secure_aggregation_prod.py
++#!/usr/bin/env python3
++"""
++Production-minded secure aggregation skeleton:
++ - Intended to integrate with vetted libraries (OpenMined, PySyft, Crypten) — this file provides an adapter/wrapper.
++ - If a supported library exists, import and use it; otherwise use a conservative additive-masking fallback (logged).
++
++Usage:
++  python3 federated/secure_aggregation_prod.py --run-demo
++"""
++import os, json, time
++
++def try_import_secure_lib():
++    try:
++        import syft  # openmined/pysyft
++        return "pysyft"
++    except Exception:
++        pass
++    try:
++        import crypten
++        return "crypten"
++    except Exception:
++        pass
++    return None
++
++def prod_secure_aggregate(clients_updates):
++    lib = try_import_secure_lib()
++    if lib == "pysyft":
++        # Integrate with PySyft primitives here...
++        raise NotImplementedError("PySyft integration not implemented in scaffold")
++    if lib == "crypten":
++        raise NotImplementedError("CrypTen integration not implemented in scaffold")
++    # Fallback: additive masking with audited logs — NOT production secure, only fallback
++    summed = None
++    for u in clients_updates:
++        if summed is None:
++            summed = [float(x) for x in u]
++        else:
++            summed = [s + float(x) for s, x in zip(summed, u)]
++    return summed
++
++if __name__ == "__main__":
++    # demo
++    clients = [[1.0,2.0,3.0],[0.5,1.5,3.5],[2.0,0.0,1.0]]
++    print("Aggregate:", prod_secure_aggregate(clients))
++
+*** End Patch
+*** Begin Patch
+*** Add File:dp/opacus_training_pipeline.py
++#!/usr/bin/env python3
++"""
++Example DP training pipeline using Opacus + PyTorch.
++ - Provides config wrapper and privacy accounting logging for MLflow.
++ - Use as a reference to integrate DP into production training jobs.
++"""
++import os, time
++try:
++    import torch
++    import torch.nn as nn
++    import torch.optim as optim
++    from torch.utils.data import DataLoader, TensorDataset
++    from opacus import PrivacyEngine
++except Exception:
++    raise RuntimeError("Please install torch and opacus")
++
++import mlflow
++
++def train_dp(run_name="dp_run", epochs=3, batch_size=32, noise_multiplier=1.1, max_grad_norm=1.0):
++    mlflow.set_tracking_uri(os.environ.get("MLFLOW_URL",""))
++    X = torch.randn(1024, 10)
++    y = (X.sum(dim=1) > 0).long()
++    ds = TensorDataset(X,y)
++    dl = DataLoader(ds, batch_size=batch_size, shuffle=True)
++    model = nn.Sequential(nn.Linear(10,32), nn.ReLU(), nn.Linear(32,2))
++    opt = optim.Adam(model.parameters(), lr=1e-3)
++    privacy_engine = PrivacyEngine(model, sample_rate=batch_size/len(ds), noise_multiplier=noise_multiplier, max_grad_norm=max_grad_norm)
++    privacy_engine.attach(opt)
++    loss_fn = nn.CrossEntropyLoss()
++    with mlflow.start_run(run_name=run_name):
++        for e in range(epochs):
++            for xb,yb in dl:
++                opt.zero_grad()
++                out = model(xb)
++                loss = loss_fn(out, yb)
++                loss.backward()
++                opt.step()
++            eps, _ = privacy_engine.get_privacy_spent(delta=1e-5)
++            mlflow.log_metric("eps", eps)
++            print(f"epoch {e} eps {eps}")
++    return model
++
++if __name__ == "__main__":
++    train_dp()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ui/approvals_app_enhanced.py
++#!/usr/bin/env python3
++"""
++Approvals UI with Keycloak JWT validation and model-card endpoints.
++ - Protected endpoints expect Authorization: Bearer <token> and validate via Keycloak public key or issuer.
++ - Stores approvals in SQLite (minimal); writes audit records to /tmp/aegis_approvals_audit.log
++"""
++import os, sqlite3, datetime, json
++from flask import Flask, request, jsonify, render_template_string
++import requests
++
++DB = os.environ.get("APPROVAL_DB","/tmp/aegis_approvals.db")
++KEYCLOAK_URL = os.environ.get("KEYCLOAK_URL","")
++KEYCLOAK_REALM = os.environ.get("KEYCLOAK_REALM","")
++
++app = Flask(__name__)
++
++def init_db():
++    conn = sqlite3.connect(DB)
++    cur = conn.cursor()
++    cur.execute("""CREATE TABLE IF NOT EXISTS approvals (
++        id INTEGER PRIMARY KEY AUTOINCREMENT,
++        entity TEXT,
++        entity_id TEXT,
++        requested_by TEXT,
++        status TEXT,
++        reviewer TEXT,
++        reviewed_at TEXT,
++        notes TEXT
++    )""")
++    conn.commit(); conn.close()
++
++def validate_token(token):
++    if not KEYCLOAK_URL:
++        return {"sub":"dev","preferred_username":"dev"}
++    # Simplified: call token introspect or userinfo (requires client secret); here we try userinfo
++    try:
++        headers={"Authorization": f"Bearer {token}"}
++        r = requests.get(f"{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/userinfo", headers=headers, timeout=5)
++        if r.status_code == 200:
++            return r.json()
++    except Exception:
++        pass
++    return None
++
++@app.before_first_request
++def startup():
++    init_db()
++
++@app.route("/api/request", methods=["POST"])
++def request_approval():
++    token = request.headers.get("Authorization","").replace("Bearer ","")
++    user = validate_token(token)
++    if not user:
++        return jsonify({"error":"unauthorized"}), 401
++    payload = request.json or {}
++    entity = payload.get("entity")
++    entity_id = payload.get("entity_id")
++    conn = sqlite3.connect(DB)
++    cur = conn.cursor()
++    cur.execute("INSERT INTO approvals (entity,entity_id,requested_by,status) VALUES (?,?,?,?)", (entity, entity_id, user.get("preferred_username","unknown"), "Pending"))
++    conn.commit(); conn.close()
++    # audit
++    with open("/tmp/aegis_approvals_audit.log","a") as f:
++        f.write(json.dumps({"time": datetime.datetime.utcnow().isoformat(), "action":"request", "entity":entity, "entity_id":entity_id, "user":user})+"\n")
++    return jsonify({"status":"requested"})
++
++@app.route("/api/review", methods=["POST"])
++def review():
++    token = request.headers.get("Authorization","").replace("Bearer ","")
++    user = validate_token(token)
++    if not user:
++        return jsonify({"error":"unauthorized"}), 401
++    payload = request.json or {}
++    id = payload.get("id")
++    status = payload.get("status")
++    notes = payload.get("notes","")
++    conn = sqlite3.connect(DB)
++    cur = conn.cursor()
++    cur.execute("UPDATE approvals SET status=?, reviewer=?, reviewed_at=?, notes=? WHERE id=?", (status, user.get("preferred_username","unknown"), datetime.datetime.utcnow().isoformat(), notes, id))
++    conn.commit(); conn.close()
++    with open("/tmp/aegis_approvals_audit.log","a") as f:
++        f.write(json.dumps({"time": datetime.datetime.utcnow().isoformat(), "action":"review", "id":id, "status":status, "reviewer":user})+"\n")
++    return jsonify({"status":"ok"})
++
++@app.route("/modelcards", methods=["GET"])
++def modelcards():
++    mcp_dir = os.environ.get("MCP_DIR","/tmp/mcp")
++    cards = []
++    if os.path.exists(mcp_dir):
++        for f in sorted(os.listdir(mcp_dir)):
++            if f.endswith(".json"):
++                try:
++                    cards.append(json.load(open(os.path.join(mcp_dir,f))))
++                except Exception:
++                    continue
++    return jsonify({"cards": cards})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=8088)
++
+*** End Patch
+*** Begin Patch
+*** Add File:observability/prometheus/recording_rules.yaml
++groups:
++- name: aegis-recording-rules
++  rules:
++    - record: feast_online_lookup_p95
++      expr: histogram_quantile(0.95, sum(rate(feast_stream_process_seconds_bucket[5m])) by (le))
++    - record: model_inference_p95
++      expr: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))
++    - record: redis_cmd_duration_p95
++      expr: histogram_quantile(0.95, sum(rate(redis_command_duration_seconds_bucket[5m])) by (le))
++
+*** End Patch
+*** Begin Patch
+*** Add File:observability/telemetry_guard_configmap.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: telemetry-guard-config
++  namespace: aegis
++data:
++  CARDINALITY_THRESHOLD: "2000"
++  HIGH_CARDINALITY_METRICS: |
++    - label: model_id
++    - label: user_id
++  ACTION: "alert"
++
+*** End Patch
+*** Begin Patch
+*** Add File:production/policy/signing/README_HSM_VALIDATION.md
++# HSM Validation & Vendor Testing Runbook
++
++Steps:
++1. Provision staging HSM device and network access.
++2. Run ops/hsm/hsm_healthcheck.py and ops/hsm/pkcs11_latency_exporter.py as CronJob.
++3. Perform signing/rotation test:
++   - Create a test key on HSM
++   - Run sign_with_retry against a variety of payload sizes and measure latency.
++4. Verify Rekor/cosign registration for signed payloads.
++5. Document failures and fallback events in the evidence bundle.
++
++Acceptance: HSM latency stable (per threshold), fallback used rarely and only when HSM unreachable; every fallback is logged and uploaded to evidence.
++
+*** End Patch
+*** Begin Patch
+*** Add File:compliance/dpa_submission.md
++# Legal / DPA / Audit guidance
++
++1. Maintain a directory with signed DPAs/BAAs in /var/aegis/legal and run compliance/collect_signed_dpa.py on schedule.
++2. For evidence bundles used in audits ensure:
++   - MCPs are signed and rekor entries verified
++   - HSM health docs are included
++   - GE data quality reports and AB analysis results attached
++   - Backup manifests and restore logs included
++3. Engage legal to produce templates and run an initial internal audit (SOC2 checklist).
++
+*** End Patch
+*** Begin Patch
+*** Add File:ci/production_checks.yaml
++name: Aegis Production Checks
++on:
++  workflow_dispatch:
++jobs:
++  feast-redis-bench:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Redis bench
++        run: |
++          pip install redis
++          python3 benchmarks/redis_latency_bench.py --host redis-headless.aegis.svc --port 6379 --duration 20 --qps 200
++  dr-test:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: trigger argo DR
++        run: |
++          argo submit ops/dr/argo_dr_test.yaml -n aegis --watch
++
+*** End Patch
+*** End Patch

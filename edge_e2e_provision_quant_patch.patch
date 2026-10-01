@@ -1,0 +1,424 @@
+*** Begin Patch
+*** Add File: .github/workflows/edge-e2e-ci.yml
++name: Edge E2E CI - convert, calibrate, validate, multi-arch build & smoke
++on:
++  workflow_dispatch:
++  push:
++    branches:
++      - main
++
++env:
++  IMAGE_REPO: ghcr.io/${{ github.repository_owner }}/aegis-edge-tflite
++  DRIFT_THRESHOLD_PCT: 2.0  # CI will fail if validation drift > this percent
++
++jobs:
++  e2e-validate:
++    name: Convert, calibrate, validate, attest (if Vault configured)
++    runs-on: ubuntu-latest
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: "3.11"
++
++      - name: Install build & test deps
++        run: |
++          python -m pip install --upgrade pip
++          pip install -r aegis_multimodal_ai_system/requirements.txt || true
++          pip install tensorflow numpy requests pytest cryptography
++          # Try to install tflite-runtime but allow failure (we test in container too)
++          pip install tflite-runtime || true
++
++      - name: Convert (dynamic) -> Calibrate (INT8) -> Validate
++        env:
++          DRIFT_THRESHOLD_PCT: ${{ env.DRIFT_THRESHOLD_PCT }}
++        run: |
++          set -euxo pipefail
++          mkdir -p artifacts/edge
++          # dynamic quant baseline
++          python3 scripts/convert_to_tflite.py \
++            --savedmodel model_registry/example-tf-model/0.1/saved_model \
++            --output artifacts/edge/example_dynamic.tflite \
++            --quantize dynamic
++
++          # calibrate using a model-specific representative loader (if available)
++          python3 scripts/quantize_calibrate.py \
++            --savedmodel model_registry/example-tf-model/0.1/saved_model \
++            --output artifacts/edge/example_int8.tflite \
++            --calib-samples 128 \
++            --rep-data-path model_registry/example-tf-model/0.1/rep_dataset.json || true
++
++          # validate and fail if drift exceeds threshold
++          python3 scripts/validate_conversion.py \
++            --savedmodel model_registry/example-tf-model/0.1/saved_model \
++            --tflite artifacts/edge/example_int8.tflite \
++            --max-drift-pct ${DRIFT_THRESHOLD_PCT}
++
++      - name: Package & attest (optional: Vault)
++        env:
++          VAULT_ADDR: ${{ secrets.VAULT_ADDR || '' }}
++          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN || '' }}
++        run: |
++          set -euxo pipefail
++          ART_DIR=artifacts/edge_pkg
++          rm -rf ${ART_DIR} && mkdir -p ${ART_DIR}
++          cp artifacts/edge/example_int8.tflite ${ART_DIR}/ || true
++          tar -C ${ART_DIR} -czf ${ART_DIR}.tar.gz -C ${ART_DIR} .
++          if [ -n "${VAULT_ADDR}" ] && [ -n "${VAULT_TOKEN}" ]; then
++            ./scripts/package_and_attest.sh ${ART_DIR} ${ART_DIR}.tar.gz
++          else
++            echo "Vault not configured; skipping attest step (set secrets VAULT_ADDR+VAULT_TOKEN)"
++          fi
++
++      - name: Upload artifacts
++        uses: actions/upload-artifact@v4
++        with:
++          name: edge-artifacts
++          path: artifacts/**
++
++  build-and-smoke:
++    name: Multi-arch build + smoke test (per-platform)
++    needs: e2e-validate
++    runs-on: ubuntu-latest
++    strategy:
++      matrix:
++        platform: [linux/amd64, linux/arm64, linux/arm/v7]
++        include:
++          - platform: linux/amd64
++            dockerfile: Dockerfile.edge.tflite.amd64
++            tag: amd64
++          - platform: linux/arm64
++            dockerfile: Dockerfile.edge.tflite.arm64
++            tag: arm64
++          - platform: linux/arm/v7
++            dockerfile: Dockerfile.edge.tflite.armv7
++            tag: armv7
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Set up QEMU
++        uses: docker/setup-qemu-action@v2
++
++      - name: Set up Docker Buildx
++        uses: docker/setup-buildx-action@v2
++
++      - name: Login to GHCR
++        uses: docker/login-action@v2
++        with:
++          registry: ghcr.io
++          username: ${{ github.actor }}
++          password: ${{ secrets.GHCR_PAT }}
++
++      - name: Build image for ${{ matrix.platform }}
++        run: |
++          docker buildx create --use --name aegis-builder || true
++          # load into local docker to allow running smoke container (uses emulation)
++          docker buildx build --platform ${{ matrix.platform }} --load -t aegis-edge-test:${{ matrix.tag }} -f ${{ matrix.dockerfile }} .
++
++      - name: Smoke run container and test runtime
++        run: |
++          set -euxo pipefail
++          # Run a short smoke command to check interpreter availability
++          docker run --rm aegis-edge-test:${{ matrix.tag }} python -c "import sys; print('python ok'); \
++            import importlib, json; \
++            try: import tflite_runtime; print('tflite_runtime present') \
++            except Exception: \
++              import tensorflow as tf; print('tensorflow present', tf.__version__)"
++
++      - name: Tag & push multi-arch manifest
++        run: |
++          # Create a manifest using buildx push (build again and push manifest for all platforms)
++          docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 \
++            -t ${IMAGE_REPO}:latest \
++            --push \
++            -f Dockerfile.edge.tflite .
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/vault/provision_device_prod.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Production-ready device provisioning using Vault AppRole.
++# - Performs AppRole login using role_id + secret_id (or role_name with interactive secretID fetch)
++# - Retries on transient errors with exponential backoff
++# - Stores short-lived token in secure path (/var/lib/aegis/vault_token)
++# - Fetches cosign public key or device-specific secrets from Vault
++# - Optionally registers device metadata in Vault under secret/data/devices/<device-id>
++#
++# Usage:
++#  VAULT_ADDR=... ./scripts/vault/provision_device_prod.sh --role-id <role_id> --secret-id <secret_id> --device-id <device-id>
++#
++ROLE_ID=""
++SECRET_ID=""
++DEVICE_ID="${DEVICE_ID:-$(hostname)}"
++OUT_DIR="/var/lib/aegis"
++VAULT_ADDR="${VAULT_ADDR:-}"
++
++usage() {
++  cat <<EOF
++Usage: $0 --role-id ROLE_ID --secret-id SECRET_ID [--device-id DEVICE_ID] [--store-pubkey PATH]
++
++Example:
++  VAULT_ADDR=https://vault.example.com ./scripts/vault/provision_device_prod.sh --role-id abc --secret-id def --device-id edge-001
++EOF
++  exit 2
++}
++
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --role-id) ROLE_ID="$2"; shift 2;;
++    --secret-id) SECRET_ID="$2"; shift 2;;
++    --device-id) DEVICE_ID="$2"; shift 2;;
++    --store-pubkey) STORE_PUBKEY="$2"; shift 2;;
++    *) echo "Unknown arg $1"; usage;;
++  esac
++done
++
++if [ -z "$ROLE_ID" ] || [ -z "$SECRET_ID" ] || [ -z "${VAULT_ADDR:-}" ]; then
++  echo "role-id, secret-id and VAULT_ADDR are required"
++  usage
++fi
++
++mkdir -p "${OUT_DIR}"
++chmod 700 "${OUT_DIR}"
++
++# exponential backoff helper
++retry() {
++  local -r max_retries=${1:-5}
++  shift
++  local n=0
++  local delay=1
++  until "$@"; do
++    exit_code=$?
++    n=$((n+1))
++    if [ $n -ge $max_retries ]; then
++      echo "Command failed after $n attempts"
++      return $exit_code
++    fi
++    echo "Command failed. Retry $n/$max_retries after $delay seconds..."
++    sleep $delay
++    delay=$((delay * 2))
++  done
++  return 0
++}
++
++echo "Logging into Vault AppRole (role_id provided)..."
++LOGIN_BODY="{\"role_id\":\"${ROLE_ID}\",\"secret_id\":\"${SECRET_ID}\"}"
++
++TMP_LOGIN_JSON="$(mktemp)"
++retry 5 curl -fsS --request POST --data "$LOGIN_BODY" "${VAULT_ADDR%/}/v1/auth/approle/login" -o "$TMP_LOGIN_JSON" || { echo "Vault login failed"; rm -f "$TMP_LOGIN_JSON"; exit 3; }
++
++VAULT_TOKEN=$(jq -r '.auth.client_token // empty' "$TMP_LOGIN_JSON")
++if [ -z "$VAULT_TOKEN" ]; then
++  echo "Failed to obtain Vault token from login response"
++  cat "$TMP_LOGIN_JSON"
++  rm -f "$TMP_LOGIN_JSON"
++  exit 4
++fi
++
++echo "Storing Vault token into ${OUT_DIR}/vault_token (permission 600)"
++echo "$VAULT_TOKEN" > "${OUT_DIR}/vault_token"
++chmod 600 "${OUT_DIR}/vault_token"
++rm -f "$TMP_LOGIN_JSON"
++
++# Optionally request cosign public key from secret path secret/data/devices/<device-id>
++PUBKEY_PATH="${STORE_PUBKEY:-/etc/aegis/cosign_pub.pem}"
++echo "Attempting to fetch device secrets for ${DEVICE_ID} from Vault..."
++TMP_SECRETS="$(mktemp)"
++if retry 5 curl -fsS --header "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR%/}/v1/secret/data/devices/${DEVICE_ID}" -o "$TMP_SECRETS"; then
++  COSIGN_PUB=$(jq -r '.data.data.cosign_pubkey // empty' "$TMP_SECRETS")
++  if [ -n "$COSIGN_PUB" ]; then
++    echo "$COSIGN_PUB" > "$PUBKEY_PATH"
++    chmod 600 "$PUBKEY_PATH"
++    echo "Stored cosign public key to $PUBKEY_PATH"
++  else
++    echo "No cosign_pubkey in secret/data/devices/${DEVICE_ID}"
++  fi
++  rm -f "$TMP_SECRETS"
++else
++  echo "No per-device secret found; attempting to fetch global cosign public key"
++  if retry 3 curl -fsS --header "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR%/}/v1/secret/data/global/cosign_pubkey" -o "$TMP_SECRETS"; then
++    COSIGN_PUB=$(jq -r '.data.data.cosign_pubkey // empty' "$TMP_SECRETS")
++    if [ -n "$COSIGN_PUB" ]; then
++      echo "$COSIGN_PUB" > "$PUBKEY_PATH"
++      chmod 600 "$PUBKEY_PATH"
++      echo "Stored global cosign public key to $PUBKEY_PATH"
++    else
++      echo "Global cosign key not present in Vault path"
++    fi
++    rm -f "$TMP_SECRETS"
++  else
++    echo "No global cosign pubkey found; continuing without pubkey (agent will rely on Vault verify if configured)"
++  fi
++fi
++
++echo "Provisioning complete for device ${DEVICE_ID}"
++echo "Token TTL/renewal should be handled by a token refresher or systemd timer to re-login before expiration."
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/rep_dataset_loader.py
++#!/usr/bin/env python3
++"""
++Model-specific representative dataset loader.
++
++This module provides a helper to produce a representative_dataset generator
++for TFLite calibration from either:
++ - a JSON file of precomputed sample tensors (model_registry/.../rep_dataset.json), or
++ - a directory of numpy .npy files, or
++ - a fallback synthetic generator (last resort).
++
++The generator yields items in the form expected by TFLiteConverter: a function
++that yields lists/tuples of numpy arrays matching model input shapes.
++"""
++from __future__ import annotations
++import json
++from pathlib import Path
++from typing import Callable, Iterable, List, Optional, Tuple
++import numpy as np
++
++
++def load_json_samples(path: Path) -> List:
++    raw = json.loads(path.read_text())
++    # expect list of lists or dicts representing inputs
++    return raw
++
++
++def load_npy_dir(path: Path) -> List:
++    # load all .npy files in sorted order and return arrays
++    arrs = []
++    for p in sorted(path.glob("*.npy")):
++        arrs.append(np.load(p))
++    return arrs
++
++
++def representative_dataset_generator_from_samples(samples: List, input_index: int = 0) -> Callable[[], Iterable[List]]:
++    """
++    Create a generator closure for TFLite converter representative_dataset.
++    samples: list of sample values (each sample is list/tuple or single array)
++    input_index: when sample is a dict, pick first value; by default we assume single input.
++    """
++    def gen():
++        for s in samples:
++            if isinstance(s, dict):
++                # take first value
++                vals = list(s.values())
++                yield [np.array(vals[input_index], dtype=np.float32)]
++            elif isinstance(s, (list, tuple)):
++                yield [np.array(s[input_index], dtype=np.float32)]
++            else:
++                yield [np.array(s, dtype=np.float32)]
++    return gen
++
++
++def get_representative_dataset(saved_model_dir: str, rep_data_path: Optional[str], num_samples: int = 128):
++    """
++    Returns a representative_dataset callable for TFLite converter.
++    Try in order:
++      - JSON file at rep_data_path
++      - directory of npy files at rep_data_path
++      - fallback: synthetic but deterministic samples based on model input shape
++    """
++    if rep_data_path:
++        p = Path(rep_data_path)
++        if p.exists():
++            if p.is_file() and p.suffix == ".json":
++                samples = load_json_samples(p)[:num_samples]
++                return representative_dataset_generator_from_samples(samples)
++            if p.is_dir():
++                arrs = load_npy_dir(p)[:num_samples]
++                return representative_dataset_generator_from_samples(arrs)
++
++    # fallback synthetic deterministic generator using simple shape heuristics
++    # Attempt to infer a 1D input shape (best-effort); user should supply real data
++    def synthetic_gen():
++        rng = np.random.default_rng(12345)
++        for _ in range(num_samples):
++            # default to scalar or length-1 vector
++            yield [rng.random((1,1), dtype=np.float32)]
++    return synthetic_gen
++
+*** End Patch
+*** Begin Patch
+*** Update File: scripts/quantize_calibrate.py
+@@
+ def make_representative_gen(n_samples: int, input_shape):
+     # Deterministic pseudo-random samples for calibration (replace with real data pipeline)
+-    rng = np.random.default_rng(42)
+-    def gen():
+-        for _ in range(n_samples):
+-            sample = rng.random(input_shape, dtype=np.float32)
+-            # yield a tuple/list of inputs depending on model signature (single input assumed)
+-            yield [sample]
+-    return gen
++    rng = np.random.default_rng(42)
++    def gen():
++        for _ in range(n_samples):
++            sample = rng.random(input_shape, dtype=np.float32)
++            # yield a tuple/list of inputs depending on model signature (single input assumed)
++            yield [sample]
++    return gen
+@@
+ def convert_with_calibration(saved_model_dir: str, out_path: str, calib_samples: int = 128):
+     try:
+         import tensorflow as tf
+     except Exception as e:
+         raise RuntimeError("TensorFlow required for conversion") from e
+@@
+-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+-    rep_gen = make_representative_gen(calib_samples, input_shape)
+-    converter.representative_dataset = rep_gen
++    converter.optimizations = [tf.lite.Optimize.DEFAULT]
++    # try to use model-specific representative dataset if user provided path via env or arg
++    rep_data_path = None
++    try:
++        import os
++        rep_data_path = os.environ.get("REPR_DATA_PATH", None)
++    except Exception:
++        rep_data_path = None
++    # If the script was invoked via CLI we may have passed a parameter; try to read it from sys.argv earlier (handled in cli)
++    # Prefer to import the rep_dataset_loader if available
++    try:
++        from scripts.rep_dataset_loader import get_representative_dataset
++        rep_gen_callable = get_representative_dataset(saved_model_dir, rep_data_path, calib_samples)
++        converter.representative_dataset = rep_gen_callable
++    except Exception:
++        # fallback to synthetic generator
++        rep_gen = make_representative_gen(calib_samples, input_shape)
++        converter.representative_dataset = rep_gen
+     converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+*** End Patch
+*** Begin Patch
+*** Add File: tests/test_rep_dataset_loader.py
++from pathlib import Path
++import numpy as np
++
++from scripts.rep_dataset_loader import get_representative_dataset
++
++def test_rep_loader_synthetic(tmp_path: Path):
++    gen = get_representative_dataset("model_registry/example-tf-model/0.1/saved_model", None, num_samples=4)
++    # generator callable
++    g = gen()
++    vals = [next(g) for _ in range(3)]
++    assert len(vals) == 3
++    # each yielded item should be a list with a numpy array
++    assert isinstance(vals[0], list)
++    assert hasattr(vals[0][0], "shape")
++
++def test_rep_loader_json(tmp_path: Path):
++    # create simple json file with samples
++    data = [[ [1.0] ], [ [2.0] ], [ [3.0] ]]
++    p = tmp_path / "rep.json"
++    p.write_text(__import__("json").dumps(data))
++    gen = get_representative_dataset("ignored", str(p), num_samples=2)
++    g = gen()
++    v1 = next(g)
++    assert isinstance(v1, list)
++    assert np.allclose(v1[0], np.array([[1.0]], dtype=np.float32))
++
+*** End Patch

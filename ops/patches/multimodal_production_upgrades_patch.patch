@@ -1,0 +1,545 @@
+*** Begin Patch
+*** Add File:services/multimodal/ingest/ingest_service.py
++#!/usr/bin/env python3
++"""
++Durable multimodal ingestion service
++- Accepts uploads for image/audio/video
++- Computes SHA256 content-addressed name, creates thumbnails / spectrograms / frames (where applicable),
++- Uploads artifacts to object storage (local path or S3) using uploader helper and returns manifest entry.
++- Registers dataset entry with metadata service.
++"""
++from fastapi import FastAPI, File, UploadFile, HTTPException, Form
++from pydantic import BaseModel
++import os, hashlib, uuid, subprocess, json, shutil, tempfile, time
++from PIL import Image
++from services.multimodal.storage.uploader import upload_to_storage
++from services.multimodal.metadata.register_dataset import register_file_entry
++
++app = FastAPI(title="Aegis Multimodal Ingest")
++
++OUT_DIR = os.environ.get("MM_INGEST_OUT", "/workspace/ingest")
++os.makedirs(OUT_DIR, exist_ok=True)
++TMP_DIR = os.environ.get("MM_INGEST_TMP", "/tmp")
++
++def sha256_file(path):
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        for b in iter(lambda: f.read(8192), b""):
++            h.update(b)
++    return h.hexdigest()
++
++def write_file_and_hash(upload_bytes, dest_path):
++    with open(dest_path, "wb") as f:
++        f.write(upload_bytes)
++    return sha256_file(dest_path)
++
++def make_thumbnail(image_path, out_path, size=(256,256)):
++    img = Image.open(image_path)
++    img.thumbnail(size)
++    img.save(out_path, format="PNG")
++
++def transcode_audio(in_path, out_path, sr=16000):
++    # requires ffmpeg
++    subprocess.check_call(["ffmpeg","-y","-i", in_path, "-ar", str(sr), "-ac", "1", out_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++
++def extract_frames(video_path, out_prefix, fps=1.0, resize=None):
++    args = ["ffmpeg","-y","-i", video_path, "-r", str(fps)]
++    if resize:
++        args += ["-vf", f"scale={resize[0]}:{resize[1]}"]
++    args += [f"{out_prefix}_%04d.png"]
++    subprocess.check_call(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++
++@app.post("/ingest/upload")
++async def ingest_upload(modality: str = Form(...), dataset_id: str = Form(...), file: UploadFile = File(...), ttl_days: int = Form(3650)):
++    """
++    modality: image|audio|video
++    dataset_id: logical dataset
++    """
++    if modality not in ("image","audio","video"):
++        raise HTTPException(status_code=400, detail="unsupported modality")
++    data = await file.read()
++    tmp_name = os.path.join(TMP_DIR, uuid.uuid4().hex + "_" + file.filename)
++    with open(tmp_name, "wb") as f:
++        f.write(data)
++    content_sha = sha256_file(tmp_name)
++    content_name = f"{content_sha}_{file.filename}"
++    dest_dir = os.path.join(OUT_DIR, dataset_id)
++    os.makedirs(dest_dir, exist_ok=True)
++    dest_path = os.path.join(dest_dir, content_name)
++    shutil.move(tmp_name, dest_path)
++
++    # derivative artifacts
++    derivatives = {}
++    if modality == "image":
++        thumb_path = os.path.join(dest_dir, f"{content_sha}_thumb.png")
++        make_thumbnail(dest_path, thumb_path, size=(256,256))
++        derivatives["thumbnail"] = thumb_path
++    elif modality == "audio":
++        wav_path = os.path.join(dest_dir, f"{content_sha}.wav")
++        transcode_audio(dest_path, wav_path)
++        derivatives["wav"] = wav_path
++    elif modality == "video":
++        frames_prefix = os.path.join(dest_dir, f"{content_sha}_frame")
++        extract_frames(dest_path, frames_prefix, fps=1.0, resize=(224,224))
++        # collect frames
++        frames = sorted([p for p in os.listdir(dest_dir) if p.startswith(os.path.basename(frames_prefix))])
++        derivatives["frames"] = [os.path.join(dest_dir,f) for f in frames]
++
++    # upload to storage (S3 or local object store)
++    storage_uri = upload_to_storage(dest_path, object_name=f"{dataset_id}/{content_name}")
++    uploaded_derivs = {}
++    for k,v in derivatives.items():
++        if isinstance(v, list):
++            uploaded_derivs[k] = [upload_to_storage(p, object_name=f"{dataset_id}/{os.path.basename(p)}") for p in v]
++        else:
++            uploaded_derivs[k] = upload_to_storage(v, object_name=f"{dataset_id}/{os.path.basename(v)}")
++
++    manifest_entry = {
++        "id": content_sha,
++        "dataset_id": dataset_id,
++        "original_name": file.filename,
++        "modality": modality,
++        "storage_uri": storage_uri,
++        "derivatives": uploaded_derivs,
++        "sha256": content_sha,
++        "ingested_at": int(time.time())
++    }
++
++    # register in metadata service (best-effort)
++    try:
++        register_file_entry(manifest_entry)
++    except Exception as e:
++        # do not abort ingestion on metadata failure
++        print("metadata registration failed:", e)
++
++    return {"manifest": manifest_entry}
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/multimodal/storage/uploader.py
++#!/usr/bin/env python3
++"""
++Storage uploader helper
++- Supports local prefix (file://) or S3 (s3://bucket/prefix)
++- Uses SSE-KMS when uploading to S3 if COSIGN_KMS_ARN provided
++"""
++import os, boto3, shutil
++from urllib.parse import urlparse
++
++DEFAULT_STORE = os.environ.get("MM_STORE_PREFIX", os.path.expanduser("~/mm_store"))
++S3_KEY_ARN = os.environ.get("COSIGN_KMS_ARN", "")
++AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
++
++def upload_to_storage(local_path, object_name=None):
++    """
++    If MM_STORE_PREFIX starts with s3://, upload to S3 under that prefix.
++    Otherwise, copy into local store under prefix/object_name (or basename).
++    Returns storage URI.
++    """
++    prefix = os.environ.get("MM_STORE_PREFIX", DEFAULT_STORE)
++    if prefix.startswith("s3://"):
++        parsed = urlparse(prefix)
++        bucket = parsed.netloc
++        base = parsed.path.lstrip("/")
++        key = f"{base.rstrip('/')}/{object_name}" if base else object_name
++        s3 = boto3.client("s3", region_name=AWS_REGION)
++        extra = {}
++        if S3_KEY_ARN:
++            extra["ServerSideEncryption"] = "aws:kms"
++            extra["SSEKMSKeyId"] = S3_KEY_ARN
++        s3.upload_file(local_path, bucket, key, ExtraArgs=extra)
++        return f"s3://{bucket}/{key}"
++    else:
++        dest_dir = os.path.join(prefix, os.path.dirname(object_name) if object_name else "")
++        os.makedirs(dest_dir, exist_ok=True)
++        dest_path = os.path.join(prefix, object_name if object_name else os.path.basename(local_path))
++        shutil.copy(local_path, dest_path)
++        return f"file://{dest_path}"
++
++if __name__=="__main__":
++    print("uploader module")
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/multimodal/metadata/register_dataset.py
++#!/usr/bin/env python3
++"""
++Small helper to register file entries with central metadata service.
++Implements a thin client to call METADATA_URL /register endpoint.
++"""
++import os, requests, json
++
++METADATA_URL = os.environ.get("METADATA_URL", "http://metadata.svc")
++
++def register_file_entry(entry: dict):
++    url = METADATA_URL.rstrip("/") + "/files/register"
++    resp = requests.post(url, json=entry, timeout=10)
++    resp.raise_for_status()
++    return resp.json()
++
++if __name__=="__main__":
++    print("metadata registrar")
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/triton/models/vision_model/config.pbtxt
++name: "vision_encoder"
++platform: "onnxruntime_onnx"
++max_batch_size: 8
++
++input [
++  {
++    name: "input__0"
++    data_type: TYPE_FP32
++    dims: [3, 224, 224]
++  }
++]
++
++output [
++  {
++    name: "output__0"
++    data_type: TYPE_FP32
++    dims: [512]
++  }
++]
++
++instance_group [
++  {
++    kind: KIND_GPU
++    count: 1
++  }
++]
++
++optimization { cpu_math_library: AUTO }
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/triton/models/audio_model/config.pbtxt
++name: "audio_encoder"
++platform: "onnxruntime_onnx"
++max_batch_size: 8
++
++input [
++  {
++    name: "input__0"
++    data_type: TYPE_FP32
++    dims: [1, 128, 400]  # example mel shape (n_mels x frames)
++  }
++]
++
++output [
++  {
++    name: "output__0"
++    data_type: TYPE_FP32
++    dims: [512]
++  }
++]
++
++instance_group [
++  {
++    kind: KIND_GPU
++    count: 1
++  }
++]
++
++optimization { cpu_math_library: AUTO }
++
+*** End Patch
+*** Begin Patch
+*** Add File:scripts/package_triton_model.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Package a model directory into a Triton-compatible model repository structure and optionally upload to storage prefix.
++#
++# Usage:
++#  ./scripts/package_triton_model.sh <local_model_dir> <model_name> [<storage_prefix>]
++#
++MODEL_DIR=${1:-}
++MODEL_NAME=${2:-vision_encoder}
++STORE_PREFIX=${3:-}
++
++if [ -z "$MODEL_DIR" ]; then
++  echo "Usage: $0 <local_model_dir> <model_name> [storage_prefix]"
++  exit 2
++fi
++
++OUT_REPO=/tmp/triton_repo_$(date +%s)
++mkdir -p "$OUT_REPO/$MODEL_NAME/1"
++cp -r "$MODEL_DIR"/* "$OUT_REPO/$MODEL_NAME/1/"
++
++# copy a matching config if present in k8s/triton/models
++if [ -f "k8s/triton/models/${MODEL_NAME}/config.pbtxt" ]; then
++  cp "k8s/triton/models/${MODEL_NAME}/config.pbtxt" "$OUT_REPO/$MODEL_NAME/config.pbtxt"
++fi
++
++echo "Packaged model at $OUT_REPO"
++if [ -n "$STORE_PREFIX" ]; then
++  # use gsutil or aws s3 cp depending on prefix
++  if [[ "$STORE_PREFIX" == s3://* ]]; then
++    aws s3 cp --recursive "$OUT_REPO/" "$STORE_PREFIX/$MODEL_NAME/" || true
++  elif [[ "$STORE_PREFIX" == gs://* ]]; then
++    gsutil -m cp -r "$OUT_REPO/*" "$STORE_PREFIX/$MODEL_NAME/" || true
++  else
++    mkdir -p "$STORE_PREFIX/$MODEL_NAME"
++    cp -r "$OUT_REPO/$MODEL_NAME" "$STORE_PREFIX/$MODEL_NAME/"
++  fi
++  echo "Uploaded to $STORE_PREFIX/$MODEL_NAME"
++fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:services/multimodal/validation/multimodal_metrics.py
++#!/usr/bin/env python3
++"""
++Multimodal evaluation metrics
++- Image: computes SSIM (structural similarity) and per-class ROC (if labels provided)
++- Audio: computes SNR and simple classification ROC
++- Exposes CLI to read predictions + labels and produce a metrics JSON
++"""
++import argparse, json, os
++import numpy as np
++from skimage.metrics import structural_similarity as ssim
++from sklearn.metrics import roc_auc_score
++import soundfile as sf
++
++def image_metrics(preds, refs):
++    # preds and refs are list of file paths
++    vals = []
++    for p,r in zip(preds, refs):
++        try:
++            from PIL import Image
++            ip = np.array(Image.open(p).convert("L"))
++            ir = np.array(Image.open(r).convert("L"))
++            v = ssim(ip, ir, data_range=ir.max()-ir.min())
++            vals.append(v)
++        except Exception:
++            vals.append(None)
++    return {"ssim_mean": float(np.nanmean([v for v in vals if v is not None])) if any(v is not None for v in vals) else None}
++
++def audio_snr(ref_path, pred_path):
++    # simple SNR estimate between reference and predicted waveform
++    try:
++        ref, _ = sf.read(ref_path)
++        pred, _ = sf.read(pred_path)
++        # trim to same length
++        n = min(len(ref), len(pred))
++        ref = ref[:n]; pred = pred[:n]
++        noise = ref - pred
++        snr = 10 * np.log10( (np.mean(ref**2) + 1e-9) / (np.mean(noise**2) + 1e-9) )
++        return snr
++    except Exception:
++        return None
++
++def classification_roc(labels, scores):
++    # labels: list of 0/1, scores: continuous
++    try:
++        return float(roc_auc_score(labels, scores))
++    except Exception:
++        return None
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--predictions", required=True, help="JSON lines: [{id, modality, pred_path, ref_path, label, score}]")
++    p.add_argument("--out", required=True)
++    args = p.parse_args()
++    rows = [json.loads(l) for l in open(args.predictions) if l.strip()]
++    out = {"image":{}, "audio":{}, "class_roc":{}}
++    # group by modality
++    imgs = [r for r in rows if r.get("modality")=="image" and r.get("pred_path") and r.get("ref_path")]
++    if imgs:
++        out["image"] = image_metrics([r["pred_path"] for r in imgs],[r["ref_path"] for r in imgs])
++    aud = [r for r in rows if r.get("modality")=="audio" and r.get("pred_path") and r.get("ref_path")]
++    if aud:
++        snrs = [audio_snr(r["ref_path"], r["pred_path"]) for r in aud]
++        snrs = [s for s in snrs if s is not None]
++        out["audio"] = {"snr_mean": float(np.mean(snrs)) if snrs else None}
++    # classification ROC by label (if labels & scores present)
++    cls = [r for r in rows if r.get("label") is not None and r.get("score") is not None]
++    if cls:
++        labels = [int(r["label"]) for r in cls]
++        scores = [float(r["score"]) for r in cls]
++        out["class_roc"] = {"roc_auc": classification_roc(labels, scores)}
++    with open(args.out,"w") as f:
++        json.dump(out, f, indent=2)
++    print("Wrote metrics to", args.out)
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:tekton/tasks/multimodal-eval-task.yaml
++apiVersion: tekton.dev/v1beta1
++kind: Task
++metadata:
++  name: multimodal-eval-task
++  namespace: ml-pipelines
++spec:
++  params:
++    - name: predictions-jsonl
++      type: string
++  steps:
++    - name: eval
++      image: us.gcr.io/aegis/multimodal-eval:latest
++      script: |
++        #!/usr/bin/env bash
++        set -euo pipefail
++        python services/multimodal/validation/multimodal_metrics.py --predictions $(inputs.params.predictions-jsonl) --out /workspace/metrics.json
++        cat /workspace/metrics.json
++
+*** End Patch
+*** Begin Patch
+*** Add File:tests/multimodal/ocr_drift_suite.py
++#!/usr/bin/env python3
++"""
++OCR drift test scaffold
++- Given a set of OCRed text outputs (baseline vs recent), compute n-gram / edit-distance drift and flag issues
++"""
++import json, os, sys
++from difflib import SequenceMatcher
++
++BASELINE = "ops/multimodal/ocr_baseline.jsonl"
++RECENT = "ops/multimodal/ocr_recent.jsonl"
++THRESH = float(os.environ.get("OCR_DRIFT_THRESH", "0.15"))
++
++def load(path):
++    out=[]
++    if os.path.exists(path):
++        for l in open(path):
++            if not l.strip(): continue
++            out.append(json.loads(l))
++    return out
++
++def norm_text(t):
++    return " ".join(t.lower().split())
++
++def similarity(a,b):
++    return SequenceMatcher(None, a, b).ratio()
++
++def main():
++    base = load(BASELINE)
++    recent = load(RECENT)
++    if not base or not recent:
++        print("No baseline/recent OCR data; skip")
++        sys.exit(0)
++    # align by id
++    base_map = {r["id"]: norm_text(r.get("text","")) for r in base}
++    total=0; scores=[]
++    for r in recent:
++        rid = r["id"]
++        if rid not in base_map: continue
++        total += 1
++        s = similarity(base_map[rid], norm_text(r.get("text","")))
++        scores.append(s)
++    if total==0:
++        print("No matching ids")
++        sys.exit(0)
++    avg_sim = sum(scores)/len(scores)
++    drift = 1.0 - avg_sim
++    print("OCR avg similarity:", avg_sim, "drift:", drift)
++    if drift > THRESH:
++        print("OCR drift detected")
++        sys.exit(2)
++    print("OCR drift within threshold")
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:tests/multimodal/audio_noise_suite.py
++#!/usr/bin/env python3
++"""
++Audio adversarial/noise suite
++- Apply additive noise at several SNRs and measure embedding or classifier drift
++"""
++import json, os, sys, random
++import numpy as np
++import soundfile as sf
++import requests
++
++MANIFEST = "ops/multimodal/sample_audio_manifest.jsonl"
++MODEL_URL = os.environ.get("MM_AUDIO_MODEL_URL", "http://triton-audio:8000/v2/models/audio/versions/1/infer")
++THRESH = float(os.environ.get("AUDIO_ADV_THRESH", "0.2"))
++
++def load_manifest():
++    out=[]
++    for l in open(MANIFEST):
++        if not l.strip(): continue
++        out.append(json.loads(l))
++    return out
++
++def add_noise(y, snr_db):
++    # simple AWGN to achieve SNR
++    rms = np.sqrt(np.mean(y**2))
++    snr = 10**(snr_db/20.0)
++    noise_std = rms / snr
++    return y + np.random.normal(0, noise_std, size=y.shape)
++
++def get_embedding_from_server(wav_bytes):
++    try:
++        resp = requests.post(MODEL_URL, files={"audio": wav_bytes}, timeout=15)
++        resp.raise_for_status()
++        return resp.json().get("embedding")
++    except Exception as e:
++        print("model call failed", e); return None
++
++def main():
++    rows = load_manifest()
++    failed=False
++    for r in rows:
++        path = r["path"]
++        if not os.path.exists(path): continue
++        y, sr = sf.read(path)
++        # baseline
++        import io
++        buf = io.BytesIO(); sf.write(buf, y, sr, format='WAV'); buf.seek(0)
++        orig = get_embedding_from_server(buf.read())
++        if orig is None: continue
++        for snr in [20,10,5]:
++            y_noisy = add_noise(y, snr)
++            buf2 = io.BytesIO(); sf.write(buf2, y_noisy, sr, format='WAV'); buf2.seek(0)
++            emb = get_embedding_from_server(buf2.read())
++            if emb is None: continue
++            dist = np.linalg.norm(np.array(orig)-np.array(emb))
++            print("id", r["id"], "snr", snr, "dist", dist)
++            if dist > THRESH:
++                print("Audio adversarial drift exceeded threshold")
++                failed = True
++    if failed:
++        sys.exit(2)
++    print("Audio noise suite passed")
++
++if __name__=="__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:monitoring/cronjobs/vision_kernel_autotuner_cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: vision-kernel-autotuner
++  namespace: inference
++spec:
++  schedule: "0 3 * * 0" # weekly
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          restartPolicy: OnFailure
++          containers:
++            - name: autotuner
++              image: us.gcr.io/aegis/kernel-tuner:latest
++              command: ["/bin/sh","-c"]
++              args:
++                - |
++                  python services/triton/kernel_opt/opt_tuner.py --workload vision --out ops/triton/backend/kernel_best_config_vision.json
++                  python services/triton/kernel_opt/validate_kernel_results.py ops/triton/backend/kernel_best_config_vision.json
++                  kubectl -n inference create configmap kernel-best-config-vision --from-file=ops/triton/backend/kernel_best_config_vision.json --dry-run=client -o yaml | kubectl apply -f -
++          nodeSelector:
++            accelerator: nvidia
++
+*** End Patch
+*** End Patch

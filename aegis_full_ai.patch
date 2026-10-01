@@ -1,0 +1,655 @@
+*** Begin Patch
+*** Add File: scripts/package_and_attest.sh
++#!/usr/bin/env bash
++#
++# Package model dir deterministically, produce SBOM, sign using Vault transit,
++# create a minimal DSSE-like attestation, post a Rekor transparency entry (optional),
++# and upload artifact + signature + attestation + SBOM to object store.
++#
++# Usage:
++#   VAULT_ADDR=... VAULT_TOKEN=... OBJECT_STORE_BUCKET=... REKOR_URL=... ./scripts/package_and_attest.sh <model_dir> <artifact_out_path>
++set -euo pipefail
++
++MODEL_DIR="${1:-}"
++OUT_TAR="${2:-}"
++
++if [ -z "$MODEL_DIR" ] || [ -z "$OUT_TAR" ]; then
++  echo "Usage: $0 <model_dir> <artifact_out_path>"
++  exit 2
++fi
++
++if [ ! -d "$MODEL_DIR" ]; then
++  echo "Model dir not found: $MODEL_DIR" >&2
++  exit 3
++fi
++
++TMPDIR=$(mktemp -d)
++trap 'rm -rf "$TMPDIR"' EXIT
++
++echo "Creating deterministic archive..."
++# If a deterministic archive helper exists, prefer it
++if [ -x scripts/make_deterministic_archive.py ]; then
++  python3 scripts/make_deterministic_archive.py "$MODEL_DIR" "$OUT_TAR"
++else
++  # simple canonical tar: sorted files, reproducible mtime
++  find "$MODEL_DIR" -type f | sort > "$TMPDIR/files.list"
++  tar --sort=name --mtime='UTC 2020-01-01' -czf "$OUT_TAR" -T "$TMPDIR/files.list"
++fi
++
++echo "Generating artifact checksum..."
++DIGEST_B64=$(openssl dgst -sha256 -binary "$OUT_TAR" | base64 -w 0)
++echo "digest (base64): ${DIGEST_B64}"
++
++if [ -z "${VAULT_ADDR:-}" ] || [ -z "${VAULT_TOKEN:-}" ]; then
++  echo "VAULT_ADDR or VAULT_TOKEN not set; cannot sign with Vault transit" >&2
++  exit 4
++fi
++
++VAULT_ADDR="${VAULT_ADDR%/}"
++echo "Requesting Vault transit sign..."
++SIGN_JSON=$(curl -sS --header "X-Vault-Token: $VAULT_TOKEN" \
++  --request POST --data "{\"input\":\"${DIGEST_B64}\"}" \
++  "${VAULT_ADDR}/v1/transit/sign/aegis-cosign")
++echo "$SIGN_JSON" > "${OUT_TAR}.sig.json"
++echo "Saved signature to ${OUT_TAR}.sig.json"
++
++# Create a minimal attestation envelope
++ATTEST="${OUT_TAR}.attestation.json"
++cat > "$ATTEST" <<EOF
++{
++  "type": "in-toto+dsse",
++  "subject": {"artifact": "$(basename "$OUT_TAR")", "digest": "${DIGEST_B64}"},
++  "signing": {
++    "method": "vault-transit",
++    "key": "aegis-cosign",
++    "signature_json": $(jq -c . < "${OUT_TAR}.sig.json")
++  },
++  "provenance": {
++    "git_commit": "${GIT_COMMIT:-}",
++    "mlflow_run_id": "${MLFLOW_RUN_ID:-}",
++    "image_digest": "${IMAGE_DIGEST:-}"
++  }
++}
++EOF
++
++echo "Attestation written to $ATTEST"
++
++# Optionally post to Rekor (minimal custom entry)
++if [ -n "${REKOR_URL:-}" ]; then
++  echo "Posting presence entry to Rekor ($REKOR_URL)..."
++  REKOR_PAYLOAD=$(jq -n --arg a "$(basename "$OUT_TAR")" --arg d "$DIGEST_B64" --arg s "$(jq -c '.data.signature // .signature // empty' < "${OUT_TAR}.sig.json")" \
++    '{kind:"aegis:artifact", artifact:$a, digest:$d, signature:$s}')
++  # POST to a simple rekor endpoint - this is a minimal integration, adapt to your Rekor client as needed
++  curl -sS -X POST -H "Content-Type: application/json" -d "$REKOR_PAYLOAD" "${REKOR_URL%/}/api/v1/log" > "${OUT_TAR}.rekor.json" || true
++  echo "Saved Rekor response to ${OUT_TAR}.rekor.json"
++fi
++
++# Generate SBOM for the model directory (best-effort, requires syft installed)
++SBOM="${OUT_TAR}.sbom.json"
++if command -v syft >/dev/null 2>&1; then
++  echo "Generating SBOM (syft) for model dir..."
++  syft dir:"$MODEL_DIR" -o json > "$SBOM" || true
++  echo "SBOM written to $SBOM"
++else
++  echo "syft not installed; skipping SBOM generation"
++fi
++
++# Upload artifacts to object store if configured
++if [ -n "${OBJECT_STORE_BUCKET:-}" ]; then
++  echo "Uploading artifacts to s3://${OBJECT_STORE_BUCKET}/model-archives/"
++  aws s3 cp "$OUT_TAR" "s3://${OBJECT_STORE_BUCKET}/model-archives/$(basename "$OUT_TAR")"
++  aws s3 cp "${OUT_TAR}.sig.json" "s3://${OBJECT_STORE_BUCKET}/model-archives/$(basename ${OUT_TAR}.sig.json)" || true
++  aws s3 cp "${OUT_TAR}.attestation.json" "s3://${OBJECT_STORE_BUCKET}/model-archives/$(basename ${OUT_TAR}.attestation.json)" || true
++  [ -f "${OUT_TAR}.rekor.json" ] && aws s3 cp "${OUT_TAR}.rekor.json" "s3://${OBJECT_STORE_BUCKET}/model-archives/$(basename ${OUT_TAR}.rekor.json)" || true
++  [ -f "${SBOM}" ] && aws s3 cp "${SBOM}" "s3://${OBJECT_STORE_BUCKET}/model-archives/$(basename ${SBOM})" || true
++else
++  echo "OBJECT_STORE_BUCKET not set; leaving artifacts in workspace"
++fi
++
++echo "Package & attest complete."
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/generate_sbom.sh
++#!/usr/bin/env bash
++# Generate SBOM for a container image or directory using syft
++# Usage:
++#   scripts/generate_sbom.sh image:tag output.json
++#   scripts/generate_sbom.sh dir:/path/to/dir output.json
++set -euo pipefail
++
++SRC="${1:-}"
++OUT="${2:-sbom.json}"
++
++if ! command -v syft >/dev/null 2>&1; then
++  echo "syft is required. Install from https://github.com/anchore/syft" >&2
++  exit 1
++fi
++
++echo "Generating SBOM for $SRC -> $OUT"
++syft "$SRC" -o json > "$OUT"
++echo "SBOM written to $OUT"
++
+*** End Patch
+*** Begin Patch
+*** Add File: .github/workflows/build_sbom_and_attest.yml
++name: Build image, generate SBOM, produce provenance attestation
++
++on:
++  push:
++    paths:
++      - 'training/**'
++      - 'scripts/**'
++      - '.github/workflows/**'
++
++jobs:
++  build-and-sbom:
++    runs-on: ubuntu-latest
++    permissions:
++      contents: read
++      id-token: write
++    env:
++      IMAGE_NAME: ghcr.io/${{ github.repository }}/aegis-train
++      OBJECT_STORE_BUCKET: ${{ secrets.OBJECT_STORE_BUCKET }}
++      REKOR_URL: ${{ secrets.REKOR_URL }}
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          fetch-depth: 0
++
++      - name: Set up QEMU and Docker Buildx
++        uses: docker/setup-buildx-action@v2
++
++      - name: Log in to registry
++        uses: docker/login-action@v2
++        with:
++          registry: ghcr.io
++          username: ${{ github.actor }}
++          password: ${{ secrets.GITHUB_TOKEN }}
++
++      - name: Build and push image
++        id: build
++        run: |
++          docker build -t "${IMAGE_NAME}:$GITHUB_SHA" training/
++          docker push "${IMAGE_NAME}:$GITHUB_SHA"
++          IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE_NAME}:$GITHUB_SHA" || true)
++          echo "image_digest=$IMAGE_DIGEST" >> $GITHUB_OUTPUT
++
++      - name: Install syft
++        run: |
++          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b ~/.local/bin
++          echo "$HOME/.local/bin" >> $GITHUB_PATH
++
++      - name: Generate SBOM for image
++        run: |
++          syft "${{ steps.build.outputs.image_digest }}" -o json > sbom.json || syft "${IMAGE_NAME}:$GITHUB_SHA" -o json > sbom.json
++          ls -lh sbom.json
++        env:
++          IMAGE_NAME: ${{ env.IMAGE_NAME }}
++
++      - name: Upload SBOM artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: sbom
++          path: sbom.json
++
++      - name: Produce example attestation & Rekor entry (dry-run)
++        run: |
++          echo "This job generates SBOM and pushes image; canonical package+attest runs in training pipeline after model artifacts are produced."
++
+*** End Patch
+*** Begin Patch
+*** Add File: argo/workflows/train_with_provenance.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: aegis-train-prov-
++  namespace: aegis
++spec:
++  entrypoint: train-package-sign
++  arguments:
++    parameters:
++      - name: image-digest
++        value: ""
++      - name: git-commit
++        value: ""
++      - name: mlflow-tracking-uri
++        value: "http://mlflow.aegis.svc.cluster.local:5000"
++  templates:
++    - name: train-package-sign
++      dag:
++        tasks:
++          - name: run-training
++            template: run-training
++          - name: convert
++            template: convert
++            dependencies: [run-training]
++          - name: package-attest
++            template: package-attest
++            dependencies: [convert]
++
++    - name: run-training
++      container:
++        image: "{{workflow.parameters.image-digest}}"
++        command: ["/bin/sh","-c"]
++        args:
++          - |
++            set -euo pipefail
++            export MLFLOW_TRACKING_URI="{{workflow.parameters.mlflow-tracking-uri}}"
++            export GIT_COMMIT="{{workflow.parameters.git-commit}}"
++            export IMAGE_DIGEST="{{workflow.parameters.image-digest}}"
++            # Training script is expected to log to MLflow and write checkpoint to /workspace/model
++            python3 /workspace/training/train_deepspeed.py --out-dir /workspace/model --max-epochs 1
++      volumeMounts:
++        - name: workspace
++          mountPath: /workspace
++
++    - name: convert
++      container:
++        image: ghcr.io/rsinghunjan/aegis-tools:latest
++        command: ["/bin/sh","-c"]
++        args:
++          - |
++            set -euo pipefail
++            mkdir -p /workspace/model/converted
++            python3 /workspace/conversion/convert_to_onnx.py /workspace/model/pytorch_model.bin /workspace/model/converted/model.onnx
++      volumeMounts:
++        - name: workspace
++          mountPath: /workspace
++
++    - name: package-attest
++      container:
++        image: ghcr.io/rsinghunjan/aegis-tools:latest
++        command: ["/bin/sh","-c"]
++        args:
++          - |
++            set -euo pipefail
++            OUTDIR=/workspace/model
++            ART=/workspace/artifacts/model-$(date -u +%Y%m%dT%H%M%SZ).tar.gz
++            mkdir -p /workspace/artifacts
++            export MLFLOW_RUN_ID=$(cat /workspace/model/.mlflow_run_id 2>/dev/null || true)
++            export IMAGE_DIGEST="{{workflow.parameters.image-digest}}"
++            export GIT_COMMIT="{{workflow.parameters.git-commit}}"
++            /workspace/scripts/package_and_attest.sh "$OUTDIR" "$ART"
++      volumeMounts:
++        - name: workspace
++          mountPath: /workspace
++
++  volumes:
++    - name: workspace
++      emptyDir: {}
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/verify_and_fetch.sh
++#!/usr/bin/env bash
++# verify_and_fetch.sh
++# Enhanced initContainer helper:
++# - downloads artifact + attestation + signature
++# - verifies via local cosign public key OR via Vault transit verify OR via Rekor inclusion check if attestation contains rekor reference
++# - extracts artifact if verification passes
++set -euo pipefail
++
++ARTIFACT_URI="${1:-}"
++DEST_DIR="${2:-}"
++
++if [ -z "$ARTIFACT_URI" ] || [ -z "$DEST_DIR" ]; then
++  echo "Usage: $0 <s3_uri_to_artifact> <dest_dir>"
++  exit 2
++fi
++
++TMPDIR=$(mktemp -d)
++trap 'rm -rf "$TMPDIR"' EXIT
++
++ARTFILE="$TMPDIR/$(basename "$ARTIFACT_URI")"
++SIGFILE="${ARTFILE}.sig.json"
++ATTEST="${ARTFILE}.attestation.json"
++
++echo "Downloading artifact: $ARTIFACT_URI"
++aws s3 cp "$ARTIFACT_URI" "$ARTFILE"
++
++SIG_S3_URI="${ARTIFACT_URI}.sig.json"
++ATTEST_S3_URI="${ARTIFACT_URI}.attestation.json"
++
++if ! aws s3 cp "$SIG_S3_URI" "$SIGFILE"; then
++  echo "Signature not found at $SIG_S3_URI" >&2
++  exit 3
++fi
++if ! aws s3 cp "$ATTEST_S3_URI" "$ATTEST"; then
++  echo "Attestation not found at $ATTEST_S3_URI; continuing if only signature verification is acceptable"
++fi
++
++# Try cosign local verification if pubkey mounted
++if [ -f /etc/cosign/pubkey.pem ]; then
++  echo "Using local cosign pubkey verification..."
++  if ! command -v cosign >/dev/null 2>&1; then
++    echo "cosign binary not found in image (required for local verify)" >&2
++    exit 4
++  fi
++  SIG_RAW=$(jq -r '.signature // .data.signature // empty' "$SIGFILE" || true)
++  if [ -n "$SIG_RAW" ]; then
++    echo "$SIG_RAW" | base64 -d > "$TMPDIR/sig.bin" || true
++    cosign verify-blob --key /etc/cosign/pubkey.pem --signature "$TMPDIR/sig.bin" "$ARTFILE"
++  else
++    cosign verify-blob --key /etc/cosign/pubkey.pem --signature "$SIGFILE" "$ARTFILE"
++  fi
++  echo "cosign verify succeeded"
++else
++  # Vault verify fallback
++  if [ -n "${VAULT_ADDR:-}" ] && [ -n "${VAULT_TOKEN:-}" ]; then
++    echo "Using Vault transit verify..."
++    DIGEST_B64=$(openssl dgst -sha256 -binary "$ARTFILE" | base64 -w 0)
++    SIGNATURE=$(jq -r '.signature // .data.signature // empty' "$SIGFILE" || true)
++    if [ -z "$SIGNATURE" ]; then
++      echo "No signature found in sig.json; cannot verify via Vault" >&2
++      exit 5
++    fi
++    VERIFY_JSON=$(curl -sS --header "X-Vault-Token: $VAULT_TOKEN" --request POST \
++      --data "{\"input\":\"${DIGEST_B64}\",\"signature\":\"${SIGNATURE}\"}" "${VAULT_ADDR%/}/v1/transit/verify/aegis-cosign")
++    VALID=$(echo "$VERIFY_JSON" | jq -r '.data.valid // false' || true)
++    if [ "$VALID" != "true" ]; then
++      echo "Vault verify failed: $VERIFY_JSON" >&2
++      exit 6
++    fi
++    echo "Vault transit verify succeeded"
++  else
++    echo "No local pubkey and Vault not available; cannot verify" >&2
++    exit 7
++  fi
++fi
++
++# Optionally, if attestation contains a Rekor UUID, confirm inclusion
++if [ -f "$ATTEST" ]; then
++  REKOR_UUID=$(jq -r '.signing.rekor_uuid // empty' "$ATTEST" || true)
++  if [ -n "$REKOR_UUID" ] && [ -n "${REKOR_URL:-}" ]; then
++    echo "Checking Rekor inclusion for uuid: $REKOR_UUID"
++    curl -sS "${REKOR_URL%/}/api/v1/log/entries/$REKOR_UUID" | jq '.' || true
++    echo "Rekor check attempted (adjust verification as needed)"
++  fi
++fi
++
++mkdir -p "$DEST_DIR"
++echo "Extracting artifact to $DEST_DIR"
++tar -xzf "$ARTFILE" -C "$DEST_DIR"
++echo "Extraction complete"
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/gatekeeper/constraint_aegis_signed_enforce.yaml
++apiVersion: constraints.gatekeeper.sh/v1beta1
++kind: AegisSignedPod
++metadata:
++  name: require-aegis-signed-enforce
++spec:
++  enforcementAction: deny   # Pilot enforcement: will deny admission for non-compliant Pods
++  match:
++    kinds:
++      - apiGroups: [""]
++        kinds: ["Pod"]
++    namespaces:
++      - "aegis-canary"    # start with canary namespace
++  parameters:
++    namespaces:
++      - "aegis-canary"
++
+*** End Patch
+*** Begin Patch
+*** Add File: governance/api.py
++#!/usr/bin/env python3
++"""
++Governance API: list artifacts, show evidence, approve promotion.
++Simple Flask app that talks to S3 (artifact store) and stores approvals in sqlite.
++"""
++from flask import Flask, jsonify, request
++import os, sqlite3, subprocess, json
++import boto3
++
++app = Flask(__name__)
++S3 = boto3.client("s3")
++BUCKET = os.environ.get("OBJECT_STORE_BUCKET")
++DB = os.environ.get("GOV_DB","./governance.db")
++
++def init_db():
++    conn = sqlite3.connect(DB)
++    c = conn.cursor()
++    c.execute("""CREATE TABLE IF NOT EXISTS promotions (id INTEGER PRIMARY KEY, artifact_key TEXT, approver TEXT, notes TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
++    conn.commit(); conn.close()
++
++init_db()
++
++@app.route("/artifacts")
++def list_artifacts():
++    if not BUCKET:
++        return jsonify({"error":"OBJECT_STORE_BUCKET not configured"}), 500
++    prefix = request.args.get("prefix","model-archives/")
++    objs = S3.list_objects_v2(Bucket=BUCKET, Prefix=prefix, MaxKeys=100)
++    items = []
++    for o in objs.get("Contents", []):
++        items.append({"key": o["Key"], "size": o["Size"], "last_modified": o["LastModified"].isoformat()})
++    return jsonify(items)
++
++@app.route("/artifact")
++def artifact_detail():
++    key = request.args.get("key")
++    if not key or not BUCKET:
++        return jsonify({"error":"key and OBJECT_STORE_BUCKET required"}), 400
++    presign = S3.generate_presigned_url("get_object", Params={"Bucket":BUCKET,"Key":key}, ExpiresIn=3600)
++    # attempt to fetch related evidence (sig, attestation, sbom)
++    base = key
++    sig_key = f"{base}.sig.json"
++    attest_key = f"{base}.attestation.json"
++    sbom_key = f"{base}.sbom.json"
++    evidence = {}
++    for k in [sig_key, attest_key, sbom_key]:
++        try:
++            S3.head_object(Bucket=BUCKET, Key=k)
++            evidence[k] = S3.generate_presigned_url("get_object", Params={"Bucket":BUCKET,"Key":k}, ExpiresIn=3600)
++        except Exception:
++            pass
++    return jsonify({"artifact_url": presign, "evidence": evidence})
++
++@app.route("/approve", methods=["POST"])
++def approve():
++    payload = request.json or {}
++    key = payload.get("artifact_key")
++    approver = payload.get("approver","unknown")
++    notes = payload.get("notes","")
++    if not key:
++        return jsonify({"error":"artifact_key required"}), 400
++    conn = sqlite3.connect(DB)
++    c = conn.cursor()
++    c.execute("INSERT INTO promotions (artifact_key, approver, notes) VALUES (?,?,?)", (key, approver, notes))
++    conn.commit()
++    conn.close()
++    # trigger promote workflow (example: kubectl apply or argo workflow submit). Keep simple: log for now.
++    # In production: call Argo Workflows API to start promote workflow with artifact key parameter.
++    return jsonify({"ok": True, "artifact_key": key})
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8080")))
++
+*** End Patch
+*** Begin Patch
+*** Add File: governance/ui/index.html
++<!doctype html>
++<html>
++  <head>
++    <meta charset="utf-8"/>
++    <title>Aegis Governance</title>
++    <style>
++      body { font-family: sans-serif; margin: 20px; }
++      table { border-collapse: collapse; width: 100%; }
++      th, td { border: 1px solid #ddd; padding: 8px; }
++    </style>
++  </head>
++  <body>
++    <h1>Aegis Governance UI (Minimal)</h1>
++    <div>
++      <label>Artifact prefix: <input id="prefix" value="model-archives/"></label>
++      <button onclick="load()">List</button>
++    </div>
++    <div id="list"></div>
++    <script>
++      async function load() {
++        const prefix = document.getElementById('prefix').value;
++        const res = await fetch('/artifacts?prefix=' + encodeURIComponent(prefix));
++        const items = await res.json();
++        const el = document.getElementById('list');
++        el.innerHTML = '';
++        const tbl = document.createElement('table');
++        tbl.innerHTML = '<tr><th>Key</th><th>Size</th><th>Modified</th><th>Action</th></tr>';
++        items.forEach(it => {
++          const row = document.createElement('tr');
++          row.innerHTML = `<td>${it.key}</td><td>${it.size}</td><td>${it.last_modified}</td><td><button onclick="view('${encodeURIComponent(it.key)}')">View</button></td>`;
++          tbl.appendChild(row);
++        });
++        el.appendChild(tbl);
++      }
++      async function view(key) {
++        const res = await fetch('/artifact?key=' + decodeURIComponent(key));
++        const info = await res.json();
++        const w = window.open('', '_blank');
++        w.document.write('<pre>' + JSON.stringify(info, null, 2) + '</pre>');
++      }
++    </script>
++  </body>
++</html>
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/secret_inventory.py
++#!/usr/bin/env python3
++"""
++Secret inventory helper (local tool).
++- Lists GitHub repository secrets (requires GITHUB_TOKEN with repo access)
++- Optionally lists k8s secrets for given namespaces (requires kubectl context)
++
++Usage:
++  python3 scripts/secret_inventory.py --repo owner/repo --namespaces aegis,prod
++"""
++import argparse, os, requests, subprocess, json
++
++def list_github_secrets(repo, token):
++    url = f"https://api.github.com/repos/{repo}/actions/secrets"
++    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
++    r = requests.get(url, headers=headers)
++    r.raise_for_status()
++    return r.json().get("secrets", [])
++
++def list_k8s_secrets(namespace):
++    try:
++        out = subprocess.check_output(["kubectl","get","secrets","-n",namespace,"-o","json"])
++        data = json.loads(out)
++        return [item["metadata"]["name"] for item in data.get("items",[])]
++    except Exception as e:
++        return {"error": str(e)}
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--repo")
++    ap.add_argument("--namespaces", default="")
++    args = ap.parse_args()
++    if args.repo:
++        token = os.environ.get("GITHUB_TOKEN")
++        if not token:
++            print("GITHUB_TOKEN not set")
++        else:
++            secrets = list_github_secrets(args.repo, token)
++            print("GitHub repo secrets:")
++            for s in secrets:
++                print(" -", s["name"])
++    if args.namespaces:
++        for ns in args.namespaces.split(","):
++            print(f"Kubernetes secrets in namespace {ns}:")
++            print(list_k8s_secrets(ns))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File: docs/PROVENANCE.md
++````markdown
++# Aegis Provenance & Attestation (MVP)
++
++This document describes the provenance guarantees produced by the Aegis platform:
++- git commit hash of training code
++- image digest of the training runtime
++- MLflow run_id for experiment tracking
++- SBOM for the builder/runtime environment
++- Vault transit signature and attestation JSON
++- Rekor transparency entry (if configured)
++
++Files & artifacts
++- For each produced artifact (artifact.tar.gz) the packaging step will produce:
++  - artifact.tar.gz
++  - artifact.tar.gz.sig.json        (Vault transit signature response)
++  - artifact.tar.gz.attestation.json (minimal DSSE-like attestation containing provenance)
++  - artifact.tar.gz.sbom.json       (SBOM produced by syft, if available)
++  - artifact.tar.gz.rekor.json      (Rekor response, if REKOR_URL configured)
++
++Recommended verification workflow
++1. CI signs artifact using Vault transit and stores the signature JSON.
++2. A minimal attestation is created that references the artifact digest and provenance metadata.
++3. An inclusion record is posted to Rekor (if available) for long-lived transparency.
++4. At deploy time, initContainer runs verify_and_fetch.sh which:
++   - prefers local cosign public key verification,
++   - falls back to Vault transit verify,
++   - optionally checks Rekor inclusion for the attestation.
++
++Notes
++- Attestation format here is a minimal DSSE/in-toto-like JSON suitable for extension.
++- Rekor integration in this MVP is minimal; for full SLSA compliance use official cosign/rekor client flows.
++````
++
+*** End Patch
+*** Begin Patch
+*** Add File: docs/OPS_OVERVIEW.md
++````markdown
++# Aegis Ops Overview (next steps to reach "fully AI")
++
++This file summarizes immediate operational steps to validate and harden the platform:
++
++1. Run a full staging end-to-end:
++   - Kick off argo/workflows/train_with_provenance.yaml with proper parameters (image-digest, git-commit).
++   - Ensure artifacts and evidence are uploaded to OBJECT_STORE_BUCKET.
++2. Validate sign/attest:
++   - Ensure package_and_attest.sh creates .sig.json, .attestation.json and .sbom.json.
++   - Use governance API to view evidence.
++3. Deploy canary:
++   - Create cosign public key secret in aegis-canary and deploy KServe/Triton with initContainer verify_and_fetch.sh.
++   - Ensure Gatekeeper is set to deny in aegis-canary only.
++4. Schedule weekly sign-verify & pg_restore smoke tests.
++5. Run secret inventory and rotate any suspected exposed keys.
++6. Integrate Rekor properly using cosign + rekor client for production-grade transparency.
++
++Security reminders
++- Do not commit secrets; use Vault / GitHub secrets / IRSA / Workload Identity.
++- Keep Vault policies minimal and token TTLs short.
++````
++
+*** End Patch
+*** Begin Patch
+*** Add File: README_APPLY.md
++````markdown
++# Apply patch: aegis_full_ai.patch
++
++This patch adds provenance, SBOM, Rekor attestation helpers, Gatekeeper enforcement (pilot), governance API/UI, SBOM workflow, and helper scripts for verification and secret inventory.
++
++Precise steps to apply (exact three git commands)
++
++1) Create feature branch:
++   git checkout -b feature/aegis-full-ai
++
++2) Apply the patch and commit:
++   git apply aegis_full_ai.patch && git add -A && git commit -m "Add provenance, SBOM, attestation, Rekor integration, verify initContainer, governance API/UI, secret inventory"
++
++3) Push branch and open PR (using gh CLI):
++   git push -u origin feature/aegis-full-ai && gh pr create --title "Aegis: provenance, attestations, SBOM & governance" --body "Adds end-to-end provenance, SBOM generation, Vault transit attestations, minimal Rekor posting, initContainer verification and Gatekeeper pilot enforcement, a governance API/UI, and secret inventory tooling. Configure secrets: OBJECT_STORE_BUCKET, VAULT_ADDR, VAULT_TOKEN, REKOR_URL, and ensure syft/cosign presence where needed." --base main
++
++Notes:
++- Replace placeholders (REKOR_URL, OBJECT_STORE_BUCKET, VAULT_ADDR, etc.) in CI/k8s secrets before running in production.
++- This patch is intended to be applied on a feature branch and tested in staging.
++````
++
+*** End Patch

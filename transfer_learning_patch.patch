@@ -1,0 +1,502 @@
+*** Begin Patch
+*** Add File:train/transfer_train.py
++#!/usr/bin/env python3
++"""
++Production-grade PyTorch transfer learning script with:
++ - Hugging Face AutoModelForSequenceClassification (text) transfer learning
++ - MLflow logging (params, metrics, artifacts) and model registration
++ - S3 checkpoint upload and cosign signing (KMS)
++ - configurable freeze/unfreeze, basic LoRA/adapter hook (optional)
++
++Usage (example):
++  export MLFLOW_TRACKING_URI="https://mlflow.example.com"
++  export EVIDENCE_BUCKET="aegis-evidence-12345"
++  export COSIGN_KMS_ARN="arn:aws:kms:...:key/..."
++  python train/transfer_train.py \
++    --base-model "distilbert-base-uncased" \
++    --dataset-s3 "s3://my-bucket/datasets/text_train.csv" \
++    --task-name "sentiment" \
++    --epochs 3 \
++    --batch-size 16 \
++    --register-name "aegis-sentiment"
++
++Notes:
++ - Training uses Hugging Face Trainer for simplicity. For large-scale jobs you can replace with DeepSpeed/torchrun.
++ - Requires boto3, transformers, datasets, mlflow, torch.
++"""
++import os
++import argparse
++import tempfile
++import time
++import tarfile
++import subprocess
++import json
++
++import boto3
++import pandas as pd
++import torch
++from datasets import load_dataset, Dataset
++from transformers import (
++    AutoTokenizer,
++    AutoModelForSequenceClassification,
++    TrainingArguments,
++    Trainer,
++)
++import mlflow
++import mlflow.pytorch
++
++def download_s3(s3uri):
++    parts = s3uri[5:].split("/", 1)
++    bucket, key = parts[0], parts[1]
++    s3 = boto3.client("s3")
++    tmp = tempfile.mktemp(suffix=os.path.basename(key))
++    s3.download_file(bucket, key, tmp)
++    return tmp
++
++def load_csv_dataset(path_or_s3):
++    if path_or_s3.startswith("s3://"):
++        local = download_s3(path_or_s3)
++    else:
++        local = path_or_s3
++    df = pd.read_csv(local)
++    # expect columns: text, label
++    if "text" not in df.columns or "label" not in df.columns:
++        raise RuntimeError("Dataset must contain 'text' and 'label' columns")
++    return Dataset.from_pandas(df)
++
++def create_tokenized(ds, tokenizer, max_length=256):
++    def preprocess(example):
++        return tokenizer(example["text"], truncation=True, padding="max_length", max_length=max_length)
++    return ds.map(preprocess, batched=False)
++
++def freeze_backbone(model):
++    for name, param in model.named_parameters():
++        if "classifier" not in name and "pooler" not in name:
++            param.requires_grad = False
++
++def tar_dir(src_dir, out_path):
++    with tarfile.open(out_path, "w:gz") as tar:
++        tar.add(src_dir, arcname=os.path.basename(src_dir))
++
++def cosign_sign(local_file, kms_arn):
++    # requires cosign binary in PATH and appropriate AWS auth/IRSA
++    try:
++        subprocess.check_call(["cosign", "sign", "--key", kms_arn, local_file])
++        sig = local_file + ".sig"
++        if os.path.exists(sig):
++            return sig
++    except subprocess.CalledProcessError as e:
++        print("cosign sign failed:", e)
++    return None
++
++def upload_to_s3(local_path, s3_prefix):
++    parts = s3_prefix[5:].split("/", 1)
++    bucket, prefix = parts[0], parts[1] if len(parts) > 1 else ""
++    key = f"{prefix.rstrip('/')}/{os.path.basename(local_path)}"
++    s3 = boto3.client("s3")
++    s3.upload_file(local_path, bucket, key)
++    return f"s3://{bucket}/{key}"
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--base-model", required=True, help="HuggingFace model id (or local path)")
++    parser.add_argument("--dataset-s3", required=True, help="S3 path to CSV with text,label")
++    parser.add_argument("--task-name", required=True)
++    parser.add_argument("--epochs", type=int, default=3)
++    parser.add_argument("--batch-size", type=int, default=16)
++    parser.add_argument("--lr", type=float, default=2e-5)
++    parser.add_argument("--freeze-backbone", action="store_true")
++    parser.add_argument("--use-lora", action="store_true", help="If True and PEFT installed, enable LoRA adapters")
++    parser.add_argument("--output-dir", default="/tmp/model_out")
++    parser.add_argument("--evidence-bucket", default=os.environ.get("EVIDENCE_BUCKET"))
++    parser.add_argument("--cosign-kms-arn", default=os.environ.get("COSIGN_KMS_ARN"))
++    parser.add_argument("--mlflow-tracking-uri", default=os.environ.get("MLFLOW_TRACKING_URI"))
++    parser.add_argument("--register-name", required=True, help="Model registry name to register final model")
++    args = parser.parse_args()
++
++    if args.mlflow_tracking_uri:
++        mlflow.set_tracking_uri(args.mlflow_tracking_uri)
++
++    # Load dataset
++    ds = load_csv_dataset(args.dataset_s3)
++    # split
++    ds = ds.train_test_split(test_size=0.1)
++    train_ds = ds["train"]
++    val_ds = ds["test"]
++
++    # Tokenizer & model
++    tokenizer = AutoTokenizer.from_pretrained(args.base_model)
++    model = AutoModelForSequenceClassification.from_pretrained(args.base_model, num_labels=len(set(train_ds["label"])))
++
++    if args.freeze_backbone:
++        print("Freezing backbone parameters...")
++        freeze_backbone(model)
++
++    # Optional LoRA/adapter hook
++    if args.use_lora:
++        try:
++            from peft import get_peft_model, LoraConfig, TaskType
++            print("Applying LoRA adapters (peft)...")
++            lora_config = LoraConfig(
++                task_type=TaskType.SEQ_CLS,
++                inference_mode=False,
++                r=8,
++                lora_alpha=32,
++                lora_dropout=0.1,
++            )
++            model = get_peft_model(model, lora_config)
++        except Exception:
++            print("PEFT/LoRA not available; continuing without adapters.")
++
++    tokenized_train = create_tokenized(train_ds, tokenizer)
++    tokenized_val = create_tokenized(val_ds, tokenizer)
++
++    training_args = TrainingArguments(
++        output_dir=args.output_dir,
++        num_train_epochs=args.epochs,
++        per_device_train_batch_size=args.batch_size,
++        per_device_eval_batch_size=args.batch_size,
++        evaluation_strategy="epoch",
++        save_strategy="no",
++        logging_strategy="epoch",
++        learning_rate=args.lr,
++        fp16=torch.cuda.is_available(),
++        load_best_model_at_end=False,
++    )
++
++    def compute_metrics(p):
++        preds = p.predictions.argmax(-1)
++        labels = p.label_ids
++        acc = (preds == labels).mean()
++        return {"accuracy": acc}
++
++    trainer = Trainer(
++        model=model,
++        args=training_args,
++        train_dataset=tokenized_train,
++        eval_dataset=tokenized_val,
++        tokenizer=tokenizer,
++        compute_metrics=compute_metrics,
++    )
++
++    # Run training inside MLflow run
++    with mlflow.start_run() as run:
++        run_id = run.info.run_id
++        print("Started MLflow run:", run_id)
++        mlflow.log_param("base_model", args.base_model)
++        mlflow.log_param("freeze_backbone", args.freeze_backbone)
++        mlflow.log_param("use_lora", args.use_lora)
++        mlflow.log_param("task", args.task_name)
++        # Train
++        trainer.train()
++        eval_res = trainer.evaluate()
++        mlflow.log_metrics({k: float(v) for k, v in eval_res.items()})
++
++        # Save model & tokenizer locally
++        model_dir = os.path.join(args.output_dir, f"run-{run_id}")
++        os.makedirs(model_dir, exist_ok=True)
++        model.save_pretrained(model_dir)
++        tokenizer.save_pretrained(model_dir)
++
++        # Archive checkpoint
++        archive = tempfile.mktemp(suffix=".tgz")
++        tar_dir(model_dir, archive)
++
++        # Sign locally with cosign (KMS) if available
++        sig = None
++        if args.cosign_kms_arn:
++            print("Signing checkpoint locally with cosign KMS...")
++            sig = cosign_sign(archive, args.cosign_kms_arn)
++        else:
++            print("COSIGN_KMS_ARN not provided; skipping sign.")
++
++        # Upload archive and signature to S3 evidence bucket
++        if not args.evidence_bucket:
++            raise RuntimeError("EVIDENCE_BUCKET is required to upload artifacts")
++        s3_prefix = f"s3://{args.evidence_bucket}/checkpoints/{args.register_name}/{run_id}"
++        archive_s3 = upload_to_s3(archive, s3_prefix)
++        if sig and os.path.exists(sig):
++            sig_s3 = upload_to_s3(sig, s3_prefix)
++        else:
++            sig_s3 = None
++
++        mlflow.log_artifact(archive, artifact_path="checkpoint")
++        if sig:
++            mlflow.log_artifact(sig, artifact_path="checkpoint")
++
++        # Log checkpoint uri and signature as run tags
++        mlflow.set_tag("checkpoint_s3", archive_s3)
++        if sig_s3:
++            mlflow.set_tag("checkpoint_signature_s3", sig_s3)
++
++        # Log model via mlflow.pytorch and register
++        try:
++            mlflow.pytorch.log_model(model, artifact_path="model")
++            model_uri = f"runs:/{run_id}/model"
++            print("Registering model to MLflow Model Registry as", args.register_name)
++            result = mlflow.register_model(model_uri, args.register_name)
++            mlflow.set_tag("model_registry_name", args.register_name)
++        except Exception as e:
++            print("mlflow model log/register failed:", e)
++
++        print("Training run complete. run_id:", run_id)
++        print("Checkpoint uploaded to:", archive_s3)
++        if sig_s3:
++            print("Signature uploaded to:", sig_s3)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:argo/transfer_finetune_workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: transfer-finetune-
++  namespace: aegis
++spec:
++  entrypoint: finetune
++  arguments:
++    parameters:
++      - name: base_model
++        value: "distilbert-base-uncased"
++      - name: dataset_s3
++        value: "s3://REPLACE_EVIDENCE_BUCKET/datasets/sentiment/train.csv"
++      - name: task_name
++        value: "sentiment"
++      - name: register_name
++        value: "aegis-sentiment"
++      - name: epochs
++        value: "3"
++      - name: batch_size
++        value: "16"
++      - name: ds_gpus
++        value: "1"
++
++  templates:
++  - name: finetune
++    steps:
++      - - name: run-finetune
++          template: finetune-task
++          arguments:
++            parameters:
++              - name: base_model
++                value: "{{workflow.parameters.base_model}}"
++              - name: dataset_s3
++                value: "{{workflow.parameters.dataset_s3}}"
++              - name: task_name
++                value: "{{workflow.parameters.task_name}}"
++              - name: register_name
++                value: "{{workflow.parameters.register_name}}"
++              - name: epochs
++                value: "{{workflow.parameters.epochs}}"
++              - name: batch_size
++                value: "{{workflow.parameters.batch_size}}"
++              - name: ds_gpus
++                value: "{{workflow.parameters.ds_gpus}}"
++
++  - name: finetune-task
++    inputs:
++      parameters:
++        - name: base_model
++        - name: dataset_s3
++        - name: task_name
++        - name: register_name
++        - name: epochs
++        - name: batch_size
++        - name: ds_gpus
++    container:
++      image: "{{IMAGE_REGISTRY}}/aegis-train:latest"
++      command: ["/bin/bash","-lc"]
++      args:
++        - |
++          set -euo pipefail
++          echo "Starting transfer learning job"
++          python train/transfer_train.py \
++            --base-model "{{inputs.parameters.base_model}}" \
++            --dataset-s3 "{{inputs.parameters.dataset_s3}}" \
++            --task-name "{{inputs.parameters.task_name}}" \
++            --epochs "{{inputs.parameters.epochs}}" \
++            --batch-size "{{inputs.parameters.batch_size}}" \
++            --output-dir /tmp/model_out \
++            --register-name "{{inputs.parameters.register_name}}"
++      resources:
++        limits:
++          nvidia.com/gpu: "{{inputs.parameters.ds_gpus}}"
++          cpu: "8000m"
++          memory: "32Gi"
++        requests:
++          nvidia.com/gpu: "{{inputs.parameters.ds_gpus}}"
++          cpu: "2000m"
++          memory: "16Gi"
++
++  # NOTE: Replace placeholders via `argo submit --parameter IMAGE_REGISTRY=ghcr.io/yourorg --parameter EVIDENCE_BUCKET=...`
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/kserve/transfer_inferenceservice.yaml
++apiVersion: "serving.kserve.io/v1beta1"
++kind: "InferenceService"
++metadata:
++  name: "aegis-transfer-sentiment"
++  namespace: "aegis"
++spec:
++  predictor:
++    minReplicas: 1
++    maxReplicas: 3
++    serviceAccountName: "model-server-sa"
++    # Use a custom container that loads an MLflow-registered model and serves via FastAPI or MLServer.
++    # Replace image with your production serving image that knows how to load MLflow models from Model Registry.
++    custom:
++      container:
++        image: "{{IMAGE_REGISTRY}}/aegis-serve:latest"
++        name: model-server
++        env:
++          - name: MLFLOW_TRACKING_URI
++            value: "{{MLFLOW_TRACKING_URI}}"
++          - name: MODEL_NAME
++            value: "aegis-sentiment"
++          - name: MODEL_STAGE
++            value: "Staging"
++          - name: MCPX_LOGGER_URL
++            value: "http://mcpx-logger.aegis.svc.cluster.local:8080/log"
++        resources:
++          limits:
++            nvidia.com/gpu: "0"   # set 1 if serving on GPU
++            cpu: "1000m"
++            memory: "2Gi"
++          requests:
++            cpu: "500m"
++            memory: "1Gi"
++    logger:
++      mode: "all"
++      url: "http://mcpx-logger.aegis.svc.cluster.local:8080/log"
++  transformer:
++    containers:
++      - image: "{{IMAGE_REGISTRY}}/aegis-transformer:latest"
++        name: transformer
++        env:
++          - name: MCPX_AUTH_TOKEN
++            valueFrom:
++              secretKeyRef:
++                name: mcpx-auth
++                key: token
++
++annotations:
++  serving.kserve.io/ingress-class: "istio"
++
++# Notes:
++# - Implement ghcr.io/yourorg/aegis-serve:latest image to load an MLflow model by name/stage and expose REST v1 endpoints.
++# - Alternatively use mlserver-mlflow and adapt storageUri to the MLflow model URI.
++
+*** End Patch
+*** Begin Patch
+*** Add File:explainability/generate_model_card.py
++#!/usr/bin/env python3
++"""
++Generate a simple model_card.md for a trained run_id.
++Usage: MODEL_RUN_ID=<run_id> MLFLOW_TRACKING_URI=... python explainability/generate_model_card.py
++"""
++import os, sys, json
++import mlflow
++
++RUN_ID = os.environ.get("MODEL_RUN_ID")
++MLFLOW = os.environ.get("MLFLOW_TRACKING_URI")
++OUT_DIR = "/tmp/explain"
++os.makedirs(OUT_DIR, exist_ok=True)
++
++if not RUN_ID or not MLFLOW:
++    print("MODEL_RUN_ID and MLFLOW_TRACKING_URI must be set", file=sys.stderr)
++    sys.exit(2)
++
++mlflow.set_tracking_uri(MLFLOW)
++client = mlflow.tracking.MlflowClient()
++run = client.get_run(RUN_ID)
++params = run.data.params
++metrics = run.data.metrics
++tags = run.data.tags
++
++md = f"# Model Card for run {RUN_ID}\n\n"
++md += "## Parameters\n\n"
++for k,v in params.items():
++    md += f"- **{k}**: {v}\n"
++md += "\n## Metrics\n\n"
++for k,v in metrics.items():
++    md += f"- **{k}**: {v}\n"
++md += "\n## Tags\n\n"
++for k,v in tags.items():
++    md += f"- **{k}**: {v}\n"
++md += "\n## Sample Predictions\n\n"
++md += "Run the model on a few sample inputs and record outputs in future iterations.\n"
++
++path = os.path.join(OUT_DIR, "model_card.md")
++with open(path, "w") as f:
++    f.write(md)
++print("Wrote model_card to", path)
++mlflow.log_artifact(path, artifact_path="model_card")
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/transfer_smoke_test.yml
++name: Transfer Learning Smoke Test & Model Card
++
++on:
++  workflow_dispatch:
++
++permissions:
++  contents: write
++
++jobs:
++  smoke-finetune:
++    runs-on: ubuntu-latest
++    env:
++      MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
++      EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++      COSIGN_KMS_ARN: ${{ secrets.COSIGN_KMS_ARN }}
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.10'
++      - name: Install deps
++        run: |
++          python -m pip install --upgrade pip
++          pip install torch transformers datasets mlflow boto3 peft
++      - name: Prepare small sample dataset
++        run: |
++          mkdir -p data && cat > data/sample.csv <<CSV
++text,label
++"I loved the movie",1
++"Terrible experience",0
++CSV
++          aws s3 cp data/sample.csv s3://${{ secrets.EVIDENCE_BUCKET }}/datasets/smoke/sample.csv
++      - name: Run smoke transfer training
++        run: |
++          python train/transfer_train.py \
++            --base-model "distilbert-base-uncased" \
++            --dataset-s3 "s3://${{ secrets.EVIDENCE_BUCKET }}/datasets/smoke/sample.csv" \
++            --task-name "smoke-sentiment" \
++            --epochs 1 \
++            --batch-size 8 \
++            --register-name "aegis-smoke-sentiment" \
++            --output-dir /tmp/smoke_out
++      - name: Capture MLflow run id from artifacts (best-effort)
++        run: |
++          # find run id from mlflow artifacts uploaded in previous step (if available)
++          echo "Looking for run metadata in /tmp/smoke_out or in mlflow server"
++      - name: Generate model_card
++        env:
++          MODEL_RUN_ID: ${{.steps.smoke_finetune.outputs.run_id || ''}}
++          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
++        run: |
++          python explainability/generate_model_card.py || true
++      - name: Upload model_card artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: model-card
++          path: /tmp/explain/model_card.md
++
+*** End Patch
+*** End Patch

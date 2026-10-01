@@ -1,0 +1,613 @@
+*** Begin Patch
+*** Add File:quantum/hsm/vendor_provisioning_runbook.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Vendor HSM provisioning & live validation orchestrator
++# This script coordinates:
++#  - optional Terraform provisioning (CloudHSM)
++#  - PKCS#11 module installation on signing hosts
++#  - publish HSM config & public keys to Vault
++#  - run validation and rotation tests
++#  - verify audit forwarding to S3 and optionally forward a sample to a SIEM endpoint
++#
++# Usage:
++#   ./vendor_provisioning_runbook.sh \
++#     --hsm-tfvars ./cloud/hsm/terraform.tfvars \
++#     --pkcs11-module /opt/vendor/lib/vendor_pkcs11.so \
++#     --pkcs11-slot 0 \
++#     --pkcs11-pin 1234 \
++#     --key-label pqkey \
++#     --vault-path secret/data/hsm/config \
++#     --s3-audit-bucket my-hsm-audit-bucket \
++#     --siem-endpoint https://siem.example.com/ingest
++#
++TFVARS=""
++PKCS11_MODULE=""
++PKCS11_SLOT=""
++PKCS11_PIN=""
++KEY_LABEL=""
++VAULT_PATH=""
++S3_AUDIT_BUCKET=""
++SIEM_ENDPOINT=""
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --hsm-tfvars) TFVARS="$2"; shift 2;;
++    --pkcs11-module) PKCS11_MODULE="$2"; shift 2;;
++    --pkcs11-slot) PKCS11_SLOT="$2"; shift 2;;
++    --pkcs11-pin) PKCS11_PIN="$2"; shift 2;;
++    --key-label) KEY_LABEL="$2"; shift 2;;
++    --vault-path) VAULT_PATH="$2"; shift 2;;
++    --s3-audit-bucket) S3_AUDIT_BUCKET="$2"; shift 2;;
++    --siem-endpoint) SIEM_ENDPOINT="$2"; shift 2;;
++    *) echo "Unknown $1"; exit 1;;
++  esac
++done
++
++check_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "missing $1"; exit 2; } }
++
++echo "[1/8] Preconditions: checking required CLIs..."
++for c in terraform aws vault jq curl; do check_cmd "$c"; done
++
++if [ -n "${TFVARS}" ]; then
++  echo "[2/8] Provisioning CloudHSM via Terraform (cloud/hsm)..."
++  pushd cloud/hsm >/dev/null
++  terraform init -input=false
++  terraform apply -input=false -auto-approve -var-file="${TFVARS}"
++  popd >/dev/null
++fi
++
++echo "[3/8] Installing vendor PKCS#11 module & audit forwarders on signing hosts..."
++if [ -n "${PKCS11_MODULE}" ]; then
++  sudo bash quantum/hsm/vendor_integration/install_vendor_pkcs11.sh --module "${PKCS11_MODULE}" --s3-audit-bucket "${S3_AUDIT_BUCKET:-}" --siem-endpoint "${SIEM_ENDPOINT:-}"
++else
++  echo "No --pkcs11-module given; ensure PKCS#11 module is installed manually."
++fi
++
++echo "[4/8] Publishing HSM config / public key to Vault..."
++if [ -n "${VAULT_PATH}" ]; then
++  if [ -n "${PKCS11_MODULE}" ]; then
++    vault kv put "${VAULT_PATH}" pkcs11_module="${PKCS11_MODULE}" slot="${PKCS11_SLOT:-}" token_label="aegis-token" || true
++  fi
++  if [ -f "/tmp/${KEY_LABEL:-pqkey}.pub" ]; then
++    vault kv put "${VAULT_PATH}" public_key=@"/tmp/${KEY_LABEL}.pub" || true
++  else
++    echo "Public key not found at /tmp/${KEY_LABEL}.pub — ensure vendor CLI exported it and re-run."
++  fi
++else
++  echo "No vault-path given; please run quantum/vault/write_hsm_config_and_pubkey.sh manually."
++fi
++
++echo "[5/8] Running HSM end-to-end validation..."
++ART="/tmp/aegis_hsm_test.bin"
++echo "aegis hsm test" > "${ART}"
++bash quantum/hsm/validate_hsm_end_to_end.sh --artifact "${ART}" --pkcs11-lib "${PKCS11_MODULE}" --pkcs11-slot "${PKCS11_SLOT:-0}" --pkcs11-pin "${PKCS11_PIN:-}" --pkcs11-keylabel "${KEY_LABEL:-pqkey}" --s3-bucket "${S3_AUDIT_BUCKET:-}" || echo "HSM validation script returned non-zero; inspect logs"
++
++echo "[6/8] Running rotation test (requires vendor create-key step done manually)..."
++echo "Operator: use vendor CLI to create new key label '${KEY_LABEL}-v2' and export public key to /tmp/${KEY_LABEL}-v2.pub"
++read -p "Press Enter once new key exists to continue rotation test (or Ctrl-C to skip)..." || true
++if [ -f "/tmp/${KEY_LABEL}-v2.pub" ]; then
++  bash quantum/hsm/vendor_rotation_test.sh --vault-path "${VAULT_PATH:-secret/data/hsm/config}" --new-label "${KEY_LABEL}-v2" --pubkey "/tmp/${KEY_LABEL}-v2.pub" --pkcs11-lib "${PKCS11_MODULE}" --slot "${PKCS11_SLOT:-0}" --pin "${PKCS11_PIN:-}" --artifact "${ART}" --s3-bucket "${S3_AUDIT_BUCKET:-}" || echo "Rotation test encountered issues"
++else
++  echo "Rotation public key not found; skipping rotation test."
++fi
++
++echo "[7/8] Verify S3 audit objects and optionally forward to SIEM..."
++if [ -n "${S3_AUDIT_BUCKET}" ]; then
++  python3 quantum/hsm/vendor_validation/verify_hsm_audit.py --s3-bucket "${S3_AUDIT_BUCKET}" --prefix hsm-audit/ --timeout 300 || echo "No audit objects found in S3 within timeout"
++  if [ -n "${SIEM_ENDPOINT}" ]; then
++    python3 quantum/hsm/verify_audit_to_siem.py --s3-bucket "${S3_AUDIT_BUCKET}" --prefix hsm-audit/ --timeout 60 --siem-endpoint "${SIEM_ENDPOINT}"
++  fi
++fi
++
++echo "[8/8] Done. Collect artifacts: hybrid-signature.json, rekor outputs, and S3 audit logs for auditor evidence."
++
+*** End Patch
+*** Begin Patch
+*** Add File:quantum/pilot/credentialed_pilot_runner.py
++#!/usr/bin/env python3
++"""
++Credentialed pilot runner:
++ - Writes provider credentials to Vault (KV v2)
++ - Runs Braket and IBM pilots via existing orchestrator
++ - Polls results, captures backend calibration/noise and raw shots to S3
++ - Runs simulator playback and generates a short verification report (JSON)
++
++Usage:
++  python3 credentialed_pilot_runner.py --vault-path secret/data/quantum/providers --braket-device <arn> --ibm-token <token> --program demo.qasm --s3-bucket my-bucket --mlflow-url http://mlflow:5000
++"""
++import argparse, os, subprocess, time, json
++import hvac, boto3
++
++def write_secret(vault_path, data):
++    client = hvac.Client(url=os.environ.get("VAULT_ADDR"), token=os.environ.get("VAULT_TOKEN"))
++    client.secrets.kv.v2.create_or_update_secret(path=vault_path, secret=data)
++    return True
++
++def run_orchestrator(provider, vault_path, program, s3_bucket, backend=None):
++    cmd = ["python3","providers/pilot/orchestrator.py","--provider", provider, "--vault-path", vault_path, "--program", program, "--s3-bucket", s3_bucket]
++    if backend:
++        cmd += ["--backend", backend]
++    print("Running:", " ".join(cmd))
++    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
++    out, _ = proc.communicate()
++    return proc.returncode, out
++
++def collect_s3_prefix(s3_bucket, prefix, outdir):
++    s3 = boto3.client("s3")
++    os.makedirs(outdir, exist_ok=True)
++    resp = s3.list_objects_v2(Bucket=s3_bucket, Prefix=prefix)
++    for o in resp.get("Contents", []):
++        key = o["Key"]
++        local = os.path.join(outdir, os.path.basename(key))
++        s3.download_file(s3_bucket, key, local)
++    return outdir
++
++def run_playback(qasm, noise_json):
++    cmd = ["python3","repro/simulator_playback.py","--qasm", qasm, "--noise", noise_json]
++    proc = subprocess.run(cmd, capture_output=True, text=True)
++    return proc.returncode, proc.stdout, proc.stderr
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--vault-path", required=True)
++    p.add_argument("--braket-device", default=None)
++    p.add_argument("--ibm-token", default=None)
++    p.add_argument("--program", required=True)
++    p.add_argument("--s3-bucket", required=True)
++    p.add_argument("--mlflow-url", required=False)
++    args = p.parse_args()
++
++    report = {"runs": []}
++
++    if args.braket_device:
++        print("Writing braket_device to Vault...")
++        write_secret(args.vault_path, {"braket_device": args.braket_device})
++        rc, out = run_orchestrator("braket", args.vault_path, args.program, args.s3_bucket)
++        report["runs"].append({"provider":"braket","rc": rc, "output": out})
++
++    if args.ibm_token:
++        print("Writing IBM token to Vault...")
++        write_secret(args.vault_path, {"ibm_token": args.ibm_token})
++        rc, out = run_orchestrator("ibm", args.vault_path, args.program, args.s3_bucket, backend=None)
++        report["runs"].append({"provider":"ibm","rc": rc, "output": out})
++
++    # short wait for outputs to land
++    print("Waiting for S3 artifacts...")
++    time.sleep(20)
++    # gather any meta/noise artifacts and attempt playback
++    for r in report["runs"]:
++        if r["rc"] != 0:
++            continue
++        # heuristic: look for prefixes in s3 bucket with "braket/results" or "ibm"
++        if r["provider"] == "braket":
++            prefix = "braket/results/"
++        else:
++            prefix = "ibm/results/"
++        outdir = collect_s3_prefix(args.s3_bucket, prefix, "/tmp/aegis_pilot_artifacts")
++        # pick a noise file
++        for f in os.listdir(outdir):
++            if "noise" in f or "meta" in f:
++                noise = os.path.join(outdir, f)
++                print("Attempting playback with noise:", noise)
++                rc, sout, serr = run_playback(args.program, noise)
++                r["playback"] = {"rc": rc, "stdout": sout, "stderr": serr}
++                break
++
++    # write report
++    rpt = "/tmp/pilot_run_report.json"
++    open(rpt,"w").write(json.dumps(report, indent=2))
++    print("Report written to", rpt)
++    print(json.dumps(report, indent=2))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:feature_store/deploy_feast_prod.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Simple productionized Feast deploy helper using Helm charts (Bitnami Redis + Postgres)
++# NOTE: customize values for your cloud/cluster and use K8s secrets or ExternalSecrets for credentials.
++RELEASE_PREFIX=${1:-aegis-feast}
++NS=${2:-feast}
++
++echo "Creating namespace ${NS}..."
++kubectl create ns "${NS}" --dry-run=client -o yaml | kubectl apply -f -
++
++echo "Installing Postgres (Bitnami) and Redis (Bitnami) via Helm..."
++helm repo add bitnami https://charts.bitnami.com/bitnami || true
++helm upgrade --install "${RELEASE_PREFIX}-postgres" bitnami/postgresql -n "${NS}" --set global.postgresql.postgresqlDatabase=feast,global.postgresql.postgresqlUsername=feast,global.postgresql.postgresqlPassword=feastpass
++helm upgrade --install "${RELEASE_PREFIX}-redis" bitnami/redis -n "${NS}" --set usePassword=false
++
++echo "Deploy Feast SDK workers/CRDs as required; operator should configure external secrets to provide DB connection."
++echo "To ingest features locally, use feature_store/ingest/ingest_pipeline.py"
++
+*** End Patch
+*** Begin Patch
+*** Add File:feature_store/ingest/ingest_pipeline.py
++#!/usr/bin/env python3
++"""
++Fabricated example of a production-capable feature ingestion pipeline:
++ - reads CSV input (batch)
++ - writes to offline store (Postgres) and populates online store (Redis) via Feast SDK
++ - logs feature version to MLflow for lineage
++"""
++import os, pandas as pd, mlflow, time
++from feast import FeatureStore, Entity, FeatureView, FileSource, ValueType, Feature
++
++def ingest(csv_path, repo_path="../feast", feature_view_name="user_features"):
++    store = FeatureStore(repo_path=repo_path)
++    df = pd.read_csv(csv_path)
++    # time_col must be present
++    if "event_timestamp" not in df.columns:
++        df["event_timestamp"] = pd.Timestamp.now()
++    # write offline store (feast recognizes file sources)
++    src = FileSource(path=csv_path, timestamp_field="event_timestamp")
++    # In production, create persistent offline store (BigQuery/S3) and use ingestion jobs (Airflow/Kubernetes Job)
++    # Here we simply log and upload for demonstration
++    # Record version in MLflow
++    mlflow.set_experiment("feature-ingestion")
++    with mlflow.start_run():
++        mlflow.log_param("feature_view", feature_view_name)
++        mlflow.log_artifact(csv_path, artifact_path="ingest")
++        mlflow.set_tag("feast_repo", repo_path)
++    print("Ingest complete. Register FeatureView in Feast (manual step) and use store.apply() if schema changed.")
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--csv", required=True)
++    args = p.parse_args()
++    ingest(args.csv)
++
+*** End Patch
+*** Begin Patch
+*** Add File:serving/ci/ci_build_and_canary.yml
++name: Build Model Image & Canary Deploy
++on:
++  workflow_dispatch:
++    inputs:
++      image_tag:
++        description: 'Image tag to build'
++        required: true
++jobs:
++  build:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up QEMU and Docker buildx
++        uses: docker/setup-buildx-action@v2
++      - name: Build and push image
++        uses: docker/build-push-action@v4
++        with:
++          push: true
++          tags: ${{ secrets.REGISTRY }}/aegis-model:${{ github.event.inputs.image_tag }}
++      - name: Deploy canary to Seldon (kubectl)
++        env:
++          KUBECONFIG: ${{ secrets.KUBECONFIG }}
++        run: |
++          kubectl -n aegis set image deployment/aegis-model aegis-model=${{ secrets.REGISTRY }}/aegis-model:${{ github.event.inputs.image_tag }}
++          # scale up small canary
++          kubectl -n aegis scale deployment/aegis-model --replicas=2
++          sleep 30
++          kubectl -n aegis rollout status deployment/aegis-model --timeout=120s
++
+*** End Patch
+*** Begin Patch
+*** Add File:agent/argo/workflow_with_approval.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: aegis-approval-
++spec:
++  entrypoint: pipeline-with-approval
++  templates:
++  - name: pipeline-with-approval
++    steps:
++      - - name: plan
++          template: run-script
++          arguments:
++            parameters:
++              - name: script
++                value: "echo 'Plan created'; sleep 1"
++      - - name: wait-for-approval
++          template: approval
++      - - name: execute
++          template: run-script
++          arguments:
++            parameters:
++              - name: script
++                value: "python3 agent/celery/tasks.py && echo 'Execution step complete'"
++
++  - name: run-script
++    inputs:
++      parameters:
++        - name: script
++    container:
++      image: alpine:3.17
++      command: [sh, -c]
++      args: ["{{inputs.parameters.script}}"]
++
++  - name: approval
++    suspend: {}
++
++  arguments:
++    parameters: []
++
+*** End Patch
+*** Begin Patch
+*** Add File:agent/celery/approval_store.py
++"""
++Lightweight approval store for Celery/agent flows.
++In production replace with a proper DB or use Argo's approvals + RBAC.
++"""
++import redis, os, json
++
++REDIS_URL = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
++r = redis.from_url(REDIS_URL)
++
++def set_approval(plan_id, approver, approved=True):
++    key = f"aegis:approvals:{plan_id}"
++    r.set(key, json.dumps({"approver": approver, "approved": approved, "ts": int(time.time())}))
++    return True
++
++def check_approval(plan_id):
++    key = f"aegis:approvals:{plan_id}"
++    v = r.get(key)
++    if not v:
++        return False
++    d = json.loads(v)
++    return d.get("approved", False)
++
+*** End Patch
+*** Begin Patch
+*** Add File:agent/celery/tasks.py
+*** End Patch
+*** Begin Patch
+*** Update File:agent/celery/tasks.py
+@@
+ from celery import Celery
+ import subprocess, os, json
+-
+-CELERY_BROKER = os.environ.get("CELERY_BROKER_URL", "redis://redis:6379/0")
+-app = Celery("aegis", broker=CELERY_BROKER, backend=os.environ.get("CELERY_RESULT_BACKEND"))
++CELERY_BROKER = os.environ.get("CELERY_BROKER_URL", "redis://redis:6379/0")
++app = Celery("aegis", broker=CELERY_BROKER, backend=os.environ.get("CELERY_RESULT_BACKEND"))
++from agent.celery.approval_store import check_approval
+@@
+ @app.task(bind=True, max_retries=3, default_retry_delay=10)
+ def run_braket_pilot(self, vault_path, program, s3_bucket, plan_id=None):
+     try:
+-        cmd = ["python3", "providers/pilot/orchestrator.py", "--provider", "braket", "--vault-path", vault_path, "--program", program, "--s3-bucket", s3_bucket]
+-        subprocess.check_call(cmd)
+-        return {"status": "submitted"}
++        # ensure approval if plan_id provided
++        if plan_id:
++            approved = check_approval(plan_id)
++            if not approved:
++                raise RuntimeError("Plan not approved")
++        cmd = ["python3", "providers/pilot/orchestrator.py", "--provider", "braket", "--vault-path", vault_path, "--program", program, "--s3-bucket", s3_bucket]
++        subprocess.check_call(cmd)
++        return {"status": "submitted"}
+     except Exception as e:
+         raise self.retry(exc=e)
+*** End Patch
+*** Begin Patch
+*** Add File:compliance/generate_evidence_bundle.py
++#!/usr/bin/env python3
++"""
++Collect deterministic evidence for auditors:
++ - Rekor entries for artifacts (via rekor-cli)
++ - MLflow run metadata for experiment quantum-pilots
++ - HSM audit S3 objects
++ - Broker logs
++ Packages everything to a tar.gz for handoff to legal/auditor.
++"""
++import os, subprocess, json, tempfile, shutil
++import boto3
++
++OUTDIR = os.environ.get("EVIDENCE_OUT","/tmp/aegis_evidence")
++MLFLOW_URL = os.environ.get("MLFLOW_URL")
++HSM_AUDIT_BUCKET = os.environ.get("HSM_AUDIT_BUCKET")
++
++def collect_rekor_for_artifact(sha256):
++    try:
++        out = subprocess.check_output(["rekor-cli","search","--hash","sha256:"+sha256,"--output","json"])
++        return out.decode()
++    except Exception:
++        return None
++
++def collect_mlflow_runs(experiment="quantum-pilots", out=OUTDIR):
++    if not MLFLOW_URL:
++        return
++    try:
++        import mlflow
++        mlflow.set_tracking_uri(MLFLOW_URL)
++        client = mlflow.tracking.MlflowClient()
++        exp = client.get_experiment_by_name(experiment)
++        if not exp:
++            return
++        runs = client.search_runs([exp.experiment_id], max_results=50)
++        os.makedirs(out, exist_ok=True)
++        for r in runs:
++            rid = r.info.run_id
++            client.download_artifacts(rid, "", os.path.join(out, "mlflow", rid))
++    except Exception as e:
++        print("mlflow collect:", e)
++
++def collect_hsm_audit(out=OUTDIR):
++    if not HSM_AUDIT_BUCKET:
++        return
++    s3 = boto3.client("s3")
++    os.makedirs(out, exist_ok=True)
++    tmp = os.path.join(out, "hsm_audit")
++    os.makedirs(tmp, exist_ok=True)
++    resp = s3.list_objects_v2(Bucket=HSM_AUDIT_BUCKET, Prefix="hsm-audit/", MaxKeys=100)
++    for o in resp.get("Contents", []):
++        key = o["Key"]
++        local = os.path.join(tmp, os.path.basename(key))
++        s3.download_file(HSM_AUDIT_BUCKET, key, local)
++
++def collect_broker_logs(out=OUTDIR):
++    os.makedirs(out, exist_ok=True)
++    try:
++        subprocess.check_call(["kubectl","logs","-n","aegis","deployment/aegis-quantum-broker"], stdout=open(os.path.join(out,"broker.log"),"w"))
++    except Exception:
++        pass
++
++def package(out=OUTDIR):
++    tb = out + ".tar.gz"
++    shutil.make_archive(out, 'gztar', root_dir=out)
++    print("Packaged evidence at", tb)
++
++def main():
++    out = OUTDIR
++    os.makedirs(out, exist_ok=True)
++    collect_broker_logs(out)
++    collect_mlflow_runs(out=out)
++    collect_hsm_audit(out=out)
++    package(out)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:billing/chargeback/cur_to_billing.py
++#!/usr/bin/env python3
++"""
++Process simplified CUR CSV mapping to Aegis job IDs and insert into billing DB (Postgres).
++Also optionally triggers broker fallback when monthly total exceeds threshold.
++"""
++import csv, os, psycopg2, argparse, requests
++from decimal import Decimal
++
++def insert_billing_row(conn, job, cost):
++    with conn.cursor() as cur:
++        cur.execute("INSERT INTO billing (job_id, cost, recorded_at) VALUES (%s,%s, now())", (job, cost))
++    conn.commit()
++
++def get_monthly_total(conn):
++    with conn.cursor() as cur:
++        cur.execute("SELECT COALESCE(SUM(cost),0) FROM billing WHERE recorded_at >= date_trunc('month', current_date)")
++        r = cur.fetchone()
++        return float(r[0] or 0.0)
++
++def process(csvfile, dburl, threshold=None, fall_back_url=None):
++    conn = psycopg2.connect(dburl)
++    with open(csvfile) as f:
++        rd = csv.DictReader(f)
++        for row in rd:
++            job = row.get("job","unknown")
++            cost = Decimal(row.get("cost","0.0"))
++            insert_billing_row(conn, job, cost)
++    total = get_monthly_total(conn)
++    print("Monthly total:", total)
++    if threshold and total > float(threshold) and fall_back_url:
++        print("Threshold exceeded; triggering fallback:", fall_back_url)
++        try:
++            requests.post(fall_back_url, json={"fallback": True}, timeout=10)
++        except Exception as e:
++            print("fallback trigger failed:", e)
++
++if __name__ == "__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("csv")
++    p.add_argument("--dburl", required=True)
++    p.add_argument("--threshold", default=None)
++    p.add_argument("--fallback-url", default=None)
++    args = p.parse_args()
++    process(args.csv, args.dburl, args.threshold, args.fallback_url)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ui/backend/routes_auth.py
++from flask import Blueprint, jsonify, request
++import os
++bp = Blueprint("auth", __name__, url_prefix="/api")
++
++# Very small role/approval mock — in production use real RBAC & OIDC
++ROLES = {"alice":"admin","bob":"approver"}
++
++@bp.route("/whoami", methods=["GET"])
++def whoami():
++    token = request.headers.get("Authorization","").replace("Bearer ","")
++    # token is username in our mock
++    user = token or "anonymous"
++    role = ROLES.get(user,"reader")
++    return jsonify({"user":user,"role":role})
++
++@bp.route("/approve", methods=["POST"])
++def approve():
++    data = request.json or {}
++    plan_id = data.get("plan_id")
++    approver = data.get("approver")
++    if not plan_id or not approver:
++        return jsonify({"error":"missing fields"}), 400
++    # call the approval store (Redis)
++    try:
++        from agent.celery.approval_store import set_approval
++        set_approval(plan_id, approver, approved=True)
++        return jsonify({"status":"approved"})
++    except Exception as e:
++        return jsonify({"error": str(e)}), 500
++
+*** End Patch
+*** Begin Patch
+*** Add File:infra/external_secrets/externalsecret_jobbroker.yaml
++apiVersion: kubernetes-client.io/v1
++kind: ExternalSecret
++metadata:
++  name: aegis-db-secret
++  namespace: aegis
++spec:
++  backendType: vault
++  vaultMountPoint: "secret"
++  vaultRole: "aegis-k8s-role"
++  data:
++    - key: "secret/data/job_database"
++      name: "JOB_DATABASE_URL"
++
+*** End Patch
+*** Begin Patch
+*** Add File:broker/scripts/enable_mtls_and_sync_secrets.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Install cert-manager (if needed), install Kubernetes External Secrets and apply ExternalSecret for broker DB and JWT secret.
++kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml || true
++kubectl wait --for=condition=available --timeout=120s deployment/cert-manager -n cert-manager || true
++
++# Install Kubernetes External Secrets (example)
++kubectl apply -f https://raw.githubusercontent.com/external-secrets/kubernetes-external-secrets/main/deploy/crds/kubernetes-client.io_externalsecrets.yaml || true
++echo "Apply ExternalSecret for jobbroker (infra team must configure Vault policies/role)."
++kubectl apply -f infra/external_secrets/externalsecret_jobbroker.yaml || true
++
++echo "Wait for secrets to be synced and then deploy broker Helm chart (ensure values-production.yaml has placeholders replaced)."
++
+*** End Patch
+*** Begin Patch
+*** Add File:compliance/auto_email_to_legal.txt
++To: legal@example.com
++Subject: Request to finalize vendor contracts & export-control review for Aegis vendor onboarding
++
++Hello legal team,
++
++Please find attached the proposed vendor contract template and the Aegis counter-sign template located in the repo at compliance/vendor_contracts/COUNTERSIGN_TEMPLATE.md.
++
++Requested actions:
++- Review vendor contract for HSM provider and QPU providers (Braket, IBM). Ensure PKCS#11, HSM audit log export, and key management clauses are present.
++- Perform export-control review for cryptographic/PQ components and QPU usage across jurisdictions. Document approvals/denials.
++- Coordinate SOC2 auditor handoff; we have an evidence bundle generator at compliance/generate_evidence_bundle.py.
++
++Suggested timeline: 2–4 weeks to finalize contracts + export control decisions.
++
++Thanks,
++Platform Team
++
+*** End Patch
+*** End Patch

@@ -1,0 +1,682 @@
+*** Begin Patch
+*** Add File: .github/workflows/ci_cosign_kms_rekor_complete.yml
++name: CI: Build, SBOM, SCA, Sign with AWS KMS (cosign) & Rekor verify
++on:
++  push:
++    branches: [ main ]
++  pull_request:
++    branches: [ main ]
++
++permissions:
++  contents: read
++  id-token: write
++  packages: write
++
++jobs:
++  build-and-sign:
++    runs-on: ubuntu-latest
++    env:
++      IMAGE: ${{ secrets.REGISTRY_HOST }}/aegis-model:${{ github.sha }}
++      REKOR_URL: ${{ secrets.REKOR_URL }}
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Configure AWS credentials via OIDC
++        uses: aws-actions/configure-aws-credentials@v2
++        with:
++          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
++          aws-region: ${{ secrets.AWS_REGION }}
++
++      - name: Set up Docker Buildx
++        uses: docker/setup-buildx-action@v2
++
++      - name: Build image
++        run: docker build -t "$IMAGE" -f services/serving/Dockerfile .
++
++      - name: Generate SBOM (syft)
++        uses: anchore/syft-action@v1
++        with:
++          image: ${{ env.IMAGE }}
++          output: sbom.json
++
++      - name: Scan with Trivy
++        uses: aquasecurity/trivy-action@v1
++        with:
++          image-ref: ${{ env.IMAGE }}
++          format: json
++          output: trivy.json
++
++      - name: Fail on critical CVEs
++        run: |
++          if jq -e '.[] | .Vulnerabilities?[]? | select(.Severity=="CRITICAL")' trivy.json >/dev/null 2>&1; then
++            echo "Critical vulnerability found"; jq . trivy.json; exit 1
++          else
++            echo "No critical vulnerabilities"
++          fi
++
++      - name: Login to registry
++        uses: docker/login-action@v2
++        with:
++          registry: ${{ secrets.REGISTRY_HOST }}
++          username: ${{ secrets.REGISTRY_USER }}
++          password: ${{ secrets.REGISTRY_TOKEN }}
++
++      - name: Push image
++        run: docker push "$IMAGE"
++
++      - name: Get image digest
++        id: digest
++        run: |
++          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE" | awk -F@ '{print $2}')
++          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
++
++      - name: Sign with AWS KMS (cosign)
++        env:
++          REKOR_URL: ${{ secrets.REKOR_URL }}
++        run: |
++          # Sign image using AWS KMS key - the OIDC role must have kms:Sign permission on the key
++          cosign sign --key "awskms://${{ secrets.AWS_KMS_ARN }}" "${IMAGE}@${{ steps.digest.outputs.digest }}"
++
++      - name: Verify signature & Rekor entry
++        run: |
++          cosign verify --rekor-url "${REKOR_URL}" "${IMAGE}@${{ steps.digest.outputs.digest }}"
++
++      - name: Annotate artifact (helper) - optional
++        run: |
++          # Optionally emit an "attested" annotation into a manifest produced for deployment pipelines,
++          # e.g., patch the k8s Deployment manifest or add metadata used by CD pipeline
++          echo "image=${IMAGE}@${{ steps.digest.outputs.digest }}" > attestation_result.txt
++          echo "sbom=sbom.json" >> attestation_result.txt
++        # Upload artifacts to compliance bucket if configured (s3)
++      - name: Upload artifacts to S3 (optional)
++        if: ${{ secrets.COMPLIANCE_BUCKET != '' }}
++        run: |
++          aws s3 cp sbom.json "${{ secrets.COMPLIANCE_BUCKET }}/ci/${GITHUB_RUN_ID}/sbom.json" || true
++          aws s3 cp trivy.json "${{ secrets.COMPLIANCE_BUCKET }}/ci/${GITHUB_RUN_ID}/trivy.json" || true
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/attestation/attestation_service.py
++"""
++Attestation HTTP service used by the ValidatingWebhook.
++- Verifies cosign signatures (supports KMS-backed cosign)
++- Optionally verifies Rekor entries and SBOM policy checks
++- Returns JSON { ok: bool, reason?: str, details?: {...} }
++
++This service expects TLS (mounted at /tls) and listens on 8443.
++"""
++import os
++import subprocess
++import json
++import tempfile
++from flask import Flask, request, jsonify
++
++app = Flask("attestation")
++COSIGN_BIN = os.environ.get("COSIGN_BIN", "cosign")
++REKOR_URL = os.environ.get("REKOR_URL", "https://rekor.sigstore.dev")
++TRIVY_BIN = os.environ.get("TRIVY_BIN", "trivy")
++
++def run_cmd(cmd, timeout=30):
++    try:
++        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=timeout)
++        return True, out.decode()
++    except subprocess.CalledProcessError as e:
++        return False, e.output.decode()
++    except Exception as e:
++        return False, str(e)
++
++def cosign_verify(image_ref):
++    cmd = [COSIGN_BIN, "verify", "--output", "json", "--rekor-url", REKOR_URL, image_ref]
++    ok, out = run_cmd(cmd, timeout=60)
++    if not ok:
++        try:
++            # provide helpful JSON if cosign returned JSON-like output
++            return False, json.loads(out)
++        except Exception:
++            return False, {"error": out}
++    try:
++        return True, json.loads(out)
++    except Exception:
++        return True, {"raw": out}
++
++def check_sbom_no_critical(sbom_local_path):
++    # Use trivy to analyze SBOM (if available). If not available, be conservative.
++    if not os.path.exists(sbom_local_path):
++        return False, {"error": "sbom_missing"}
++    cmd = [TRIVY_BIN, "sbom", "--format", "json", sbom_local_path]
++    ok, out = run_cmd(cmd, timeout=120)
++    if not ok:
++        return False, {"error": out}
++    try:
++        data = json.loads(out)
++        # Walk results for critical severities; adjust path depending on Trivy SBOM format
++        for r in data.get("Results", []):
++            for v in r.get("Vulnerabilities", []) or []:
++                if v.get("Severity") == "CRITICAL":
++                    return False, {"critical": v}
++    except Exception as e:
++        return False, {"error": str(e)}
++    return True, {}
++
++@app.route("/verify", methods=["POST"])
++def verify():
++    """
++    Accepts JSON:
++      { "image": "registry/repo@sha256:...", "sbom_uri": "s3://...", "optional": ... }
++    Returns:
++      { ok: true/false, reason: "...", details: {...} }
++    """
++    body = request.get_json() or {}
++    image = body.get("image")
++    sbom_uri = body.get("sbom_uri")
++    # Basic validation
++    if not image:
++        return jsonify({"ok": False, "reason": "no_image"}), 400
++
++    ok, cosign_info = cosign_verify(image)
++    if not ok:
++        return jsonify({"ok": False, "reason": "cosign_failed", "details": cosign_info}), 403
++
++    sbom_ok = True
++    sbom_details = {}
++    if sbom_uri:
++        # If sbom is s3:// or http(s), download locally to temp file for trivy check
++        tmp = tempfile.NamedTemporaryFile(delete=False)
++        try:
++            if sbom_uri.startswith("s3://"):
++                # require AWS CLI configured in pod; use aws s3 cp
++                r = subprocess.run(["aws","s3","cp", sbom_uri, tmp.name], capture_output=True, text=True)
++                if r.returncode != 0:
++                    sbom_ok = False
++                    sbom_details = {"error": r.stderr}
++                else:
++                    sbom_ok, sbom_details = check_sbom_no_critical(tmp.name)
++            elif sbom_uri.startswith("http://") or sbom_uri.startswith("https://"):
++                r = subprocess.run(["curl","-sS", sbom_uri, "-o", tmp.name], capture_output=True, text=True)
++                if r.returncode != 0:
++                    sbom_ok = False
++                    sbom_details = {"error": r.stderr}
++                else:
++                    sbom_ok, sbom_details = check_sbom_no_critical(tmp.name)
++            else:
++                # local path
++                sbom_ok, sbom_details = check_sbom_no_critical(sbom_uri)
++        finally:
++            try:
++                tmp.close()
++            except Exception:
++                pass
++    if not sbom_ok:
++        return jsonify({"ok": False, "reason": "sbom_failed", "details": sbom_details}), 403
++
++    # All checks passed
++    return jsonify({"ok": True, "cosign": cosign_info})
++
++if __name__ == "__main__":
++    # Serve TLS from mounted secret at /tls with files tls.crt and tls.key
++    tls_dir = "/tls"
++    cert = os.path.join(tls_dir, "tls.crt")
++    key = os.path.join(tls_dir, "tls.key")
++    if os.path.exists(cert) and os.path.exists(key):
++        app.run(host="0.0.0.0", port=8443, ssl_context=(cert, key))
++    else:
++        # fallback to HTTP for local testing
++        app.run(host="0.0.0.0", port=8080)
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/create_webhook_certs.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Create a CA and server cert and create TLS secret for attestation
++#
++NS=${1:-ops}
++SVC=${2:-attestation}
++SECRET=${3:-attestation-tls}
++
++TMPDIR=$(mktemp -d)
++CA_KEY="$TMPDIR/ca.key.pem"
++CA_CERT="$TMPDIR/ca.cert.pem"
++SERVER_KEY="$TMPDIR/server.key.pem"
++SERVER_CSR="$TMPDIR/server.csr.pem"
++SERVER_CERT="$TMPDIR/server.cert.pem"
++CSR_CONF="$TMPDIR/csr.conf"
++
++openssl genpkey -algorithm RSA -out "$CA_KEY" -pkeyopt rsa_keygen_bits:2048
++openssl req -x509 -new -nodes -key "$CA_KEY" -sha256 -days 3650 -subj "/CN=aegis-webhook-ca" -out "$CA_CERT"
++
++openssl genpkey -algorithm RSA -out "$SERVER_KEY" -pkeyopt rsa_keygen_bits:2048
++cat > "$CSR_CONF" <<EOF
++[req]
++distinguished_name = req_distinguished_name
++req_extensions = v3_req
++[req_distinguished_name]
++
++[v3_req]
++subjectAltName = @alt_names
++
++[alt_names]
++DNS.1 = ${SVC}
++DNS.2 = ${SVC}.${NS}
++DNS.3 = ${SVC}.${NS}.svc
++EOF
++
++openssl req -new -key "$SERVER_KEY" -subj "/CN=${SVC}.${NS}.svc" -out "$SERVER_CSR" -config "$CSR_CONF"
++openssl x509 -req -in "$SERVER_CSR" -CA "$CA_CERT" -CAkey "$CA_KEY" -CAcreateserial -out "$SERVER_CERT" -days 365 -sha256 -extensions v3_req -extfile "$CSR_CONF"
++
++kubectl create secret tls "$SECRET" -n "$NS" --cert="$SERVER_CERT" --key="$SERVER_KEY" --dry-run=client -o yaml | kubectl apply -f -
++
++base64 -w0 < "$CA_CERT"
++
++echo
++echo "CA bundle printed above (base64). Use it to patch ValidatingWebhookConfiguration caBundle."
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/attestation/validatingwebhook.template.yaml
++apiVersion: admissionregistration.k8s.io/v1
++kind: ValidatingWebhookConfiguration
++metadata:
++  name: aegis-attestation-webhook
++webhooks:
++  - name: attestation.aegis.local
++    sideEffects: None
++    admissionReviewVersions: ["v1"]
++    clientConfig:
++      service:
++        name: attestation
++        namespace: ops
++        path: /verify
++      caBundle: "__CA_BUNDLE__" # replace with base64 CA bundle
++    rules:
++      - operations: ["CREATE", "UPDATE"]
++        apiGroups: ["apps",""]
++        apiVersions: ["v1"]
++        resources: ["deployments","pods"]
++    failurePolicy: Fail
++    timeoutSeconds: 10
++    matchPolicy: Equivalent
++
+*** End Patch
+*** Begin Patch
+*** Add File: governance/gatekeeper/constrainttemplate_attested_annotation.yaml
++apiVersion: templates.gatekeeper.sh/v1beta1
++kind: ConstraintTemplate
++metadata:
++  name: k8srequireattested
++spec:
++  crd:
++    spec:
++      names:
++        kind: K8sRequireAttested
++  targets:
++  - target: admission.k8s.gatekeeper.sh
++    rego: |
++      package k8srequireattested
++
++      violation[{"msg": msg}] {
++        input.review.object.kind == "Deployment"
++        annotations := input.review.object.metadata.annotations
++        not attested(annotations)
++        msg := "Deployment missing aegis.attested=true annotation"
++      }
++
++      attested(annotations) {
++        annotations["aegis.attested"] == "true"
++      }
++
+*** End Patch
+*** Begin Patch
+*** Add File: governance/gatekeeper/constraint_require_attested.yaml
++apiVersion: constraints.gatekeeper.sh/v1beta1
++kind: K8sRequireAttested
++metadata:
++  name: require-attestation-annotation
++spec:
++  match:
++    kinds:
++      - apiGroups: ["apps"]
++        kinds: ["Deployment"]
++    namespaces: ["staging","ops"]
++  parameters: {}
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/annotate_manifest.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# After CI signs and verifies via cosign+kms+rekor, annotate the deployment manifest
++# with aegis.attested=true and optionally update image to image@sha digest.
++#
++MANIFEST=${1:-deployment.yaml}
++OUT=${2:-deployment.annotated.yaml}
++
++python3 - <<PY
++import sys, yaml, json
++f = sys.argv[1]
++out = sys.argv[2]
++doc = yaml.safe_load(open(f))
++meta = doc.setdefault('spec', {}).setdefault('template', {}).setdefault('metadata', {})
++ann = meta.setdefault('annotations', {})
++ann['aegis.attested'] = "true"
++open(out, "w").write(yaml.safe_dump(doc))
++print("Wrote", out)
++PY
++
+*** End Patch
+*** Begin Patch
+*** Add File: helm/postgres/values-ha.yaml
++# Helm values example for Bitnami PostgreSQL in primary-replica mode for staging
++primary:
++  persistence:
++    size: 50Gi
++  resources:
++    requests:
++      cpu: 500m
++      memory: 1Gi
++    limits:
++      cpu: 1
++      memory: 2Gi
++replica:
++  replicaCount: 2
++  resources:
++    requests:
++      cpu: 250m
++      memory: 512Mi
++  persistence:
++    size: 50Gi
++
+*** End Patch
+*** Begin Patch
+*** Add File: helm/redis/values-cluster.yaml
++# Helm values example for Redis cluster (bitnami)
++cluster:
++  enabled: true
++  slaveCount: 2
++resources:
++  requests:
++    cpu: 100m
++    memory: 256Mi
++  limits:
++    cpu: 500m
++    memory: 512Mi
++
+*** End Patch
+*** Begin Patch
+*** Add File: k8s/postgres/pg_backup_cronjob.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: postgres-backup
++  namespace: ops
++spec:
++  schedule: "0 2 * * *"
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          containers:
++            - name: pgdump
++              image: bitnami/postgresql:15
++              env:
++                - name: PGPASSWORD
++                  valueFrom:
++                    secretKeyRef:
++                      name: aegis-db
++                      key: password
++              command: ["/bin/sh","-c"]
++              args:
++                - |
++                  pg_dump -h postgres -U $POSTGRES_USER -d aegis > /tmp/backup.sql
++                  if [ -n "${COMPLIANCE_BUCKET:-}" ]; then
++                    aws s3 cp /tmp/backup.sql ${COMPLIANCE_BUCKET}/backups/backup-$(date +%s).sql
++                  fi
++          restartPolicy: OnFailure
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/pg_backup_restore.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Simple wrapper to restore a backup file into Postgres (for operator/managed DB adapt accordingly)
++#
++BACKUP_FILE=${1:-}
++if [ -z "$BACKUP_FILE" ]; then
++  echo "Usage: $0 s3://bucket/path/to/backup.sql"
++  exit 2
++fi
++TMP=/tmp/pg_restore_$$.sql
++aws s3 cp "$BACKUP_FILE" "$TMP"
++kubectl exec -i deploy/postgres -n ops -- bash -c "PGPASSWORD=\$POSTGRES_PASSWORD psql -U \$POSTGRES_USER -d aegis" < "$TMP"
++echo "Restore complete"
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/agent_controller/leader_election.py
++"""
++Kubernetes Lease-based leader election helper (simple).
++Controller should use this module to become leader before running planner loops.
++"""
++from kubernetes import client, config
++import time, socket, uuid, os
++
++LEASE_NAME = os.environ.get("LEADER_LEASE_NAME", "agent-controller-lease")
++NAMESPACE = os.environ.get("LEADER_LEASE_NS", "staging")
++ID = f"{socket.gethostname()}-{uuid.uuid4().hex[:6]}"
++
++def load_kube():
++    try:
++        config.load_incluster_config()
++    except:
++        config.load_kube_config()
++
++def try_acquire():
++    load_kube()
++    coord = client.CoordinationV1Api()
++    lease = client.V1Lease(
++        metadata=client.V1ObjectMeta(name=LEASE_NAME, namespace=NAMESPACE),
++        spec=client.V1LeaseSpec(holder_identity=ID)
++    )
++    try:
++        coord.create_namespaced_lease(NAMESPACE, lease)
++        return True
++    except client.exceptions.ApiException:
++        # exists, attempt to update holder identity if lease expired - left as a simple check
++        return False
++
++def run_election(on_leader, on_standby, poll=5):
++    while True:
++        if try_acquire():
++            on_leader()
++        else:
++            on_standby()
++        time.sleep(poll)
++
+*** End Patch
+*** Begin Patch
+*** Add File: services/agent_controller/app_postgres_leader_integration.md
++Integration notes: leader election for controller
++
++1. Import leader_election.run_election and pass two callbacks:
++   - on_leader: start or resume planner background worker(s)
++   - on_standby: stop scheduling new planner tasks; remain read-only
++2. This avoids multiple controllers concurrently running planners; controller pods still respond to HTTP requests.
++3. Example pseudo:
++   from services.agent_controller.leader_election import run_election
++   def on_leader(): start_planner_loop()
++   def on_standby(): stop_planner_loop()
++   run_election(on_leader, on_standby)
++
+*** End Patch
+*** Begin Patch
+*** Add File: runbooks/ha_and_attestation_runbook.md
++# HA & Attestation Deployment Runbook (Step-by-step)
++
++Overview
++- This runbook shows how to: deploy Postgres primary+replicas (helm), deploy Redis cluster (helm), deploy Milvus (helm with HA values), deploy attestation service + webhook CA, install Gatekeeper, and validate signed deployments.
++
++Prerequisites
++- kubectl configured, helm installed, aws cli configured (if using S3 & AWS KMS), cosign installed.
++- GitHub OIDC role and AWS KMS key provisioned if you will use KMS-backed cosign in CI.
++
++Steps
++1) Install Gatekeeper:
++   kubectl apply -f https://raw.githubusercontent.com/open-policy-agent/gatekeeper/master/deploy/gatekeeper.yaml
++
++2) Deploy Postgres (Helm Bitnami primary-replica example):
++   helm repo add bitnami https://charts.bitnami.com/bitnami
++   helm install aegis-postgres bitnami/postgresql -f helm/postgres/values-ha.yaml --namespace ops --create-namespace
++
++3) Deploy Redis cluster (Bitnami):
++   helm install aegis-redis bitnami/redis-cluster -f helm/redis/values-cluster.yaml --namespace ops
++
++4) Deploy Milvus in HA (use milvus helm chart and values previously added)
++
++5) Deploy attestation service and TLS secret:
++   ./scripts/create_webhook_certs.sh ops attestation attestation-tls
++   kubectl apply -f k8s/attestation/attestation-deployment.yaml
++
++6) Patch ValidatingWebhookConfiguration with CA bundle:
++   # copy the base64 output from the create_webhook_certs.sh command
++   sed "s#__CA_BUNDLE__#<base64-ca-bundle>#g" k8s/attestation/validatingwebhook.template.yaml > /tmp/validatingwebhook.yaml
++   kubectl apply -f /tmp/validatingwebhook.yaml
++
++7) Deploy Gatekeeper ConstraintTemplate & Constraint:
++   kubectl apply -f governance/gatekeeper/constrainttemplate_attested_annotation.yaml
++   kubectl apply -f governance/gatekeeper/constraint_require_attested.yaml
++
++8) Wire CI to sign images with cosign KMS (see .github/workflows/ci_cosign_kms_rekor_complete.yml)
++   - Ensure the GitHub Action has permission to assume AWS role with kms:Sign privilege.
++
++9) Test:
++   - Run scripts/attestation_smoke_test.sh with REGISTRY set, verify unsigned is rejected and signed accepted.
++   - Run tests/pen_test_runner.py to validate Gatekeeper + OPA rejections as expected.
++
++Notes
++- For production, use managed Postgres (RDS/Cloud SQL) and managed Redis or Redis Enterprise/Elasticache to simplify HA & backups.
++- Use cert-manager for better certificate lifecycle management rather than self-signed CA in the long run.
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/attestation_smoke_test.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Basic smoke test: requires cosign, docker, kubectl, aws cli (for s3 upload if using S3).
++#
++REGISTRY=${REGISTRY:-}
++NAMESPACE=${NAMESPACE:-staging}
++
++if [ -z "$REGISTRY" ]; then
++  echo "Set REGISTRY env var (e.g. ghcr.io/yourorg)"
++  exit 2
++fi
++
++echo "Attempt unsigned deploy (should be rejected)"
++if kubectl apply -f tests/unsigned_deploy.yaml; then
++  echo "ERROR: unsigned deployment accepted (expected rejection)"
++  kubectl delete -f tests/unsigned_deploy.yaml || true
++  exit 1
++else
++  echo "OK: unsigned deploy rejected"
++fi
++
++TMPDIR=$(mktemp -d)
++cat > "$TMPDIR/Dockerfile" <<EOF
++FROM busybox
++CMD ["sleep","3600"]
++EOF
++IMAGE="$REGISTRY/attestation-test:$(date +%s)"
++docker build -t "$IMAGE" "$TMPDIR"
++docker push "$IMAGE"
++
++echo "Generate cosign keypair (local test only)"
++COSIGN_KEY="$TMPDIR/cosign.key"
++cosign generate-key-pair -password "" -key "$COSIGN_KEY"
++cosign sign --key "$COSIGN_KEY" "$IMAGE"
++
++echo "Prepare signed deployment manifest"
++sed "s|REPLACE_WITH_SIGNED_IMAGE|$IMAGE|g" tests/signed_deploy.yaml > /tmp/signed_deploy.yaml
++
++kubectl apply -f /tmp/signed_deploy.yaml
++echo "Signed deployment applied (should be accepted). Cleaning up..."
++kubectl delete -f /tmp/signed_deploy.yaml || true
++
++echo "Smoke test completed. Note: for KMS-backed cosign, sign in CI using awskms:// key and ensure Rekor url configured."
++
+*** End Patch
+*** Begin Patch
+*** Add File: tests/unsigned_deploy.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: unsigned-test
++  namespace: staging
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: unsigned-test
++  template:
++    metadata:
++      labels:
++        app: unsigned-test
++    spec:
++      containers:
++      - name: app
++        image: busybox:1.36
++        command: ["sleep","3600"]
++
+*** End Patch
+*** Begin Patch
+*** Add File: tests/signed_deploy.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: signed-test
++  namespace: staging
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: signed-test
++  template:
++    metadata:
++      labels:
++        app: signed-test
++      annotations:
++        aegis.attested: "true"
++    spec:
++      containers:
++      - name: app
++        image: REPLACE_WITH_SIGNED_IMAGE
++        command: ["sleep","3600"]
++
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/README_deploy_attestation.md
++# How to deploy attestation and Gatekeeper (quick)
++
++1. Ensure k8s context is pointing to your staging cluster.
++2. Install Gatekeeper:
++   kubectl apply -f https://raw.githubusercontent.com/open-policy-agent/gatekeeper/master/deploy/gatekeeper.yaml
++3. Create TLS secret and get CA bundle:
++   ./scripts/create_webhook_certs.sh ops attestation attestation-tls
++   Copy the base64 CA printed by the script.
++4. Deploy attestation service:
++   kubectl apply -f k8s/attestation/attestation-deployment.yaml
++5. Patch ValidatingWebhookConfiguration template:
++   sed "s#__CA_BUNDLE__#<base64-ca-bundle>#g" k8s/attestation/validatingwebhook.template.yaml > /tmp/validatingwebhook.yaml
++   kubectl apply -f /tmp/validatingwebhook.yaml
++6. Deploy Gatekeeper templates:
++   kubectl apply -f governance/gatekeeper/constrainttemplate_attested_annotation.yaml
++   kubectl apply -f governance/gatekeeper/constraint_require_attested.yaml
++7. Test:
++   REGISTRY=ghcr.io/yourorg ./scripts/attestation_smoke_test.sh
++
+*** End Patch
+*** End Patch

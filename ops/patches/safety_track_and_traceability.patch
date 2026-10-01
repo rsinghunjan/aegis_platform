@@ -1,0 +1,493 @@
+*** Begin Patch
+*** Add File:ops/safety/safety_controller.py
++#!/usr/bin/env python3
++"""
++Safety Controller service (lightweight).
++ - Receives monitor alerts and verification outcomes.
++ - Executes safety actions: quiesce model deployments, flip FAIL_CLOSED, create incident tickets (stub).
++ - Exposes a small HTTP JSON API for monitors and CI to call.
++
++This is intentionally small and easy to integrate with your orchestrator.
++"""
++import os
++import json
++import logging
++from http.server import HTTPServer, BaseHTTPRequestHandler
++from threading import Thread
++from subprocess import check_call, CalledProcessError
++
++LOG = logging.getLogger("safety_controller")
++LOG.setLevel(logging.INFO)
++
++SAFETY_NAMESPACE = os.environ.get("SAFETY_NAMESPACE", "aegis-retriever")
++FAIL_CLOSED_KEY = os.environ.get("FAIL_CLOSED_CONFIGMAP", "aegis-fail-closed")
++
++def quiesce_deployment(deployment, namespace=SAFETY_NAMESPACE):
++    """Scale deployment to zero to stop unsafe model serving"""
++    try:
++        check_call(["kubectl", "scale", "deployment", deployment, "--replicas=0", "-n", namespace])
++        LOG.info("Scaled %s to 0 in %s", deployment, namespace)
++        return True
++    except CalledProcessError as e:
++        LOG.exception("Failed to scale deployment: %s", e)
++        return False
++
++def set_fail_closed(value=True):
++    """Write a small flag file or config (best-effort). In k8s this could patch a ConfigMap or set env via rollout."""
++    try:
++        path = os.environ.get("FAIL_CLOSED_FILE", "/tmp/aegis_fail_closed.flag")
++        if value:
++            open(path, "w").write("1")
++        else:
++            try:
++                os.remove(path)
++            except Exception:
++                pass
++        LOG.info("Set fail_closed=%s (file=%s)", value, path)
++        return True
++    except Exception:
++        LOG.exception("set_fail_closed failed")
++        return False
++
++class Handler(BaseHTTPRequestHandler):
++    def _send(self, code=200, body=None):
++        self.send_response(code)
++        self.send_header("Content-Type", "application/json")
++        self.end_headers()
++        if body is None:
++            body = {}
++        self.wfile.write(json.dumps(body).encode())
++
++    def do_POST(self):
++        length = int(self.headers.get("content-length", "0"))
++        raw = self.rfile.read(length) if length else b""
++        try:
++            payload = json.loads(raw.decode() or "{}")
++        except Exception:
++            payload = {}
++        LOG.info("received POST %s payload=%s", self.path, payload)
++        if self.path == "/alert":
++            # expected: {"deployment": "...", "reason":"verification_failed", "action":"quiesce|fail_closed"}
++            dep = payload.get("deployment")
++            action = payload.get("action")
++            if action == "quiesce" and dep:
++                ok = quiesce_deployment(dep)
++                return self._send(200, {"ok": ok})
++            if action == "fail_closed":
++                ok = set_fail_closed(True)
++                return self._send(200, {"ok": ok})
++            return self._send(400, {"error": "unknown_action"})
++        elif self.path == "/verify-result":
++            # expected: {"model": "model-name", "verdict":"pass|fail", "evidence": {...}}
++            v = payload.get("verdict")
++            model = payload.get("model")
++            if v == "fail":
++                # default action: fail closed + quiesce serving for this model
++                set_fail_closed(True)
++                quiesce_deployment(f"model-serving-{model}")
++                return self._send(200, {"taken": ["fail_closed","quiesce"]})
++            return self._send(200, {"taken": []})
++        else:
++            return self._send(404, {"error": "not_found"})
++
++def run(host="0.0.0.0", port=8081):
++    LOG.info("Starting safety_controller on %s:%s", host, port)
++    server = HTTPServer((host, port), Handler)
++    server.serve_forever()
++
++if __name__ == "__main__":
++    run()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/safety/monitor_agent.py
++#!/usr/bin/env python3
++"""
++Lightweight runtime monitor agent intended as a sidecar or library embed.
++ - Evaluates configured invariants (loaded from /etc/aegis/invariants or env) against runtime telemetry
++ - Emits alerts to Safety Controller when a monitored invariant is violated
++ - Emits short audit records to local file for evidence packaging
++"""
++import os
++import time
++import json
++import requests
++import logging
++from datetime import datetime
++
++LOG = logging.getLogger("monitor_agent")
++LOG.setLevel(logging.INFO)
++
++SAFETY_CONTROLLER = os.environ.get("SAFETY_CONTROLLER_URL", "http://safety-controller.aegis-retriever.svc.cluster.local:8081")
++INVARIANTS_PATH = os.environ.get("INVARIANTS_PATH", "/etc/aegis/invariants.json")
++AUDIT_DIR = os.environ.get("MONITOR_AUDIT_DIR", "/tmp/aegis_monitor")
++
++def load_invariants():
++    if os.path.exists(INVARIANTS_PATH):
++        try:
++            return json.load(open(INVARIANTS_PATH))
++        except Exception:
++            LOG.exception("bad invariants file")
++    # fallback simple example
++    return [{"name": "max_speed", "variable": "speed", "op":"le", "value": 30}]
++
++def sample_runtime():
++    """Hook to collect runtime telemetry. In production integrate with /metrics or local telemetry API."""
++    # best-effort example
++    return {"speed": float(os.environ.get("TEST_SPEED", "0")), "latency_ms": float(os.environ.get("TEST_LATENCY_MS","0"))}
++
++def check_and_alert(deployment_name=None):
++    invariants = load_invariants()
++    rt = sample_runtime()
++    violations = []
++    for inv in invariants:
++        v = rt.get(inv["variable"])
++        if v is None:
++            continue
++        op = inv.get("op")
++        if op == "le" and v > inv["value"]:
++            violations.append({"invariant": inv, "value": v})
++        if op == "ge" and v < inv["value"]:
++            violations.append({"invariant": inv, "value": v})
++    if violations:
++        os.makedirs(AUDIT_DIR, exist_ok=True)
++        rec = {"ts": datetime.utcnow().isoformat()+"Z", "violations": violations, "runtime": rt}
++        fname = os.path.join(AUDIT_DIR, f"monitor_violation_{int(time.time())}.json")
++        open(fname, "w").write(json.dumps(rec))
++        try:
++            requests.post(SAFETY_CONTROLLER + "/alert", json={"deployment": deployment_name, "action":"quiesce", "reason":"invariant_violation", "details": rec}, timeout=5)
++        except Exception:
++            LOG.exception("failed to notify safety_controller")
++        return False
++    return True
++
++def loop(deployment_name=None, interval=5):
++    while True:
++        try:
++            check_and_alert(deployment_name)
++        except Exception:
++            LOG.exception("monitor loop error")
++        time.sleep(interval)
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--deployment", default=os.environ.get("DEPLOYMENT_NAME"))
++    p.add_argument("--interval", type=int, default=5)
++    args = p.parse_args()
++    loop(args.deployment, args.interval)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/safety/verification_service.py
++#!/usr/bin/env python3
++"""
++Verification service wrapper that composes existing verifier primitives with formal tooling.
++ - Provides a simple CLI/API to run verification for a model artifact and return a structured verdict and evidence.
++ - Integrates with verifier_with_cas, targeted_prover and continuous_fuzz triage outputs where available.
++"""
++import os
++import json
++import logging
++from datetime import datetime
++import subprocess
++
++LOG = logging.getLogger("verification_service")
++LOG.setLevel(logging.INFO)
++
++def run_nli_and_cas(model_artifact_path, test_suite_path):
++    """Run the existing verifier_with_cas on a set of tests (best-effort wrapper)"""
++    try:
++        # assume ops/verifier/verify_model.py exists; call it as a black box
++        out = subprocess.check_output(["python", "ops/verifier/verify_model.py", "--model", model_artifact_path, "--tests", test_suite_path], timeout=600)
++        result = json.loads(out.decode())
++        return result
++    except Exception as e:
++        LOG.exception("verification run error")
++        return {"ok": False, "error": str(e)}
++
++def run_targeted_prover(invariants_path):
++    try:
++        out = subprocess.check_output(["python", "ops/formal/targeted_prover.py", "--invariants", invariants_path], timeout=600)
++        return {"ok": True, "prover_output": out.decode()[:2000]}
++    except Exception as e:
++        LOG.exception("prover error")
++        return {"ok": False, "error": str(e)}
++
++def pack_evidence(model_name, model_artifact_path, verification_result, prover_result=None):
++    evidence = {
++        "model": model_name,
++        "artifact": model_artifact_path,
++        "verification": verification_result,
++        "prover": prover_result,
++        "ts": datetime.utcnow().isoformat()+"Z"
++    }
++    out = os.environ.get("EVIDENCE_OUT", f"/tmp/evidence_{model_name}.json")
++    open(out, "w").write(json.dumps(evidence, indent=2))
++    return out
++
++def verify_model(model_name, model_artifact_path, test_suite_path, invariants_path=None):
++    verification_result = run_nli_and_cas(model_artifact_path, test_suite_path)
++    prover_result = None
++    if invariants_path:
++        prover_result = run_targeted_prover(invariants_path)
++    evidence_path = pack_evidence(model_name, model_artifact_path, verification_result, prover_result)
++    return {"verdict": "pass" if verification_result.get("ok") else "fail", "evidence": evidence_path}
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--model", required=True)
++    p.add_argument("--artifact", required=True)
++    p.add_argument("--tests", required=True)
++    p.add_argument("--invariants", default=None)
++    args = p.parse_args()
++    print(json.dumps(verify_model(args.model, args.artifact, args.tests, args.invariants)))
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/evidence/evidence_packager.py
++#!/usr/bin/env python3
++"""
++Evidence packager for safety track promotion.
++ - Collects model artifact, verification evidence, provenance, tests run and creates a signed (stub) archive for the safety track.
++ - Archive structure:
++     evidence/
++       model/
++       provenance.json
++       verification.json
++       tests/
++       metadata.json
++ - In production, signing should be performed with an HSM or similar.
++"""
++import os
++import json
++import zipfile
++from datetime import datetime
++
++OUT_DIR = os.environ.get("EVIDENCE_ROOT", "/tmp/safety_evidence")
++
++def package(model_name, model_artifact, verification_evidence, provenance, metadata):
++    os.makedirs(OUT_DIR, exist_ok=True)
++    out_path = os.path.join(OUT_DIR, f"{model_name}_evidence_{int(time.time())}.zip")
++    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as z:
++        # model artifact
++        if os.path.exists(model_artifact):
++            z.write(model_artifact, arcname=f"evidence/model/{os.path.basename(model_artifact)}")
++        # verification evidence file
++        if os.path.exists(verification_evidence):
++            z.write(verification_evidence, arcname="evidence/verification.json")
++        # provenance and metadata
++        z.writestr("evidence/provenance.json", json.dumps(provenance, indent=2))
++        z.writestr("evidence/metadata.json", json.dumps(metadata, indent=2))
++    # stub signing
++    sig_path = out_path + ".sig"
++    open(sig_path, "w").write("signed-by:ops@aegis\n")
++    return out_path, sig_path
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--model", required=True)
++    p.add_argument("--artifact", required=True)
++    p.add_argument("--evidence", required=True)
++    p.add_argument("--prov", default="{}")
++    p.add_argument("--meta", default="{}")
++    args = p.parse_args()
++    prov = json.loads(args.prov) if args.prov else {}
++    meta = json.loads(args.meta) if args.meta else {}
++    out, sig = package(args.model, args.artifact, args.evidence, prov, meta)
++    print(out, sig)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/ci/promote_to_safety.py
++#!/usr/bin/env python3
++"""
++Promotion script: promote a model artifact from research -> safety track.
++ - Checks that required evidence exists (metadata file), runs verification_service, packages evidence and moves artifact to safety registry.
++ - Intended to be invoked by CI (manual gate) or automation after human signoff.
++"""
++import os
++import json
++import shutil
++import logging
++from ops.safety.verification_service import verify_model
++from ops.evidence.evidence_packager import package
++
++LOG = logging.getLogger("promote_to_safety")
++LOG.setLevel(logging.INFO)
++
++def require_metadata(model_dir):
++    meta_path = os.path.join(model_dir, "metadata.json")
++    if not os.path.exists(meta_path):
++        raise RuntimeError("metadata.json missing for model")
++    meta = json.load(open(meta_path))
++    # minimal fields required
++    for k in ("owner","approver","tests"):
++        if k not in meta:
++            raise RuntimeError(f"metadata.json missing field {k}")
++    return meta
++
++def promote(model_name, model_dir, artifact_path, tests_path, invariants_path=None, safety_registry_path=None):
++    meta = require_metadata(model_dir)
++    LOG.info("Running verification for model %s", model_name)
++    res = verify_model(model_name, artifact_path, tests_path, invariants_path)
++    LOG.info("Verification result: %s", res)
++    if res.get("verdict") != "pass":
++        raise RuntimeError("verification failed; cannot promote")
++    prov = {"git_commit": meta.get("git_commit"), "trained_on": meta.get("dataset_snapshot")}
++    metadata = {"owner": meta.get("owner"), "approver": meta.get("approver"), "promoted_at": meta.get("promoted_at") or "", "notes": meta.get("notes", "")}
++    evidence_zip, sig = package(model_name, artifact_path, res["evidence"], prov, metadata)
++    # stage artifact to safety registry (simple file move or registry push)
++    if safety_registry_path:
++        os.makedirs(safety_registry_path, exist_ok=True)
++        dest = os.path.join(safety_registry_path, os.path.basename(artifact_path))
++        shutil.copyfile(artifact_path, dest)
++        LOG.info("Copied artifact to safety registry: %s", dest)
++    return {"evidence": evidence_zip, "signature": sig}
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--model", required=True)
++    p.add_argument("--model-dir", required=True)
++    p.add_argument("--artifact", required=True)
++    p.add_argument("--tests", required=True)
++    p.add_argument("--invariants", default=None)
++    p.add_argument("--safety-registry", default=None)
++    args = p.parse_args()
++    print(promote(args.model, args.model_dir, args.artifact, args.tests, args.invariants, args.safety_registry))
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/promote_model_to_safety.yml
++name: Promote Model to Safety Track
++on:
++  workflow_dispatch:
++    inputs:
++      model:
++        description: 'Model name'
++        required: true
++      model_dir:
++        description: 'Path to model dir in repo (e.g. models/my-model)'
++        required: true
++      artifact:
++        description: 'Path to artifact (e.g. artifacts/my-model.pt)'
++        required: true
++      tests:
++        description: 'Path to tests/battery'
++        required: true
++      safety_registry:
++        description: 'Path to safety registry (s3://bucket/path or local path)'
++        required: false
++
++jobs:
++  promote:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.11'
++      - name: Install deps
++        run: python -m pip install --upgrade pip && pip install requests
++      - name: Promote model
++        run: |
++          python ops/ci/promote_to_safety.py --model "${{ github.event.inputs.model }}" --model-dir "${{ github.event.inputs.model_dir }}" --artifact "${{ github.event.inputs.artifact }}" --tests "${{ github.event.inputs.tests }}" --safety-registry "${{ github.event.inputs.safety_registry }}" 
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/ci/require_evidence_check.py
++#!/usr/bin/env python3
++"""
++CI check to ensure that any change to models/ must include metadata and basic evidence pointers before merge to protected branches.
++ - Enforces metadata.json with owner/approver/tests fields and a lightweight evidence pointer file (evidence_url or evidence_path)
++ - Exits non-zero if requirements not met
++"""
++import os
++import sys
++import json
++import subprocess
++from pathlib import Path
++
++ROOT = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
++
++def changed_files():
++    try:
++        subprocess.check_call(["git", "fetch", "origin", "main"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++        out = subprocess.check_output(["git", "diff", "--name-only", "origin/main...HEAD"], cwd=ROOT).decode().splitlines()
++        return [p for p in out if p]
++    except Exception:
++        return []
++
++def check_model_changes(changed):
++    issues = []
++    for p in changed:
++        if p.startswith("models/"):
++            # require models/<name>/metadata.json
++            parts = Path(p).parts
++            if len(parts) >= 2:
++                model_dir = Path(ROOT) / parts[0] / parts[1]
++                meta = model_dir / "metadata.json"
++                if not meta.exists():
++                    issues.append(f"{model_dir}/metadata.json missing")
++                else:
++                    j = json.loads(meta.read_text())
++                    for f in ("owner","approver","tests"):
++                        if f not in j:
++                            issues.append(f"{meta}: missing field {f}")
++    return issues
++
++def main():
++    changed = changed_files()
++    issues = check_model_changes(changed)
++    if issues:
++        print("Evidence metadata checks failed:")
++        for i in issues:
++            print(" -", i)
++        sys.exit(2)
++    print("Model evidence checks passed.")
++    sys.exit(0)
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/release_tracks.md
++Release tracks and safety promotion
++---------------------------------
++
++Overview
++--------
++We maintain two release tracks:
++ - research (rapid): for experiments, frequent model updates, and low-cost iteration.
++ - safety (certified): for models that will be deployed into safety-critical systems (e.g., AV controllers). Models in this track must have evidence, pass verification and be packaged for audit.
++
++Requirements for promotion
++ - metadata.json in models/<name>/metadata.json containing at minimum:
++   - owner (email)
++   - approver (email)
++   - tests (path to test battery)
++   - git_commit (source)
++ - verification evidence (produced by ops/safety/verification_service) and packaged via ops/evidence/evidence_packager.py
++ - human sign-off by approver (explicit CI gate)
++
++Process
++ 1. Develop and iterate in the research track as normal (fast CI).
++ 2. When ready, open a promotion request (use the Promote Model to Safety Track workflow).
++ 3. The promotion workflow will:
++    - Run verification (NLI+CAS + targeted prover)
++    - Package evidence and sign (stub)
++    - Copy artifact to safety registry and record promotion metadata
++ 4. Safety track deployments are only allowed from the safety registry and must be handled by the Safety Controller.
++
++Operational notes
++ - All heavy jobs (train/eval) must be wrapped with job_wrapper_improved.py to produce traceable job metadata.
++ - Monitors (monitor_agent) run as sidecars on safety-critical deployments and report to safety_controller.
++ - Safety Controller can quiesce deployments and set fail-closed state on violations.
++
+*** End Patch
+*** End Patch

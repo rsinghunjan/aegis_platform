@@ -1,0 +1,439 @@
+*** Begin Patch
+*** Add File:services/agents/orchestrator.py
++#!/usr/bin/env python3
++"""
++Agent Orchestrator service (FastAPI).
++
++Features (PoC):
++ - Accepts an agent "plan" (sequence of steps). Each step names a tool and input.
++ - Schedules execution, records per-step evidence (inputs, outputs, metadata) to S3.
++ - Uses a sandbox tool-runner service to execute tools securely (microVM/runsc/Kata in production).
++ - Publishes orchestration job into Redis for background workers.
++ - Simple audit/evidence signing hook available.
++"""
++import os
++import time
++import json
++import uuid
++import boto3
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++try:
++    import redis
++except Exception:
++    redis = None
++
++REDIS_URL = os.environ.get("REDIS_BROKER", "redis://redis:6379/0")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++SANDBOX_RUNNER = os.environ.get("SANDBOX_RUNNER_URL", "http://sandbox-runner:8081/v1/run")
++SIGNING_KEY_REF = os.environ.get("COSIGN_KEY_REF", "")
++
++app = FastAPI(title="Aegis Agent Orchestrator")
++
++class Step(BaseModel):
++    name: str
++    tool: str
++    input: dict = {}
++
++class Plan(BaseModel):
++    agent_id: str
++    plan_id: str = None
++    steps: list[Step]
++    tenant: str | None = None
++
++def _push_job(key: str, payload: dict):
++    if redis is None:
++        raise RuntimeError("Redis client required")
++    r = redis.from_url(REDIS_URL)
++    r.rpush(key, json.dumps(payload))
++
++def _s3_put_bytes(key: str, data: bytes, content_type="application/json"):
++    if not EVIDENCE_BUCKET:
++        return None
++    s3 = boto3.client("s3")
++    bucket = EVIDENCE_BUCKET.replace("s3://","")
++    s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType=content_type)
++    return f"s3://{bucket}/{key}"
++
++@app.post("/v1/submit-plan")
++def submit_plan(body: Plan):
++    # assign id
++    plan_id = body.plan_id or f"plan-{int(time.time())}-{uuid.uuid4().hex[:8]}"
++    job = {"plan_id": plan_id, "agent_id": body.agent_id, "steps": [s.dict() for s in body.steps], "tenant": body.tenant, "ts": time.time()}
++    # record evidence
++    meta_key = f"agents/evidence/{plan_id}.json"
++    _s3_put_bytes(meta_key, json.dumps(job, indent=2).encode("utf-8"))
++    # push to Redis queue for workers
++    try:
++        _push_job("aegis:agent:plans", job)
++    except Exception as e:
++        raise HTTPException(status_code=500, detail=f"failed to enqueue: {e}")
++    return {"plan_id": plan_id, "status": "queued"}
++
++@app.get("/healthz")
++def health():
++    return {"status": "ok", "sandbox_runner": SANDBOX_RUNNER}
++
+*** End File
+*** Add File:services/agents/orchestrator_worker.py
++#!/usr/bin/env python3
++"""
++Background worker that processes plans from Redis and executes steps via sandbox runner.
++ - Durable: acknowledges via Redis pop pattern and writes per-step evidence to S3.
++ - In production, run multiple replicas with leader-election/consumer groups for HA.
++"""
++import os
++import time
++import json
++import requests
++try:
++    import redis
++except Exception:
++    redis = None
++import boto3
++
++REDIS_URL = os.environ.get("REDIS_BROKER", "redis://redis:6379/0")
++QUEUE = os.environ.get("AGENT_PLAN_QUEUE", "aegis:agent:plans")
++SANDBOX_RUNNER = os.environ.get("SANDBOX_RUNNER_URL", "http://sandbox-runner:8081/v1/run")
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++
++def s3_put(key, data, content_type="application/json"):
++    if not EVIDENCE_BUCKET:
++        return None
++    s3 = boto3.client("s3")
++    bucket = EVIDENCE_BUCKET.replace("s3://","")
++    s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType=content_type)
++    return f"s3://{bucket}/{key}"
++
++def execute_step(step, meta):
++    """
++    Call sandbox runner with JSON payload:
++    { "tool": <tool>, "input": {...}, "meta": {...} }
++    """
++    payload = {"tool": step["tool"], "input": step.get("input", {}), "meta": meta}
++    r = requests.post(SANDBOX_RUNNER, json=payload, timeout=60)
++    r.raise_for_status()
++    return r.json()
++
++def run_loop(poll_interval=0.5):
++    if redis is None:
++        raise RuntimeError("redis required")
++    r = redis.from_url(REDIS_URL)
++    print("Agent worker started")
++    while True:
++        raw = r.lpop(QUEUE)
++        if not raw:
++            time.sleep(poll_interval)
++            continue
++        job = json.loads(raw)
++        plan_id = job["plan_id"]
++        results = []
++        for idx, step in enumerate(job["steps"]):
++            step_meta = {"plan_id": plan_id, "step_index": idx, "step_name": step["name"], "ts": time.time()}
++            try:
++                out = execute_step(step, step_meta)
++                results.append({"step": step["name"], "ok": True, "out": out})
++            except Exception as e:
++                results.append({"step": step["name"], "ok": False, "error": str(e)})
++                # stop on error for now
++                break
++            # persist per-step evidence
++            key = f"agents/evidence/{plan_id}/step-{idx}.json"
++            s3_put(key, json.dumps({"step": step, "result": results[-1], "meta": step_meta}).encode("utf-8"))
++        # record plan result summary
++        summary_key = f"agents/evidence/{plan_id}/summary.json"
++        s3_put(summary_key, json.dumps({"plan_id": plan_id, "results": results, "ts": time.time()}).encode("utf-8"))
++
++if __name__ == "__main__":
++    run_loop()
++
+*** End File
+*** Add File:services/agents/tool_adapter_example.py
++#!/usr/bin/env python3
++"""
++Example tool adapter (search) that the sandbox can execute.
++In production each tool adapter lives in a sandboxed runner (microVM) and is invoked by orchestrator worker.
++"""
++def search_web(query: str, max_results: int = 3):
++    # PoC: return synthetic results
++    return {"query": query, "results": [{"title": f"Result {i}", "url": f"https://example.com/{i}"} for i in range(max_results)]}
++
++TOOLS = {
++    "web_search": search_web
++}
++
++def run_tool(tool_name: str, input_payload: dict):
++    fn = TOOLS.get(tool_name)
++    if not fn:
++        raise RuntimeError(f"tool not found: {tool_name}")
++    return fn(**input_payload)
++
+*** End File
+*** Add File:services/sandbox/runner_stub.py
++#!/usr/bin/env python3
++"""
++Sandbox runner stub (Flask).
++ - This simulates the microVM/tool-runner service. It looks up a tool adapter and executes it.
++ - In production, replace this with a runner that creates a microVM / runsc process per job, enforces seccomp, timeouts, and network restrictions.
++"""
++from flask import Flask, request, jsonify
++from services.agents.tool_adapter_example import run_tool
++import time
++
++APP = Flask("aegis-sandbox-runner")
++
++@APP.route("/v1/run", methods=["POST"])
++def run():
++    payload = request.get_json(force=True)
++    tool = payload.get("tool")
++    input_payload = payload.get("input", {})
++    meta = payload.get("meta", {})
++    # enforce simple timeout / resource limits at caller level in PoC
++    start = time.time()
++    try:
++        out = run_tool(tool, input_payload)
++    except Exception as e:
++        return jsonify({"ok": False, "error": str(e), "duration": time.time()-start}), 500
++    return jsonify({"ok": True, "out": out, "duration": time.time()-start})
++
++if __name__ == "__main__":
++    APP.run(host="0.0.0.0", port=8081)
++
+*** End File
+*** Add File:services/serving/diffusers/watermark/.github-workflows-watermark-scale.yml
++name: Watermark scale test & gate
++
++on:
++  workflow_dispatch:
++
++jobs:
++  watermark-scale:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: 3.10
++      - name: Install deps
++        run: |
++          python -m pip install --upgrade pip
++          pip install -r services/serving/diffusers/requirements.txt || true
++          pip install pillow boto3
++      - name: Run watermark scale tests
++        env:
++          WATERMARK_TEST_INPUT: ./tests/watermark_samples
++          WATERMARK_TEST_CSV: ./artifacts/wm_scale.csv
++        run: |
++          python services/serving/diffusers/watermark/scale_test.py
++      - name: Fail if detection rate below threshold
++        run: |
++          python - <<'PY'
++import csv, sys
++rows = list(csv.DictReader(open("artifacts/wm_scale.csv")))
++det_rate = sum(1 for r in rows if r["detected"]=="True")/max(1,len(rows))
++print("detection_rate", det_rate)
++if det_rate < 0.9:
++    print("Watermark detection below 90% - failing gate")
++    sys.exit(1)
++PY
++
+*** End File
+*** Add File:services/serving/diffusers/moderation_calibrate_and_ci.yml
++name: Moderation calibration & reviewer smoke
++
++on:
++  workflow_dispatch:
++
++jobs:
++  calibrate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: 3.10
++      - name: Install deps
++        run: |
++          python -m pip install --upgrade pip
++          pip install -r services/serving/diffusers/requirements.txt || true
++          pip install langdetect numpy
++      - name: Run calibration (requires labeled dataset secret)
++        env:
++          DATASET_PATH: ${{ secrets.MOD_DATASET_JSONL }}
++        run: |
++          python services/serving/diffusers/moderation_multilingual.py --calibrate --dataset "$DATASET_PATH" --out thresholds.json || true
++  reviewer-smoke:
++    runs-on: ubuntu-latest
++    needs: calibrate
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run reviewer smoke (sanity only)
++        run: |
++          python - <<'PY'
++from requests import post, get
++print("Reviewer smoke skipped in CI - run locally against deployed reviewer")
++PY
++
+*** End File
+*** Add File:services/serving/diffusers/moderation_ui.py
++#!/usr/bin/env python3
++"""
++Simple reviewer UI backend (FastAPI) to list pending moderation items and accept/reject them.
++Integrates with moderation_reviewer_audit.record_review for durable audit logging.
++"""
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++try:
++    import redis
++except Exception:
++    redis = None
++import json
++from services.serving.diffusers.moderation_reviewer_audit import record_review
++
++REDIS_URL = "redis://redis:6379/0"
++STREAM = "diffusers:moderation:stream"
++
++app = FastAPI(title="Aegis Moderation Reviewer UI")
++
++class ReviewReq(BaseModel):
++    action: str
++    reviewer: str
++    notes: str | None = ""
++
++@app.get("/pending")
++def pending(limit: int = 50):
++    if redis is None:
++        raise HTTPException(status_code=500, detail="redis not installed")
++    r = redis.from_url(REDIS_URL)
++    entries = r.xrange(STREAM, count=limit)
++    out = []
++    for e in entries:
++        _id = e[0]
++        payload = json.loads(e[1].get(b"payload").decode("utf-8"))
++        out.append({"id": _id.decode() if isinstance(_id, bytes) else _id, "payload": payload})
++    return out
++
++@app.post("/review/{entry_id}")
++def review(entry_id: str, body: ReviewReq):
++    if redis is None:
++        raise HTTPException(status_code=500, detail="redis not installed")
++    r = redis.from_url(REDIS_URL)
++    entries = r.xrange(STREAM, entry_id, entry_id, count=1)
++    if not entries:
++        raise HTTPException(status_code=404, detail="entry not found")
++    payload = json.loads(entries[0][1][b"payload"].decode("utf-8"))
++    # record audit
++    res = record_review(entry_id, body.action, body.reviewer, body.notes or "", payload)
++    # remove from pending
++    try:
++        r.xdel(STREAM, entry_id)
++    except Exception:
++        pass
++    return {"ok": True, "audit": res}
++
+*** End File
+*** Add File:.github/workflows/autoscale_tuning.yml
++name: Autoscale tuning (load test + validator)
++
++on:
++  workflow_dispatch:
++
++jobs:
++  autoscale:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: 3.10
++      - name: Install deps
++        run: |
++          python -m pip install --upgrade pip
++          pip install redis requests || true
++      - name: Trigger load test
++        run: |
++          python ops/monitoring/queue_load_test.py --count 200 --mode stream || true
++      - name: Wait and validate exporters
++        run: |
++          sleep 30
++          python ops/monitoring/autoscale_validator.py || true
++
+*** End File
+*** Add File:services/telemetry/sample_finance_endpoint.py
++#!/usr/bin/env python3
++"""
++Simple sample finance webhook that accepts POSTed charge records.
++ - Stores them locally to a file for inspection (PoC).
++"""
++from flask import Flask, request, jsonify
++import os, json, time
++
++APP = Flask("aegis-finance-webhook")
++STORE = os.environ.get("FINANCE_STORE", "/data/charges")
++os.makedirs(STORE, exist_ok=True)
++
++@APP.route("/v1/charge", methods=["POST"])
++def charge():
++    j = request.get_json(force=True)
++    tid = j.get("id", f"charge-{int(time.time())}-{os.urandom(4).hex()}")
++    path = os.path.join(STORE, f"{tid}.json")
++    with open(path, "w") as f:
++        json.dump({"received": time.time(), "record": j}, f)
++    return jsonify({"ok": True, "stored": path})
++
++if __name__ == "__main__":
++    APP.run(host="0.0.0.0", port=8090)
++
+*** End File
+*** Add File:services/gateway/preflight_example.py
++#!/usr/bin/env python3
++"""
++Example gateway snippet: run quota preflight then orchestrator pre-check before enqueuing.
++ - Uses QuotaClientV2 (idempotent reservation)
++ - Calls orchestrator submit-plan dry-run (if provided) or performs simple validation
++"""
++from services.gateway.quota_middleware import reserve_for_tenant, release_for_tenant
++from services.agents.orchestrator import submit_plan
++
++def handle_agent_request(req):
++    tenant = req.get("tenant") or "default"
++    est_gpu_sec = req.get("estimated_gpu_seconds", 10.0)
++    ok, idempotency_key = reserve_for_tenant(tenant, est_gpu_sec)
++    if not ok:
++        return {"error": "quota_exceeded"}
++    # simple plan validation: ensure tools are allowed
++    plan = req.get("plan")
++    # ideally call orchestrator dry-run endpoint; here we just submit
++    try:
++        resp = submit_plan(plan)
++    except Exception as e:
++        # release reservation on failure
++        release_for_tenant(tenant, idempotency_key)
++        raise
++    resp["quota_reservation"] = {"idempotency_key": idempotency_key, "tenant": tenant}
++    return resp
++
+*** End File
+*** Add File:docs/runbooks/agent_orchestrator.md
++# Agent Orchestrator runbook (PoC)
++
++Overview
++- The orchestrator accepts "plans" with ordered steps. Each step executes a tool in an isolated sandbox runner.
++- Evidence (plan, per-step results) is written to S3 under `agents/evidence/<plan_id>/`.
++
++Deployment notes
++- Deploy Redis and the orchestrator worker (services/agents/orchestrator_worker.py) as a Deployment with multiple replicas.
++- Deploy the sandbox runner as a separate service (ideally microVM-backed). Example runner stub is provided (services/sandbox/runner_stub.py) for testing only.
++- Ensure EVIDENCE_BUCKET is set for S3 evidence uploads.
++- Ensure SANDBOX_RUNNER_URL points to the sandbox runner service.
++- Enforce admission rules for sandbox & runner pods using RuntimeClass and admission webhook.
++
++Security
++- Replace the runner stub with a microVM-based runner (e.g., Firecracker/Kata) before running untrusted third-party tools.
++- Enforce per-run CPU/memory limits and timeouts. Record audit logs for each execution.
++
+*** End File
+*** End Patch

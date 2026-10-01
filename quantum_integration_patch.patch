@@ -1,0 +1,409 @@
+*** Begin Patch
+*** Add File:k8s/crd/quantumjob_crd.yaml
++apiVersion: apiextensions.k8s.io/v1
++kind: CustomResourceDefinition
++metadata:
++  name: quantumjobs.aegis.ai
++spec:
++  group: aegis.ai
++  names:
++    plural: quantumjobs
++    singular: quantumjob
++    kind: QuantumJob
++    shortNames:
++      - qjob
++  scope: Namespaced
++  versions:
++    - name: v1alpha1
++      served: true
++      storage: true
++      schema:
++        openAPIV3Schema:
++          type: object
++          properties:
++            spec:
++              type: object
++              properties:
++                backend:
++                  type: string
++                  description: "Backend adapter to use (qiskit|braket|ibm). Default: qiskit"
++                shots:
++                  type: integer
++                  description: "Number of shots"
++                circuit:
++                  type: string
++                  description: "Name of circuit to run (maps to samples/ module)"
++                params:
++                  type: object
++                storage:
++                  type: object
++                  properties:
++                    mode:
++                      type: string
++                      enum: ["s3","local"]
++                    prefix:
++                      type: string
++            status:
++              type: object
++              properties:
++                state:
++                  type: string
++                message:
++                  type: string
++                result_uri:
++                  type: string
++      subresources:
++        status: {}
++
+*** End Patch
+*** Begin Patch
+*** Add File:controllers/quantum_operator/requirements.txt
++kopf==1.38.0
++kubernetes>=23.0.0
++qiskit==0.40.0
++boto3
++requests
++
+*** End Patch
+*** Begin Patch
+*** Add File:controllers/quantum_operator/Dockerfile
++FROM python:3.10-slim
++WORKDIR /app
++COPY requirements.txt /app/requirements.txt
++RUN apt-get update && apt-get install -y build-essential libssl-dev git && rm -rf /var/lib/apt/lists/*
++RUN pip install --no-cache-dir -r /app/requirements.txt
++COPY operator.py /app/operator.py
++COPY ../adapters /app/adapters
++COPY ../../samples /app/samples
++COPY ../../tools /app/tools
++ENV PYTHONPATH=/app
++CMD ["python3","/app/operator.py"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:controllers/quantum_operator/operator.py
++#!/usr/bin/env python3
++"""
++Kopf-based QuantumJob operator
++- Watches QuantumJob CRs in aegis namespace
++- Executes quantum circuits via adapters (default: qiskit_adapter)
++- Stores results to S3 (if MODEL_ARTIFACT_BUCKET) or /tmp, creates provenance MCP JSON and signs it
++"""
++import os
++import time
++import json
++import kopf
++import logging
++from kubernetes import client, config
++from kubernetes.client.rest import ApiException
++
++LOG = logging.getLogger("quantum-operator")
++LOG.setLevel(logging.INFO)
++
++NAMESPACE = os.environ.get("WATCH_NAMESPACE", "aegis")
++MODEL_BUCKET = os.environ.get("MODEL_ARTIFACT_BUCKET", "")
++
++try:
++    if os.environ.get("KUBERNETES_SERVICE_HOST"):
++        config.load_incluster_config()
++    else:
++        config.load_kube_config()
++except Exception:
++    LOG.exception("Could not load Kube config")
++
++api = client.CustomObjectsApi()
++core = client.CoreV1Api()
++
++def save_result_local(job_name, payload):
++    outdir = "/tmp/quantum_results"
++    os.makedirs(outdir, exist_ok=True)
++    fn = f"{outdir}/{job_name}_{int(time.time())}.json"
++    with open(fn, "w") as f:
++        json.dump(payload, f, indent=2)
++    return fn
++
++def upload_to_s3(local_path, bucket, key):
++    import boto3
++    s3 = boto3.client("s3")
++    s3.upload_file(local_path, bucket, key)
++    return f"s3://{bucket}/{key}"
++
++def sign_and_write_mcp(mcp, dest_path):
++    try:
++        from production.policy.signing.sign_with_retry import sign_payload
++        sig, meta = sign_payload(json.dumps(mcp).encode(), None)
++        if sig:
++            mcp["signature"] = sig
++            mcp["signed_by"] = meta.get("keylabel", meta.get("method"))
++    except Exception as e:
++        LOG.info("Signing unavailable: %s", e)
++    with open(dest_path, "w") as f:
++        json.dump(mcp, f, indent=2)
++    return dest_path
++
++@kopf.on.create("aegis.ai", "v1alpha1", "quantumjobs")
++@kopf.on.update("aegis.ai", "v1alpha1", "quantumjobs")
++def run_quantumjob(spec, name, namespace, body, **kwargs):
++    LOG.info("Reconciling QuantumJob %s/%s", namespace, name)
++    backend = spec.get("backend", "qiskit")
++    shots = int(spec.get("shots", 1024))
++    circuit_name = spec.get("circuit", "bell")
++    params = spec.get("params", {}) or {}
++    storage = spec.get("storage", {}) or {}
++
++    # import adapter
++    adapter = None
++    if backend == "qiskit":
++        from adapters.qiskit_adapter import run_qiskit_circuit
++        adapter = run_qiskit_circuit
++    else:
++        raise kopf.PermanentError(f"Unsupported backend: {backend}")
++
++    # execute
++    try:
++        LOG.info("Running circuit %s on backend %s (shots=%s)", circuit_name, backend, shots)
++        result = adapter(circuit_name, shots=shots, params=params)
++        # result is dict, may contain 'counts' and 'raw'
++        payload = {
++            "job_name": name,
++            "backend": backend,
++            "circuit": circuit_name,
++            "shots": shots,
++            "params": params,
++            "result": result,
++            "timestamp": time.time()
++        }
++        # save locally
++        local_path = save_result_local(name, payload)
++        result_uri = local_path
++        # upload if bucket configured
++        if MODEL_BUCKET:
++            key = f"quantum/{name}/{os.path.basename(local_path)}"
++            try:
++                result_uri = upload_to_s3(local_path, MODEL_BUCKET, key)
++            except Exception as e:
++                LOG.exception("S3 upload failed, keeping local result: %s", e)
++
++        # create MCP/provenance
++        mcp = {
++            "model_id": f"quantum-{name}",
++            "job_id": name,
++            "artifact_uri": result_uri,
++            "metadata": {"backend": backend, "circuit": circuit_name, "shots": shots, "params": params},
++            "created_at": time.time()
++        }
++        mcp_path = os.path.join(os.path.dirname(local_path), f"mcp_{name}_{int(time.time())}.json")
++        sign_and_write_mcp(mcp, mcp_path)
++        if MODEL_BUCKET:
++            try:
++                upload_to_s3(mcp_path, MODEL_BUCKET, f"quantum/{name}/{os.path.basename(mcp_path)}")
++            except Exception:
++                LOG.exception("Failed to upload MCP to S3")
++
++        # update status
++        status = {"state": "COMPLETED", "message": "Job finished", "result_uri": result_uri}
++        try:
++            api.patch_namespaced_custom_object_status(group="aegis.ai", version="v1alpha1", namespace=namespace, plural="quantumjobs", name=name, body={"status": status})
++        except ApiException:
++            api.patch_namespaced_custom_object(group="aegis.ai", version="v1alpha1", namespace=namespace, plural="quantumjobs", name=name, body={"status": status})
++
++        LOG.info("QuantumJob %s completed, result: %s", name, result_uri)
++    except Exception as e:
++        LOG.exception("Quantum job execution failed: %s", e)
++        status = {"state": "FAILED", "message": str(e)}
++        try:
++            api.patch_namespaced_custom_object_status(group="aegis.ai", version="v1alpha1", namespace=namespace, plural="quantumjobs", name=name, body={"status": status})
++        except ApiException:
++            api.patch_namespaced_custom_object(group="aegis.ai", version="v1alpha1", namespace=namespace, plural="quantumjobs", name=name, body={"status": status})
++        raise
++
+*** End Patch
+*** Begin Patch
+*** Add File:adapters/qiskit_adapter.py
++#!/usr/bin/env python3
++"""
++Adapter to run named sample circuits using Qiskit (Aer simulator by default).
++Exposes run_qiskit_circuit(circuit_name, shots, params).
++"""
++import os, json
++from qiskit import Aer, transpile, assemble
++from qiskit import QuantumCircuit
++import importlib
++
++BACKEND = os.environ.get("QISKIT_BACKEND", "aer_simulator")
++
++def run_qiskit_circuit(circuit_name, shots=1024, params=None):
++    params = params or {}
++    # circuits are in samples module, each exposes get_circuit(params) -> QuantumCircuit
++    try:
++        mod = importlib.import_module(f"samples.{circuit_name}_circuit")
++    except Exception:
++        # fallback to samples.bell_circuit
++        mod = importlib.import_module("samples.bell_circuit")
++    qc = mod.get_circuit(params)
++    backend = Aer.get_backend(BACKEND)
++    # transpile & run
++    tqc = transpile(qc, backend=backend)
++    qobj = assemble(tqc, shots=shots)
++    job = backend.run(qobj)
++    res = job.result()
++    counts = res.get_counts()
++    return {"counts": counts, "backend_name": BACKEND}
++
+*** End Patch
+*** Begin Patch
+*** Add File:samples/bell_circuit.py
++#!/usr/bin/env python3
++from qiskit import QuantumCircuit
++
++def get_circuit(params=None):
++    """
++    Build a simple Bell pair circuit.
++    """
++    qc = QuantumCircuit(2, 2)
++    qc.h(0)
++    qc.cx(0,1)
++    qc.measure([0,1],[0,1])
++    return qc
++
+*** End Patch
+*** Begin Patch
+*** Add File:argo/quantum_job_cr.yaml
++apiVersion: "aegis.ai/v1alpha1"
++kind: QuantumJob
++metadata:
++  name: demo-quantum-bell
++  namespace: aegis
++spec:
++  backend: qiskit
++  shots: 1024
++  circuit: bell
++  storage:
++    mode: local
++    prefix: quantum/demo
++
+*** End Patch
+*** Begin Patch
+*** Add File:argo/quantum_job_workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: aegis-quantum-job-
++  namespace: aegis
++spec:
++  entrypoint: run-quantum
++  templates:
++    - name: run-quantum
++      steps:
++        - - name: submit-quantum-cr
++            template: submit-cr
++        - - name: wait-quantum
++            template: wait-cr
++
++    - name: submit-cr
++      container:
++        image: bitnami/kubectl:1.27
++        command: [sh, -c]
++        args:
++          - kubectl apply -f argo/quantum_job_cr.yaml -n aegis
++
++    - name: wait-cr
++      container:
++        image: bitnami/kubectl:1.27
++        command: [sh, -c]
++        args:
++          - |
++            for i in $(seq 1 120); do
++              state=$(kubectl -n aegis get quantumjob demo-quantum-bell -o jsonpath='{.status.state}' 2>/dev/null || echo "")
++              echo "State: $state"
++              if [ "$state" = "COMPLETED" ]; then
++                kubectl -n aegis get quantumjob demo-quantum-bell -o yaml
++                exit 0
++              fi
++              if [ "$state" = "FAILED" ]; then
++                kubectl -n aegis get quantumjob demo-quantum-bell -o yaml
++                exit 2
++              fi
++              sleep 5
++            done
++            echo "Timed out waiting for quantum job" && exit 1
++
+*** End Patch
+*** Begin Patch
+*** Add File:tools/quantum_mcp_creator.py
++#!/usr/bin/env python3
++"""
++Utility to create/sign a provenance (MCP-like) JSON for quantum jobs.
++Inputs: path to result JSON (local) and optional S3 bucket/prefix to upload MCP.
++"""
++import os, json, time
++
++def create_mcp_from_result(result_path, out_dir="/tmp/mcp", bucket=None, prefix=None):
++    os.makedirs(out_dir, exist_ok=True)
++    r = json.load(open(result_path))
++    mcp = {
++        "type": "quantum_result",
++        "job_name": r.get("job_name"),
++        "artifact": result_path,
++        "backend": r.get("backend"),
++        "circuit": r.get("circuit"),
++        "shots": r.get("shots"),
++        "timestamp": r.get("timestamp"),
++        "result_summary": {"counts": r.get("result",{}).get("counts")}
++    }
++    out_path = os.path.join(out_dir, f"quantum_mcp_{mcp['job_name']}_{int(time.time())}.json")
++    try:
++        from production.policy.signing.sign_with_retry import sign_payload
++        sig, meta = sign_payload(json.dumps(mcp).encode(), None)
++        if sig:
++            mcp["signature"] = sig
++            mcp["signed_by"] = meta.get("keylabel", meta.get("method"))
++    except Exception:
++        pass
++    with open(out_path, "w") as f:
++        json.dump(mcp, f, indent=2)
++    # optionally upload: left to operator / caller (boto3)
++    return out_path
++
++if __name__ == "__main__":
++    import sys
++    if len(sys.argv) < 2:
++        print("usage: quantum_mcp_creator.py <result_json>")
++        raise SystemExit(2)
++    print("Wrote", create_mcp_from_result(sys.argv[1]))
++
+*** End Patch
+*** Begin Patch
+*** Add File:README_QUANTUM.md
++# Quantum capability for Aegis (simulator-first)
++
++This patch adds a QuantumJob CRD, a Kopf operator that executes jobs via Qiskit Aer simulator,
++an Argo workflow example, a sample Bell circuit, and tools to create an MCP-style provenance file.
++
++Quick start (staging / dev)
++1. Apply the CRD:
++   kubectl apply -f k8s/crd/quantumjob_crd.yaml
++2. Build & deploy operator (for dev you can run operator.py locally with kubeconfig):
++   - Build image (if desired): docker build -t registry.example.com/aegis/quantum-operator:latest -f controllers/quantum_operator/Dockerfile .
++   - Or run locally: pip install -r controllers/quantum_operator/requirements.txt && python3 controllers/quantum_operator/operator.py
++3. Submit the Argo workflow to create & wait for a QuantumJob:
++   argo submit argo/quantum_job_workflow.yaml -n aegis --watch
++
++How it works
++- Create a QuantumJob CR (sample provided at argo/quantum_job_cr.yaml).
++- Operator picks it up, runs the named circuit via adapters/qiskit_adapter.py (samples/bell_circuit.py).
++- Result is written to /tmp/quantum_results and (optionally) uploaded to S3 if MODEL_ARTIFACT_BUCKET env var is set for the operator.
++- An MCP-like provenance JSON is created and signed if sign_with_retry is available.
++
++Extending to real backends
++- Implement adapters for IBMQ, AWS Braket or Azure Quantum in adapters/ and set spec.backend accordingly.
++- When using remote backends:
++  - Require SPIRE-issued identities and Vault short-lived tokens to access provider credentials.
++  - Capture queue id, backend_version, noise_model and job metadata for provenance.
++
++Security & audit notes
++- All circuits and results should be recorded and signed for reproducibility.
++- Jobs submitted to external providers should be allowed only for approved namespaces/service-accounts via Gatekeeper policies.
++
+*** End Patch
+*** End Patch

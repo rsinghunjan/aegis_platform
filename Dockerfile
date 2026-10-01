@@ -1,28 +1,25 @@
-# Minimal image for running Aegis components (safety, federated demo, metrics)
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    POETRY_VIRTUALENVS_CREATE=false
+    PIP_NO_CACHE_DIR=1 \
+    AEGIS_AGENT_DATABASE_URL=sqlite:////data/aegis_agent.db \
+    AEGIS_MEMORY_DATABASE_URL=sqlite:////data/aegis_agent.db
 
 WORKDIR /app
 
-# System deps for common scientific packages and building wheels
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    git \
-    && rm -rf /var/lib/apt/lists/*
+RUN useradd --create-home --uid 10001 aegis \
+    && mkdir -p /data \
+    && chown aegis:aegis /data
 
-# Copy only requirements first to leverage Docker cache
-COPY aegis_multimodal_ai_system/requirements.txt /app/requirements.txt
+COPY requirements-control-plane.txt /app/requirements.txt
+RUN python -m pip install --upgrade pip \
+    && python -m pip install -r /app/requirements.txt
 
-RUN pip install --upgrade pip setuptools wheel
-RUN pip install -r /app/requirements.txt
+COPY --chown=aegis:aegis . /app
+USER aegis
 
-# Copy the repository code
-COPY . /app
-
-# Expose prometheus metrics port (default)
 EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD python -c "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/readyz', timeout=2)"
 
-# Default command: keep container alive; override with federated server/client or other entrypoints.
-CMD ["tail", "-f", "/dev/null"]
+CMD ["uvicorn", "production:app", "--host", "0.0.0.0", "--port", "8000"]

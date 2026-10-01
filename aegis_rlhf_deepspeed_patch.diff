@@ -1,0 +1,666 @@
+diff --git a/rlhf/requirements.txt b/rlhf/requirements.txt
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/rlhf/requirements.txt
+@@ -0,0 +8 @@
++torch>=2.1.0
++transformers>=4.32.2
++datasets>=2.13.2
++accelerate>=0.24.0
++trl>=0.6.0
++deepspeed>=0.9.2
++numpy>=1.25.0
++psycopg2-binary>=2.9.7
++mlflow>=2.5.0
+diff --git a/scripts/ppo_trainer_trl.py b/scripts/ppo_trainer_trl.py
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/scripts/ppo_trainer_trl.py
+@@ -0,0 +1,340 @@
++#!/usr/bin/env python3
++"""
++TRL-based PPO trainer for RLHF (Aegis)
++
++This script uses the `trl` library (Hugging Face TRL) to run PPO on a policy model
++using a reward model. It is intended to run inside the RLHF step of the Argo workflow
++or as a standalone job in a node with GPUs (can be integrated with DeepSpeed).
++
++Notes:
++ - This is a practical scaffold. For production, tune batch sizes, learning rates,
++   rollout buffers, and integrate with a robust cluster-backed rollout system.
++ - The script expects:
++    * Policy model checkpoint (HF-compatible) or HF model id
++    * Reference model (for KL penalty) or will be copied from policy
++    * Reward model path (HF SequenceClassification that outputs scalar reward)
++    * Dataset of prompts to perform rollouts (jsonl or Hugging Face dataset)
++ - It logs metrics and artifacts to MLflow if MLOPS_MLFLOW_TRACKING_URI is set.
++
++Usage example:
++  python3 scripts/ppo_trainer_trl.py --policy-model gpt2 --reward-model ./reward_model --dataset ./data/rollouts.jsonl --output-dir ./rlhf_output
++"""
++import os
++import argparse
++import logging
++import json
++from pathlib import Path
++import random
++
++import torch
++from datasets import load_dataset
++from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSequenceClassification
++
++try:
++    # trl offers PPOTrainer / PPOConfig
++    from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead
++except Exception:
++    raise RuntimeError("trl library required: pip install trl")
++
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger("aegis.rlhf.ppo_trl")
++
++def load_prompts(path):
++    # Accept jsonl with {"prompt": "..."} or a HF dataset path
++    if os.path.exists(path):
++        ds = load_dataset("json", data_files=path)["train"]
++        prompts = [r.get("prompt","") for r in ds]
++        return prompts
++    else:
++        # try HF dataset id
++        ds = load_dataset(path)
++        prompts = [r.get("prompt","") for r in ds["train"]]
++        return prompts
++
++def build_reward_fn(reward_model, tokenizer, device):
++    """
++    Return a reward function that accepts list[str] and returns list[float].
++    The reward model is expected to be a sequence classification/regression model
++    that outputs a scalar (logit) representing reward.
++    """
++    reward_model.to(device)
++    reward_model.eval()
++
++    def reward_fn(prompts, completions):
++        # Concatenate prompt+completion and run reward model in batch
++        texts = [p + "\n\n" + c for p, c in zip(prompts, completions)]
++        enc = tokenizer(texts, return_tensors="pt", truncation=True, padding=True).to(device)
++        with torch.no_grad():
++            out = reward_model(**enc)
++            # out.logits shape: (batch, num_labels) ; for regression / single scalar, take logits[:,0]
++            logits = out.logits
++            if logits is None:
++                # fallback
++                return [0.0] * len(texts)
++            scores = logits.squeeze(-1).cpu().tolist()
++            # ensure list
++            if isinstance(scores, float):
++                scores = [scores]
++            return scores
++    return reward_fn
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--policy-model", required=True, help="HF model id or path for policy (e.g. gpt2, EleutherAI/gpt-j)")
++    p.add_argument("--ref-model", default=None, help="Reference model id/path for KL penalty; if not provided, policy will be copied")
++    p.add_argument("--reward-model", required=True, help="HF model path/id for reward model (classification/regression)")
++    p.add_argument("--dataset", required=True, help="JSONL file or HF dataset id containing prompts")
++    p.add_argument("--output-dir", required=True)
++    p.add_argument("--batch-size", type=int, default=4)
++    p.add_argument("--ppo-epochs", type=int, default=1)
++    p.add_argument("--mini-batch-rollouts", type=int, default=4)
++    p.add_argument("--learning-rate", type=float, default=1.41e-5)
++    p.add_argument("--seed", type=int, default=42)
++    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
++    args = p.parse_args()
++
++    random.seed(args.seed)
++    os.makedirs(args.output_dir, exist_ok=True)
++
++    device = torch.device(args.device)
++    logger.info("Device: %s", device)
++
++    # load tokenizer and models
++    tokenizer = AutoTokenizer.from_pretrained(args.policy_model, use_fast=True)
++    if tokenizer.pad_token is None:
++        tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
++
++    # Policy model: wrap with value head if needed
++    logger.info("Loading policy model: %s", args.policy_model)
++    try:
++        policy = AutoModelForCausalLMWithValueHead.from_pretrained(args.policy_model)
++    except Exception:
++        # fallback: load a normal LM and let trl handle value head creation
++        policy = AutoModelForCausalLM.from_pretrained(args.policy_model)
++
++    policy.to(device)
++
++    if args.ref_model:
++        logger.info("Loading reference model: %s", args.ref_model)
++        ref_model = AutoModelForCausalLM.from_pretrained(args.ref_model).to(device)
++    else:
++        logger.info("No reference model provided; copying policy as reference")
++        ref_model = AutoModelForCausalLM.from_pretrained(args.policy_model).to(device)
++
++    logger.info("Loading reward model: %s", args.reward_model)
++    reward_model = AutoModelForSequenceClassification.from_pretrained(args.reward_model)
++    reward_model.to(device)
++
++    # PPO config
++    ppo_config = PPOConfig(
++        model_name=args.policy_model,
++        learning_rate=args.learning_rate,
++        batch_size=args.batch_size,
++        ppo_epochs=args.ppo_epochs,
++    )
++
++    trainer = PPOTrainer(
++        config=ppo_config,
++        model=policy,
++        ref_model=ref_model,
++        tokenizer=tokenizer,
++        # Use default optimizers; DeepSpeed integration should be configured in environment/accelerate
++    )
++
++    # load prompts
++    prompts = load_prompts(args.dataset)
++    logger.info("Loaded %d prompts", len(prompts))
++
++    reward_fn = build_reward_fn(reward_model, tokenizer, device)
++
++    # Simple rollout + PPO loop
++    # For each epoch, sample a batch of prompts, generate completions from policy, score using reward_fn, then run PPO step.
++    num_prompts = len(prompts)
++    batch_size = args.batch_size
++    for epoch in range(args.ppo_epochs):
++        logger.info("PPO epoch %d/%d", epoch+1, args.ppo_epochs)
++        random.shuffle(prompts)
++        for i in range(0, num_prompts, batch_size):
++            batch_prompts = prompts[i : i + batch_size]
++            # Generate completions (use policy.generate via tokenizer)
++            encoded = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(device)
++            # Use generate with sampling parameters - adapt as needed
++            generated_ids = policy.generate(**encoded, max_new_tokens=64, do_sample=True, top_k=50, temperature=1.0)
++            completions = tokenizer.batch_decode(generated_ids[:, encoded["input_ids"].shape[1]:], skip_special_tokens=True)
++
++            # compute rewards
++            rewards = reward_fn(batch_prompts, completions)
++            # Run PPO step
++            try:
++                stats = trainer.step(batch_prompts, completions, rewards)
++                logger.info("PPO step stats: %s", stats)
++            except Exception as e:
++                logger.exception("PPO step failed: %s", e)
++
++    # Save final policy checkpoint
++    save_path = Path(args.output_dir) / "policy_final"
++    save_path.mkdir(parents=True, exist_ok=True)
++    trainer.save_pretrained(str(save_path))
++    logger.info("Saved final policy to %s", save_path)
++
++    # Log artifacts to MLflow if configured
++    try:
++        import mlflow
++        if os.environ.get("MLOPS_MLFLOW_TRACKING_URI"):
++            mlflow.set_tracking_uri(os.environ.get("MLOPS_MLFLOW_TRACKING_URI"))
++            with mlflow.start_run() as run:
++                mlflow.log_param("policy_model", args.policy_model)
++                mlflow.log_param("reward_model", args.reward_model)
++                mlflow.log_artifacts(str(save_path), artifact_path="policy_final")
++                logger.info("Logged RLHF run to MLflow run_id=%s", run.info.run_id)
++    except Exception:
++        logger.warning("MLflow not configured or failed to log")
++
++if __name__ == "__main__":
++    main()
+diff --git a/argo/workflows/fine_tune_rlhf_trl.yaml b/argo/workflows/fine_tune_rlhf_trl.yaml
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/argo/workflows/fine_tune_rlhf_trl.yaml
+@@ -0,0 +1,220 @@
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: aegis-finetune-rlhf-trl-
++  namespace: aegis-ml
++spec:
++  entrypoint: finetune-rlhf-trl
++  serviceAccountName: aegis-agent-sa
++  templates:
++    - name: finetune-rlhf-trl
++      steps:
++        - - name: prepare-data
++            template: prepare-data
++        - - name: finetune-sharded
++            template: finetune-sharded
++        - - name: validate
++            template: validate
++        - - name: train-reward-model
++            template: train-reward-model
++        - - name: rlhf-ppo-trl
++            template: rlhf-ppo-trl
++        - - name: register-model
++            template: register-model
++
++    - name: prepare-data
++      container:
++        image: <REGISTRY>/aegis-data-tools:latest
++        command: ["bash", "-lc"]
++        args:
++          - |
++            set -euo pipefail
++            python3 /app/scripts/prepare_finetune_data.py --input-s3 ${INPUT_S3} --out /workspace/data
++      volumeMounts:
++        - name: workspace
++          mountPath: /workspace
++
++    - name: finetune-sharded
++      container:
++        image: <REGISTRY>/aegis-deepspeed-launcher:latest
++        command: ["bash", "-lc"]
++        args:
++          - |
++            set -euo pipefail
++            python3 /app/scripts/deepspeed_launcher.py --config /app/configs/deepspeed_config.json --data-dir /workspace/data --output-dir /workspace/checkpoints
++      volumeMounts:
++        - name: workspace
++          mountPath: /workspace
++        - name: deepspeed-config
++          mountPath: /app/configs
++
++    - name: validate
++      container:
++        image: <REGISTRY>/aegis-validate:latest
++        command: ["python3", "/app/validate.py", "--model-dir", "/workspace/checkpoints", "--threshold", "0.8"]
++      volumeMounts:
++        - name: workspace
++          mountPath: /workspace
++
++    - name: train-reward-model
++      container:
++        image: <REGISTRY>/aegis-reward-trainer:latest
++        command: ["python3", "/app/scripts/train_reward_model.py", "--data", "/workspace/reward_data", "--out", "/workspace/reward_model"]
++      volumeMounts:
++        - name: workspace
++          mountPath: /workspace
++
++    - name: rlhf-ppo-trl
++      container:
++        image: <REGISTRY>/aegis-rlhf-trl:latest
++        command: ["python3", "/app/scripts/ppo_trainer_trl.py", "--policy-model", "/workspace/checkpoints", "--reward-model", "/workspace/reward_model", "--dataset", "/workspace/rollout_prompts.jsonl", "--output-dir", "/workspace/rlhf_model", "--ppo-epochs", "1", "--batch-size", "4"]
++      volumeMounts:
++        - name: workspace
++          mountPath: /workspace
++
++    - name: register-model
++      container:
++        image: <REGISTRY>/aegis-tools:latest
++        command: ["python3", "/app/scripts/register_model.py", "--model-dir", "/workspace/rlhf_model", "--model-name", "${MODEL_NAME}"]
++      volumeMounts:
++        - name: workspace
++          mountPath: /workspace
++
++  volumes:
++    - name: workspace
++      emptyDir: {}
++    - name: deepspeed-config
++      configMap:
++        name: aegis-deepspeed-config
++
++  arguments:
++    parameters:
++      - name: INPUT_S3
++        value: ""
++      - name: MODEL_NAME
++        value: "aegis-rlhf-trl-model"
++
++  ttlStrategy:
++    secondsAfterCompletion: 3600
++
+diff --git a/k8s/manifests/deepspeed-multinode-statefulset.yaml b/k8s/manifests/deepspeed-multinode-statefulset.yaml
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/k8s/manifests/deepspeed-multinode-statefulset.yaml
+@@ -0,0 +1,320 @@
++apiVersion: v1
++kind: Service
++metadata:
++  name: deepspeed-headless
++  namespace: aegis-ml
++spec:
++  clusterIP: None
++  selector:
++    app: deepspeed-trainer
++  ports:
++    - port: 29500
++
++---
++# StatefulSet to run multi-node DeepSpeed jobs. This pattern uses a predictable hostname
++# for the master (pod-0). The container entrypoint should set MASTER_ADDR to:
++#   deepspeed-trainer-0.deepspeed-headless.aegis-ml.svc.cluster.local
++# and MASTER_PORT to 29500 (or other).
++# The container image must contain deepspeed, torch, and the training script.
++apiVersion: apps/v1
++kind: StatefulSet
++metadata:
++  name: deepspeed-trainer
++  namespace: aegis-ml
++spec:
++  serviceName: deepspeed-headless
++  replicas: 2  # change to number of nodes you want
++  selector:
++    matchLabels:
++      app: deepspeed-trainer
++  template:
++    metadata:
++      labels:
++        app: deepspeed-trainer
++    spec:
++      serviceAccountName: aegis-agent-sa
++      containers:
++        - name: deepspeed
++          image: <REGISTRY>/aegis-deepspeed-trainer:latest
++          env:
++            - name: MASTER_PORT
++              value: "29500"
++            - name: MASTER_ADDR
++              value: "deepspeed-trainer-0.deepspeed-headless.aegis-ml.svc.cluster.local"
++            - name: NODE_RANK
++              valueFrom:
++                fieldRef:
++                  fieldPath: metadata.name
++            - name: NCCL_DEBUG
++              value: "INFO"
++            - name: NCCL_IB_DISABLE
++              value: "0"
++            - name: NCCL_SOCKET_IFNAME
++              value: "eth0"
++          # Aegis image should implement an entrypoint script that maps the pod name to a numeric rank
++          # and calls torchrun or deepspeed with appropriate --nproc_per_node and --nnodes.
++          command:
++            - "/bin/bash"
++            - "-c"
++            - |
++              set -euo pipefail
++              # derive ordinal from pod name: deepspeed-trainer-0 -> 0
++              ORD=${HOSTNAME##*-}
++              export RANK=${ORD}
++              export WORLD_SIZE=$(( ${ORD} + 1 )) # this will be overridden by launcher below
++              # determine replicas from statefulset spec via downward API not available here; pass via env if needed
++              # default to 2 nodes, 8 gpus per node - adapt in production
++              NNODES=${DEEPSPEED_NNODES:-2}
++              GPUS_PER_NODE=${DEEPSPEED_GPUS_PER_NODE:-8}
++              export MASTER_ADDR=${MASTER_ADDR}
++              export MASTER_PORT=${MASTER_PORT}
++              echo "Starting deepspeed node with RANK=${RANK}, NNODES=${NNODES}, GPUS_PER_NODE=${GPUS_PER_NODE}"
++              # Launch deepspeed in module mode; the training script should be present in /workspace/train_finetune.py
++              deepspeed --num_nodes ${NNODES} --num_gpus ${GPUS_PER_NODE} --module /app/train_finetune --deepspeed_config /app/configs/deepspeed_config.json --data_dir /workspace/data --output_dir /workspace/checkpoints
++          resources:
++            limits:
++              nvidia.com/gpu: 8
++              memory: "120Gi"
++              cpu: "8000m"
++          volumeMounts:
++            - name: workspace
++              mountPath: /workspace
++            - name: deepspeed-config
++              mountPath: /app/configs
++      volumes:
++        - name: workspace
++          emptyDir: {}
++        - name: deepspeed-config
++          configMap:
++            name: aegis-deepspeed-config
++  volumeClaimTemplates:
++    - metadata:
++        name: model-repo
++      spec:
++        accessModes: ["ReadWriteOnce"]
++        resources:
++          requests:
++            storage: 200Gi
++
++---
++# Example Service to expose training logs / metrics (optional)
++apiVersion: v1
++kind: Service
++metadata:
++  name: deepspeed-trainer-metrics
++  namespace: aegis-ml
++spec:
++  selector:
++    app: deepspeed-trainer
++  ports:
++    - name: metrics
++      port: 9090
++      targetPort: 9090
++
++# Notes:
++# - This StatefulSet expects a custom image (<REGISTRY>/aegis-deepspeed-trainer:latest) that includes:
++#   * deepspeed, torch, transformers
++#   * /app/train_finetune (module entrypoint)
++#   * /app/configs/deepspeed_config.json
++# - The entrypoint uses deepspeed launcher with --num_nodes & --num_gpus flags. Adjust NNODES and GPU counts to match your cluster.
++# - For production multi-node runs, integrate with a scheduler that can allocate nodes with required GPU topology and RDMA; validate NCCL and RDMA availability.
++
+diff --git a/scripts/sharded_restore_test.py b/scripts/sharded_restore_test.py
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/scripts/sharded_restore_test.py
+@@ -0,0 +1,220 @@
++#!/usr/bin/env python3
++"""
++Sharded checkpoint upload/restore validation helper for DeepSpeed.
++
++This script:
++ - Computes checksums for local shard files
++ - (Optionally) uploads them to S3 / LakeFS
++ - Simulates a restore plan by downloading shards to a temp dir and verifying checksums
++
++Usage:
++  python3 scripts/sharded_restore_test.py --shards ./ckpt/checkpoint-000/mp_rank_00 --s3-prefix s3://bucket/models/checkpoint-000 --upload
++
++Note: This is a validation helper and should be run in staging with actual object storage credentials.
++"""
++import os
++import argparse
++import hashlib
++import json
++import tempfile
++import shutil
++from typing import List
++
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++def checksum(path):
++    h = hashlib.sha256()
++    with open(path, "rb") as fh:
++        while True:
++            chunk = fh.read(65536)
++            if not chunk:
++                break
++            h.update(chunk)
++    return h.hexdigest()
++
++def collect_shards(shard_paths: List[str]):
++    meta = []
++    for p in shard_paths:
++        if os.path.isdir(p):
++            for root, _, files in os.walk(p):
++                for f in files:
++                    full = os.path.join(root, f)
++                    meta.append({"path": full, "sha256": checksum(full), "size": os.path.getsize(full)})
++        elif os.path.isfile(p):
++            meta.append({"path": p, "sha256": checksum(p), "size": os.path.getsize(p)})
++    return meta
++
++def upload_to_s3(meta, s3_prefix):
++    if boto3 is None:
++        raise RuntimeError("boto3 not installed")
++    s3 = boto3.client("s3")
++    # s3_prefix: s3://bucket/path
++    if not s3_prefix.startswith("s3://"):
++        raise RuntimeError("s3_prefix must be s3://bucket/path")
++    parts = s3_prefix[5:].split("/", 1)
++    bucket = parts[0]
++    base = parts[1] if len(parts) > 1 else ""
++    uploaded = []
++    for m in meta:
++        key = os.path.join(base, os.path.basename(m["path"]))
++        print("Uploading", m["path"], "to s3://%s/%s" % (bucket, key))
++        s3.upload_file(m["path"], bucket, key)
++        uploaded.append({"s3": f"s3://{bucket}/{key}", "sha256": m["sha256"]})
++    return uploaded
++
++def download_and_verify(uploaded):
++    # download into tempdir and verify checksums
++    tmp = tempfile.mkdtemp()
++    ok = True
++    for u in uploaded:
++        s3uri = u["s3"]
++        parts = s3uri[5:].split("/", 1)
++        bucket = parts[0]
++        key = parts[1]
++        dest = os.path.join(tmp, os.path.basename(key))
++        print("Downloading", s3uri, "to", dest)
++        boto3.client("s3").download_file(bucket, key, dest)
++        cs = checksum(dest)
++        if cs != u["sha256"]:
++            print("Checksum mismatch for", dest, cs, "vs", u["sha256"])
++            ok = False
++        else:
++            print("Verified", dest)
++    shutil.rmtree(tmp)
++    return ok
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--shards", nargs="+", required=True, help="Paths to shard files or directories")
++    p.add_argument("--s3-prefix", help="s3://bucket/path to upload shards to")
++    p.add_argument("--upload", action="store_true")
++    args = p.parse_args()
++
++    meta = collect_shards(args.shards)
++    print("Collected %d files" % len(meta))
++    meta_path = "shard_metadata.json"
++    with open(meta_path, "w") as fh:
++        json.dump(meta, fh, indent=2)
++    print("Wrote metadata to", meta_path)
++
++    if args.upload:
++        if not args.s3_prefix:
++            raise RuntimeError("--s3-prefix required when --upload")
++        uploaded = upload_to_s3(meta, args.s3_prefix)
++        print("Uploaded %d files" % len(uploaded))
++        ok = download_and_verify(uploaded)
++        if ok:
++            print("Restore validation OK")
++        else:
++            print("Restore validation FAILED")
++
++if __name__ == "__main__":
++    main()
++
+diff --git a/docs/RLHF_TRL_AND_DEEPSPEED_RUNBOOK.md b/docs/RLHF_TRL_AND_DEEPSPEED_RUNBOOK.md
+new file mode 100644
+index 0000000..7777777
+--- /dev/null
++++ b/docs/RLHF_TRL_AND_DEEPSPEED_RUNBOOK.md
+@@ -0,0 +1,300 @@
++# TRL/PPO RLHF Implementation + DeepSpeed Multi-node Validation — Runbook
++
++This runbook explains how to run the TRL/PPO RLHF implementation and perform multi-node DeepSpeed validation using the artifacts in this patch.
++
++Prerequisites
++- Kubernetes cluster with GPU nodes (RDMA recommended for large-scale runs).
++- Persistent storage for model checkpoints.
++- Deployed components: Argo Workflows (for orchestration), Vault (for secrets), MLflow (optional).
++- Images built and pushed to your registry for:
++  - <REGISTRY>/aegis-rlhf-trl: contains trl, transformers, deepspeed, datasets, torch
++  - <REGISTRY>/aegis-deepspeed-trainer: deepspeed + training script module at /app/train_finetune
++  - <REGISTRY>/aegis-deepspeed-launcher: helper image for single-node sharded finetune
++  - <REGISTRY>/aegis-reward-trainer: reward trainer image
++
++1) TRL/PPO RLHF (Standalone)
++- Build image for RLHF runner:
++  - Dockerfile should install python, torch, transformers, trl, deepspeed, datasets, accelerate
++  - Copy scripts/ppo_trainer_trl.py into /app/scripts/
++
++- Prepare inputs:
++  - policy checkpoint or base HF model id (e.g., "gpt2" or a checkpoint path)
++  - reward model path (or HF model id) — train via scripts/train_reward_model.py
++  - rollout prompt dataset (JSONL with {"prompt":"..."})
++
++- Run locally (development):
++  export MLOPS_MLFLOW_TRACKING_URI=...
++  python3 scripts/ppo_trainer_trl.py --policy-model gpt2 --reward-model ./reward_model --dataset ./data/rollouts.jsonl --output-dir ./rlhf_out --ppo-epochs 1 --batch-size 2
++
++- In Argo (production/staging), use argo/workflows/fine_tune_rlhf_trl.yaml to submit a workflow that includes the rlhf-ppo-trl step.
++
++2) DeepSpeed multi-node validation (StatefulSet)
++- The StatefulSet pattern in k8s/manifests/deepspeed-multinode-statefulset.yaml provides:
++  - Headless Service `deepspeed-headless` for predictable master address
++  - StatefulSet `deepspeed-trainer` with replicas=2 (tweak as needed)
++
++- Prepare the image <REGISTRY>/aegis-deepspeed-trainer which must include:
++  - deepspeed, torch, transformers
++  - /app/train_finetune module (compatible with deepspeed --module)
++  - /app/configs/deepspeed_config.json
++
++- Deploy:
++  kubectl apply -f k8s/manifests/deepspeed-multinode-statefulset.yaml
++
++- Validate NCCL and RDMA:
++  - Check pod logs for NCCL debug lines (NCCL_DEBUG=INFO).
++  - Use `kubectl exec` into pod-0 and run quick NCCL test if available.
++
++- Run sharded restore test:
++  - On a node with the checkpoint shards, run:
++      python3 scripts/sharded_restore_test.py --shards /path/to/checkpoint-000/mp_rank_00 --s3-prefix s3://your-bucket/models/checkpoint-000 --upload
++    This will upload shards to S3 and immediately download & checksum them to validate round-trip integrity.
++
++- Monitor:
++  - Use pod logs to observe deepspeed progress and ensure no NCCL handshake errors.
++  - Confirm that deepspeed checkpoints are being written to /workspace/checkpoints (PVC).
++
++3) Recommended validations & metrics
++- Sharded restore success rate: run restore test 10x across random checkpoints, expect ≥ 99% success.
++- Training resume: simulate preemption by deleting one pod mid-run and verify deepspeed can resume from checkpoint.
++- NCCL connectivity: verify no IB/NIC errors in logs; check throughput using NCCL benchmarks if available.
++- MLflow: verify RLHF run artifacts are logged and model registered in registry.
++- Decision_log: ensure register_model created a promotion_requested entry and approval gateway is notified.
++
++4) Troubleshooting
++- If deepspeed fails to find master:
++  - Confirm DNS for master hostname resolves (pod-0 headless service).
++  - Confirm MASTER_PORT env matches deepspeed port.
++  - Ensure network policies allow pod-to-pod traffic on required ports.
++- If NCCL reports IB errors:
++  - Check NIC config; set NCCL_IB_DISABLE=1 to fallback to TCP for debugging.
++  - Engage infra to verify RDMA/NIC drivers.
++- If sharded restore fails checksum:
++  - Verify shard files were uploaded completely and S3 eventual consistency is not interfering; add retries.
++
++5) Security and cost controls
++- Always run large-scale tests in a restricted staging project with budget caps.
++- Ensure pods use service accounts with least privilege to access S3/LakeFS and MLflow.
++- Use OPA to gate expensive training runs until budget approval.
++
++6) Next steps (productionize)
++- Integrate with cluster scheduler (e.g., Volcano / kube-batch) to allocate GPU nodes with topology awareness.
++- Add automated restore CI job that runs sharded_restore_test periodically.
++- Add Prometheus exporters to collect GPU utilization, NCCL metrics, training step throughput and checkpoint I/O metrics.
++- Add runbooks for preemption/resume and model-card readiness before promotion.
++
++If you want, I can:
++- Produce Dockerfiles for the RLHF and deepspeed-trainer images.
++- Create an automated CI job that runs the sharded restore validation on every checkpoint release.
++- Implement a TRL-based PPO workflow with advanced options (KL control, reference model decay, reward normalization).
++
++End of runbook.

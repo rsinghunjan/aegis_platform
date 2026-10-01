@@ -1,0 +1,443 @@
+*** Begin Patch
+*** Add File:telemetry/cron_telemetry_collector.yaml
++apiVersion: batch/v1
++kind: CronJob
++metadata:
++  name: aegis-telemetry-health-collector
++  namespace: aegis
++spec:
++  schedule: "0 3 * * *" # daily at 03:00 UTC
++  concurrencyPolicy: "Forbid"
++  jobTemplate:
++    spec:
++      template:
++        spec:
++          serviceAccountName: aegis-ci-sa
++          containers:
++            - name: telemetry-health
++              image: ghcr.io/yourorg/aegis-tools:latest
++              command: ["/bin/sh","-c"]
++              env:
++                - name: EVIDENCE_BUCKET
++                  value: "REPLACE_WITH_EVIDENCE_BUCKET"
++                - name: AWS_REGION
++                  value: "REPLACE_WITH_AWS_REGION"
++              args:
++                - python3 /opt/telemetry/telemetry_healthcheck.py --prefix telemetry/ --days 14
++          restartPolicy: OnFailure
++
++# Deploy this CronJob to run daily. It will write telemetry health JSONs to s3://<EVIDENCE_BUCKET>/telemetry/health/
++
+*** End Patch
+*** Begin Patch
+*** Add File:calibration/iterative_convergence_runner.py
++#!/usr/bin/env python3
++"""
++Run iterative calibration until median_relative_error <= threshold or until max iterations.
++ - Reads reconciliations from S3, computes median relative error.
++ - If above threshold, triggers calibration and training jobs in cluster and waits for them.
++ - Re-evaluates and uploads validation reports/drafts to S3.
++ - Requires: EVIDENCE_BUCKET, AWS_REGION, K8S_NAMESPACE, CALIB_CRONJOB_NAME, TRAIN_JOB_MANIFEST (or image)
++"""
++import os, time, json, statistics, subprocess
++from datetime import datetime
++import boto3
++from kubernetes import client, config
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET") or "REPLACE_WITH_EVIDENCE_BUCKET"
++AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
++K8S_NAMESPACE = os.environ.get("K8S_NAMESPACE", "aegis")
++CALIB_CRONJOB_NAME = os.environ.get("CALIB_CRONJOB_NAME", "aegis-iterative-calibration")
++TRAIN_JOB_MANIFEST = os.environ.get("TRAIN_JOB_MANIFEST", "/opt/calib/runtime_train_job.yaml")
++MEDIAN_THRESHOLD = float(os.environ.get("MEDIAN_THRESHOLD", "0.10"))
++MAX_ITER = int(os.environ.get("MAX_CALIB_ITER", "5"))
++RECON_PREFIX = os.environ.get("RECON_PREFIX", "reconciliations/")
++S3_DRAFT_PREFIX = os.environ.get("S3_DRAFT_PREFIX", "calibration/drafts")
++
++def s3_client():
++    return boto3.client("s3", region_name=AWS_REGION)
++
++def list_recon_keys(s3):
++    paginator = s3.get_paginator("list_objects_v2")
++    for page in paginator.paginate(Bucket=EVIDENCE_BUCKET, Prefix=RECON_PREFIX):
++        for obj in page.get("Contents", []):
++            if obj["Key"].endswith(".json"):
++                yield obj["Key"]
++
++def compute_median(s3):
++    vals = []
++    for key in list_recon_keys(s3):
++        try:
++            body = s3.get_object(Bucket=EVIDENCE_BUCKET, Key=key)["Body"].read().decode()
++            j = json.loads(body)
++            est = j.get("estimate", {}).get("estimated_emissions_kg")
++            meas = j.get("measured", {}).get("measured_emissions_kg")
++            if est is None or meas in (None,0):
++                continue
++            vals.append(abs(meas - est) / float(meas))
++        except Exception:
++            continue
++    if not vals:
++        return None, 0
++    return statistics.median(vals), len(vals)
++
++def upload_report(s3, report):
++    key = f"calibration/validation_reports/validation_{int(time.time())}.json"
++    s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(report).encode())
++    return key
++
++def trigger_calibration_job():
++    # create one-off job from CronJob
++    name = f"calib-run-{int(time.time())}"
++    subprocess.run(["kubectl","-n",K8S_NAMESPACE,"create","job","--from=cronjob/"+CALIB_CRONJOB_NAME,name], check=False)
++    return name
++
++def apply_manifest(path):
++    subprocess.run(["kubectl","-n",K8S_NAMESPACE,"apply","-f",path], check=True)
++
++def wait_for_job(name, timeout=3600):
++    start = time.time()
++    api = client.BatchV1Api()
++    while time.time() - start < timeout:
++        try:
++            j = api.read_namespaced_job(name, K8S_NAMESPACE)
++            if j.status.succeeded and j.status.succeeded >= 1:
++                return True
++            if j.status.failed and j.status.failed > 0:
++                return False
++        except Exception:
++            pass
++        time.sleep(5)
++    return False
++
++def main():
++    config.load_incluster_config() if os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount/token") else config.load_kube_config()
++    s3 = s3_client()
++    for iter_n in range(1, MAX_ITER+1):
++        median, count = compute_median(s3)
++        report = {"iteration": iter_n, "median_relative_error": median, "sample_count": count, "ts": datetime.utcnow().isoformat()+"Z"}
++        print("Iteration", iter_n, "median", median, "count", count)
++        if median is None:
++            report["status"] = "no_reconciliations"
++            upload_report(s3, report)
++            return
++        if median <= MEDIAN_THRESHOLD:
++            report["status"] = "within_threshold"
++            upload_report(s3, report)
++            print("Converged: median <= threshold")
++            return
++        # else trigger calibration and training
++        report["status"] = "above_threshold_triggering_calibration"
++        upload_report(s3, report)
++        job_name = trigger_calibration_job()
++        ok = wait_for_job(job_name, timeout=1800)
++        if not ok:
++            print("Calibration job failed or timed out")
++            break
++        # apply train manifest
++        try:
++            apply_manifest(TRAIN_JOB_MANIFEST)
++        except Exception as e:
++            print("Training manifest apply failed:", e)
++            break
++        # wait for training job (assumes job name aegis-runtime-train)
++        wait_for_job("aegis-runtime-train", timeout=3600)
++        # loop: recompute median next iteration
++    # after max iter
++    final = {"status": "max_iterations_reached_or_failed", "ts": datetime.utcnow().isoformat()+"Z"}
++    upload_report(s3, final)
++    raise SystemExit("Calibration convergence not reached")
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:ci/calibration_converge.yml
++name: Calibration Convergence Runner
++
++on:
++  workflow_dispatch:
++  schedule:
++    - cron: '0 7 * * 1' # weekly Monday 07:00 UTC
++
++env:
++  EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++  AWS_REGION: ${{ secrets.AWS_REGION }}
++  KUBECONFIG: ${{ secrets.KUBECONFIG }}
++  MEDIAN_THRESHOLD: "0.10"
++  MAX_CALIB_ITER: "5"
++
++jobs:
++  converge:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: '3.11'
++      - name: Install deps
++        run: pip install boto3 kubernetes
++      - name: Configure kubeconfig
++        run: |
++          echo "${{ secrets.KUBECONFIG }}" > /tmp/kubeconfig
++          mkdir -p ~/.kube
++          cp /tmp/kubeconfig ~/.kube/config
++      - name: Run convergence runner
++        env:
++          EVIDENCE_BUCKET: ${{ secrets.EVIDENCE_BUCKET }}
++          AWS_REGION: ${{ secrets.AWS_REGION }}
++          K8S_NAMESPACE: "aegis"
++          CALIB_CRONJOB_NAME: "aegis-iterative-calibration"
++          TRAIN_JOB_MANIFEST: "calibration/runtime_train_job.yaml"
++          MEDIAN_THRESHOLD: ${{ env.MEDIAN_THRESHOLD }}
++          MAX_CALIB_ITER: ${{ env.MAX_CALIB_ITER }}
++        run: |
++          python3 calibration/iterative_convergence_runner.py
++
+*** End Patch
+*** Begin Patch
+*** Add File:enforcement/rollout/rollout_staged.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Staged rollout helper for scheduler extender + Argo enforcer.
++# Usage: rollout_staged.sh <staging-namespace> <prod-namespace> <target-coverage>
++#
++STAGE_NS=${1:-aegis-staging}
++PROD_NS=${2:-aegis}
++TARGET=${3:-0.95}
++EVIDENCE_BUCKET=${EVIDENCE_BUCKET:-REPLACE_WITH_EVIDENCE_BUCKET}
++AWS_REGION=${AWS_REGION:-REPLACE_WITH_AWS_REGION}
++
++echo "Deploying enforcer & extender to staging (${STAGE_NS})"
++kubectl -n ${STAGE_NS} apply -f ../enforcer-webhook-manifests.yaml || true
++kubectl -n kube-system apply -f ../extender/deploy_extender.yaml || true
++
++echo "Waiting 30s for services to stabilize..."
++sleep 30
++
++echo "Running enforcement coverage harness against staging"
++python3 ../test_harness/enforcement_coverage_harness.py || true
++
++echo "Download latest coverage report from S3 (best-effort)"
++aws s3 ls s3://${EVIDENCE_BUCKET}/enforcement/coverage_reports/ || true
++
++LATEST=$(aws s3 ls s3://${EVIDENCE_BUCKET}/enforcement/coverage_reports/ | tail -n1 | awk '{print $4}')
++if [ -n "$LATEST" ]; then
++  echo "Found report $LATEST; downloading..."
++  aws s3 cp s3://${EVIDENCE_BUCKET}/enforcement/coverage_reports/${LATEST} /tmp/coverage.json || true
++  COVERAGE=$(jq -r '.coverage' /tmp/coverage.json)
++  echo "Coverage reported: $COVERAGE"
++else
++  echo "No coverage report found; aborting staged promotion"
++  exit 1
++fi
++
++awk "BEGIN { if ($COVERAGE+0 >= ${TARGET}+0) exit 0; else exit 1 }"
++if [ $? -eq 0 ]; then
++  echo "Coverage >= target; consider promoting to limited PROD namespace"
++  # apply to small prod namespace (operator decision)
++  # kubectl -n ${PROD_NS} apply -f ../enforcer-webhook-manifests.yaml
++else
++  echo "Coverage below target; iterate policies and re-run harness"
++  exit 2
++fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:etl/tune_parquet.py
++#!/usr/bin/env python3
++"""
++Analyze a sample of JSON evidence files and recommend parquet batch size and partitioning.
++Writes a suggested config to stdout and optionally uploads to S3.
++"""
++import os, json, argparse, boto3, statistics
++from glob import glob
++
++def sample_stats(sample_files):
++    sizes = []
++    for f in sample_files:
++        try:
++            sizes.append(os.path.getsize(f))
++        except Exception:
++            continue
++    if not sizes:
++        return None
++    avg = sum(sizes)/len(sizes)
++    median = statistics.median(sizes)
++    return {"count": len(sizes), "avg_bytes": avg, "median_bytes": median}
++
++def recommend_batch(avg_bytes, target_parquet_size_mb=128):
++    # approximate rows per parquet: assume avg json -> bytes per record
++    if avg_bytes <= 0:
++        return 2000
++    est_rows = (target_parquet_size_mb * 1024 * 1024) / avg_bytes
++    return max(500, int(est_rows))
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--local-sample-glob", default="/data/sample_evidence/*.json")
++    p.add_argument("--target-mb", type=int, default=128)
++    p.add_argument("--upload-s3", action="store_true")
++    p.add_argument("--evidence-bucket", default=None)
++    args = p.parse_args()
++    files = glob(args.local_sample_glob)[:500]
++    stats = sample_stats(files)
++    if not stats:
++        print("No sample files found at", args.local_sample_glob)
++        return
++    batch = recommend_batch(stats["avg_bytes"], args.target_mb)
++    out = {"sample_count": stats["count"], "avg_bytes": stats["avg_bytes"], "median_bytes": stats["median_bytes"], "recommended_batch_size": batch, "target_parquet_mb": args.target_mb}
++    print(json.dumps(out, indent=2))
++    if args.upload_s3 and args.evidence_bucket:
++        s3 = boto3.client("s3")
++        key = f"parquet/tuning/recommendation_{int(time.time())}.json"
++        s3.put_object(Bucket=args.evidence_bucket, Key=key, Body=json.dumps(out).encode())
++        print("Uploaded recommendation to s3://%s/%s" % (args.evidence_bucket, key))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:security/create_cert_secret.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Create Kubernetes TLS secret for cert-manager ClusterIssuer usage (operator-run)
++#
++if [ $# -lt 2 ]; then
++  echo "Usage: $0 <cert-file.pem> <key-file.pem> [namespace: cert-manager]"
++  exit 2
++fi
++CERT=$1
++KEY=$2
++NS=${3:-cert-manager}
++
++kubectl -n ${NS} create secret tls corporate-ca-keypair --cert="${CERT}" --key="${KEY}" --dry-run=client -o yaml | kubectl apply -f -
++echo "Created corporate CA secret in namespace ${NS} as corporate-ca-keypair"
++
+*** End Patch
+*** Begin Patch
+*** Add File:security/rbac_audit_report.py
++#!/usr/bin/env python3
++"""
++Scans cluster RBAC and writes a JSON report to S3 for audit review.
++ - Lists ClusterRoleBindings and RoleBindings referencing serviceaccounts in aegis namespace
++ - Writes report to s3://<EVIDENCE_BUCKET>/security/rbac_audit_<ts>.json
++"""
++import os, json, time, subprocess, boto3
++
++EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET") or "REPLACE_WITH_EVIDENCE_BUCKET"
++AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
++
++def kubectl_json(cmd):
++    out = subprocess.check_output(["kubectl"] + cmd.split(), text=True)
++    return json.loads(out)
++
++def main():
++    crbs = kubectl_json("get clusterrolebinding -o json")
++    rbs = kubectl_json("get rolebinding --all-namespaces -o json")
++    findings = {"clusterrolebindings": crbs.get("items", []), "rolebindings": rbs.get("items", [])}
++    s3 = boto3.client("s3", region_name=AWS_REGION)
++    key = f"security/rbac_audit_{int(time.time())}.json"
++    s3.put_object(Bucket=EVIDENCE_BUCKET, Key=key, Body=json.dumps(findings).encode())
++    print("Wrote RBAC audit report to s3://%s/%s" % (EVIDENCE_BUCKET, key))
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch
+*** Begin Patch
+*** Add File:operational/alertmanager_slack_pagerduty.yaml
++global:
++  resolve_timeout: 5m
++route:
++  receiver: slack-or-pagerduty
++  routes:
++    - match:
++        severity: page
++      receiver: pagerduty
++    - match_re:
++        severity: warning|info
++      receiver: slack
++receivers:
++  - name: slack
++    slack_configs:
++      - api_url: 'https://hooks.slack.com/services/REPLACE/SLACK/WEBHOOK'
++        channel: '#aegis-alerts'
++  - name: pagerduty
++    pagerduty_configs:
++      - service_key: 'REPLACE_PAGERDUTY_KEY'
++        severity: '{{ .CommonLabels.severity }}'
++
++# Load this into Alertmanager and ensure secrets are stored in your secret manager for webhooks/PD keys.
++
+*** End Patch
+*** Begin Patch
+*** Add File:airflow/dags/monthly_dr_resume_drill.py
++from datetime import datetime, timedelta
++from airflow import DAG
++from airflow.operators.python import PythonOperator
++import subprocess
++
++DEFAULT_ARGS = {
++    'owner': 'aegis',
++    'depends_on_past': False,
++    'email_on_failure': True,
++    'retries': 0,
++}
++
++def run_dr_script():
++    subprocess.check_call("python3 operational/dr_resume_test.py", shell=True)
++
++with DAG(
++    dag_id="aegis_monthly_dr_resume_drill",
++    default_args=DEFAULT_ARGS,
++    schedule_interval="@monthly",
++    start_date=datetime(2025,1,1),
++    catchup=False,
++) as dag:
++    drill = PythonOperator(task_id="run_dr_resume_test", python_callable=run_dr_script)
++
+*** End Patch
+*** Begin Patch
+*** Add File:runbooks/production_finalize_actions.md
++# Production Finalize Actions — checklist and automation
++
++This file ties the automated scripts together and gives the exact sequence to make Aegis fully operational:
++
++1) Telemetry collection (14 days)
++ - Ensure telemetry/cron_telemetry_collector.yaml CronJob deployed.
++ - Verify daily S3 reports in s3://<EVIDENCE_BUCKET>/telemetry/health/
++
++2) Calibration convergence
++ - Run ci/calibration_converge.yml workflow (or run calibration/iterative_convergence_runner.py)
++ - Iterate until validation report median_relative_error <= 0.10 for sustained window.
++
++3) Enforcement staged rollout
++ - Run enforcement/rollout/rollout_staged.sh against staging and follow the prompts. Iterate policies until coverage >= 0.95.
++
++4) DW provisioning & tuning
++ - Provision DW using terraform modules (terraform/redshift/*).
++ - Run etl/tune_parquet.py on samples to get recommended PARQUET_BATCH_SIZE for s3_parquet_pipeline_v3.py.
++ - Run parquet pipeline, manifest and loader in dev; validate MERGE/upsert idempotency.
++
++5) Security finalization
++ - Create cert-manager corporate CA secret using security/create_cert_secret.sh.
++ - Provision KMS key and alias using Terraform (security/provision_kms.tf) and rotate cosign key with security/cosign_rotate_and_rekor_log.sh.
++ - Run security/rbac_audit_report.py and remediate broad RBAC.
++
++6) Operationalization
++ - Deploy Alertmanager config (operational/alertmanager_slack_pagerduty.yaml).
++ - Ensure monthly DR/resume drill DAG is enabled and execute first drill.
++ - Collect audit package artifacts per audit/AUDIT_PACKAGE_TEMPLATE.md.
++
++Notes:
++- Replace placeholders before running scripts (EVIDENCE_BUCKET, AWS_REGION, webhook/pd keys).
++- All operator actions that promote to production must be manual and recorded with cosign signatures.
++
+*** End Patch
+*** End Patch

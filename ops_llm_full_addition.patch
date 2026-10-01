@@ -1,0 +1,629 @@
+*** Begin Patch
+*** Add File:ops/llm/inference_adapter/app.py
++#!/usr/bin/env python3
++"""
++Inference adapter service
++- Provides /v1/embeddings and /v1/complete endpoints
++- Emits Prometheus metrics (requests, tokens_estimated, latency)
++- Forwards to external LLM APIs (OpenAI/Anthropic/etc.) or to a local model endpoint depending on env
++
++Config (env):
++  MODEL_ENDPOINT - optional local model URL (http://host:port)
++  OPENAI_API_KEY - optional (if using OpenAI)
++  PORT - server port (default 8080)
++  LOG_LEVEL - python logging level
++"""
++import os
++import time
++import logging
++from flask import Flask, request, jsonify
++import requests
++from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
++
++LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
++logging.basicConfig(level=LOG_LEVEL)
++log = logging.getLogger("inference-adapter")
++
++MODEL_ENDPOINT = os.environ.get("MODEL_ENDPOINT", "")
++OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
++
++REQUEST_COUNT = Counter("llm_requests_total", "Total LLM adapter requests", ["endpoint"])
++TOKEN_ESTIMATE = Counter("llm_token_estimated_total", "Estimated tokens processed", ["endpoint"])
++LATENCY = Histogram("llm_request_latency_seconds", "Latency seconds", ["endpoint"])
++
++app = Flask(__name__)
++
++def estimate_tokens_from_text(text: str) -> int:
++    # very rough token approximation (words * 1.33)
++    return max(1, int(len(text.split()) * 1.33))
++
++@app.route("/metrics")
++def metrics():
++    return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}
++
++@app.route("/v1/embeddings", methods=["POST"])
++def embeddings():
++    REQUEST_COUNT.labels(endpoint="embeddings").inc()
++    payload = request.json or {}
++    inputs = payload.get("input") or payload.get("inputs")
++    if inputs is None:
++        return jsonify({"error": "missing input"}), 400
++    start = time.time()
++    # simple proxy to OpenAI embeddings if key provided
++    if OPENAI_API_KEY:
++        resp = requests.post(
++            "https://api.openai.com/v1/embeddings",
++            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
++            json={"model": payload.get("model", "text-embedding-3-small"), "input": inputs},
++            timeout=30,
++        )
++        result = resp.json()
++    elif MODEL_ENDPOINT:
++        resp = requests.post(f"{MODEL_ENDPOINT}/v1/embeddings", json=payload, timeout=30)
++        result = resp.json()
++    else:
++        # placeholder embedding: hash of text -> list
++        vec = [float(sum(bytearray(str(inputs), "utf-8")) % 1000) / 1000.0]
++        result = {"data": [{"embedding": vec, "index": 0}]}
++    elapsed = time.time() - start
++    LATENCY.labels(endpoint="embeddings").observe(elapsed)
++    TOKEN_ESTIMATE.labels(endpoint="embeddings").inc(sum(estimate_tokens_from_text(x) for x in [inputs]) )
++    return jsonify(result)
++
++@app.route("/v1/complete", methods=["POST"])
++def complete():
++    REQUEST_COUNT.labels(endpoint="complete").inc()
++    payload = request.json or {}
++    prompt = payload.get("prompt", "")
++    start = time.time()
++    # Proxy to OpenAI chat completions if key present
++    if OPENAI_API_KEY:
++        resp = requests.post(
++            "https://api.openai.com/v1/chat/completions",
++            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
++            json={
++                "model": payload.get("model", "gpt-4o-mini"),
++                "messages": [{"role": "user", "content": prompt}],
++                "max_tokens": payload.get("max_tokens", 512),
++            },
++            timeout=60,
++        )
++        result = resp.json()
++    elif MODEL_ENDPOINT:
++        resp = requests.post(f"{MODEL_ENDPOINT}/v1/complete", json=payload, timeout=60)
++        result = resp.json()
++    else:
++        # fallback deterministic answer
++        result = {"id": "local-fallback", "choices": [{"message": {"content": f"Echo: {prompt}"}}]}
++    elapsed = time.time() - start
++    LATENCY.labels(endpoint="complete").observe(elapsed)
++    TOKEN_ESTIMATE.labels(endpoint="complete").inc(estimate_tokens_from_text(prompt))
++    return jsonify(result)
++
++if __name__ == "__main__":
++    port = int(os.environ.get("PORT", 8080))
++    app.run(host="0.0.0.0", port=port)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/llm/inference_adapter/Dockerfile
++FROM python:3.11-slim
++WORKDIR /app
++COPY app.py /app/app.py
++RUN pip install --no-cache-dir flask requests prometheus_client
++EXPOSE 8080
++CMD ["python", "app.py"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/llm/inference-adapter-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: inference-adapter
++  namespace: aegis
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: inference-adapter
++  template:
++    metadata:
++      labels:
++        app: inference-adapter
++    spec:
++      serviceAccountName: inference-adapter-sa
++      containers:
++        - name: adapter
++          image: REPLACE_IMAGE_REGISTRY/inference-adapter:latest
++          ports:
++            - containerPort: 8080
++          env:
++            - name: OPENAI_API_KEY
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-runtime-secrets
++                  key: OPENAI_API_KEY
++            - name: MODEL_ENDPOINT
++              value: ""
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: inference-adapter
++  namespace: aegis
++spec:
++  ports:
++    - port: 8080
++      targetPort: 8080
++  selector:
++    app: inference-adapter
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/llm/rag_service/app.py
++#!/usr/bin/env python3
++"""
++RAG service:
++- /query accepts {"question": "...", "top_k": 5}
++- uses PGVector (Postgres) to fetch top_k docs, composes context, calls inference adapter, returns answer + provenance
++- writes minimal evidence artifact to S3 (signed write is left to infra)
++"""
++import os
++import json
++import time
++import logging
++from flask import Flask, request, jsonify
++import requests
++import psycopg2
++import boto3
++
++logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
++log = logging.getLogger("rag-service")
++
++PG_HOST = os.environ.get("PG_HOST", "postgres.aegis.svc.cluster.local")
++PG_PORT = int(os.environ.get("PG_PORT", 5432))
++PG_DB = os.environ.get("PG_DB", "aegis")
++PG_USER = os.environ.get("PG_USER", "aegis")
++S3_BUCKET = os.environ.get("EVIDENCE_BUCKET", "")
++ADAPTER_URL = os.environ.get("INFERENCE_ADAPTER_URL", "http://inference-adapter.aegis.svc.cluster.local:8080")
++
++app = Flask(__name__)
++
++def pg_connect():
++    return psycopg2.connect(host=PG_HOST, port=PG_PORT, dbname=PG_DB, user=PG_USER)
++
++def fetch_topk(query_embedding, top_k=5):
++    # placeholder: assume embeddings table "documents" with vector column "embedding"
++    conn = pg_connect()
++    cur = conn.cursor()
++    # Use <-> operator for pgvector if available. This is a placeholder paramized query.
++    cur.execute("SELECT id, content, metadata FROM documents ORDER BY embedding <-> %s LIMIT %s", (query_embedding, top_k))
++    rows = cur.fetchall()
++    cur.close()
++    conn.close()
++    return [{"id": r[0], "content": r[1], "metadata": r[2]} for r in rows]
++
++def call_adapter(prompt, max_tokens=512):
++    resp = requests.post(f"{ADAPTER_URL}/v1/complete", json={"prompt": prompt, "max_tokens": max_tokens}, timeout=30)
++    return resp.json()
++
++def write_evidence(answer, context, question):
++    if not S3_BUCKET:
++        log.info("No EVIDENCE_BUCKET configured, skipping evidence write")
++        return None
++    s3 = boto3.client("s3")
++    key = f"evidence/llm/{int(time.time())}.json"
++    payload = {"question": question, "answer": answer, "context": context}
++    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(payload).encode("utf-8"))
++    return key
++
++@app.route("/query", methods=["POST"])
++def query():
++    body = request.json or {}
++    question = body.get("question") or body.get("q") or ""
++    top_k = int(body.get("top_k", 5))
++    if not question:
++        return jsonify({"error": "missing question"}), 400
++    # 1) get embedding for question
++    emb_resp = requests.post(f"{ADAPTER_URL}/v1/embeddings", json={"input": question}, timeout=30).json()
++    # Attempt to read the embedding vector
++    try:
++        query_embedding = emb_resp["data"][0]["embedding"]
++    except Exception:
++        return jsonify({"error": "failed to compute embedding", "details": emb_resp}), 500
++    # 2) fetch top-k from vector DB
++    docs = fetch_topk(query_embedding, top_k=top_k)
++    context = "\n\n".join([d["content"] for d in docs])
++    prompt = f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer concisely and cite sources."
++    # 3) call adapter for completion
++    answer_resp = call_adapter(prompt)
++    answer_text = ""
++    try:
++        if "choices" in answer_resp:
++            answer_text = answer_resp["choices"][0].get("message", {}).get("content", "") or answer_resp["choices"][0].get("text", "")
++        else:
++            answer_text = answer_resp.get("result") or str(answer_resp)
++    except Exception:
++        answer_text = str(answer_resp)
++    # 4) write evidence to S3
++    evidence_key = write_evidence(answer_text, context, question)
++    return jsonify({"answer": answer_text, "sources": [d["id"] for d in docs], "evidence_key": evidence_key})
++
++if __name__ == "__main__":
++    port = int(os.environ.get("PORT", 8081))
++    app.run(host="0.0.0.0", port=port)
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/llm/rag_service/Dockerfile
++FROM python:3.11-slim
++WORKDIR /app
++COPY app.py /app/app.py
++RUN pip install --no-cache-dir flask requests psycopg2-binary boto3
++EXPOSE 8081
++CMD ["python", "app.py"]
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/llm/rag-service-deployment.yaml
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: rag-service
++  namespace: aegis
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: rag-service
++  template:
++    metadata:
++      labels:
++        app: rag-service
++    spec:
++      serviceAccountName: rag-service-sa
++      containers:
++        - name: rag
++          image: REPLACE_IMAGE_REGISTRY/rag-service:latest
++          env:
++            - name: PG_HOST
++              value: "postgres.aegis.svc.cluster.local"
++            - name: PG_DB
++              value: "aegis"
++            - name: PG_USER
++              value: "aegis"
++            - name: EVIDENCE_BUCKET
++              valueFrom:
++                secretKeyRef:
++                  name: aegis-runtime-secrets
++                  key: EVIDENCE_BUCKET
++            - name: INFERENCE_ADAPTER_URL
++              value: "http://inference-adapter.aegis.svc.cluster.local:8080"
++          ports:
++            - containerPort: 8081
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: rag-service
++  namespace: aegis
++spec:
++  ports:
++    - port: 8081
++      targetPort: 8081
++  selector:
++    app: rag-service
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/llm/install_vector_db.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Install Postgres + pgvector using Helm (bitnami/postgresql) and enable pgvector extension.
++# This script is a convenience; adjust values (storageClass, passwords) for your environment.
++#
++NAMESPACE=${1:-aegis}
++helm repo add bitnami https://charts.bitnami.com/bitnami || true
++helm repo update
++kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
++
++echo "Installing Postgres via Helm (release: aegis-postgres)"
++helm upgrade --install aegis-postgres bitnami/postgresql -n "${NAMESPACE}" \
++  --set auth.postgresPassword=REPLACE_POSTGRES_PASSWORD \
++  --set primary.persistence.size=10Gi \
++  --wait
++
++echo "Creating pgvector extension in the database (requires psql client and credentials)."
++echo "You can run: kubectl run -it --rm --namespace ${NAMESPACE} psql --image=postgres:15 -- bash"
++echo "Then connect and run: CREATE EXTENSION IF NOT EXISTS vector;"
++
++echo "Vector DB installation complete. Create external secret for DB credentials and create table 'documents' with a vector column 'embedding'."
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/external-secrets/vector-db-externalsecret.yaml
++apiVersion: external-secrets.io/v1beta1
++kind: ExternalSecret
++metadata:
++  name: vector-db-credentials
++  namespace: aegis
++spec:
++  refreshInterval: "24h"
++  secretStoreRef:
++    name: aws-secrets-manager
++    kind: SecretStore
++  target:
++    name: vector-db-creds
++    creationPolicy: Owner
++  data:
++    - secretKey: PG_HOST
++      remoteRef:
++        key: "aegis/vector-db"
++        property: "host"
++    - secretKey: PG_PORT
++      remoteRef:
++        key: "aegis/vector-db"
++        property: "port"
++    - secretKey: PG_DB
++      remoteRef:
++        key: "aegis/vector-db"
++        property: "db"
++    - secretKey: PG_USER
++      remoteRef:
++        key: "aegis/vector-db"
++        property: "user"
++    - secretKey: PG_PASSWORD
++      remoteRef:
++        key: "aegis/vector-db"
++        property: "password"
++
+*** End Patch
+*** Begin Patch
+*** Add File:argo/llm/embed_workflow.yaml
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: llm-embed-
++  namespace: argo
++spec:
++  entrypoint: embed-and-upsert
++  templates:
++    - name: embed-and-upsert
++      steps:
++        - - name: fetch-docs
++            template: fetch-docs
++        - - name: compute-embeddings
++            template: compute-embeddings
++        - - name: upsert-to-pg
++            template: upsert-to-pg
++
++    - name: fetch-docs
++      script:
++        image: bitnami/kubectl:1.27
++        command: [bash]
++        source: |
++          # Placeholder: fetch docs from a source (S3, GCS, repo)
++          echo '{"docs":[{"id":"doc1","text":"Example document text 1"},{"id":"doc2","text":"Example document text 2"}]}' > /tmp/docs.json
++          cat /tmp/docs.json
++
++    - name: compute-embeddings
++      script:
++        image: curlimages/curl:7.85
++        command: [sh]
++        source: |
++          DOCS_JSON=/tmp/docs.json
++          # iterate docs and call inference adapter embeddings endpoint (replace host if needed)
++          jq -c '.docs[]' ${DOCS_JSON} | while read -r doc; do
++            id=$(echo $doc | jq -r .id)
++            text=$(echo $doc | jq -r .text)
++            echo "Embedding doc ${id}"
++            curl -s -X POST -H "Content-Type: application/json" -d "{\"input\": ${text@Q}}" http://inference-adapter.aegis.svc.cluster.local:8080/v1/embeddings > /tmp/embed_${id}.json
++          done
++          ls -l /tmp/embed_*.json || true
++
++    - name: upsert-to-pg
++      script:
++        image: postgres:15
++        command: [bash]
++        source: |
++          # This script assumes PG env vars are present (PGHOST, PGUSER, PGPASSWORD, PGDATABASE)
++          for f in /tmp/embed_*.json; do
++            id=$(basename $f | sed 's/embed_//;s/\.json//')
++            emb=$(jq -c '.data[0].embedding' $f)
++            # Placeholder: upsert using psql. Requires pgvector extension and documents table (id text, content text, embedding vector)
++            psql -c "INSERT INTO documents (id, content, embedding) VALUES ('$id','placeholder content', '$emb') ON CONFLICT (id) DO UPDATE SET content=EXCLUDED.content, embedding=EXCLUDED.embedding;"
++          done
++
+*** End Patch
+*** Begin Patch
+*** Add File:prompts/sample_prompts/prompt_catalog.md
++# Prompt Catalog (example)
++
++Each prompt is versioned in files under prompts/. Use the CI validation workflow to lint and ensure placeholders are present.
++
++- prompts/generic_qa_v1.txt
++  - Description: Generic QA with provenance request
++  - Content:
++    Context:
++    {context}
++
++    Question:
++    {question}
++
++    Instructions:
++    Answer concisely, cite sources by id.
++
+*** End Patch
+*** Begin Patch
+*** Add File:.github/workflows/validate_prompts.yml
++name: Validate Prompts
++
++on:
++  push:
++    paths:
++      - 'prompts/**'
++
++jobs:
++  lint:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Validate prompt placeholders
++        run: |
++          set -e
++          for f in prompts/*; do
++            if ! grep -q '{question}' "$f" || ! grep -q '{context}' "$f"; then
++              echo "Prompt $f missing required placeholders {question} or {context}"
++              exit 1
++            fi
++          done
++          echo "All prompts contain required placeholders."
++
+*** End Patch
+*** Begin Patch
+*** Add File:ops/llm/llm_cost_gate.sh
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# LLM cost gate wrapper: call estimator and exit non-zero if estimate > BUDGET_USD
++#
++JOB_SPEC=${1:-}
++BUDGET_USD=${BUDGET_USD:-100}
++
++if [ -z "${JOB_SPEC}" ]; then
++  echo "Usage: $0 path/to/job_spec.json"
++  exit 2
++fi
++
++if [ -x ./ops/qpu_cost_estimator_braket_integration.py ]; then
++  EST=$(python3 ./ops/qpu_cost_estimator_braket_integration.py --estimate --job "${JOB_SPEC}")
++  echo "Estimated cost: ${EST} USD"
++  python3 - <<PY
++est=float("${EST}")
++budget=float("${BUDGET_USD}")
++import sys
++sys.exit(2 if est>budget else 0)
++PY
++  rc=$?
++  if [ $rc -eq 2 ]; then
++    echo "Cost ${EST} exceeds budget ${BUDGET_USD} -> gating execution."
++    exit 2
++  else
++    echo "Cost within budget -> proceed."
++    exit 0
++  fi
++else
++  echo "Cost estimator not found; require manual approval."
++  exit 1
++fi
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/monitoring/llm_prometheus_rules.yaml
++apiVersion: monitoring.coreos.com/v1
++kind: PrometheusRule
++metadata:
++  name: aegis-llm-rules
++  namespace: monitoring
++spec:
++  groups:
++    - name: llm.rules
++      rules:
++        - alert: LLMTokenSpike
++          expr: increase(llm_token_estimated_total[5m]) > 100000
++          for: 2m
++          labels:
++            severity: warning
++          annotations:
++            summary: "Large token usage spike detected"
++            description: "Estimated token usage increased by >100k in 5m; check for runaway calls."
++        - alert: LLMLatencyHigh
++          expr: histogram_quantile(0.95, sum(rate(llm_request_latency_seconds_bucket[5m])) by (le)) > 5
++          for: 5m
++          labels:
++            severity: warning
++          annotations:
++            summary: "High LLM request latency"
++            description: "95th percentile latency > 5s for LLM adapter."
++
+*** End Patch
+*** Begin Patch
+*** Add File:k8s/gatekeeper/constraint_llm_namespace_label.yaml
++apiVersion: constraints.gatekeeper.sh/v1beta1
++kind: K8sRequiredLabels
++metadata:
++  name: require-legal-signoff
++spec:
++  match:
++    kinds:
++      - apiGroups: [""]
++        kinds: ["Namespace"]
++  parameters:
++    labels:
++      - "legal_signoff"
++
++# Usage:
++# - Gatekeeper will require namespaces to include label 'legal_signoff' when created.
++# - Use this to ensure namespaces intended for real-data or QPU runs have explicit signoff.
++
+*** End Patch
+*** Begin Patch
+*** Add File:docs/llm_readme.md
++# LLM‑D Integration for Aegis
++
++This patch adds a minimal but complete LLM development & deployment surface integrated with Aegis:
++
++Components added
++- Inference adapter: ops/llm/inference_adapter (Flask app) + k8s deployment/service.
++  - Provides /v1/embeddings and /v1/complete endpoints. Proxies to OpenAI if OPENAI_API_KEY set, or to a local MODEL_ENDPOINT.
++  - Exposes Prometheus metrics (/metrics).
++- RAG service: ops/llm/rag_service (Flask app) + k8s deployment/service.
++  - Composes context from PGVector documents table and calls the inference adapter.
++  - Writes evidence artifacts to S3 (EVIDENCE_BUCKET) if configured.
++- Vector DB install helper: ops/llm/install_vector_db.sh (helm + instructions to enable pgvector).
++- ExternalSecrets mapping for vector DB credentials: k8s/external-secrets/vector-db-externalsecret.yaml
++- Argo embedding workflow: argo/llm/embed_workflow.yaml (fetch docs -> compute embeddings -> upsert to Postgres)
++- Prompt store sample: prompts/sample_prompts + CI validator workflow (.github/workflows/validate_prompts.yml)
++- LLM cost gate: ops/llm/llm_cost_gate.sh (wraps estimator and gates expensive runs)
++- Prometheus rules for LLM monitoring: k8s/monitoring/llm_prometheus_rules.yaml
++- Gatekeeper constraint to require 'legal_signoff' label on namespaces for real-data/QPU use: k8s/gatekeeper/constraint_llm_namespace_label.yaml
++
++Quick start (operator)
++1. Build and push images for inference-adapter and rag-service:
++   - docker build -t REGISTRY/inference-adapter:latest ops/llm/inference_adapter
++   - docker push ...
++   - docker build -t REGISTRY/rag-service:latest ops/llm/rag_service
++   - docker push ...
++2. Install vector DB:
++   - ./ops/llm/install_vector_db.sh
++   - Create pgvector extension and create documents table:
++     CREATE EXTENSION IF NOT EXISTS vector;
++     CREATE TABLE documents (id text PRIMARY KEY, content text, metadata jsonb, embedding vector(1536));
++3. Create vector DB credentials in AWS Secrets Manager and let ExternalSecrets create k8s secret using k8s/external-secrets/vector-db-externalsecret.yaml
++4. Deploy inference adapter and rag service:
++   - kubectl apply -f k8s/llm/inference-adapter-deployment.yaml
++   - kubectl apply -f k8s/llm/rag-service-deployment.yaml
++5. Deploy Argo embed workflow (argo/llm/embed_workflow.yaml) and run it to populate documents.
++6. Add prompts to prompts/ and rely on the validate_prompts workflow to lint them.
++7. Integrate llm_cost_gate.sh into your workflows for budget gating.
++8. Install Gatekeeper (if not already) and apply k8s/gatekeeper/constraint_llm_namespace_label.yaml to require legal_signoff label for namespaces.
++9. Apply Prometheus rules file to monitoring namespace.
++
++Security & governance notes
++- Use ExternalSecrets to avoid storing DB and API credentials in git.
++- Keep OPENAI_API_KEY and other provider keys in GitHub Secrets & ExternalSecrets.
++- Limit promoter & CI tokens to minimal scopes. Use OIDC for Actions where possible.
++- Require legal signoff label on namespaces before enabling real-data QPU usage.
++- Hook up cost estimator and ops/llm/llm_cost_gate.sh in workflows to prevent runaway expenses.
++
++This implementation is intentionally minimal and meant to be extended. I can:
++- Fill in any REPLACE_* placeholders and open a PR with non-secret values.
++- Expand the Argo workflows to support large-scale ingestion, chunking, and parallel embedding.
++- Create Helm charts for inference-adapter and rag-service with resource limits and HPA.
++- Add sample pg upsert helper container image used by the embed_workflow to perform safe upserts.
++
++Which next step would you like me to generate or expand?
++
+*** End Patch

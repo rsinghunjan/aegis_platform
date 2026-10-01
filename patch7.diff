@@ -1,0 +1,411 @@
+diff --git a/api/golden_k8s.py b/api/golden_k8s.py
+index 8c0d584..8a0f2b3 100644
+--- a/api/golden_k8s.py
++++ b/api/golden_k8s.py
+@@ -1,10 +1,12 @@
+ from __future__ import annotations
+ 
+ import os
+ import re
+ from typing import Dict, Optional, Tuple
+ 
+ from kubernetes import client, config
+ from kubernetes.client.rest import ApiException
+ 
+@@ -12,6 +14,30 @@ from kubernetes.client.rest import ApiException
+ def _load_k8s():
+     mode = os.environ.get("AEGIS_K8S_CONFIG", "auto")  # auto|incluster|kubeconfig
+     if mode == "incluster":
+         config.load_incluster_config()
+         return
+@@ -32,6 +58,74 @@ def _apps() -> client.AppsV1Api:
+     _load_k8s()
+     return client.AppsV1Api()
+ 
+ 
++def _maybe_create_secret(namespace: str, name: str, data: Dict[str, str], labels: Optional[Dict[str, str]] = None):
++    """
++    Best-effort: create a secret if it doesn't exist.
++    NOTE: This stores sensitive data in a Kubernetes Secret; use External Secrets / Vault Agent in production.
++    """
++    core = _core()
++    try:
++        core.read_namespaced_secret(name=name, namespace=namespace)
++        return
++    except ApiException as e:
++        if e.status != 404:
++            raise
++    body = client.V1Secret(
++        metadata=client.V1ObjectMeta(name=name, namespace=namespace, labels=labels or {}),
++        type="Opaque",
++        string_data=data,
++    )
++    core.create_namespaced_secret(namespace=namespace, body=body)
++
++
+ def ensure_tenant_namespace(tenant_id: str) -> str:
+     ns = f"aegis-{tenant_id}"
+     core = _core()
+     try:
+         core.read_namespace(ns)
+@@ -49,11 +143,36 @@ def ensure_tenant_namespace(tenant_id: str) -> str:
+     core.create_namespace(body=body)
+     return ns
+ 
+ 
+ def _parse_s3_uri(uri: str) -> Tuple[str, str]:
+@@ -78,6 +197,116 @@ def _sanitize_name(s: str) -> str:
+     return s[:50] if len(s) > 50 else s
+ 
+ 
++def _storage_env_and_secrets(namespace: str) -> Tuple[list[client.V1EnvVar], list[client.V1EnvFromSource]]:
++    """
++    Provide S3/MinIO credentials to initContainers.
++
++    Supported modes:
++      1) AWS in-cluster with IRSA/instance profile: no explicit creds required.
++      2) MinIO / static creds: set AEGIS_MINIO_ACCESS_KEY + AEGIS_MINIO_SECRET_KEY
++         -> secret aegis-s3-creds will be created in the tenant namespace.
++
++    This keeps the patch self-contained. For production, use:
++      - External Secrets Operator, or
++      - Vault Agent injector + templates, or
++      - AWS IRSA only.
++    """
++    env: list[client.V1EnvVar] = [
++        client.V1EnvVar(name="AEGIS_S3_ENDPOINT_URL", value=os.environ.get("AEGIS_S3_ENDPOINT_URL", "")),
++        client.V1EnvVar(name="AEGIS_S3_REGION", value=os.environ.get("AEGIS_S3_REGION", "us-east-1")),
++    ]
++    env_from: list[client.V1EnvFromSource] = []
++
++    ak = os.environ.get("AEGIS_MINIO_ACCESS_KEY", "")
++    sk = os.environ.get("AEGIS_MINIO_SECRET_KEY", "")
++    if ak and sk:
++        _maybe_create_secret(
++            namespace=namespace,
++            name="aegis-s3-creds",
++            data={
++                "AWS_ACCESS_KEY_ID": ak,
++                "AWS_SECRET_ACCESS_KEY": sk,
++            },
++            labels={"aegis.io/managed-by": "aegis-golden-api"},
++        )
++        env_from.append(client.V1EnvFromSource(secret_ref=client.V1SecretEnvSource(name="aegis-s3-creds")))
++    # else: rely on AWS ambient credentials (IRSA / node role / local env)
++    return env, env_from
++
++
++def _vault_env_and_secrets(namespace: str) -> Tuple[list[client.V1EnvVar], list[client.V1EnvFromSource]]:
++    """
++    Provide Vault auth to initContainers.
++
++    Recommended production patterns:
++      - Vault Agent Injector (sidecar/init) using Kubernetes auth (no tokens in env)
++      - OR External Secrets synced from Vault into K8s Secret
++
++    Self-contained patch option:
++      - if AEGIS_VAULT_TOKEN is set, create secret aegis-vault-token in tenant namespace.
++        (Not recommended long-term.)
++    """
++    env: list[client.V1EnvVar] = [
++        client.V1EnvVar(name="VAULT_ADDR", value=os.environ.get("VAULT_ADDR", "")),
++        client.V1EnvVar(name="AEGIS_VAULT_TRANSIT_MOUNT", value=os.environ.get("AEGIS_VAULT_TRANSIT_MOUNT", "transit")),
++        client.V1EnvVar(name="AEGIS_VAULT_TRANSIT_KEY", value=os.environ.get("AEGIS_VAULT_TRANSIT_KEY", "aegis-model-sign")),
++    ]
++    env_from: list[client.V1EnvFromSource] = []
++
++    token = os.environ.get("AEGIS_VAULT_TOKEN", "") or os.environ.get("VAULT_TOKEN", "")
++    if token:
++        _maybe_create_secret(
++            namespace=namespace,
++            name="aegis-vault-token",
++            data={"VAULT_TOKEN": token},
++            labels={"aegis.io/managed-by": "aegis-golden-api"},
++        )
++        env_from.append(client.V1EnvFromSource(secret_ref=client.V1SecretEnvSource(name="aegis-vault-token")))
++    return env, env_from
++
++
+ def _artifact_init_container(
+     name: str,
+     artifact_uri: str,
+     artifact_sha256: str,
+@@ -91,6 +320,7 @@ def _artifact_init_container(
+       - verifies signature (HMAC or Vault Transit via env)
+       - extracts into mount_path if tar.gz, else copies as single file
+     """
+     bucket, key = _parse_s3_uri(artifact_uri)
+@@ -100,7 +330,15 @@ def _artifact_init_container(
+     # Uses boto3 + requests in a tiny inline script to keep this patch self-contained.
+     # In production, replace with a hardened image.
+     cmd = r"""
+ set -euo pipefail
++python -V
++python - <<'PIP'
++import sys,subprocess
++subprocess.check_call([sys.executable,"-m","pip","install","--no-cache-dir","boto3==1.34.131","requests==2.32.3"])
++print("deps installed")
++PIP
+ python - <<'PY'
+ import os,sys,hashlib,base64,tarfile,shutil
+ import boto3
+ import requests
+@@ -167,6 +405,8 @@ def _artifact_init_container(
+ 
+ outdir=os.environ.get("AEGIS_MODELS_DIR","/models")
+ os.makedirs(outdir, exist_ok=True)
+ 
+-if artifact_path.endswith(".tar.gz") or artifact_path.endswith(".tgz"):
++fname=os.environ.get("AEGIS_ARTIFACT_FILENAME","artifact")
++if fname.endswith(".tar.gz") or fname.endswith(".tgz"):
+     with tarfile.open(artifact_path, "r:gz") as tf:
+         tf.extractall(outdir)
+ else:
+     # fallback: copy single file to /models/artifact
+     shutil.copyfile(artifact_path, os.path.join(outdir, "artifact"))
+@@ -188,6 +428,10 @@ def _artifact_init_container(
+         env=[
+             client.V1EnvVar(name="AEGIS_S3_BUCKET", value=bucket),
+             client.V1EnvVar(name="AEGIS_S3_KEY", value=key),
++            client.V1EnvVar(name="AEGIS_ARTIFACT_FILENAME", value=os.environ.get("AEGIS_ARTIFACT_FILENAME", "artifact")),
+             client.V1EnvVar(name="AEGIS_S3_ENDPOINT_URL", value=os.environ.get("AEGIS_S3_ENDPOINT_URL", "")),
+             client.V1EnvVar(name="AEGIS_S3_REGION", value=os.environ.get("AEGIS_S3_REGION", "us-east-1")),
+             client.V1EnvVar(name="AEGIS_ARTIFACT_SHA256", value=artifact_sha256),
+             client.V1EnvVar(name="AEGIS_ARTIFACT_SIGNATURE", value=signature or ""),
+             client.V1EnvVar(name="AEGIS_SIGNATURE_TYPE", value=signature_type or "hmac"),
+             client.V1EnvVar(name="AEGIS_MODELS_DIR", value=mount_path),
+             # Vault vars (only used if signature_type=vault_transit)
+             client.V1EnvVar(name="VAULT_ADDR", value=os.environ.get("VAULT_ADDR", "")),
+-            client.V1EnvVar(name="VAULT_TOKEN", value=os.environ.get("VAULT_TOKEN", "")),
+             client.V1EnvVar(name="AEGIS_VAULT_TRANSIT_MOUNT", value=os.environ.get("AEGIS_VAULT_TRANSIT_MOUNT", "transit")),
+             client.V1EnvVar(name="AEGIS_VAULT_TRANSIT_KEY", value=os.environ.get("AEGIS_VAULT_TRANSIT_KEY", "aegis-model-sign")),
+             client.V1EnvVar(name="AEGIS_SIGN_HMAC_SECRET", value=os.environ.get("AEGIS_SIGN_HMAC_SECRET", "")),
+         ],
++        # NOTE: envFrom will be attached by caller so we can inject AWS/Vault secrets when needed
+         volume_mounts=[
+             client.V1VolumeMount(name="workdir", mount_path="/work"),
+             client.V1VolumeMount(name="models", mount_path=mount_path),
+         ],
+     )
+@@ -214,6 +458,10 @@ def deploy_vllm(
+     signature_type: str = "hmac",
+     gpu: int = 1,
+     image: Optional[str] = None,
+ ) -> Tuple[str, str]:
+@@ -232,6 +480,11 @@ def deploy_vllm(
+     init_containers = []
+     if artifact_sha256 and signature is not None:
+-        init_containers.append(
++        ic = _artifact_init_container(
++            name="aegis-artifact-init",
++            artifact_uri=model_artifact_uri,
++            artifact_sha256=artifact_sha256,
++            signature=signature,
++            signature_type=signature_type,
++            mount_path="/models",
++        )
++        s3_env, s3_env_from = _storage_env_and_secrets(namespace)
++        v_env, v_env_from = _vault_env_and_secrets(namespace)
++        ic.env = (ic.env or []) + s3_env + v_env
++        ic.env_from = (s3_env_from + v_env_from) or None
++        init_containers.append(
+             _artifact_init_container(
+                 name="aegis-artifact-init",
+                 artifact_uri=model_artifact_uri,
+                 artifact_sha256=artifact_sha256,
+                 signature=signature,
+                 signature_type=signature_type,
+                 mount_path="/models",
+             )
+         )
+@@ -281,6 +534,10 @@ def deploy_triton(
+     signature_type: str = "hmac",
+     gpu: int = 0,
+     image: Optional[str] = None,
+ ) -> Tuple[str, str]:
+@@ -296,15 +553,21 @@ def deploy_triton(
+     init_containers = []
+     if artifact_sha256 and signature is not None:
+-        init_containers.append(
+-            _artifact_init_container(
+-                name="aegis-artifact-init",
+-                artifact_uri=model_artifact_uri,
+-                artifact_sha256=artifact_sha256,
+-                signature=signature,
+-                signature_type=signature_type,
+-                mount_path="/models",
+-            )
+-        )
++        ic = _artifact_init_container(
++            name="aegis-artifact-init",
++            artifact_uri=model_artifact_uri,
++            artifact_sha256=artifact_sha256,
++            signature=signature,
++            signature_type=signature_type,
++            mount_path="/models",
++        )
++        s3_env, s3_env_from = _storage_env_and_secrets(namespace)
++        v_env, v_env_from = _vault_env_and_secrets(namespace)
++        ic.env = (ic.env or []) + s3_env + v_env
++        ic.env_from = (s3_env_from + v_env_from) or None
++        init_containers.append(ic)
+diff --git a/api/golden_signing.py b/api/golden_signing.py
+index 92df3af..1778c7e 100644
+--- a/api/golden_signing.py
++++ b/api/golden_signing.py
+@@ -1,6 +1,6 @@
+ """
+ Golden-path artifact signing.
+ 
+ Dev/test:
+   - HMAC signature of sha256
+ 
+ Production:
+   - replace with Vault Transit/KMS signing (your repo already has Vault OIDC/Transit docs/scripts).
+ """
+@@ -16,8 +16,8 @@ import os
+ import hmac
+ import hashlib
+ import base64
+ import json
+ import requests
+ from typing import Optional
+ 
+ 
+ SIGN_MODE = os.environ.get("AEGIS_SIGN_MODE", "hmac")  # noop|hmac|vault_transit
+ HMAC_SECRET = os.environ.get("AEGIS_SIGN_HMAC_SECRET", "dev-sign-secret-change-me")
+@@ -26,8 +26,12 @@ HMAC_SECRET = os.environ.get("AEGIS_SIGN_HMAC_SECRET", "dev-sign-secret-change-me")
+ # Vault Transit config (SIGN_MODE=vault_transit)
+ VAULT_ADDR = os.environ.get("VAULT_ADDR", "")
+-VAULT_TOKEN = os.environ.get("VAULT_TOKEN", "")
++# Prefer AEGIS_VAULT_TOKEN, fallback to VAULT_TOKEN
++VAULT_TOKEN = os.environ.get("AEGIS_VAULT_TOKEN", "") or os.environ.get("VAULT_TOKEN", "")
+ VAULT_TRANSIT_MOUNT = os.environ.get("AEGIS_VAULT_TRANSIT_MOUNT", "transit")
+ VAULT_TRANSIT_KEY = os.environ.get("AEGIS_VAULT_TRANSIT_KEY", "aegis-model-sign")
+diff --git a/api/golden_app.py b/api/golden_app.py
+index 2edbc13..6a50f1a 100644
+--- a/api/golden_app.py
++++ b/api/golden_app.py
+@@ -1,11 +1,14 @@
+ """
+ Aegis Golden Path API
+ 
+ Implements:
+   - Register model artifact -> S3/MinIO -> sign -> DB record
+   - Approve + eval pass -> deploy vLLM/Triton into tenant namespace
+   - Inference gateway routes -> meters usage -> writes audit events
+   - Enforced by OIDC roles + tenant_id scoping on all endpoints (except /healthz, /metrics)
+ """
+@@ -22,6 +25,7 @@ import os
+ import time
+ import uuid
+ import logging
+ import re
+ from typing import Any, Dict, Optional
+ 
+ import httpx
+ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+@@ -61,6 +65,14 @@ DEFAULT_UNIT_PER_CALL = int(os.environ.get("AEGIS_DEFAULT_UNITS_PER_CALL", "1"))
+ CHARS_PER_UNIT = int(os.environ.get("AEGIS_CHARS_PER_UNIT", "400"))  # crude heuristic if tokens not provided
+ 
++# Proxy hardening
++ALLOW_PROXY = os.environ.get("AEGIS_INFER_PROXY_ENABLED", "false").lower() == "true"
++PROXY_TIMEOUT_S = float(os.environ.get("AEGIS_INFER_PROXY_TIMEOUT_S", "10"))
++# Optional: block proxy to unknown paths (defense in depth)
++VLLM_ROUTE = os.environ.get("AEGIS_VLLM_ROUTE", "/v1/chat/completions")
++
+ 
+ @app.middleware("http")
+ async def enforce_tenant_auth(request: Request, call_next):
+@@ -480,12 +492,7 @@ async def infer(
+         if not dep:
+             raise HTTPException(status_code=409, detail="no deployment for model version")
+ 
+         backend = dep.backend
+ 
+-        timeout = float(os.environ.get("AEGIS_INFER_PROXY_TIMEOUT_S", "10"))
+-        # Safer default: proxy off unless explicitly enabled
+-        proxy = os.environ.get("AEGIS_INFER_PROXY_ENABLED", "false").lower() == "true"
++        proxy = ALLOW_PROXY
+ 
+         # Golden path: route to deployment (optional proxy on/off for local dev)
+         result: Dict[str, Any]
+         if proxy:
+-            async with httpx.AsyncClient(timeout=timeout) as client:
++            async with httpx.AsyncClient(timeout=PROXY_TIMEOUT_S) as client:
+                 if backend == "vllm":
+-                    route = _vllm_route()
++                    route = VLLM_ROUTE
+                     # Minimal OpenAI chat payload if not provided:
+                     # You can replace this with a full OpenAI-compatible request body from your client.
+                     body = {
+                         "model": model_id,
+                         "messages": [{"role": "user", "content": prompt or payload}],
+                         "temperature": 0.0,
+                     }
+                     r = await client.post(f"{dep.url}{route}", json=body)
+                     r.raise_for_status()
+                     result = r.json()
+                 elif backend == "triton":
+                     # Triton expects a specific JSON structure; this is a placeholder.
+                     # For real Triton usage, you must send proper inputs/outputs.
+                     route = _triton_infer_route(model_id)
+                     body = {"inputs": [{"name": "TEXT", "datatype": "BYTES", "shape": [1], "data": [payload]}]}
+                     r = await client.post(f"{dep.url}{route}", json=body)
+                     r.raise_for_status()
+                     result = r.json()
+                 else:
+                     r = await client.post(f"{dep.url}/infer", json={"payload": payload})
+                     r.raise_for_status()
+                     result = r.json()
+         else:
+             result = {"deployment_url": dep.url, "note": "proxy disabled; set AEGIS_INFER_PROXY_ENABLED=true"}
+diff --git a/api/requirements-golden.txt b/api/requirements-golden.txt
+index c4d8421..6f08b70 100644
+--- a/api/requirements-golden.txt
++++ b/api/requirements-golden.txt
+@@ -1,9 +1,9 @@
+ # Golden-path dependencies
+ -r api/requirements-api2.txt
+ -r api/requirements-db.txt
+ 
+ prometheus-client==0.20.0
+ httpx==0.27.0
+ boto3==1.34.131
+ kubernetes==29.0.0
+ requests==2.32.3
+diff --git a/README_GOLDEN_PATH.md b/README_GOLDEN_PATH.md
+index f0f9f24..3e9a62c 100644
+--- a/README_GOLDEN_PATH.md
++++ b/README_GOLDEN_PATH.md
+@@ -67,6 +67,42 @@ MinIO in-cluster:
+ ### Runtime artifact fetch/verify (initContainer)
+ Deployments now include an initContainer that:
+ 1) downloads the artifact from S3/MinIO
+ 2) verifies sha256 and signature
+ 3) extracts/copies into `/models` (emptyDir shared with Triton/vLLM)
+ 
+-For MinIO, ensure the serving namespace has credentials available (IRSA/instance role for AWS, or MinIO access keys).
++For AWS S3 on EKS:
++- Prefer IRSA so pods do not need static credentials.
++
++For MinIO:
++- Set these env vars on the Aegis API (temporary/self-contained option):
++  - `AEGIS_MINIO_ACCESS_KEY=...`
++  - `AEGIS_MINIO_SECRET_KEY=...`
++  The deployer will create a tenant-namespace secret `aegis-s3-creds` and attach it to initContainers.
++
++Production recommendation:
++- Replace this with External Secrets Operator or Vault Agent injector.
++
++### Vault auth (self-contained vs production)
++Self-contained (NOT recommended long term):
++- Set `AEGIS_VAULT_TOKEN=...` on the Aegis API
++  - deployer will create secret `aegis-vault-token` in each tenant namespace
++
++Production recommendation:
++- Use Vault Kubernetes auth + Vault Agent injector to provide a short-lived token to the initContainer,
++  or use External Secrets to sync Vault token/approles into namespace.
+ 
+ ## Kubernetes config
+ - `AEGIS_K8S_CONFIG=auto|incluster|kubeconfig`

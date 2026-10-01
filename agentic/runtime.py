@@ -278,7 +278,11 @@ def _hash(value: Any) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-_SENSITIVE_KEY = re.compile(r"(secret|password|token|credential|authorization|api.?key)", re.I)
+_SENSITIVE_KEY = re.compile(
+    r"(secret|password|token|"
+    r"credential(?![_-]?id\b)|authorization|api.?key)",
+    re.I,
+)
 
 
 def _persistable(value: Any) -> Any:

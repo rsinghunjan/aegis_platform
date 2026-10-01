@@ -18,7 +18,13 @@ from agentic.runtime import (
 
 
 def make_runtime(path, **kwargs):
+    kwargs.setdefault("sandbox_executor", LocalTestSandboxExecutor())
     return AgentRuntime(store=AgentStore(f"sqlite:///{path}"), **kwargs)
+
+
+class LocalTestSandboxExecutor:
+    async def execute(self, _spec, payload, handler):
+        return handler(payload)
 
 
 def test_create_plan_execute_verify_and_persist(tmp_path):
@@ -89,6 +95,47 @@ def test_high_risk_requires_explicit_approval_and_resumes(tmp_path):
         if item.kind == "policy_decision"
     ]
     assert decisions == ["review", "allow"]
+
+
+@pytest.mark.parametrize(
+    ("risk_level", "sandbox_required"),
+    [("high", False), ("medium", True)],
+)
+def test_sandboxed_tool_is_dispatched_through_sandbox_executor(
+    tmp_path, risk_level, sandbox_required
+):
+    dispatched = []
+
+    class RecordingSandboxExecutor:
+        async def execute(self, spec, payload, handler):
+            dispatched.append((spec.name, payload))
+            return handler(payload)
+
+    runtime = make_runtime(
+        tmp_path / "sandbox-dispatch.db",
+        sandbox_executor=RecordingSandboxExecutor(),
+    )
+    runtime.register_tool(
+        ToolSpec(
+            name="release",
+            risk_level=risk_level,
+            sandbox_required=sandbox_required,
+        ),
+        lambda payload: {"released": payload["artifact"]},
+    )
+    run = runtime.create_run(
+        "tenant-a",
+        '{"tool":"release","input":{"artifact":"model-v1"}}',
+    )
+    assert asyncio.run(runtime.execute(run.run_id, "tenant-a"))[
+        "status"
+    ] == "WAITING_APPROVAL"
+    runtime.approve(run.run_id, "tenant-a", "release-manager")
+
+    result = asyncio.run(runtime.resume(run.run_id, "tenant-a", autonomous=False))
+
+    assert result["status"] == "SUCCEEDED"
+    assert dispatched == [("release", {"artifact": "model-v1"})]
 
 
 def test_high_risk_approval_is_bound_to_a_single_plan_step(tmp_path):

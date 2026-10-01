@@ -21,6 +21,11 @@ class CollectingDispatcher:
         return f"dispatch-{len(self.messages)}"
 
 
+class LocalTestSandboxExecutor:
+    async def execute(self, _spec, payload, handler):
+        return handler(payload)
+
+
 def test_celery_dispatcher_sends_run_reference():
     class FakeCelery:
         def __init__(self):
@@ -173,7 +178,10 @@ def test_run_can_be_created_then_executed_separately(tmp_path):
 
 
 def test_agent_approval_requires_authorized_actor(tmp_path):
-    runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'approval.db'}"))
+    runtime = AgentRuntime(
+        store=AgentStore(f"sqlite:///{tmp_path / 'approval.db'}"),
+        sandbox_executor=LocalTestSandboxExecutor(),
+    )
     runtime.register_tool(
         ToolSpec(name="release", risk_level="high"),
         lambda _payload: {"released": True},

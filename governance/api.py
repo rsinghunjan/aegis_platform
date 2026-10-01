@@ -22,7 +22,10 @@ def authorize(action: str, tenant_id: str) -> tuple[dict | None, tuple]:
     """Require a trusted host callback for identity, policy, and approval evidence."""
     callback = app.config.get("AEGIS_GOVERNANCE_AUTHORIZER")
     if not callable(callback):
-        return None, (jsonify({"error": "governance authorization is not configured"}), 503)
+        return None, (
+            jsonify({"error": "governance authorization is not configured"}),
+            503,
+        )
     grant = callback(request, action, tenant_id)
     if not grant:
         return None, (jsonify({"error": "governance access denied"}), 403)
@@ -96,7 +99,15 @@ def promote():
     if error:
         return error
     if not _promotion_evidence_is_complete(grant):
-        return jsonify({"error": "promotion requires verified artifact and approval evidence"}), 403
+        return (
+            jsonify(
+                {
+                    "error": "promotion requires verified artifact "
+                    "and approval evidence"
+                }
+            ),
+            403,
+        )
     governance_evidence = {
         key: grant[key]
         for key in (

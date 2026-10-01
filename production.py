@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import hashlib
 import json
 from contextlib import asynccontextmanager
@@ -496,19 +495,6 @@ def create_app(
         return app.state.agent_runtime.list_remediation_events(
             tenant_id, offset, limit
         )
-
-    if os.getenv("AEGIS_MOUNT_LEGACY_API", "").lower() in {"1", "true", "yes"}:
-        try:
-            from api.api_server import app as legacy_app
-
-            app.mount("/legacy", legacy_app)
-        except ImportError as exc:
-            logger.warning(
-                "Legacy API routes were requested but optional modules are missing: %s",
-                exc.name,
-            )
-        except Exception:
-            logger.exception("Legacy API routes could not be mounted")
 
     return app
 

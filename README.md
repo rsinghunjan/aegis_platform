@@ -131,10 +131,10 @@ adapters.
 embeddings, durable/shared vector storage, cloud deployment, secret managers,
 external approval systems, promotion/canary systems, and GPU/TPU support. The
 local inference fallback is an echo provider for smoke testing, not an AI model.
-The optional legacy routes are mounted only when
-`AEGIS_MOUNT_LEGACY_API=true`; their dependencies and configuration must be
-installed separately. The default image intentionally does not install large
-model or accelerator packages.
+The default image intentionally does not install large model or accelerator
+packages. The historical multipart prediction route is not mounted or
+production-supported; see the
+[legacy API status and migration guide](docs/legacy_api.md).
 
 The pre-existing Alembic history contains multiple roots and an unresolved
 revision reference. Agent and memory tables therefore use idempotent SQLAlchemy

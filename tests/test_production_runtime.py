@@ -51,6 +51,17 @@ def test_canonical_health_and_readiness(tmp_path):
         assert client.get("/readyz").json() == {"status": "ready"}
 
 
+def test_legacy_api_flag_does_not_mount_routes(monkeypatch, tmp_path):
+    monkeypatch.setenv("AEGIS_MOUNT_LEGACY_API", "true")
+    runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'legacy.db'}"))
+    app = create_app(runtime, tenant_authorizer=lambda *_args: True)
+
+    paths = {route.path for route in app.routes}
+    assert "/legacy" not in paths
+    assert "/healthz" in paths
+    assert "/ai/answer" in paths
+
+
 def test_canonical_agent_endpoint_runs_safe_registered_tool(tmp_path):
     runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'api.db'}"))
     calls = []

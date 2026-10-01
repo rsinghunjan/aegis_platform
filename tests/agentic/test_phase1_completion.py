@@ -25,7 +25,13 @@ from agentic.runtime import (
 
 
 def make_runtime(path, **kwargs):
+    kwargs.setdefault("sandbox_executor", LocalTestSandboxExecutor())
     return AgentRuntime(store=AgentStore(f"sqlite:///{path}"), **kwargs)
+
+
+class LocalTestSandboxExecutor:
+    async def execute(self, _spec, payload, handler):
+        return handler(payload)
 
 
 def _mock_completion(monkeypatch, content):

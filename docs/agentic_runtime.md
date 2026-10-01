@@ -40,8 +40,38 @@ Profiles are `pure` (default), `network` (requires an injected network-policy
 hook), `storage`, and `restricted-subprocess`. The built-in boundary rejects
 oversized payloads, code-like pure-profile fields, unconfigured network access,
 and subprocess profiles without an external adapter. Sync handlers run in a
-worker thread. This is a policy boundary around trusted registered handlers,
-not kernel/container isolation; do not register untrusted Python callables.
+worker thread only for in-process tools. High-risk tools always use the
+`GVisorSandboxExecutor`; medium-risk tools can opt in with
+`sandbox_required=True`. Low-risk tools run in-process. A missing image,
+entrypoint, gVisor runtime, or container backend fails the tool execution; the
+runtime never falls back to calling a high-risk handler in-process.
+
+For each sandboxed tool, configure `sandbox_image` with a preloaded, preferably
+digest-pinned OCI image and `sandbox_entrypoint` as `module:function`. The image
+must contain Python, this package's `agentic.sandbox_runner`, and the
+entrypoint's implementation. The host requires Docker Engine with the gVisor
+`runsc` runtime installed and configured. The executor runs one container per
+tool call with networking disabled, a read-only root filesystem, dropped Linux
+capabilities, no-new-privileges, a non-root UID, a PID limit, and per-tool CPU,
+memory, and `/tmp` limits (`sandbox_cpu_limit`, `sandbox_memory_limit_mb`, and
+`sandbox_disk_limit_mb`). Images are not pulled during execution, avoiding
+unbounded startup/network behavior; operators must fetch approved images before
+dispatching runs.
+
+Use `sandbox_secret_environment` to map container variable names to host
+environment variable names. Only the mapped values are sent to the container
+over stdin; values are not part of tool metadata, command-line arguments, or
+execution logs. The container receives no host mounts or network access. Keep
+the host environment and Docker daemon restricted to trusted operators: the
+daemon remains a privileged host service.
+
+The executor logs container creation, terminal state, duration, configured
+resource limits, and per-run CPU time, peak memory, and `/tmp` usage. It bounds
+JSON output and force-removes containers after success, failure, or timeout.
+Image preloading avoids pull latency, but container startup overhead depends on
+the host and image; benchmark deployments against the production latency budget.
+The sandbox integration tests use a mocked container client and do not require
+Docker or gVisor.
 
 Tools should be registered with their input/output schemas, risk level, roles,
 environments, approval setting, idempotency declaration, maximum cost, tenant

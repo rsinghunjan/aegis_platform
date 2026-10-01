@@ -34,6 +34,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from policy.agent_policy import AgentPolicyGate
 from agentic.capabilities import CapabilityCatalog
+from agentic.oci_sandbox import GVisorSandboxExecutor
 from agentic.evidence_anchor import EvidenceAnchorBackend, HttpTransparencyLogBackend
 from agentic.sandbox import SandboxBoundary, SandboxProfile
 
@@ -91,6 +92,13 @@ class ToolSpec(BaseModel):
     allowed_scopes: list[str] = Field(default_factory=list)
     version: str = "1.0.0"
     sandbox_profile: str = SandboxProfile.PURE.value
+    sandbox_required: bool = False
+    sandbox_image: Optional[str] = None
+    sandbox_entrypoint: Optional[str] = None
+    sandbox_cpu_limit: float = 1.0
+    sandbox_memory_limit_mb: int = 256
+    sandbox_disk_limit_mb: int = 64
+    sandbox_secret_environment: dict[str, str] = Field(default_factory=dict)
     timeout_seconds: Optional[float] = None
     approval_sla_seconds: Optional[int] = None
     max_input_bytes: int = 65536
@@ -565,6 +573,7 @@ class AgentRuntime:
         max_replans: int = 1,
         step_timeout: float = 30.0,
         sandbox: Optional[SandboxBoundary] = None,
+        sandbox_executor: Optional[Any] = None,
         capability_enforcement: Optional[bool] = None,
         approval_sla_seconds: Optional[int] = None,
         evidence_anchor_backend: Optional[EvidenceAnchorBackend] = None,
@@ -581,6 +590,9 @@ class AgentRuntime:
         self.max_replans = max(0, max_replans)
         self.step_timeout = step_timeout
         self.sandbox = sandbox or SandboxBoundary()
+        self.sandbox_executor = sandbox_executor or GVisorSandboxExecutor(
+            max_output_bytes=self.sandbox.max_output_bytes
+        )
         self.capability_enforcement = (
             capability_enforcement
             if capability_enforcement is not None
@@ -610,6 +622,13 @@ class AgentRuntime:
             raise AgentRuntimeError("Tool max_cost cannot be negative")
         if spec.max_input_bytes <= 0 or spec.max_output_bytes <= 0:
             raise AgentRuntimeError("Tool payload limits must be positive")
+        if (
+            not math.isfinite(spec.sandbox_cpu_limit)
+            or spec.sandbox_cpu_limit <= 0
+            or spec.sandbox_memory_limit_mb <= 0
+            or spec.sandbox_disk_limit_mb <= 0
+        ):
+            raise AgentRuntimeError("Sandbox resource limits must be positive")
         if spec.timeout_seconds is not None and (
             not math.isfinite(spec.timeout_seconds) or spec.timeout_seconds <= 0
         ):
@@ -1722,6 +1741,8 @@ class AgentRuntime:
                             spec.max_output_bytes, self.sandbox.max_output_bytes
                         ),
                         "timeout_seconds": spec.timeout_seconds or self.step_timeout,
+                        "execution_mode": self._execution_mode(spec),
+                        "sandbox_resources": self._sandbox_resources(spec),
                     },
                     created_at=_now(),
                 )
@@ -1742,12 +1763,19 @@ class AgentRuntime:
                         spec.max_output_bytes, self.sandbox.max_output_bytes
                     ),
                     "timeout_seconds": spec.timeout_seconds or self.step_timeout,
+                    "execution_mode": self._execution_mode(spec),
+                    "sandbox_resources": self._sandbox_resources(spec),
                 },
             )
             session.commit()
 
         try:
-            if inspect.iscoroutinefunction(tool):
+            if self._requires_os_sandbox(spec):
+                raw_result = await asyncio.wait_for(
+                    self.sandbox_executor.execute(spec, safe_input, tool),
+                    spec.timeout_seconds or self.step_timeout,
+                )
+            elif inspect.iscoroutinefunction(tool):
                 raw_result = await asyncio.wait_for(
                     tool(safe_input), spec.timeout_seconds or self.step_timeout
                 )
@@ -1797,6 +1825,8 @@ class AgentRuntime:
                         spec.max_output_bytes, self.sandbox.max_output_bytes
                     ),
                     "timeout_seconds": spec.timeout_seconds or self.step_timeout,
+                    "execution_mode": self._execution_mode(spec),
+                    "sandbox_resources": self._sandbox_resources(spec),
                 }
                 self._add_evidence(
                     session,
@@ -1838,6 +1868,24 @@ class AgentRuntime:
                     principal_id,
                 )
             return {"status": run.status, "run_id": run_id, "error": error}
+
+    @staticmethod
+    def _requires_os_sandbox(spec: ToolSpec) -> bool:
+        return spec.risk_level == RiskLevel.HIGH or spec.sandbox_required
+
+    @classmethod
+    def _execution_mode(cls, spec: ToolSpec) -> str:
+        return "gvisor" if cls._requires_os_sandbox(spec) else "in_process"
+
+    @classmethod
+    def _sandbox_resources(cls, spec: ToolSpec) -> dict[str, Any]:
+        if not cls._requires_os_sandbox(spec):
+            return {}
+        return {
+            "cpu_limit": spec.sandbox_cpu_limit,
+            "memory_limit_mb": spec.sandbox_memory_limit_mb,
+            "disk_limit_mb": spec.sandbox_disk_limit_mb,
+        }
 
     def _step_ids(self, run_id: str, tenant_id: str) -> list[str]:
         with self.store.sessions() as session:

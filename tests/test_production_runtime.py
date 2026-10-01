@@ -1,7 +1,19 @@
+import asyncio
+
 from fastapi.testclient import TestClient
 
 from agentic.runtime import AgentRuntime, AgentStore, ToolSpec
+from agentic.worker import AgentExecutionMessage, AgentPrincipal, AgentWorker
 from production import create_app
+
+
+class CollectingDispatcher:
+    def __init__(self):
+        self.messages = []
+
+    def dispatch(self, message: AgentExecutionMessage):
+        self.messages.append(message)
+        return f"dispatch-{len(self.messages)}"
 
 
 def test_canonical_health_and_readiness(tmp_path):
@@ -19,8 +31,13 @@ def test_canonical_agent_endpoint_runs_safe_registered_tool(tmp_path):
         ToolSpec(name="echo", output_schema={"type": "object", "required": ["ok"]}),
         lambda payload: {"ok": True, "value": payload.get("value")},
     )
+    dispatcher = CollectingDispatcher()
     with TestClient(
-        create_app(runtime, tenant_authorizer=lambda *_args: True)
+        create_app(
+            runtime,
+            tenant_authorizer=lambda *_args: True,
+            execution_dispatcher=dispatcher,
+        )
     ) as client:
         response = client.post(
             "/agent/runs",
@@ -30,8 +47,19 @@ def test_canonical_agent_endpoint_runs_safe_registered_tool(tmp_path):
                 "idempotency_key": "api-request",
             },
         )
-    assert response.status_code == 200
-    assert response.json()["status"] == "SUCCEEDED"
+        assert response.status_code == 200
+        assert response.json()["status"] == "PENDING"
+        assert calls == []
+        queued = client.post(
+            f"/agent/runs/{response.json()['run_id']}/execute",
+            json={"tenant_id": "tenant-a", "role": "admin", "scopes": ["deploy"]},
+        )
+        assert queued.status_code == 200
+        assert queued.json()["status"] == "QUEUED"
+    assert dispatcher.messages[0].principal.role == "agent"
+    assert dispatcher.messages[0].principal.scopes == []
+    result = asyncio.run(AgentWorker(runtime).execute(dispatcher.messages.pop()))
+    assert result["status"] == "SUCCEEDED"
 
 
 def test_agent_api_fails_closed_without_tenant_authorizer(tmp_path):
@@ -88,8 +116,13 @@ def test_run_can_be_created_then_executed_separately(tmp_path):
         ToolSpec(name="echo", idempotent=True),
         lambda _payload: calls.append(True) or {"ok": True},
     )
+    dispatcher = CollectingDispatcher()
     with TestClient(
-        create_app(runtime, tenant_authorizer=lambda *_args: True)
+        create_app(
+            runtime,
+            tenant_authorizer=lambda *_args: True,
+            execution_dispatcher=dispatcher,
+        )
     ) as client:
         created = client.post(
             "/agent/runs/create",
@@ -101,8 +134,11 @@ def test_run_can_be_created_then_executed_separately(tmp_path):
             f"/agent/runs/{created.json()['run_id']}/execute",
             json={"tenant_id": "tenant-a"},
         )
+    assert executed.json()["status"] == "QUEUED"
+    assert calls == []
+    result = asyncio.run(AgentWorker(runtime).execute(dispatcher.messages.pop()))
     assert executed.status_code == 200
-    assert executed.json()["status"] == "SUCCEEDED"
+    assert result["status"] == "SUCCEEDED"
     assert calls == [True]
 
 
@@ -113,12 +149,22 @@ def test_agent_approval_requires_authorized_actor(tmp_path):
         lambda _payload: {"released": True},
     )
     authorizations = []
+    dispatcher = CollectingDispatcher()
 
     def authorize(_request, tenant_id, action, actor):
         authorizations.append((tenant_id, action, actor))
         return actor == "release-manager" or actor is None
 
-    with TestClient(create_app(runtime, tenant_authorizer=authorize)) as client:
+    with TestClient(
+        create_app(
+            runtime,
+            tenant_authorizer=authorize,
+            principal_resolver=lambda _request: AgentPrincipal(
+                principal_id="release-manager"
+            ),
+            execution_dispatcher=dispatcher,
+        )
+    ) as client:
         created = client.post(
             "/agent/runs",
             json={
@@ -127,29 +173,48 @@ def test_agent_approval_requires_authorized_actor(tmp_path):
             },
         )
         run_id = created.json()["run_id"]
-        assert created.json()["status"] == "WAITING_APPROVAL"
+        assert created.json()["status"] == "PENDING"
+        queued = client.post(
+            f"/agent/runs/{run_id}/execute",
+            json={"tenant_id": "tenant-a"},
+        )
+        assert queued.status_code == 200
+        waiting = asyncio.run(AgentWorker(runtime).execute(dispatcher.messages.pop()))
+        assert waiting["status"] == "WAITING_APPROVAL"
         approved = client.post(
             f"/agent/runs/{run_id}/approve",
             json={
                 "tenant_id": "tenant-a",
-                "actor": "release-manager",
+                "actor": "attacker-controlled-body-value",
                 "reason": "reviewed",
             },
         )
-    assert approved.status_code == 200
-    assert approved.json()["status"] == "SUCCEEDED"
+        assert approved.status_code == 200
+        assert approved.json()["status"] == "APPROVED"
+        queued_resume = client.post(
+            f"/agent/runs/{run_id}/execute",
+            json={"tenant_id": "tenant-a"},
+        )
+    assert queued_resume.status_code == 200
+    result = asyncio.run(AgentWorker(runtime).execute(dispatcher.messages.pop()))
+    assert result["status"] == "SUCCEEDED"
     assert authorizations[-1] == ("tenant-a", "approve", "release-manager")
+    approval = runtime.list_approvals("tenant-a", status="approved")[0]
+    assert approval.actor == "release-manager"
+    assert approval.plan_hash and approval.policy_version
 
 
 def test_new_approval_notification_is_injected_and_evidence_safe(tmp_path):
     runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'notify.db'}"))
     runtime.register_tool(ToolSpec(name="release", risk_level="high"), lambda _: {})
     notifications = []
+    dispatcher = CollectingDispatcher()
     with TestClient(
         create_app(
             runtime,
             tenant_authorizer=lambda *_args: True,
             approval_notifier=lambda approval: notifications.append(approval),
+            execution_dispatcher=dispatcher,
         )
     ) as client:
         response = client.post(
@@ -159,7 +224,14 @@ def test_new_approval_notification_is_injected_and_evidence_safe(tmp_path):
                 "goal": '{"tool":"release","input":{}}',
             },
         )
-    assert response.json()["status"] == "WAITING_APPROVAL"
+        assert response.json()["status"] == "PENDING"
+        queued = client.post(
+            f"/agent/runs/{response.json()['run_id']}/execute",
+            json={"tenant_id": "tenant-a"},
+        )
+    result = asyncio.run(AgentWorker(runtime).execute(dispatcher.messages.pop()))
+    assert queued.json()["status"] == "QUEUED"
+    assert result["status"] == "WAITING_APPROVAL"
     assert len(notifications) == 1
     assert notifications[0].tool_name == "release"
     assert any(

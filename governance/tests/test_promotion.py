@@ -68,6 +68,7 @@ def test_promote_persists_governance_and_resolves_model(session_factory):
         "version": "v2",
         "run_id": "mlflow-run-1",
         "artifact_uri": "file:///models/model-1",
+        "governance_evidence": {},
         "tenant_id": "tenant-a",
         "job_id": result["job_id"],
     }
@@ -128,6 +129,20 @@ def test_governance_routes_keep_promotion_and_run_listing(monkeypatch, session_f
     monkeypatch.setattr(
         promotion, "get_promotion_sessionmaker", lambda: session_factory
     )
+    monkeypatch.setitem(
+        api.app.config,
+        "AEGIS_GOVERNANCE_AUTHORIZER",
+        lambda _request, action, tenant_id: {
+            "actor_id": "trusted-operator",
+            "approval_id": "approval-42",
+            "policy_version": "policy-v3",
+            "decision_evidence_sha256": "a" * 64,
+            "artifact_sha256": "b" * 64,
+            "signature_verified": True,
+        }
+        if tenant_id == "default" and action in {"model.read", "model.promote"}
+        else None,
+    )
     client = api.app.test_client()
 
     runs_response = client.get("/runs/demo")
@@ -147,3 +162,12 @@ def test_governance_routes_keep_promotion_and_run_listing(monkeypatch, session_f
     assert promotion_response.json == {"ok": True, "run_id": "mlflow-run-1"}
     assert resolve_response.status_code == 200
     assert resolve_response.json["artifact_uri"] == "file:///models/model-1"
+    assert resolve_response.json["governance_evidence"] == {
+        "approval_id": "approval-42",
+        "policy_version": "policy-v3",
+        "decision_evidence_sha256": "a" * 64,
+        "artifact_sha256": "b" * 64,
+        "signature_verified": True,
+    }
+    with session_factory() as session:
+        assert session.query(AuditLog).one().actor == "trusted-operator"

@@ -137,6 +137,8 @@ class Approval(BaseModel):
     escalation_status: str = "none"
     denial_reason: Optional[str] = None
     capability_version: Optional[str] = None
+    plan_hash: Optional[str] = None
+    policy_version: Optional[str] = None
 
 
 class Evidence(BaseModel):
@@ -145,6 +147,7 @@ class Evidence(BaseModel):
     tenant_id: str
     kind: str
     sha256: str
+    previous_sha256: Optional[str] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
 
@@ -242,6 +245,8 @@ class ApprovalRow(AgentBase):
     escalation_status: Mapped[str] = mapped_column(String(32), nullable=False, default="none")
     denial_reason: Mapped[Optional[str]] = mapped_column(Text)
     capability_version: Mapped[Optional[str]] = mapped_column(String(64))
+    plan_hash: Mapped[Optional[str]] = mapped_column(String(64))
+    policy_version: Mapped[Optional[str]] = mapped_column(String(64))
 
 
 class CapabilityRow(AgentBase):
@@ -262,6 +267,7 @@ class EvidenceRow(AgentBase):
     tenant_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     kind: Mapped[str] = mapped_column(String(64), nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    previous_sha256: Mapped[Optional[str]] = mapped_column(String(64))
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
@@ -339,6 +345,10 @@ class AgentStore:
             column["name"]
             for column in sqlalchemy_inspect(self.engine).get_columns("agent_approvals")
         }
+        evidence_columns = {
+            column["name"]
+            for column in sqlalchemy_inspect(self.engine).get_columns("agent_evidence")
+        }
         additions = {
             "requested_at": "TIMESTAMP",
             "expires_at": "TIMESTAMP",
@@ -346,6 +356,8 @@ class AgentStore:
             "escalation_status": "VARCHAR(32) NOT NULL DEFAULT 'none'",
             "denial_reason": "TEXT",
             "capability_version": "VARCHAR(64)",
+            "plan_hash": "VARCHAR(64)",
+            "policy_version": "VARCHAR(64)",
         }
         with self.engine.begin() as connection:
             for name, sql_type in additions.items():
@@ -353,6 +365,10 @@ class AgentStore:
                     connection.execute(
                         text(f"ALTER TABLE agent_approvals ADD COLUMN {name} {sql_type}")
                     )
+            if "previous_sha256" not in evidence_columns:
+                connection.execute(
+                    text("ALTER TABLE agent_evidence ADD COLUMN previous_sha256 VARCHAR(64)")
+                )
         with self.sessions() as session:
             legacy_pending = session.scalars(
                 select(ApprovalRow).where(
@@ -666,6 +682,7 @@ class AgentRuntime:
         environment: str = "local",
         scopes: Optional[set[str]] = None,
         autonomous: bool = True,
+        principal_id: Optional[str] = None,
     ) -> dict[str, Any]:
         scopes = scopes or set()
         with self.store.sessions() as session:
@@ -767,7 +784,14 @@ class AgentRuntime:
 
         for step_id in self._step_ids(run_id, tenant_id):
             result = await self._execute_step(
-                step_id, run_id, tenant_id, role, environment, scopes, autonomous
+                step_id,
+                run_id,
+                tenant_id,
+                role,
+                environment,
+                scopes,
+                autonomous,
+                principal_id,
             )
             if result["status"] != "SUCCEEDED":
                 return result
@@ -884,6 +908,11 @@ class AgentRuntime:
                 or self._active_capability_version(spec[0]) != pending.capability_version
             ):
                 raise AgentRuntimeError("Approval capability version is no longer active")
+            if (
+                pending.plan_hash != _hash(row.plan_json or {})
+                or pending.policy_version != self.policy.version
+            ):
+                raise AgentRuntimeError("Approval context is no longer active")
             pending.status = "approved"
             pending.actor = actor
             pending.reason = reason
@@ -1021,29 +1050,21 @@ class AgentRuntime:
         self, run_id: str, tenant_id: str, kind: str, metadata: dict[str, Any]
     ) -> str:
         safe_metadata = _persistable(metadata)
-        digest = _hash(safe_metadata)
         with self.store.sessions() as session:
             run = self._owned_run(session, run_id, tenant_id)
-            existing = session.scalar(
+            matching = session.scalars(
                 select(EvidenceRow).where(
                     EvidenceRow.run_id == run_id,
                     EvidenceRow.tenant_id == tenant_id,
                     EvidenceRow.kind == kind,
-                    EvidenceRow.sha256 == digest,
                 )
-            )
-            if existing:
-                return existing.evidence_id
-            self._add_evidence(session, run, kind, safe_metadata)
+            ).all()
+            for item in matching:
+                if item.metadata_json == safe_metadata:
+                    return item.evidence_id
+            evidence_id = self._add_evidence(session, run, kind, safe_metadata)
             session.commit()
-            return session.scalar(
-                select(EvidenceRow.evidence_id).where(
-                    EvidenceRow.run_id == run_id,
-                    EvidenceRow.tenant_id == tenant_id,
-                    EvidenceRow.kind == kind,
-                    EvidenceRow.sha256 == digest,
-                )
-            )
+            return evidence_id
 
     def has_evidence(
         self,
@@ -1182,11 +1203,52 @@ class AgentRuntime:
                     tenant_id=item.tenant_id,
                     kind=item.kind,
                     sha256=item.sha256,
+                    previous_sha256=item.previous_sha256,
                     metadata=item.metadata_json,
                     created_at=item.created_at,
                 )
                 for item in rows
             ]
+
+    def verify_evidence_chain(self, run_id: str, tenant_id: str) -> dict[str, Any]:
+        """Verify the run's append-only hash links and return its current chain head."""
+        entries = self.list_evidence(run_id, tenant_id)
+        if not entries:
+            return {"valid": True, "count": 0, "head_sha256": None}
+        by_hash = {entry.sha256: entry for entry in entries}
+        if len(by_hash) != len(entries):
+            return {"valid": False, "count": len(entries), "head_sha256": None}
+        roots = [entry for entry in entries if entry.previous_sha256 is None]
+        if len(roots) != 1:
+            return {"valid": False, "count": len(entries), "head_sha256": None}
+        current = roots[0]
+        visited: set[str] = set()
+        while True:
+            if current.sha256 in visited:
+                return {"valid": False, "count": len(entries), "head_sha256": None}
+            visited.add(current.sha256)
+            expected = _hash(
+                {
+                    "previous_sha256": current.previous_sha256,
+                    "kind": current.kind,
+                    "metadata": current.metadata,
+                }
+            )
+            if expected != current.sha256:
+                return {"valid": False, "count": len(entries), "head_sha256": None}
+            children = [
+                entry for entry in entries if entry.previous_sha256 == current.sha256
+            ]
+            if not children:
+                break
+            if len(children) != 1:
+                return {"valid": False, "count": len(entries), "head_sha256": None}
+            current = children[0]
+        return {
+            "valid": len(visited) == len(entries),
+            "count": len(entries),
+            "head_sha256": current.sha256 if len(visited) == len(entries) else None,
+        }
 
     async def _execute_step(
         self,
@@ -1197,6 +1259,7 @@ class AgentRuntime:
         environment: str,
         scopes: set[str],
         autonomous: bool,
+        principal_id: Optional[str],
     ) -> dict[str, Any]:
         with self.store.sessions() as session:
             run = self._owned_run(session, run_id, tenant_id)
@@ -1234,6 +1297,8 @@ class AgentRuntime:
                 session.commit()
                 return {"status": "BLOCKED", "run_id": run_id, "reason": str(exc)}
             active_capability = self._active_capability_version(spec)
+            plan_hash = _hash(run.plan_json or {})
+            policy_version = self.policy.version
             approved = bool(
                 session.scalar(
                     select(ApprovalRow).where(
@@ -1242,12 +1307,21 @@ class AgentRuntime:
                         ApprovalRow.step_id == step_id,
                         ApprovalRow.status == "approved",
                         ApprovalRow.capability_version == active_capability,
+                        ApprovalRow.plan_hash == plan_hash,
+                        ApprovalRow.policy_version == policy_version,
                     )
                 )
             )
             effective_autonomous = autonomous and not approved
             action, reason = self.policy.evaluate(
-                run, spec, role, environment, scopes, approved, effective_autonomous
+                run,
+                spec,
+                role,
+                environment,
+                scopes,
+                approved,
+                effective_autonomous,
+                principal_id,
             )
             decision = PolicyDecisionRow(
                 decision_id=str(uuid.uuid4()),
@@ -1263,7 +1337,20 @@ class AgentRuntime:
                 session,
                 run,
                 "policy_decision",
-                {"decision_id": decision.decision_id, "action": action, "reason": reason},
+                {
+                    "decision_id": decision.decision_id,
+                    "action": action,
+                    "reason": reason,
+                    "policy_version": self.policy.version,
+                    "principal_id": principal_id,
+                    "engines": [
+                        {
+                            "name": getattr(engine, "engine_name", type(engine).__name__),
+                            "bundle_sha256": getattr(engine, "bundle_sha256", ""),
+                        }
+                        for engine in self.policy.engines
+                    ],
+                },
             )
             if action == "block":
                 run.status = "BLOCKED"
@@ -1303,6 +1390,8 @@ class AgentRuntime:
                         or self.approval_sla_seconds,
                         escalation_status="none",
                         capability_version=active_capability,
+                        plan_hash=plan_hash,
+                        policy_version=policy_version,
                     )
                     session.add(new_approval)
                 session.commit()
@@ -1395,6 +1484,7 @@ class AgentRuntime:
                     created_at=_now(),
                 )
             )
+            return evidence_id
             self._add_evidence(
                 session,
                 run,
@@ -1503,7 +1593,8 @@ class AgentRuntime:
             session.commit()
             if step.status == "RETRYING":
                 return await self._execute_step(
-                    step_id, run_id, tenant_id, role, environment, scopes, autonomous
+                    step_id, run_id, tenant_id, role, environment, scopes, autonomous,
+                    principal_id,
                 )
             return {"status": run.status, "run_id": run_id, "error": error}
 
@@ -1531,15 +1622,36 @@ class AgentRuntime:
         return row
 
     @staticmethod
-    def _add_evidence(session: Any, run: AgentRunRow, kind: str, metadata: dict[str, Any]) -> None:
+    def _add_evidence(
+        session: Any, run: AgentRunRow, kind: str, metadata: dict[str, Any]
+    ) -> str:
         safe_metadata = _persistable(metadata)
+        previous = session.scalar(
+            select(EvidenceRow)
+            .where(
+                EvidenceRow.run_id == run.run_id,
+                EvidenceRow.tenant_id == run.tenant_id,
+            )
+            .order_by(EvidenceRow.created_at.desc(), EvidenceRow.evidence_id.desc())
+            .limit(1)
+        )
+        previous_sha256 = previous.sha256 if previous else None
+        digest = _hash(
+            {
+                "previous_sha256": previous_sha256,
+                "kind": kind,
+                "metadata": safe_metadata,
+            }
+        )
+        evidence_id = str(uuid.uuid4())
         session.add(
             EvidenceRow(
-                evidence_id=str(uuid.uuid4()),
+                evidence_id=evidence_id,
                 run_id=run.run_id,
                 tenant_id=run.tenant_id,
                 kind=kind,
-                sha256=_hash(safe_metadata),
+                sha256=digest,
+                previous_sha256=previous_sha256,
                 metadata_json=safe_metadata,
                 created_at=_now(),
             )
@@ -1581,7 +1693,10 @@ class AgentRuntime:
             escalation_status=row.escalation_status,
             denial_reason=row.denial_reason,
             capability_version=row.capability_version,
+            plan_hash=row.plan_hash,
+            policy_version=row.policy_version,
         )
+
 
     def _active_capability_version(self, spec: ToolSpec) -> str:
         with self.store.sessions() as session:

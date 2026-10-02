@@ -136,6 +136,39 @@ with an application-owned Celery instance and broker. Do not expose the worker
 consumer directly to untrusted clients. A missing dispatcher fails closed with
 HTTP 503.
 
+## Configuration reference
+
+The default `production:app` requires no environment variables to boot. It has
+no trusted tenant authorizer or execution dispatcher by default, however, so
+protected AI/agent requests fail closed until an embedding application supplies
+them. A `principal_resolver` should also be supplied when operations require a
+trusted actor identity, including approval decisions. No request-body tenant,
+role, scope, or actor value substitutes for these trusted integrations.
+
+| Setting | Default / requirement | Purpose |
+| --- | --- | --- |
+| `AEGIS_AGENT_DATABASE_URL` | `sqlite:///./aegis_agent.db` | Agent runtime database; takes precedence over `DATABASE_URL`. |
+| `DATABASE_URL` | Agent runtime fallback: `sqlite:///./aegis_agent.db`; memory fallback when its own URL is unset: `sqlite:///./aegis_memory.db` | Compatibility database URL. Set service-specific URLs when agent and memory stores should differ. |
+| `AEGIS_MEMORY_DATABASE_URL` | `DATABASE_URL`, then `sqlite:///./aegis_memory.db` | Optional persistent conversation-memory database. |
+| `AEGIS_AUTONOMY_MODE` | `autonomous-for-low-risk` | One of `disabled`, `advisory`, `supervised`, or `autonomous-for-low-risk`. |
+| `AEGIS_AUTONOMY_ENABLED` | `true` | Global autonomy kill switch; `false` disables autonomous execution. |
+| `AEGIS_APPROVAL_SLA_SECONDS` | `3600` | Approval expiration interval in seconds. |
+| `AEGIS_CAPABILITY_ENFORCEMENT` | `false` | Require persisted active capability versions/hashes when enabled. |
+| `AEGIS_LLM_PLANNER_ENABLED` | `false` | Opt in to the optional OpenAI-compatible agent planner. |
+| `AEGIS_LLM_BASE_URL`, `AEGIS_LLM_MODEL`, `AEGIS_LLM_API_KEY` | Required together only when enabling the optional hosted planner; otherwise unset | Planner endpoint, model, and key. `OPENAI_API_KEY` is accepted as a key fallback. |
+| `AEGIS_LLM_TIMEOUT_SECONDS`, `AEGIS_LLM_MAX_STEPS` | `10`, `16` | Optional hosted planner request timeout and plan bound. |
+| `AEGIS_EMBEDDING_PROVIDER` | `local-hash` | Select `openai` for optional model-backed workflow embeddings. |
+| `AEGIS_EVIDENCE_ANCHOR_URL` | Unset | Optional HTTPS transparency-log endpoint; setting it enables external evidence anchoring. |
+| `AEGIS_EVIDENCE_ANCHOR_TOKEN`, `AEGIS_EVIDENCE_ANCHOR_TIMEOUT` | Token unset; timeout `5` seconds | Optional bearer token and HTTPS request timeout for the anchor service. |
+| `AEGIS_EVIDENCE_ANCHOR_INTERVAL_SECONDS` | `60` seconds | Positive interval for periodic anchoring when an anchor backend is configured. |
+
+`AEGIS_LLM_API_KEY` and `AEGIS_LLM_BASE_URL` are also used by the optional AI
+workflow provider. Without provider configuration, the workflow uses local hash
+embeddings and an echo inference provider. See [AI workflows](ai_workflows.md)
+for setup and the limitations of these local defaults. `api/tasks.py` uses the
+application's configured Celery instance and registered handlers; it has no
+additional environment variables required by the control plane.
+
 ## Unified policy engines
 
 `AgentPolicyGate` keeps its local identity, tenant, scope, environment, budget,

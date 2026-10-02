@@ -62,6 +62,11 @@ Agent HTTP routes fail closed until `create_app` is given a
 `tenant_authorizer(request, tenant_id, action, actor)` callback. The embedding
 service must derive identity and tenant membership from its trusted auth
 context; request-body tenant and actor fields are not credentials.
+The importable `production:app` is a bootable default with no authorizer or
+dispatcher configured: health/readiness work, while protected AI/agent requests
+fail closed. Production integrations must construct the app with trusted
+authorization, and configure an execution dispatcher and worker to run agent
+tools.
 
 `POST /agent/runs` only creates a durable run. Execution is queued separately
 through `/agent/runs/{run_id}/execute` using the injected
@@ -92,11 +97,11 @@ docker run --rm -p 8000:8000 -v aegis-data:/data aegis-platform
   SQLite/PostgreSQL persistence, idempotency, execution, verification, and
   audit hashes.
 - `api/memory.py` retains the compatible in-process `ConversationMemory` and
-  adds a tenant/session-scoped persistent backend with retention and bounded
-  compaction.
-- `api/tasks.py` is a Celery lifecycle adapter. It executes only explicitly
-  registered handlers; retries are enabled only for handlers registered as
-  idempotent. It does not return simulated inference output.
+  adds an optional tenant/session-scoped persistent backend with retention and
+  bounded compaction; the control plane does not mount it automatically.
+- `agentic/worker.py` is the separate agent execution boundary. `api/tasks.py`
+  is a distinct Celery lifecycle adapter for registered jobs; it executes only
+  explicitly registered handlers and retries only handlers declared idempotent.
 
 Risk levels `low`, `medium`, and `high` are declared on tool metadata. Explicit
 autonomy modes are `disabled`, `advisory`, `supervised`, and
@@ -115,7 +120,8 @@ are linked into a verifiable per-run chain, but the chain head should be
 externally anchored to protect against deletion or wholesale database
 replacement. See
 [`docs/agentic_runtime.md`](docs/agentic_runtime.md) for the state machine and
-configuration details.
+configuration details. The consolidated environment and integration settings
+reference is in that guide.
 
 ## Implemented versus optional
 

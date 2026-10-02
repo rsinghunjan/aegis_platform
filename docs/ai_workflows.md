@@ -19,6 +19,11 @@ the app with a `tenant_authorizer` that validates the caller's trusted identity
 and tenant membership. The authorization actions for this workflow are
 `ai_knowledge_write` and `ai_generate`. A tenant ID in a request is a resource
 selector, not proof of access.
+The default `production:app` starts without an authorizer or execution
+dispatcher, so its protected AI/agent routes return 503 until an embedding
+application supplies those dependencies. See the [runtime configuration
+reference](agentic_runtime.md#configuration-reference) for required integration
+callbacks and optional environment settings.
 
 Without external credentials, Aegis uses local hash embeddings and an echo
 inference provider. These make the workflow exercisable offline but do not
@@ -36,7 +41,9 @@ The provider key and base URL are shared with the optional OpenAI-compatible
 planner. Set `AEGIS_LLM_PLANNER_ENABLED=true` to use that planner; otherwise
 agent planning stays deterministic. For model-backed document embeddings, set
 `AEGIS_EMBEDDING_PROVIDER=openai`; the default `local-hash` embedding provider
-is deterministic but not semantically trained.
+is deterministic but not semantically trained. Defaults and all supported
+runtime environment settings are listed in the [runtime configuration
+reference](agentic_runtime.md#configuration-reference).
 
 Index a tenant document and ask a question:
 

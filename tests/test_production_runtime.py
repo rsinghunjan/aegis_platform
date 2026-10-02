@@ -147,6 +147,62 @@ def test_agent_api_fails_closed_without_tenant_authorizer(tmp_path):
     assert response.json()["detail"] == "agent API authorization is not configured"
 
 
+def test_agent_routes_authorize_tenant_and_hide_cross_tenant_runs(tmp_path):
+    runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'tenant.db'}"))
+    run = runtime.create_run("tenant-a", "private goal")
+
+    with TestClient(
+        create_app(
+            runtime,
+            tenant_authorizer=lambda _request, tenant_id, *_args: tenant_id == "tenant-a",
+        )
+    ) as client:
+        denied = client.get(
+            f"/agent/runs/{run.run_id}", params={"tenant_id": "tenant-b"}
+        )
+    assert denied.status_code == 403
+
+    with TestClient(create_app(runtime, tenant_authorizer=lambda *_args: True)) as client:
+        hidden_run = client.get(
+            f"/agent/runs/{run.run_id}", params={"tenant_id": "tenant-b"}
+        )
+        hidden_evidence = client.get(
+            f"/agent/runs/{run.run_id}/evidence", params={"tenant_id": "tenant-b"}
+        )
+    assert hidden_run.status_code == 404
+    assert hidden_evidence.status_code == 404
+
+
+def test_run_creation_does_not_execute_without_dispatcher(tmp_path):
+    runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'no-dispatch.db'}"))
+    calls = []
+    runtime.register_tool(
+        ToolSpec(name="echo"),
+        lambda payload: calls.append(payload) or {"ok": True},
+    )
+
+    with TestClient(
+        create_app(runtime, tenant_authorizer=lambda *_args: True)
+    ) as client:
+        created = client.post(
+            "/agent/runs",
+            json={
+                "tenant_id": "tenant-a",
+                "goal": '{"tool":"echo","input":{"value":"not-run"}}',
+            },
+        )
+        execution = client.post(
+            f"/agent/runs/{created.json()['run_id']}/execute",
+            json={"tenant_id": "tenant-a"},
+        )
+
+    assert created.status_code == 200
+    assert created.json()["status"] == "PENDING"
+    assert execution.status_code == 503
+    assert execution.json()["detail"] == "agent execution dispatcher is not configured"
+    assert calls == []
+
+
 def test_operator_read_models_are_authorized_and_return_summaries(tmp_path):
     runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'operator.db'}"))
     runtime.register_tool(

@@ -537,6 +537,38 @@ def create_app(
             tenant_id, offset, limit
         )
 
+    @app.get("/operator/governance/status", tags=["operator"])
+    async def operator_governance_status(
+        request: Request, tenant_id: str
+    ) -> dict[str, Any]:
+        await authorize(request, tenant_id, "operator_read")
+        agent_runtime = app.state.agent_runtime
+        policy = agent_runtime.policy
+        anchor_backend = agent_runtime.evidence_anchor_backend
+        return {
+            "tenant_id": tenant_id,
+            "identity": {
+                "tenant_authorizer_configured": tenant_authorizer is not None,
+                "principal_resolver_configured": principal_resolver is not None,
+            },
+            "execution": {
+                "execution_dispatcher_configured": execution_dispatcher is not None,
+                "capability_enforcement": agent_runtime.capability_enforcement,
+                "approval_sla_seconds": agent_runtime.approval_sla_seconds,
+            },
+            "policy": {
+                "autonomy_enabled": policy.autonomy_enabled,
+                "autonomy_mode": policy.autonomy_mode,
+                "medium_requires_approval": policy.medium_requires_approval,
+                "policy_version": policy.version,
+                "external_engine_count": len(policy.engines),
+            },
+            "evidence": {
+                "anchoring_configured": anchor_backend is not None,
+                "anchor_backend": getattr(anchor_backend, "name", None),
+            },
+        }
+
     return app
 
 

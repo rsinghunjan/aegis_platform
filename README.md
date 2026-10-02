@@ -58,6 +58,12 @@ compatibility fallback. The application provides `/healthz`, `/readyz`, `/ai/kno
 must be registered by the embedding application before an agent plan can call
 it; planner output cannot execute shell or Python code.
 
+`GET /operator/governance/status` reports the live governance posture for a
+tenant (identity/authorizer wiring, policy autonomy mode and version, evidence
+anchoring, and execution dispatcher configuration) for compliance dashboards
+and operator review. See [`docs/GOVERNANCE.md`](docs/GOVERNANCE.md) for the
+full governance control map.
+
 Agent HTTP routes fail closed until `create_app` is given a
 `tenant_authorizer(request, tenant_id, action, actor)` callback. The embedding
 service must derive identity and tenant membership from its trusted auth
@@ -121,7 +127,9 @@ externally anchored to protect against deletion or wholesale database
 replacement. See
 [`docs/agentic_runtime.md`](docs/agentic_runtime.md) for the state machine and
 configuration details. The consolidated environment and integration settings
-reference is in that guide.
+reference is in that guide. See [`docs/GOVERNANCE.md`](docs/GOVERNANCE.md) for
+a control-by-control map of identity, policy/approval, evidence, risk-tiered
+execution, and operator/compliance reporting.
 
 ## Implemented versus optional
 

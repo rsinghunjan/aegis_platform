@@ -545,6 +545,9 @@ def create_app(
         agent_runtime = app.state.agent_runtime
         policy = agent_runtime.policy
         anchor_backend = agent_runtime.evidence_anchor_backend
+        # Only non-sensitive configuration flags, hashes, and backend names may
+        # be added below. Never include secrets, credentials, or connection
+        # strings in this response.
         return {
             "tenant_id": tenant_id,
             "identity": {

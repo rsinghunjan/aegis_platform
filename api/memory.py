@@ -12,6 +12,7 @@ from sqlalchemy import DateTime, Integer, String, Text, delete, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from aegis_db.session import create_sessionmaker
+from aegis_db.migrations import upgrade_database
 
 logger = logging.getLogger("aegis.memory")
 
@@ -92,7 +93,12 @@ class PersistentConversationMemory:
             or os.getenv("DATABASE_URL")
             or "sqlite:///./aegis_memory.db"
         )
-        _MemoryBase.metadata.create_all(self.engine, checkfirst=True)
+        upgrade_database(
+            database_url
+            or os.getenv("AEGIS_MEMORY_DATABASE_URL")
+            or os.getenv("DATABASE_URL")
+            or "sqlite:///./aegis_memory.db"
+        )
 
     def add(self, message: Dict[str, Any]) -> None:
         role = str(message.get("role", "user"))[:32]

@@ -19,13 +19,13 @@ def upgrade():
     op.create_table(
         'safety_events',
         sa.Column('id', sa.Integer(), primary_key=True),
-        sa.Column('request_id', sa.String(length=100), nullable=False, index=True),
+        sa.Column('request_id', sa.String(length=100), nullable=False),
         sa.Column('user_id', sa.Integer(), nullable=True),
         sa.Column('model_version_id', sa.Integer(), nullable=True),
         sa.Column('decision', sa.String(length=20), nullable=False),
         sa.Column('reasons', sa.JSON(), nullable=True),
         sa.Column('input_snapshot', sa.Text(), nullable=True),
-        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.now()),
+        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.current_timestamp()),
     )
     op.create_index('ix_safety_events_request_id', 'safety_events', ['request_id'])
     op.create_index('ix_safety_events_decision', 'safety_events', ['decision'])

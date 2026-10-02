@@ -1,40 +1,7 @@
-  1
-  2
-  3
-  4
-  5
-  6
-  7
-  8
-  9
- 10
- 11
- 12
- 13
- 14
- 15
- 16
- 17
- 18
- 19
- 20
- 21
- 22
- 23
- 24
- 25
- 26
- 27
- 28
- 29
- 30
- 31
- 32
- 33
 """create model_audit table
 
 Revision ID: 0001_create_model_audit_table
-Revises: 
+Revises: 0007_billing_enforcement_fields
 Create Date: 2025-12-05 00:00:00.000000
 
 """
@@ -43,7 +10,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision = '0001_create_model_audit_table'
-down_revision = None
+down_revision = '0007_billing_enforcement_fields'
 branch_labels = None
 depends_on = None
 
@@ -64,4 +31,3 @@ def upgrade():
 
 def downgrade():
     op.drop_table('model_audit')
-alembic/versions/0001_create_model_audit_table.py

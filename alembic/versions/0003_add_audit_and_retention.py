@@ -24,7 +24,7 @@ def upgrade():
         sa.Column('target_type', sa.String(length=200), nullable=False),
         sa.Column('target_id', sa.Integer(), nullable=True),
         sa.Column('details', sa.JSON(), nullable=True),
-        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.now()),
+        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.current_timestamp()),
     )
     op.create_index('ix_audit_logs_action', 'audit_logs', ['action'])
 
@@ -38,8 +38,8 @@ def upgrade():
         sa.Column('action', sa.String(length=20), nullable=False, server_default='delete'),
         sa.Column('tenant_column', sa.String(length=200), nullable=True),
         sa.Column('filter_sql', sa.Text(), nullable=True),
-        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.now()),
-        sa.Column('updated_at', sa.DateTime(), nullable=False, server_default=sa.func.now()),
+        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.current_timestamp()),
+        sa.Column('updated_at', sa.DateTime(), nullable=False, server_default=sa.func.current_timestamp()),
     )
     op.create_index('ix_data_retention_policies_name', 'data_retention_policies', ['name'])
 

@@ -24,9 +24,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
-    inspect as sqlalchemy_inspect,
     select,
-    text,
     update,
 )
 
@@ -37,6 +35,7 @@ from agentic.capabilities import CapabilityCatalog
 from agentic.oci_sandbox import GVisorSandboxExecutor
 from agentic.evidence_anchor import EvidenceAnchorBackend, HttpTransparencyLogBackend
 from agentic.sandbox import SandboxBoundary, SandboxProfile
+from aegis_db.migrations import upgrade_database
 
 
 class RiskLevel(str, Enum):
@@ -341,7 +340,7 @@ def _persistable(value: Any) -> Any:
 
 
 class AgentStore:
-    """Small SQLAlchemy store with idempotent table initialization."""
+    """Small SQLAlchemy store backed by the repository's Alembic migrations."""
 
     def __init__(self, database_url: Optional[str] = None):
         self.database_url = database_url or os.getenv(
@@ -372,35 +371,7 @@ class AgentStore:
         return self._sessions
 
     def initialize(self) -> None:
-        AgentBase.metadata.create_all(self.engine, checkfirst=True)
-        existing = {
-            column["name"]
-            for column in sqlalchemy_inspect(self.engine).get_columns("agent_approvals")
-        }
-        evidence_columns = {
-            column["name"]
-            for column in sqlalchemy_inspect(self.engine).get_columns("agent_evidence")
-        }
-        additions = {
-            "requested_at": "TIMESTAMP",
-            "expires_at": "TIMESTAMP",
-            "sla_seconds": "INTEGER NOT NULL DEFAULT 3600",
-            "escalation_status": "VARCHAR(32) NOT NULL DEFAULT 'none'",
-            "denial_reason": "TEXT",
-            "capability_version": "VARCHAR(64)",
-            "plan_hash": "VARCHAR(64)",
-            "policy_version": "VARCHAR(64)",
-        }
-        with self.engine.begin() as connection:
-            for name, sql_type in additions.items():
-                if name not in existing:
-                    connection.execute(
-                        text(f"ALTER TABLE agent_approvals ADD COLUMN {name} {sql_type}")
-                    )
-            if "previous_sha256" not in evidence_columns:
-                connection.execute(
-                    text("ALTER TABLE agent_evidence ADD COLUMN previous_sha256 VARCHAR(64)")
-                )
+        upgrade_database(self.database_url)
         with self.sessions() as session:
             legacy_pending = session.scalars(
                 select(ApprovalRow).where(

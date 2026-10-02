@@ -38,6 +38,9 @@ remain outside the repository root are not part of this cleanup.
 - `requirements-control-plane.txt` — minimal API image dependencies;
   `requirements.txt` and `pyproject.toml` cover wider repository components.
 - `Dockerfile` — non-root server image and container startup.
+- `frontend/src/api/client.ts` — typed dashboard client for the tenant-scoped
+  `production.py` routes; `frontend/README.md` describes its local proxy and
+  trusted-authentication boundary.
 
 The supported workflow is tenant-authorized knowledge ingestion and retrieval
 through `/ai/knowledge` and `/ai/answer`, plus separately dispatched durable

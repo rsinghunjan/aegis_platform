@@ -7,6 +7,7 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      "/ai": "http://localhost:8000",
       "/operator": "http://localhost:8000",
       "/agent": "http://localhost:8000",
     },

@@ -10,11 +10,20 @@ type Tab = "workflows" | "runs" | "approvals" | "evidence" | "analytics";
 export default function App() {
   const [tab, setTab] = useState<Tab>("workflows");
   const [selectedRunId, setSelectedRunId] = useState("");
+  const [tenantId, setTenantId] = useState(import.meta.env.VITE_AEGIS_TENANT_ID ?? "");
 
   return (
     <main>
       <h1>Aegis AI Operations</h1>
       <p>Production operations for governed AI, ML, and LLM workflows.</p>
+      <label>
+        Tenant ID:
+        <input
+          value={tenantId}
+          onChange={(event) => setTenantId(event.target.value)}
+          required
+        />
+      </label>
       <nav>
         <button onClick={() => setTab("runs")}>AI Runs</button>
         <button onClick={() => setTab("workflows")}>AI Workflows</button>
@@ -23,9 +32,9 @@ export default function App() {
         <button onClick={() => setTab("analytics")}>Run Analytics</button>
       </nav>
 
-      {tab === "workflows" && <AIWorkbench />}
-      {tab === "runs" && <RunMonitor />}
-      {tab === "approvals" && <ApprovalQueue />}
+      {tab === "workflows" && <AIWorkbench tenantId={tenantId} />}
+      {tab === "runs" && <RunMonitor tenantId={tenantId} />}
+      {tab === "approvals" && <ApprovalQueue tenantId={tenantId} />}
       {tab === "evidence" && (
         <div>
           <label>
@@ -35,10 +44,12 @@ export default function App() {
               onChange={(e) => setSelectedRunId(e.target.value)}
             />
           </label>
-          {selectedRunId && <EvidenceExplorer runId={selectedRunId} />}
+          {selectedRunId && (
+            <EvidenceExplorer tenantId={tenantId} runId={selectedRunId} />
+          )}
         </div>
       )}
-      {tab === "analytics" && <AnalyticsPanel />}
+      {tab === "analytics" && <AnalyticsPanel tenantId={tenantId} />}
     </main>
   );
 }

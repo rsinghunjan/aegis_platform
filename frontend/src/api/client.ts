@@ -4,28 +4,39 @@
  */
 
 export interface AgentRunSummary {
-  id: string;
-  goal: string;
+  run_id: string;
   status: string;
-  tenant_id: string;
+  risk: string;
+  goal_hash: string;
+  result_hash: string | null;
   created_at: string;
+  updated_at: string;
 }
 
 export interface ApprovalSummary {
-  id: string;
+  approval_id: string;
   run_id: string;
+  tenant_id: string;
+  tool_name: string;
   status: string;
-  risk_level: string;
-  requested_at: string;
+  created_at: string;
+  expires_at: string | null;
 }
 
 export interface EvidenceEntry {
-  id: string;
+  evidence_id: string;
   run_id: string;
-  step_index: number;
-  hash: string;
-  previous_hash: string | null;
+  tenant_id: string;
+  kind: string;
+  sha256: string;
+  previous_sha256: string | null;
   created_at: string;
+}
+
+export interface Page<T> {
+  items: T[];
+  offset: number;
+  limit: number;
 }
 
 export interface AIAnswer {
@@ -65,14 +76,28 @@ export const aegisApi = {
       method: "POST",
       body: JSON.stringify({ tenant_id: tenantId, query }),
     }),
-  listRuns: () => request<AgentRunSummary[]>("/operator/agent/runs"),
-  getRun: (runId: string) => request<AgentRunSummary>(`/operator/agent/runs/${runId}`),
-  listApprovals: () => request<ApprovalSummary[]>("/operator/agent/approvals"),
-  decideApproval: (approvalId: string, decision: "approve" | "deny") =>
-    request<ApprovalSummary>(`/operator/agent/approvals/${approvalId}`, {
-      method: "POST",
-      body: JSON.stringify({ decision }),
-    }),
-  listEvidence: (runId: string) =>
-    request<EvidenceEntry[]>(`/operator/agent/runs/${runId}/evidence`),
+  listRuns: (tenantId: string) =>
+    request<Page<AgentRunSummary>>(
+      `/operator/agent/runs?tenant_id=${encodeURIComponent(tenantId)}`,
+    ),
+  listApprovals: (tenantId: string) =>
+    request<ApprovalSummary[]>(
+      `/agent/approvals?tenant_id=${encodeURIComponent(tenantId)}&status=pending`,
+    ),
+  decideApproval: (
+    tenantId: string,
+    approvalId: string,
+    decision: "approve" | "deny",
+  ) =>
+    request<{ approval: ApprovalSummary; status: string; run_id: string }>(
+      `/agent/approvals/${encodeURIComponent(approvalId)}/decision`,
+      {
+        method: "POST",
+        body: JSON.stringify({ tenant_id: tenantId, decision }),
+      },
+    ),
+  listEvidence: (tenantId: string, runId: string) =>
+    request<EvidenceEntry[]>(
+      `/agent/runs/${encodeURIComponent(runId)}/evidence?tenant_id=${encodeURIComponent(tenantId)}`,
+    ),
 };

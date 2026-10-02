@@ -1,8 +1,7 @@
 import { FormEvent, useState } from "react";
 import { aegisApi, AIAnswer } from "../api/client";
 
-export function AIWorkbench() {
-  const [tenantId, setTenantId] = useState("");
+export function AIWorkbench({ tenantId }: { tenantId: string }) {
   const [document, setDocument] = useState("");
   const [query, setQuery] = useState("");
   const [answer, setAnswer] = useState<AIAnswer | null>(null);
@@ -37,14 +36,6 @@ export function AIWorkbench() {
   return (
     <section aria-label="AI workflow workbench">
       <h2>Knowledge and AI workflow</h2>
-      <label>
-        Tenant ID:
-        <input
-          value={tenantId}
-          onChange={(event) => setTenantId(event.target.value)}
-          required
-        />
-      </label>
       <form onSubmit={ingest}>
         <label>
           Knowledge document:

@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { aegisApi, AgentRunSummary } from "../api/client";
 
 /** Lists agent runs with their current status, polling for live updates. */
-export function RunMonitor() {
+export function RunMonitor({ tenantId }: { tenantId: string }) {
   const [runs, setRuns] = useState<AgentRunSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
 
@@ -11,9 +11,14 @@ export function RunMonitor() {
 
     async function load() {
       try {
-        const data = await aegisApi.listRuns();
+        if (!tenantId) {
+          setRuns([]);
+          setError("Set a tenant ID to load agent runs.");
+          return;
+        }
+        const data = await aegisApi.listRuns(tenantId);
         if (!cancelled) {
-          setRuns(data);
+          setRuns(data.items);
           setError(null);
         }
       } catch (err) {
@@ -29,7 +34,7 @@ export function RunMonitor() {
       cancelled = true;
       clearInterval(interval);
     };
-  }, []);
+  }, [tenantId]);
 
   if (error) {
     return <div role="alert">Failed to load runs: {error}</div>;
@@ -42,19 +47,17 @@ export function RunMonitor() {
         <thead>
           <tr>
             <th>ID</th>
-            <th>Goal</th>
+            <th>Goal digest</th>
             <th>Status</th>
-            <th>Tenant</th>
             <th>Created</th>
           </tr>
         </thead>
         <tbody>
           {runs.map((run) => (
-            <tr key={run.id}>
-              <td>{run.id}</td>
-              <td>{run.goal}</td>
+            <tr key={run.run_id}>
+              <td>{run.run_id}</td>
+              <td>{run.goal_hash}</td>
               <td>{run.status}</td>
-              <td>{run.tenant_id}</td>
               <td>{run.created_at}</td>
             </tr>
           ))}

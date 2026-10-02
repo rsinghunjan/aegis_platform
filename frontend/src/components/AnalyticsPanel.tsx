@@ -2,12 +2,19 @@ import { useEffect, useMemo, useState } from "react";
 import { aegisApi, AgentRunSummary } from "../api/client";
 
 /** Simple aggregate analytics derived from the run list (counts by status). */
-export function AnalyticsPanel() {
+export function AnalyticsPanel({ tenantId }: { tenantId: string }) {
   const [runs, setRuns] = useState<AgentRunSummary[]>([]);
 
   useEffect(() => {
-    aegisApi.listRuns().then(setRuns).catch(() => setRuns([]));
-  }, []);
+    if (!tenantId) {
+      setRuns([]);
+      return;
+    }
+    aegisApi
+      .listRuns(tenantId)
+      .then((page) => setRuns(page.items))
+      .catch(() => setRuns([]));
+  }, [tenantId]);
 
   const statusCounts = useMemo(() => {
     const counts: Record<string, number> = {};

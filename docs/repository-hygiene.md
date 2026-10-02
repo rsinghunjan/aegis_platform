@@ -53,6 +53,11 @@ application supplies trusted authorization and, for execution, a dispatcher and
 worker. The [runtime configuration reference](agentic_runtime.md#configuration-reference)
 collects the related integration requirements and optional environment settings.
 
+Consolidating similarly named utility scripts and suffixed deployment or
+dependency files remains follow-up work: first map references from CI,
+automation, and subsystem-specific guides, then retire only verified-unused
+variants. This pass intentionally leaves those files unchanged.
+
 The RAG index is currently process-local and volatile. AI answer requests and
 durable agent runs do not yet share one workflow ID, and the model registry,
 feature store, evaluation, and promotion components are not a unified runtime

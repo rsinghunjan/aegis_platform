@@ -4,7 +4,7 @@ import pytest
 from agentic.runtime import AgentRuntime, AgentStore
 from production import create_app
 from services.ai_storage import AIDataStore
-from services.ai_workflow import AIWorkflow
+from services.ai_workflow import AIWorkflow, AIWorkflowError
 from services.embeddings import LocalHashEmbeddingProvider
 from services.inference import EchoProvider, ModelRouter
 
@@ -19,6 +19,7 @@ def test_ai_workflow_routes_are_tenant_authorized_and_retrieve_tenant_docs(tmp_p
     workflow = AIWorkflow(
         inference_router=ModelRouter([EchoProvider()]),
         embedding_provider=LocalHashEmbeddingProvider(dimensions=64),
+        data_store=AIDataStore(f"sqlite:///{tmp_path / 'workflow-ai.db'}"),
     )
     runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'workflow.db'}"))
     with TestClient(
@@ -50,10 +51,11 @@ def test_ai_workflow_routes_are_tenant_authorized_and_retrieve_tenant_docs(tmp_p
     assert ("tenant-b", "ai_generate") in authorizations
 
 
-def test_ai_workflow_rejects_oversized_document():
+def test_ai_workflow_rejects_oversized_document(tmp_path):
     workflow = AIWorkflow(
         inference_router=ModelRouter([EchoProvider()]),
         embedding_provider=LocalHashEmbeddingProvider(),
+        data_store=AIDataStore(f"sqlite:///{tmp_path / 'limits-ai.db'}"),
     )
     with pytest.raises(ValueError, match="maximum length"):
         workflow.ingest("tenant-a", "x" * (workflow.max_document_chars + 1))
@@ -63,10 +65,11 @@ def test_ai_workflow_rejects_oversized_document():
         workflow.ingest("tenant-a", "x")
 
 
-def test_ai_workflow_keeps_tenant_indexes_isolated():
+def test_ai_workflow_keeps_tenant_indexes_isolated(tmp_path):
     workflow = AIWorkflow(
         inference_router=ModelRouter([EchoProvider()]),
         embedding_provider=LocalHashEmbeddingProvider(dimensions=64),
+        data_store=AIDataStore(f"sqlite:///{tmp_path / 'isolation-ai.db'}"),
     )
     workflow.ingest("tenant-a", "Private tenant A knowledge.")
     response = workflow.answer("tenant-b", "What is tenant A knowledge?")
@@ -95,8 +98,12 @@ def test_ai_workflow_persists_tenant_documents_and_metered_audit(tmp_path, monke
     answer_after_restart = restarted.answer("tenant-a", "What does Aegis store?")
     assert answer_after_restart["citations"][0]["document_id"] == indexed["document_id"]
     assert restarted.answer("tenant-b", "What does tenant A store?")["citations"] == []
+    assert restarted.delete_document("tenant-b", indexed["document_id"]) is False
+    assert restarted.answer("tenant-a", "What does Aegis store?")["citations"]
+    assert restarted.delete_document("tenant-a", indexed["document_id"]) is True
+    assert restarted.answer("tenant-a", "What does Aegis store?")["citations"] == []
     usage = restarted.list_usage("tenant-a")
-    assert len(usage) == 2
+    assert len(usage) == 4
     assert all(record["status"] == "succeeded" for record in usage)
     assert all("request_sha256" in record for record in usage)
     assert all("prompt" not in record and "answer" not in record for record in usage)
@@ -114,7 +121,7 @@ def test_ai_workflow_persists_failed_inference_audit(tmp_path):
         embedding_provider=LocalHashEmbeddingProvider(),
         data_store=AIDataStore(f"sqlite:///{tmp_path / 'failed-ai.db'}"),
     )
-    with pytest.raises(Exception, match="AI workflow provider is unavailable"):
+    with pytest.raises(AIWorkflowError, match="AI workflow provider is unavailable"):
         workflow.answer("tenant-a", "A query with private content")
     usage = workflow.list_usage("tenant-a")
     assert len(usage) == 1
@@ -136,16 +143,22 @@ def test_operator_ai_usage_is_tenant_authorized_and_filtered(tmp_path):
         create_app(
             runtime,
             tenant_authorizer=lambda _request, tenant_id, action, _actor: (
-                tenant_id == "tenant-a" and action == "operator_read"
+                tenant_id == "tenant-a"
+                and action in {"operator_read", "ai_knowledge_write"}
             ),
             ai_workflow=workflow,
         )
     ) as client:
         allowed = client.get("/operator/ai/usage", params={"tenant_id": "tenant-a"})
         denied = client.get("/operator/ai/usage", params={"tenant_id": "tenant-b"})
+        deleted = client.delete(
+            "/ai/knowledge/" + "not-a-document",
+            params={"tenant_id": "tenant-a"},
+        )
     assert allowed.status_code == 200
     assert all(item["tenant_id"] == "tenant-a" for item in allowed.json()["records"])
     assert denied.status_code == 403
+    assert deleted.status_code == 404
 
 
 def test_ai_endpoints_fail_closed_without_tenant_authorizer(tmp_path):

@@ -1,9 +1,9 @@
 """Tenant-scoped reference workflow connecting retrieval and model inference."""
 from __future__ import annotations
 
-import os
 import hashlib
 import math
+import os
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -32,12 +32,7 @@ class AIWorkflowError(RuntimeError):
 
 
 class AIWorkflow:
-    """Small local workflow for indexing tenant documents and answering questions.
-
-    This reference implementation keeps its vector index in process memory.
-    Production deployments should inject a durable vector store with tenant
-    filtering rather than share this local implementation across workers.
-    """
+    """Tenant-scoped knowledge retrieval and metered model inference."""
 
     max_document_chars = 64_000
     max_query_chars = 8_000
@@ -131,6 +126,7 @@ class AIWorkflow:
         request_id = str(uuid.uuid4())
         request_sha256 = hashlib.sha256(query.encode("utf-8")).hexdigest()
         provider_name = "not_invoked"
+        provider_invoked = False
         try:
             retrieved = knowledge.pipeline.retrieve(query, top_k=5)
             context = "\n\n".join(
@@ -142,30 +138,15 @@ class AIWorkflow:
                 f"Context:\n{context}\n\nQuestion: {query}\nAnswer:"
             )
             request_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            provider_invoked = True
             result = self.inference_router.generate(
                 InferenceRequest(prompt=prompt, model=self.model, max_tokens=max_tokens)
             )
-            cost_usd = estimate_cost(
-                result.input_tokens,
-                result.output_tokens,
-                self.input_cost_per_1k,
-                self.output_cost_per_1k,
-            )
-            response_sha256 = hashlib.sha256(result.text.encode("utf-8")).hexdigest()
-            self.data_store.record_inference(
-                request_id=request_id,
-                tenant_id=tenant_id,
-                provider=result.provider,
-                model=result.model,
-                input_tokens=result.input_tokens,
-                output_tokens=result.output_tokens,
-                latency_ms=result.latency_ms,
-                cost_usd=cost_usd,
-                status="succeeded",
-                request_sha256=request_sha256,
-                response_sha256=response_sha256,
-            )
         except Exception as exc:
+            if provider_invoked:
+                attempts = getattr(self.inference_router, "last_attempts", [])
+                if attempts:
+                    provider_name = attempts[-1].provider
             self.data_store.record_inference(
                 request_id=request_id,
                 tenant_id=tenant_id,
@@ -180,6 +161,26 @@ class AIWorkflow:
                 error_type=type(exc).__name__,
             )
             raise AIWorkflowError("AI workflow provider is unavailable") from exc
+        cost_usd = estimate_cost(
+            result.input_tokens,
+            result.output_tokens,
+            self.input_cost_per_1k,
+            self.output_cost_per_1k,
+        )
+        response_sha256 = hashlib.sha256(result.text.encode("utf-8")).hexdigest()
+        self.data_store.record_inference(
+            request_id=request_id,
+            tenant_id=tenant_id,
+            provider=result.provider,
+            model=result.model,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            latency_ms=result.latency_ms,
+            cost_usd=cost_usd,
+            status="succeeded",
+            request_sha256=request_sha256,
+            response_sha256=response_sha256,
+        )
         return {
             "request_id": request_id,
             "answer": result.text,
@@ -205,3 +206,8 @@ class AIWorkflow:
         if limit < 1 or limit > 500:
             raise ValueError("limit must be between 1 and 500")
         return self.data_store.list_usage(tenant_id, limit)
+
+    def delete_document(self, tenant_id: str, document_id: str) -> bool:
+        if not tenant_id or not document_id:
+            raise ValueError("tenant_id and document_id are required")
+        return self.data_store.remove_document(tenant_id, document_id)

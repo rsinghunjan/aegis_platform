@@ -229,6 +229,15 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @app.delete("/ai/knowledge/{document_id}", tags=["ai-workflows"])
+    async def delete_knowledge(
+        request: Request, document_id: str, tenant_id: str
+    ) -> dict[str, Any]:
+        await authorize(request, tenant_id, "ai_knowledge_write")
+        if not app.state.ai_workflow.delete_document(tenant_id, document_id):
+            raise HTTPException(status_code=404, detail="knowledge document not found")
+        return {"tenant_id": tenant_id, "document_id": document_id, "deleted": True}
+
     @app.post("/ai/answer", tags=["ai-workflows"])
     async def answer_question(request: Request, body: AskAIRequest) -> dict[str, Any]:
         await authorize(request, body.tenant_id, "ai_generate")

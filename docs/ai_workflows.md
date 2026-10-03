@@ -53,7 +53,8 @@ is deterministic but not semantically trained. Defaults and all supported
 runtime environment settings are listed in the [runtime configuration
 reference](agentic_runtime.md#configuration-reference).
 
-Index a tenant document and ask a question:
+Index a tenant document, ask a question, and (when needed) delete the
+tenant-owned document:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/ai/knowledge \
@@ -63,6 +64,8 @@ curl -X POST http://127.0.0.1:8000/ai/knowledge \
 curl -X POST http://127.0.0.1:8000/ai/answer \
   -H 'Content-Type: application/json' \
   -d '{"tenant_id":"team-a","query":"How does Aegis protect AI workloads?"}'
+
+curl -X DELETE 'http://127.0.0.1:8000/ai/knowledge/DOCUMENT_ID?tenant_id=team-a'
 ```
 
 Knowledge documents, chunks, and embeddings are persisted in SQL storage
@@ -85,6 +88,8 @@ process). Database quotas survive restarts. Storage operations and retrieval
 are tenant-filtered; all AI endpoints still require the trusted injected
 tenant authorizer. Configure database backups, access controls, and retention
 for the knowledge and audit tables as part of deployment operations.
+Document deletion requires the `ai_knowledge_write` authorization action and
+removes only the selected tenant's document and chunks.
 
 ## Governed agent operations and feedback
 

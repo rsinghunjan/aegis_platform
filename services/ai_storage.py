@@ -6,7 +6,18 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import DateTime, Float, Integer, JSON, String, Text, create_engine, delete, func, select
+from sqlalchemy import (
+    DateTime,
+    Float,
+    Integer,
+    JSON,
+    String,
+    Text,
+    create_engine,
+    delete,
+    func,
+    select,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from services.embeddings.vector_store import VectorRecord, VectorStore, _cosine_similarity
@@ -104,7 +115,7 @@ class AIDataStore:
                 )
             )
 
-    def remove_document(self, tenant_id: str, document_id: str) -> None:
+    def remove_document(self, tenant_id: str, document_id: str) -> bool:
         self.initialize()
         with self._sessions.begin() as session:
             session.execute(
@@ -113,12 +124,14 @@ class AIDataStore:
                     KnowledgeChunkRow.document_id == document_id,
                 )
             )
-            session.execute(
+            result = session.execute(
                 delete(KnowledgeDocumentRow).where(
                     KnowledgeDocumentRow.tenant_id == tenant_id,
                     KnowledgeDocumentRow.document_id == document_id,
                 )
             )
+            deleted = result.rowcount == 1
+        return deleted
 
     def record_inference(
         self,
@@ -208,7 +221,9 @@ class TenantVectorStore(VectorStore):
         metadatas = metadatas or [{} for _ in texts]
         ids = ids or [str(uuid.uuid4()) for _ in texts]
         if len(metadatas) != len(texts) or len(ids) != len(texts):
-            raise ValueError("vectors, texts, metadata, and ids must have equal lengths")
+            raise ValueError(
+                "vectors, texts, metadata, and ids must have equal lengths"
+            )
         self.store.initialize()
         with self.store._sessions.begin() as session:
             for vector, text, metadata, record_id in zip(vectors, texts, metadatas, ids):

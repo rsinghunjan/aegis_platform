@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 import inspect
 from typing import Any, Callable, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from agentic.runtime import AgentRuntime, AgentRuntimeError, AgentStore
@@ -243,6 +243,18 @@ def create_app(
             raise HTTPException(
                 status_code=503, detail="configured AI provider is unavailable"
             ) from exc
+
+    @app.get("/operator/ai/usage", tags=["ai-workflows"])
+    async def list_ai_usage(
+        request: Request,
+        tenant_id: str,
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        await authorize(request, tenant_id, "operator_read")
+        return {
+            "tenant_id": tenant_id,
+            "records": app.state.ai_workflow.list_usage(tenant_id, limit),
+        }
 
     @app.post("/agent/runs/{run_id}/feedback", tags=["agentic"])
     async def record_agent_feedback(

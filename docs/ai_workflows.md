@@ -27,7 +27,8 @@ callbacks and optional environment settings.
 
 Without external credentials, Aegis uses local hash embeddings and an echo
 inference provider. These make the workflow exercisable offline but do not
-provide semantic embeddings or generated answers. For a real model provider:
+provide semantic embeddings or generated answers. Configure one or more
+providers to use the unified inference gateway:
 
 ```bash
 python -m pip install -e '.[ai]'
@@ -35,11 +36,18 @@ export AEGIS_LLM_API_KEY='...'
 export AEGIS_LLM_MODEL='gpt-4o-mini'
 # Optional for an OpenAI-compatible host (the value should include /v1 as needed).
 export AEGIS_LLM_BASE_URL='https://api.openai.com/v1'
+# Optional ordered fallback chain: openai, anthropic, ollama, vllm, echo.
+export AEGIS_INFERENCE_PROVIDERS='openai,ollama'
 ```
 
-The provider key and base URL are shared with the optional OpenAI-compatible
-planner. Set `AEGIS_LLM_PLANNER_ENABLED=true` to use that planner; otherwise
-agent planning stays deterministic. For model-backed document embeddings, set
+The default provider selection preserves OpenAI-compatible inference when
+credentials and the SDK are available, otherwise it uses the offline echo
+provider. An explicit `AEGIS_INFERENCE_PROVIDERS` list is attempted in order;
+it does not silently add echo. Set provider credentials/base URLs using the
+provider-specific environment variables. The OpenAI-compatible key and base URL
+are also shared with the optional planner. Set `AEGIS_LLM_PLANNER_ENABLED=true`
+to use that planner; otherwise agent planning stays deterministic. For
+model-backed document embeddings, set
 `AEGIS_EMBEDDING_PROVIDER=openai`; the default `local-hash` embedding provider
 is deterministic but not semantically trained. Defaults and all supported
 runtime environment settings are listed in the [runtime configuration
@@ -57,16 +65,26 @@ curl -X POST http://127.0.0.1:8000/ai/answer \
   -d '{"tenant_id":"team-a","query":"How does Aegis protect AI workloads?"}'
 ```
 
-The answer response includes the provider/model, token and latency signals, and
-document/chunk citations. Requests are bounded (64,000 document characters,
+Knowledge documents, chunks, and embeddings are persisted in SQL storage
+(`AEGIS_AI_DATABASE_URL`, default `sqlite:///./aegis_ai.db`) with tenant-bound
+vector queries. Use PostgreSQL for a shared multi-worker service; schema tables
+are initialized idempotently by the application. Every answer writes an
+inference audit row containing provider/model, token counts, latency, estimated
+cost, status, and SHA-256 request/response fingerprints—not raw prompts or
+answers. Set `AEGIS_LLM_INPUT_COST_PER_1K` and
+`AEGIS_LLM_OUTPUT_COST_PER_1K` to the deployment's USD price per 1,000 tokens;
+the default is zero until rates are configured. The tenant-authorized
+`GET /operator/ai/usage?tenant_id=...` endpoint requires the `operator_read`
+action and returns bounded usage records.
+
+The answer response includes provider/model, token and latency signals,
+estimated cost, request ID, and document/chunk citations. Requests are bounded (64,000 document characters,
 8,000 query characters, at most 4,096 output tokens, 100 documents and 256,000
-indexed characters per tenant, and 100 in-memory tenants). Tenant indexes are
-separate in the reference service. The default in-memory vector store is
-process-local and volatile; it is intended for local development and a
-single-process demonstration, not production persistence or multi-worker
-deployment. Production deployments must inject a durable vector service whose
-query and mutation operations enforce tenant isolation. The current reference
-API does not accept a caller-selected vector backend.
+indexed characters per tenant, and 100 cached tenant pipeline objects per
+process). Database quotas survive restarts. Storage operations and retrieval
+are tenant-filtered; all AI endpoints still require the trusted injected
+tenant authorizer. Configure database backups, access controls, and retention
+for the knowledge and audit tables as part of deployment operations.
 
 ## Governed agent operations and feedback
 
@@ -95,12 +113,9 @@ prompts, retrain models, or promote a model based on feedback.
 
 ## Operations and scope
 
-The answer endpoint returns per-request token and latency metadata. Existing
-Prometheus/Grafana, drift monitoring, model promotion, billing, deployment, and
-security components remain separate integrations; they are not yet joined to
-AI workflow responses by one durable workflow ID. The reference workflow
-therefore demonstrates AI inference and retrieval, while durable agent runs
-provide policy, approval, verification, and evidence lifecycle. Durable
-knowledge storage, model evaluation pipelines, cross-service trace correlation,
-automated feedback loops, and end-to-end deployment/promotion orchestration
+The answer endpoint reports per-request tokens, latency, cost, citations, and
+request ID. Durable AI usage/audit records are available in the operator usage
+endpoint. Agent runs remain a separate lifecycle; cross-service trace
+correlation, provider-specific price catalogs, budget enforcement for direct
+AI workflow calls, model evaluation pipelines, and automated feedback loops
 remain follow-on work.

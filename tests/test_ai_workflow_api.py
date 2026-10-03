@@ -3,6 +3,7 @@ import pytest
 
 from agentic.runtime import AgentRuntime, AgentStore
 from production import create_app
+from services.ai_storage import AIDataStore
 from services.ai_workflow import AIWorkflow
 from services.embeddings import LocalHashEmbeddingProvider
 from services.inference import EchoProvider, ModelRouter
@@ -70,6 +71,81 @@ def test_ai_workflow_keeps_tenant_indexes_isolated():
     workflow.ingest("tenant-a", "Private tenant A knowledge.")
     response = workflow.answer("tenant-b", "What is tenant A knowledge?")
     assert response["citations"] == []
+
+
+def test_ai_workflow_persists_tenant_documents_and_metered_audit(tmp_path, monkeypatch):
+    monkeypatch.setenv("AEGIS_LLM_INPUT_COST_PER_1K", "2")
+    monkeypatch.setenv("AEGIS_LLM_OUTPUT_COST_PER_1K", "4")
+    database_url = f"sqlite:///{tmp_path / 'ai-data.db'}"
+    first = AIWorkflow(
+        inference_router=ModelRouter([EchoProvider()]),
+        embedding_provider=LocalHashEmbeddingProvider(dimensions=64),
+        data_store=AIDataStore(database_url),
+    )
+    indexed = first.ingest("tenant-a", "Aegis stores durable private knowledge.")
+    response = first.answer("tenant-a", "What does Aegis store?")
+    assert response["cost_usd"] > 0
+    assert response["request_id"]
+
+    restarted = AIWorkflow(
+        inference_router=ModelRouter([EchoProvider()]),
+        embedding_provider=LocalHashEmbeddingProvider(dimensions=64),
+        data_store=AIDataStore(database_url),
+    )
+    answer_after_restart = restarted.answer("tenant-a", "What does Aegis store?")
+    assert answer_after_restart["citations"][0]["document_id"] == indexed["document_id"]
+    assert restarted.answer("tenant-b", "What does tenant A store?")["citations"] == []
+    usage = restarted.list_usage("tenant-a")
+    assert len(usage) == 2
+    assert all(record["status"] == "succeeded" for record in usage)
+    assert all("request_sha256" in record for record in usage)
+    assert all("prompt" not in record and "answer" not in record for record in usage)
+
+
+def test_ai_workflow_persists_failed_inference_audit(tmp_path):
+    class FailedProvider(EchoProvider):
+        name = "failed-test"
+
+        def generate(self, _request):
+            raise RuntimeError("provider failure")
+
+    workflow = AIWorkflow(
+        inference_router=ModelRouter([FailedProvider()]),
+        embedding_provider=LocalHashEmbeddingProvider(),
+        data_store=AIDataStore(f"sqlite:///{tmp_path / 'failed-ai.db'}"),
+    )
+    with pytest.raises(Exception, match="AI workflow provider is unavailable"):
+        workflow.answer("tenant-a", "A query with private content")
+    usage = workflow.list_usage("tenant-a")
+    assert len(usage) == 1
+    assert usage[0]["status"] == "failed"
+    assert usage[0]["error_type"] == "NoProviderAvailableError"
+    assert "private content" not in repr(usage[0])
+
+
+def test_operator_ai_usage_is_tenant_authorized_and_filtered(tmp_path):
+    workflow = AIWorkflow(
+        inference_router=ModelRouter([EchoProvider()]),
+        embedding_provider=LocalHashEmbeddingProvider(),
+        data_store=AIDataStore(f"sqlite:///{tmp_path / 'usage-api.db'}"),
+    )
+    workflow.answer("tenant-a", "hello")
+    workflow.answer("tenant-b", "world")
+    runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'usage-agent.db'}"))
+    with TestClient(
+        create_app(
+            runtime,
+            tenant_authorizer=lambda _request, tenant_id, action, _actor: (
+                tenant_id == "tenant-a" and action == "operator_read"
+            ),
+            ai_workflow=workflow,
+        )
+    ) as client:
+        allowed = client.get("/operator/ai/usage", params={"tenant_id": "tenant-a"})
+        denied = client.get("/operator/ai/usage", params={"tenant_id": "tenant-b"})
+    assert allowed.status_code == 200
+    assert all(item["tenant_id"] == "tenant-a" for item in allowed.json()["records"])
+    assert denied.status_code == 403
 
 
 def test_ai_endpoints_fail_closed_without_tenant_authorizer(tmp_path):

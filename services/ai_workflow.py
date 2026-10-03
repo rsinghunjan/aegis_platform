@@ -42,6 +42,7 @@ class AIWorkflow:
     max_query_chars = 8_000
     max_documents_per_tenant = 100
     max_indexed_chars_per_tenant = 256_000
+    max_chunks_per_tenant = 512
     max_tenants = 100
 
     def __init__(
@@ -101,13 +102,19 @@ class AIWorkflow:
         chunks = semantic_chunk(document)
         if not chunks:
             raise ValueError("document produced no indexable text")
-        vectors = self.embedding_provider.embed(chunks)
+        try:
+            vectors = self.embedding_provider.embed(chunks)
+        except Exception as exc:
+            raise AIWorkflowError(
+                "AI workflow embedding provider is unavailable"
+            ) from exc
         self.data_store.ingest_document(
             tenant_id,
             document_id,
             len(document),
             self.max_documents_per_tenant,
             self.max_indexed_chars_per_tenant,
+            self.max_chunks_per_tenant,
             chunks,
             vectors,
         )
@@ -153,7 +160,7 @@ class AIWorkflow:
                 InferenceRequest(prompt=prompt, model=self.model, max_tokens=max_tokens)
             )
         except Exception as exc:
-            attempts = getattr(self.inference_router, "last_attempts", [])
+            attempts = getattr(exc, "attempts", ())
             provider = attempts[-1].provider if attempts else "unavailable"
             self._record_failed_request(
                 request_id=request_id,

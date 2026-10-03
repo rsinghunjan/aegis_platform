@@ -5,6 +5,7 @@ import math
 import os
 import uuid
 from datetime import datetime, timezone
+from heapq import nlargest
 from typing import Any
 
 from sqlalchemy import (
@@ -20,6 +21,8 @@ from sqlalchemy import (
     func,
     select,
 )
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from services.embeddings.vector_store import VectorRecord, VectorStore, _cosine_similarity
@@ -36,6 +39,12 @@ class KnowledgeDocumentRow(AIStorageBase):
     document_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     char_count: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class TenantIngestionLockRow(AIStorageBase):
+    __tablename__ = "ai_tenant_ingestion_locks"
+
+    tenant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
 
 
 class KnowledgeChunkRow(AIStorageBase):
@@ -96,6 +105,7 @@ class AIDataStore:
         char_count: int,
         max_documents: int,
         max_indexed_chars: int,
+        max_chunks: int,
         chunks: list[str],
         vectors: list[list[float]],
     ) -> None:
@@ -105,6 +115,26 @@ class AIDataStore:
             raise ValueError("embeddings must contain only finite numbers")
         self.initialize()
         with self._sessions.begin() as session:
+            dialect_name = session.bind.dialect.name
+            lock_values = {"tenant_id": tenant_id}
+            if dialect_name == "sqlite":
+                statement = sqlite_insert(TenantIngestionLockRow).values(
+                    **lock_values
+                ).on_conflict_do_nothing()
+            elif dialect_name == "postgresql":
+                statement = postgresql_insert(TenantIngestionLockRow).values(
+                    **lock_values
+                ).on_conflict_do_nothing()
+            else:
+                raise RuntimeError(
+                    "AI ingestion quota locking supports SQLite and PostgreSQL"
+                )
+            session.execute(statement)
+            session.execute(
+                select(TenantIngestionLockRow)
+                .where(TenantIngestionLockRow.tenant_id == tenant_id)
+                .with_for_update()
+            ).scalar_one()
             doc_count, char_total = session.execute(
                 select(
                     func.count(KnowledgeDocumentRow.document_id),
@@ -115,6 +145,13 @@ class AIDataStore:
                 raise ValueError("tenant document limit reached")
             if char_total + char_count > max_indexed_chars:
                 raise ValueError("tenant indexed text limit reached")
+            chunk_count = session.scalar(
+                select(func.count(KnowledgeChunkRow.id)).where(
+                    KnowledgeChunkRow.tenant_id == tenant_id
+                )
+            )
+            if chunk_count + len(chunks) > max_chunks:
+                raise ValueError("tenant indexed chunk limit reached")
             session.add(
                 KnowledgeDocumentRow(
                     tenant_id=tenant_id,
@@ -290,24 +327,24 @@ class TenantVectorStore(VectorStore):
         self.store.initialize()
         with self.store._sessions() as session:
             rows = session.scalars(
-                select(KnowledgeChunkRow).where(
-                    KnowledgeChunkRow.tenant_id == self.tenant_id
+                select(KnowledgeChunkRow)
+                .where(KnowledgeChunkRow.tenant_id == self.tenant_id)
+                .order_by(KnowledgeChunkRow.id)
+                .execution_options(stream_results=True)
+            ).yield_per(128)
+            scored = (
+                (
+                    VectorRecord(
+                        id=row.id,
+                        vector=row.embedding,
+                        text=row.text,
+                        metadata=row.metadata_json,
+                    ),
+                    _cosine_similarity(vector, row.embedding),
                 )
-            ).all()
-        scored = [
-            (
-                VectorRecord(
-                    id=row.id,
-                    vector=row.embedding,
-                    text=row.text,
-                    metadata=row.metadata_json,
-                ),
-                _cosine_similarity(vector, row.embedding),
+                for row in rows
             )
-            for row in rows
-        ]
-        scored.sort(key=lambda pair: pair[1], reverse=True)
-        return scored[:top_k]
+            return nlargest(top_k, scored, key=lambda pair: (pair[1], pair[0].id))
 
     def delete(self, ids: list[str]) -> None:
         self.store.initialize()

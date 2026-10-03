@@ -13,6 +13,10 @@ logger = logging.getLogger("aegis.inference.router")
 class NoProviderAvailableError(RuntimeError):
     """Raised when every provider in the fallback chain fails or is unavailable."""
 
+    def __init__(self, message: str, attempts: List[RouteAttempt]):
+        super().__init__(message)
+        self.attempts = tuple(attempts)
+
 
 @dataclass
 class RouteAttempt:
@@ -54,5 +58,6 @@ class ModelRouter:
                 logger.exception("provider %s raised unexpected error", provider.name)
         self.last_attempts = attempts
         raise NoProviderAvailableError(
-            f"all providers failed: {[(a.provider, a.error) for a in attempts]}"
+            f"all providers failed: {[(a.provider, a.error) for a in attempts]}",
+            attempts,
         )

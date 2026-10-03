@@ -79,20 +79,21 @@ answers. Set `AEGIS_LLM_INPUT_COST_PER_1K` and
 the default is zero until rates are configured. The tenant-authorized
 `GET /operator/ai/usage?tenant_id=...` endpoint requires the `operator_read`
 action and returns bounded usage records.
-Document metadata and all generated chunks are committed atomically, and the
-service computes cosine similarity over the requesting tenant's bounded chunk
-set. This SQL implementation is intended for modest per-tenant corpora; use a
-database vector index or another `VectorStore` implementation for larger
-collections.
+Document metadata and all generated chunks are committed atomically. Ingestion
+serializes quota checks per tenant, with a maximum of 512 indexed chunks per
+tenant. Retrieval streams the requesting tenant's bounded rows and retains only
+the top matches while computing cosine similarity. This SQL implementation is
+intended for modest per-tenant corpora; use a database vector index or another
+`VectorStore` implementation for larger collections.
 
 The answer response includes provider/model, token and latency signals,
 estimated cost, request ID, and document/chunk citations. Requests are bounded (64,000 document characters,
-8,000 query characters, at most 4,096 output tokens, 100 documents and 256,000
-indexed characters per tenant, and 100 cached tenant pipeline objects per
-process). Database quotas survive restarts. Storage operations and retrieval
-are tenant-filtered; all AI endpoints still require the trusted injected
-tenant authorizer. Configure database backups, access controls, and retention
-for the knowledge and audit tables as part of deployment operations.
+8,000 query characters, at most 4,096 output tokens, 100 documents, 256,000
+indexed characters, 512 indexed chunks per tenant, and 100 cached tenant pipeline
+objects per process). Database quotas survive restarts. Storage operations and
+retrieval are tenant-filtered; all AI endpoints still require the trusted
+injected tenant authorizer. Configure database backups, access controls, and
+retention for the knowledge and audit tables as part of deployment operations.
 Document deletion requires the `ai_knowledge_write` authorization action and
 removes only the selected tenant's document and chunks.
 

@@ -228,6 +228,14 @@ def create_app(
             return app.state.ai_workflow.ingest(body.tenant_id, body.document)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except AIWorkflowError as exc:
+            logger.warning(
+                "AI workflow ingestion unavailable error_type=%s",
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=503, detail="AI workflow is unavailable"
+            ) from exc
 
     @app.delete("/ai/knowledge/{document_id}", tags=["ai-workflows"])
     async def delete_knowledge(
@@ -248,10 +256,11 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except AIWorkflowError as exc:
-            logger.warning("AI workflow operation unavailable: %s", str(exc))
-            raise HTTPException(
-                status_code=503, detail=str(exc)
-            ) from exc
+            logger.warning(
+                "AI workflow operation unavailable error_type=%s",
+                type(exc).__name__,
+            )
+            raise HTTPException(status_code=503, detail="AI workflow is unavailable") from exc
 
     @app.get("/operator/ai/usage", tags=["ai-workflows"])
     async def list_ai_usage(

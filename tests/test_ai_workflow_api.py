@@ -7,6 +7,7 @@ from services.ai_storage import AIDataStore
 from services.ai_workflow import AIWorkflow, AIWorkflowError
 from services.embeddings import LocalHashEmbeddingProvider
 from services.inference import EchoProvider, ModelRouter
+from services.inference.router import NoProviderAvailableError, RouteAttempt
 
 
 def test_ai_workflow_routes_are_tenant_authorized_and_retrieve_tenant_docs(tmp_path):
@@ -63,6 +64,54 @@ def test_ai_workflow_rejects_oversized_document(tmp_path):
         workflow.ingest("tenant-a", "x" * workflow.max_document_chars)
     with pytest.raises(ValueError, match="indexed text limit"):
         workflow.ingest("tenant-a", "x")
+
+
+def test_ai_workflow_enforces_chunk_quota(tmp_path):
+    workflow = AIWorkflow(
+        inference_router=ModelRouter([EchoProvider()]),
+        embedding_provider=LocalHashEmbeddingProvider(),
+        data_store=AIDataStore(f"sqlite:///{tmp_path / 'chunk-limit.db'}"),
+    )
+    workflow.max_chunks_per_tenant = 1
+    indexed = workflow.ingest("tenant-a", "First document.")
+    with pytest.raises(ValueError, match="indexed chunk limit"):
+        workflow.ingest("tenant-a", "Second document.")
+    assert workflow.answer("tenant-a", "First document?")["citations"][0][
+        "document_id"
+    ] == indexed["document_id"]
+
+
+def test_concurrent_ingestion_serializes_tenant_quotas(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    class ConcurrentEmbedding(LocalHashEmbeddingProvider):
+        barrier = Barrier(8)
+
+        def embed(self, texts):
+            self.barrier.wait(timeout=5)
+            return super().embed(texts)
+
+    workflow = AIWorkflow(
+        inference_router=ModelRouter([EchoProvider()]),
+        embedding_provider=ConcurrentEmbedding(),
+        data_store=AIDataStore(f"sqlite:///{tmp_path / 'concurrent-ingest.db'}"),
+    )
+    workflow.max_documents_per_tenant = 2
+    workflow.data_store.initialize()
+
+    def ingest(index):
+        try:
+            workflow.ingest("tenant-a", f"Document {index}.")
+            return True
+        except ValueError:
+            return False
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(ingest, range(8)))
+
+    assert sum(results) == 2
+    assert len(workflow.data_store.vector_store("tenant-a").query([0.0] * 256)) == 2
 
 
 def test_ai_workflow_keeps_tenant_indexes_isolated(tmp_path):
@@ -139,6 +188,25 @@ def test_ai_workflow_persists_failed_inference_audit(tmp_path):
     assert "private content" not in repr(usage[0])
 
 
+def test_inference_failure_audit_uses_request_local_attempts(tmp_path):
+    class InterleavedFailureRouter:
+        last_attempts = [RouteAttempt("another-request", False)]
+
+        def generate(self, _request):
+            raise NoProviderAvailableError(
+                "provider failed", [RouteAttempt("this-request", False)]
+            )
+
+    workflow = AIWorkflow(
+        inference_router=InterleavedFailureRouter(),
+        embedding_provider=LocalHashEmbeddingProvider(),
+        data_store=AIDataStore(f"sqlite:///{tmp_path / 'request-local-attempts.db'}"),
+    )
+    with pytest.raises(AIWorkflowError):
+        workflow.answer("tenant-a", "A question")
+    assert workflow.list_usage("tenant-a")[0]["provider"] == "this-request"
+
+
 def test_ai_workflow_retrieval_failure_is_not_reported_as_inference(tmp_path):
     class SwitchableEmbedding(LocalHashEmbeddingProvider):
         fail = False
@@ -172,6 +240,20 @@ def test_ai_workflow_retrieval_failure_is_not_reported_as_inference(tmp_path):
     assert record["provider"] == "not_invoked"
 
 
+def test_ai_workflow_ingestion_embedding_failure_is_normalized(tmp_path):
+    class FailedEmbedding(LocalHashEmbeddingProvider):
+        def embed(self, _texts):
+            raise RuntimeError("provider internals")
+
+    workflow = AIWorkflow(
+        inference_router=ModelRouter([EchoProvider()]),
+        embedding_provider=FailedEmbedding(),
+        data_store=AIDataStore(f"sqlite:///{tmp_path / 'failed-ingest-embedding.db'}"),
+    )
+    with pytest.raises(AIWorkflowError, match="embedding provider is unavailable"):
+        workflow.ingest("tenant-a", "An indexable document.")
+
+
 def test_ai_workflow_audit_storage_failure_returns_clear_error(tmp_path):
     class BrokenAuditStore(AIDataStore):
         def record_inference(self, **_kwargs):
@@ -185,6 +267,25 @@ def test_ai_workflow_audit_storage_failure_returns_clear_error(tmp_path):
     with pytest.raises(AIWorkflowError, match="audit could not be persisted"):
         workflow.answer("tenant-a", "A metered request")
 
+
+def test_ai_workflow_api_returns_fixed_error_for_provider_failures(tmp_path):
+    class FailingWorkflow:
+        def answer(self, *_args):
+            raise AIWorkflowError("database credentials must not be exposed")
+
+    runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'fixed-error.db'}"))
+    with TestClient(
+        create_app(
+            runtime,
+            tenant_authorizer=lambda *_args: True,
+            ai_workflow=FailingWorkflow(),
+        )
+    ) as client:
+        response = client.post(
+            "/ai/answer", json={"tenant_id": "tenant-a", "query": "A question"}
+        )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "AI workflow is unavailable"
 
 def test_inference_gateway_uses_configured_provider_order(monkeypatch):
     from services.inference.gateway import configured_providers

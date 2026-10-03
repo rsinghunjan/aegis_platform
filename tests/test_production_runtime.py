@@ -240,6 +240,39 @@ def test_operator_read_models_are_authorized_and_return_summaries(tmp_path):
     assert summary.json()["anchors"] == []
 
 
+def test_governance_status_reports_posture_and_fails_closed(tmp_path):
+    runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'governance.db'}"))
+    dispatcher = CollectingDispatcher()
+    with TestClient(
+        create_app(
+            runtime,
+            tenant_authorizer=lambda *_args: True,
+            execution_dispatcher=dispatcher,
+        )
+    ) as client:
+        response = client.get(
+            "/operator/governance/status", params={"tenant_id": "tenant-a"}
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["identity"]["tenant_authorizer_configured"] is True
+    assert body["execution"]["execution_dispatcher_configured"] is True
+    assert body["policy"]["autonomy_mode"] in {
+        "disabled",
+        "advisory",
+        "supervised",
+        "autonomous-for-low-risk",
+    }
+    assert body["policy"]["policy_version"] == runtime.policy.version
+
+    # Without a configured tenant authorizer, the endpoint must fail closed.
+    with TestClient(create_app(runtime)) as unauthorized_client:
+        unauthorized = unauthorized_client.get(
+            "/operator/governance/status", params={"tenant_id": "tenant-a"}
+        )
+    assert unauthorized.status_code == 503
+
+
 def test_periodic_evidence_anchor_is_visible_in_operator_summary(tmp_path, monkeypatch):
     monkeypatch.setenv("AEGIS_EVIDENCE_ANCHOR_INTERVAL_SECONDS", "0.01")
     backend = CollectingEvidenceAnchorBackend()

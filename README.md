@@ -134,20 +134,21 @@ execution, and operator/compliance reporting.
 ## Implemented versus optional
 
 **Implemented here:** health/readiness, tenant-authorized knowledge ingestion and
-retrieval-augmented inference, provider and embedding adapters, a durable local
-agent runtime, registered tool execution, deterministic and optional LLM
-planning, policy and approval gates, hash-versioned capabilities, bounded tool
-payloads, verification, bounded idempotent retries, agent feedback evidence,
-tenant-scoped memory, operator read models, and pluggable job/remediation
-adapters.
+retrieval-augmented inference with durable tenant-scoped SQL storage, configurable
+provider routing, per-request cost estimates and hash-only inference audit,
+registered tool execution, deterministic and optional LLM planning, policy and
+approval gates, hash-versioned capabilities, bounded tool payloads, verification,
+bounded idempotent retries, agent feedback evidence, tenant-scoped memory,
+operator read models, and pluggable job/remediation adapters.
 
 **Adapter-backed or optional:** hosted LLM planning and inference, semantic
-embeddings, durable/shared vector storage, cloud deployment, secret managers,
-external approval systems, promotion/canary systems, and GPU/TPU support. The
-local inference fallback is an echo provider for smoke testing, not an AI model.
-The default image intentionally does not install large model or accelerator
-packages. The historical multipart prediction route is not mounted or
-production-supported; see the
+embeddings, indexed vector databases for large corpora, cloud deployment, secret
+managers, external approval systems, promotion/canary systems, and GPU/TPU
+support. The local inference fallback is an echo provider for smoke testing, not
+an AI model. Configure `AEGIS_AI_DATABASE_URL`, provider pricing, and provider
+credentials for production use. The default image intentionally does not install
+large model or accelerator packages. The historical multipart prediction route
+is not mounted or production-supported; see the
 [legacy API status and migration guide](docs/legacy_api.md).
 
 The pre-existing Alembic history contains multiple roots and an unresolved

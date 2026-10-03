@@ -99,6 +99,9 @@ def test_ai_workflow_persists_tenant_documents_and_metered_audit(tmp_path, monke
     assert answer_after_restart["citations"][0]["document_id"] == indexed["document_id"]
     assert restarted.answer("tenant-b", "What does tenant A store?")["citations"] == []
     assert restarted.delete_document("tenant-b", indexed["document_id"]) is False
+    restarted.max_documents_per_tenant = 1
+    with pytest.raises(ValueError, match="document limit"):
+        restarted.ingest("tenant-a", "Quota survives service restart.")
     assert restarted.answer("tenant-a", "What does Aegis store?")["citations"]
     assert restarted.delete_document("tenant-a", indexed["document_id"]) is True
     assert restarted.answer("tenant-a", "What does Aegis store?")["citations"] == []
@@ -107,6 +110,11 @@ def test_ai_workflow_persists_tenant_documents_and_metered_audit(tmp_path, monke
     assert all(record["status"] == "succeeded" for record in usage)
     assert all("request_sha256" in record for record in usage)
     assert all("prompt" not in record and "answer" not in record for record in usage)
+    metered_restart_answer = next(
+        item for item in usage if item["request_id"] == answer_after_restart["request_id"]
+    )
+    assert metered_restart_answer["cost_usd"] == answer_after_restart["cost_usd"]
+    assert metered_restart_answer["provider"] == "local-echo"
 
 
 def test_ai_workflow_persists_failed_inference_audit(tmp_path):
@@ -127,7 +135,20 @@ def test_ai_workflow_persists_failed_inference_audit(tmp_path):
     assert len(usage) == 1
     assert usage[0]["status"] == "failed"
     assert usage[0]["error_type"] == "NoProviderAvailableError"
+    assert usage[0]["provider"] == "failed-test"
     assert "private content" not in repr(usage[0])
+
+
+def test_inference_gateway_uses_configured_provider_order(monkeypatch):
+    from services.inference.gateway import configured_providers
+
+    monkeypatch.setenv("AEGIS_INFERENCE_PROVIDERS", "ollama,echo")
+    providers = configured_providers()
+    assert [provider.name for provider in providers] == ["ollama", "local-echo"]
+
+    monkeypatch.setenv("AEGIS_INFERENCE_PROVIDERS", "unknown")
+    with pytest.raises(ValueError, match="unsupported inference provider"):
+        configured_providers()
 
 
 def test_operator_ai_usage_is_tenant_authorized_and_filtered(tmp_path):

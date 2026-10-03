@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 import inspect
 from typing import Any, Callable, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from agentic.runtime import AgentRuntime, AgentRuntimeError, AgentStore
@@ -228,6 +228,23 @@ def create_app(
             return app.state.ai_workflow.ingest(body.tenant_id, body.document)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except AIWorkflowError as exc:
+            logger.warning(
+                "AI workflow ingestion unavailable error_type=%s",
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=503, detail="AI workflow is unavailable"
+            ) from exc
+
+    @app.delete("/ai/knowledge/{document_id}", tags=["ai-workflows"])
+    async def delete_knowledge(
+        request: Request, document_id: str, tenant_id: str
+    ) -> dict[str, Any]:
+        await authorize(request, tenant_id, "ai_knowledge_write")
+        if not app.state.ai_workflow.delete_document(tenant_id, document_id):
+            raise HTTPException(status_code=404, detail="knowledge document not found")
+        return {"tenant_id": tenant_id, "document_id": document_id, "deleted": True}
 
     @app.post("/ai/answer", tags=["ai-workflows"])
     async def answer_question(request: Request, body: AskAIRequest) -> dict[str, Any]:
@@ -239,10 +256,23 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except AIWorkflowError as exc:
-            logger.warning("AI workflow inference unavailable")
-            raise HTTPException(
-                status_code=503, detail="configured AI provider is unavailable"
-            ) from exc
+            logger.warning(
+                "AI workflow operation unavailable error_type=%s",
+                type(exc).__name__,
+            )
+            raise HTTPException(status_code=503, detail="AI workflow is unavailable") from exc
+
+    @app.get("/operator/ai/usage", tags=["ai-workflows"])
+    async def list_ai_usage(
+        request: Request,
+        tenant_id: str,
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        await authorize(request, tenant_id, "operator_read")
+        return {
+            "tenant_id": tenant_id,
+            "records": app.state.ai_workflow.list_usage(tenant_id, limit),
+        }
 
     @app.post("/agent/runs/{run_id}/feedback", tags=["agentic"])
     async def record_agent_feedback(

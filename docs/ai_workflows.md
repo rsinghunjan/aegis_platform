@@ -79,6 +79,11 @@ answers. Set `AEGIS_LLM_INPUT_COST_PER_1K` and
 the default is zero until rates are configured. The tenant-authorized
 `GET /operator/ai/usage?tenant_id=...` endpoint requires the `operator_read`
 action and returns bounded usage records.
+Document metadata and all generated chunks are committed atomically, and the
+service computes cosine similarity over the requesting tenant's bounded chunk
+set. This SQL implementation is intended for modest per-tenant corpora; use a
+database vector index or another `VectorStore` implementation for larger
+collections.
 
 The answer response includes provider/model, token and latency signals,
 estimated cost, request ID, and document/chunk citations. Requests are bounded (64,000 document characters,

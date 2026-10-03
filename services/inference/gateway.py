@@ -14,40 +14,37 @@ from .providers import (
 from .router import ModelRouter
 
 
+def _openai_provider() -> OpenAICompatibleProvider:
+    return OpenAICompatibleProvider(
+        api_key=os.getenv("AEGIS_LLM_API_KEY") or os.getenv("OPENAI_API_KEY"),
+        base_url=os.getenv("AEGIS_LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL"),
+    )
+
+
+def _provider_factory(name: str):
+    factories = {
+        "openai": _openai_provider,
+        "anthropic": AnthropicProvider,
+        "ollama": OllamaProvider,
+        "vllm": VLLMProvider,
+        "echo": EchoProvider,
+    }
+    try:
+        return factories[name]
+    except KeyError as exc:
+        raise ValueError(f"unsupported inference provider: {name}") from exc
+
+
 def configured_providers() -> list[InferenceProvider]:
     configured = os.getenv("AEGIS_INFERENCE_PROVIDERS")
     if configured:
         names = [name.strip().lower() for name in configured.split(",") if name.strip()]
         if not names:
             raise ValueError("AEGIS_INFERENCE_PROVIDERS must name at least one provider")
-        providers: list[InferenceProvider] = []
-        for name in names:
-            if name == "openai":
-                providers.append(
-                    OpenAICompatibleProvider(
-                        api_key=os.getenv("AEGIS_LLM_API_KEY")
-                        or os.getenv("OPENAI_API_KEY"),
-                        base_url=os.getenv("AEGIS_LLM_BASE_URL")
-                        or os.getenv("OPENAI_BASE_URL"),
-                    )
-                )
-            elif name == "anthropic":
-                providers.append(AnthropicProvider())
-            elif name == "ollama":
-                providers.append(OllamaProvider())
-            elif name == "vllm":
-                providers.append(VLLMProvider())
-            elif name == "echo":
-                providers.append(EchoProvider())
-            else:
-                raise ValueError(f"unsupported inference provider: {name}")
-        return providers
+        return [_provider_factory(name)() for name in names]
 
-    provider = OpenAICompatibleProvider(
-        api_key=os.getenv("AEGIS_LLM_API_KEY") or os.getenv("OPENAI_API_KEY"),
-        base_url=os.getenv("AEGIS_LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL"),
-    )
-    return [provider, EchoProvider()] if provider.is_available() else [EchoProvider()]
+    provider = _openai_provider()
+    return [provider] if provider.is_available() else [EchoProvider()]
 
 
 def build_inference_router() -> ModelRouter:

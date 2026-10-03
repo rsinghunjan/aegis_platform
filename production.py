@@ -248,9 +248,9 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except AIWorkflowError as exc:
-            logger.warning("AI workflow inference unavailable")
+            logger.warning("AI workflow operation unavailable: %s", str(exc))
             raise HTTPException(
-                status_code=503, detail="configured AI provider is unavailable"
+                status_code=503, detail=str(exc)
             ) from exc
 
     @app.get("/operator/ai/usage", tags=["ai-workflows"])

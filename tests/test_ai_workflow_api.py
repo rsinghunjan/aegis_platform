@@ -139,6 +139,53 @@ def test_ai_workflow_persists_failed_inference_audit(tmp_path):
     assert "private content" not in repr(usage[0])
 
 
+def test_ai_workflow_retrieval_failure_is_not_reported_as_inference(tmp_path):
+    class SwitchableEmbedding(LocalHashEmbeddingProvider):
+        fail = False
+
+        def embed(self, texts):
+            if self.fail:
+                raise RuntimeError("embedding failure")
+            return super().embed(texts)
+
+    class CountingProvider(EchoProvider):
+        calls = 0
+
+        def generate(self, request):
+            self.calls += 1
+            return super().generate(request)
+
+    embedding = SwitchableEmbedding()
+    provider = CountingProvider()
+    workflow = AIWorkflow(
+        inference_router=ModelRouter([provider]),
+        embedding_provider=embedding,
+        data_store=AIDataStore(f"sqlite:///{tmp_path / 'retrieval-failure.db'}"),
+    )
+    workflow.ingest("tenant-a", "A durable document.")
+    embedding.fail = True
+    with pytest.raises(AIWorkflowError, match="retrieval is unavailable"):
+        workflow.answer("tenant-a", "A question")
+    assert provider.calls == 0
+    record = workflow.list_usage("tenant-a")[0]
+    assert record["status"] == "retrieval_failed"
+    assert record["provider"] == "not_invoked"
+
+
+def test_ai_workflow_audit_storage_failure_returns_clear_error(tmp_path):
+    class BrokenAuditStore(AIDataStore):
+        def record_inference(self, **_kwargs):
+            raise OSError("database details must not reach clients")
+
+    workflow = AIWorkflow(
+        inference_router=ModelRouter([EchoProvider()]),
+        embedding_provider=LocalHashEmbeddingProvider(),
+        data_store=BrokenAuditStore(f"sqlite:///{tmp_path / 'broken-audit.db'}"),
+    )
+    with pytest.raises(AIWorkflowError, match="audit could not be persisted"):
+        workflow.answer("tenant-a", "A metered request")
+
+
 def test_inference_gateway_uses_configured_provider_order(monkeypatch):
     from services.inference.gateway import configured_providers
 

@@ -1,6 +1,7 @@
 """Durable tenant-scoped knowledge and hash-only inference audit storage."""
 from __future__ import annotations
 
+import math
 import os
 import uuid
 from datetime import datetime, timezone
@@ -10,6 +11,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     Integer,
+    Index,
     JSON,
     String,
     Text,
@@ -49,6 +51,7 @@ class KnowledgeChunkRow(AIStorageBase):
 
 class InferenceAuditRow(AIStorageBase):
     __tablename__ = "ai_inference_audit"
+    __table_args__ = (Index("ix_ai_audit_tenant_created", "tenant_id", "created_at"),)
 
     request_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
@@ -86,14 +89,20 @@ class AIDataStore:
             raise ValueError("tenant_id is required")
         return TenantVectorStore(self, tenant_id)
 
-    def create_document(
+    def ingest_document(
         self,
         tenant_id: str,
         document_id: str,
         char_count: int,
         max_documents: int,
         max_indexed_chars: int,
+        chunks: list[str],
+        vectors: list[list[float]],
     ) -> None:
+        if len(chunks) != len(vectors) or not chunks:
+            raise ValueError("document chunks and embeddings must be non-empty and aligned")
+        if any(not math.isfinite(float(value)) for vector in vectors for value in vector):
+            raise ValueError("embeddings must contain only finite numbers")
         self.initialize()
         with self._sessions.begin() as session:
             doc_count, char_total = session.execute(
@@ -114,6 +123,21 @@ class AIDataStore:
                     created_at=datetime.now(timezone.utc),
                 )
             )
+            for chunk_index, (text, embedding) in enumerate(zip(chunks, vectors)):
+                session.add(
+                    KnowledgeChunkRow(
+                        id=str(uuid.uuid4()),
+                        tenant_id=tenant_id,
+                        document_id=document_id,
+                        text=text,
+                        embedding=embedding,
+                        metadata_json={
+                            "tenant_id": tenant_id,
+                            "document_id": document_id,
+                            "chunk_index": chunk_index,
+                        },
+                    )
+                )
 
     def remove_document(self, tenant_id: str, document_id: str) -> bool:
         self.initialize()
@@ -175,7 +199,10 @@ class AIDataStore:
             rows = session.scalars(
                 select(InferenceAuditRow)
                 .where(InferenceAuditRow.tenant_id == tenant_id)
-                .order_by(InferenceAuditRow.created_at.desc())
+                .order_by(
+                    InferenceAuditRow.created_at.desc(),
+                    InferenceAuditRow.request_id.desc(),
+                )
                 .limit(limit)
             ).all()
         return [

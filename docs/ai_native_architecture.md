@@ -8,7 +8,7 @@ governance, or agent-runtime components.
 
 - `AICore` wraps `AIWorkflow` for knowledge ingestion and answering, records
   tenant-scoped memory and observations, and produces operator insights.
-- `AIMemory` keeps bounded, process-local interaction metadata. Query and run
+- `AIMemory` keeps bounded interaction metadata, durable in SQL via `AICoreStore`. Query and run
   identifiers are hashed; raw prompts, goals, and answers are not retained.
 - `AIObservability` summarizes answer failures, citations, latency, cost, and
   successful agent lifecycle events.
@@ -23,13 +23,13 @@ governance, or agent-runtime components.
 The existing `/ai/knowledge` and `/ai/answer` endpoints are routed through
 `AICore`. Agent run endpoints continue to use `AgentRuntime` and the configured
 execution dispatcher. `GET /operator/ai/insights?tenant_id=...` returns
-tenant-scoped in-process metrics, heuristic recommendations, and advisory
+tenant-scoped persisted metrics, heuristic recommendations, and advisory
 policy suggestions. It requires the existing `operator_read` authorization.
 The existing authorization callbacks remain required; a tenant ID is not
 authentication.
 
 The answer response includes `repeated_query`, indicating whether the same
-tenant asked the same exact query during this process's retained memory window.
+tenant asked the same exact query within the retained memory window.
 It is a best-effort signal, not durable deduplication or idempotency.
 
 ## Production-readiness assessment
@@ -37,9 +37,10 @@ It is a best-effort signal, not durable deduplication or idempotency.
 This foundation does **not** make Aegis fully AI-native or establish that a
 deployment is production-ready. Important limitations include:
 
-- Memory and insight counters are in-process, bounded, and lost on restart;
-  replicas do not share them. Agent lifecycle events in these counters are
-  observability hints, not the durable audit record.
+- Memory and telemetry persist in `ai_core_events` (hash-only metadata, newest
+  500 per tenant and kind), shared across replicas on a shared database. During
+  a database outage they degrade to per-process state. Agent lifecycle events
+  here are observability hints, not the durable audit record.
 - Policy and operational recommendations are simple thresholds, not evaluated
   policy decisions. They must not be used as automatic enforcement.
 - The AI core currently wraps the knowledge workflow; it does not unify every

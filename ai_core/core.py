@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from ai_core.memory import AIMemory, query_digest
 from ai_core.observability import AIObservability
 from ai_core.policy import AIPolicyEngine
+from ai_core.store import AICoreStore
 from services.ai_workflow import AIWorkflow, AIWorkflowError
 
 
@@ -22,6 +24,25 @@ class AICore:
         self.memory = memory or AIMemory()
         self.observability = observability or AIObservability()
         self.policy = policy or AIPolicyEngine(self.observability)
+
+    @classmethod
+    def durable(cls, workflow: AIWorkflow) -> "AICore":
+        """Build a core whose memory and telemetry persist in SQL.
+
+        Uses AEGIS_AI_CORE_DATABASE_URL when set, otherwise the workflow's own
+        AI database so replicas sharing that database share state.
+        """
+        url = os.getenv("AEGIS_AI_CORE_DATABASE_URL") or getattr(
+            getattr(workflow, "data_store", None), "database_url", None
+        )
+        if not url:
+            return cls(workflow)
+        store = AICoreStore(url)
+        return cls(
+            workflow,
+            memory=AIMemory(store=store),
+            observability=AIObservability(store=store),
+        )
 
     def ingest(self, tenant_id: str, document: str) -> dict[str, Any]:
         result = self.workflow.ingest(tenant_id, document)

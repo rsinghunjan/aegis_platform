@@ -158,7 +158,7 @@ def create_app(
     )
     app.state.agent_runtime = selected_runtime
     app.state.ai_workflow = selected_ai_workflow
-    app.state.ai_core = AICore(selected_ai_workflow)
+    app.state.ai_core = AICore.durable(selected_ai_workflow)
 
     async def resolve_principal(request: Request) -> AgentPrincipal:
         if principal_resolver is None:

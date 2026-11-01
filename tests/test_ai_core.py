@@ -2,7 +2,7 @@ from fastapi.testclient import TestClient
 
 from agentic.runtime import AgentRuntime, AgentStore
 from agentic.worker import AgentPrincipal
-from ai_core import AICore, AIMemory, AIObservability, AIPolicyEngine
+from ai_core import AICore, AICoreStore, AIMemory, AIObservability, AIPolicyEngine
 from production import create_app
 from services.ai_storage import AIDataStore
 from services.ai_workflow import AIWorkflow
@@ -113,3 +113,69 @@ def test_agent_routes_feed_tenant_scoped_ai_insights(tmp_path):
     assert insights.json()["summary"]["agent_events"] == 3
     assert insights.json()["summary"]["agent_failures"] == 0
     assert other_tenant.status_code == 403
+
+
+def _store(tmp_path, **kwargs):
+    return AICoreStore(f"sqlite:///{tmp_path / 'core.db'}", **kwargs)
+
+
+def test_state_survives_restart_and_is_shared_between_instances(tmp_path):
+    first = AICore(
+        _workflow(tmp_path),
+        memory=AIMemory(store=_store(tmp_path)),
+        observability=AIObservability(store=_store(tmp_path)),
+    )
+    first.ingest("t", "Aegis governs AI workflows.")
+    first.answer("t", "What does Aegis govern?")
+    first.record_agent_event("t", "run-1", "create", "created")
+
+    restarted = AICore(
+        _workflow(tmp_path),
+        memory=AIMemory(store=_store(tmp_path)),
+        observability=AIObservability(store=_store(tmp_path)),
+    )
+    assert restarted.answer("t", "What does Aegis govern?")["repeated_query"] is True
+    summary = restarted.insights("t")["summary"]
+    assert summary["answers"] == 2
+    assert summary["agent_events"] == 1
+    assert restarted.insights("other")["summary"]["answers"] == 0
+
+
+def test_store_retention_is_bounded_per_tenant_and_kind(tmp_path):
+    store = _store(tmp_path, max_events_per_tenant_kind=3)
+    for index in range(10):
+        store.append("a", "mem:answer", {"n": index})
+    store.append("b", "mem:answer", {"n": 99})
+    assert [e["n"] for e in store.recent("a")] == [7, 8, 9]
+    assert [e["n"] for e in store.recent("b")] == [99]
+    store.forget("a")
+    assert store.recent("a") == []
+
+
+def test_store_outage_does_not_fail_requests(tmp_path):
+    class BrokenStore:
+        def append(self, *args, **kwargs):
+            raise RuntimeError("db down")
+
+        def recent(self, *args, **kwargs):
+            raise RuntimeError("db down")
+
+    core = AICore(
+        _workflow(tmp_path),
+        memory=AIMemory(store=BrokenStore()),
+        observability=AIObservability(store=BrokenStore()),
+    )
+    core.ingest("t", "Aegis governs AI workflows.")
+    assert core.answer("t", "What does Aegis govern?")["repeated_query"] is False
+    assert core.answer("t", "What does Aegis govern?")["repeated_query"] is True
+    assert core.insights("t")["summary"]["answers"] == 2
+
+
+def test_persisted_events_contain_no_raw_text(tmp_path):
+    store = _store(tmp_path)
+    core = AICore(_workflow(tmp_path), memory=AIMemory(store=store))
+    core.ingest("t", "Aegis governs AI workflows.")
+    core.answer("t", "SECRET-QUERY-TEXT")
+    core.record_agent_event("t", "SECRET-RUN-ID", "create", "created")
+    dump = str(store.recent("t"))
+    assert "SECRET" not in dump

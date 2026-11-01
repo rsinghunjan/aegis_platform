@@ -14,6 +14,7 @@ from typing import Any, Callable, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from ai_core import AICore
 from agentic.runtime import AgentRuntime, AgentRuntimeError, AgentStore
 from agentic.worker import AgentExecutionMessage, AgentPrincipal
 from services.ai_workflow import AIWorkflow, AIWorkflowError
@@ -157,6 +158,7 @@ def create_app(
     )
     app.state.agent_runtime = selected_runtime
     app.state.ai_workflow = selected_ai_workflow
+    app.state.ai_core = AICore(selected_ai_workflow)
 
     async def resolve_principal(request: Request) -> AgentPrincipal:
         if principal_resolver is None:
@@ -203,6 +205,9 @@ def create_app(
         result = dispatch(message)
         if inspect.isawaitable(result):
             result = await result
+        app.state.ai_core.record_agent_event(
+            tenant_id, run_id, "resume" if resume else "execute", "queued"
+        )
         return {"status": "QUEUED", "run_id": run_id, "dispatch_id": result}
 
     @app.get("/healthz", tags=["health"])
@@ -225,7 +230,7 @@ def create_app(
     ) -> dict[str, Any]:
         await authorize(request, body.tenant_id, "ai_knowledge_write")
         try:
-            return app.state.ai_workflow.ingest(body.tenant_id, body.document)
+            return app.state.ai_core.ingest(body.tenant_id, body.document)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except AIWorkflowError as exc:
@@ -250,7 +255,7 @@ def create_app(
     async def answer_question(request: Request, body: AskAIRequest) -> dict[str, Any]:
         await authorize(request, body.tenant_id, "ai_generate")
         try:
-            return app.state.ai_workflow.answer(
+            return app.state.ai_core.answer(
                 body.tenant_id, body.query, body.max_tokens
             )
         except ValueError as exc:
@@ -274,6 +279,11 @@ def create_app(
             "records": app.state.ai_workflow.list_usage(tenant_id, limit),
         }
 
+    @app.get("/operator/ai/insights", tags=["ai-workflows"])
+    async def ai_insights(request: Request, tenant_id: str) -> dict[str, Any]:
+        await authorize(request, tenant_id, "operator_read")
+        return app.state.ai_core.insights(tenant_id)
+
     @app.post("/agent/runs/{run_id}/feedback", tags=["agentic"])
     async def record_agent_feedback(
         request: Request, run_id: str, body: AgentFeedbackRequest
@@ -290,6 +300,9 @@ def create_app(
                     if body.note
                     else None,
                 },
+            )
+            app.state.ai_core.record_agent_event(
+                body.tenant_id, run_id, "feedback", "recorded"
             )
             return {"run_id": run_id, "evidence_id": evidence_id}
         except AgentRuntimeError as exc:
@@ -308,6 +321,9 @@ def create_app(
                 budget=body.budget,
                 idempotency_key=body.idempotency_key,
             )
+            app.state.ai_core.record_agent_event(
+                body.tenant_id, run.run_id, "create", "created"
+            )
             return _run_summary(run)
         except AgentRuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -323,6 +339,9 @@ def create_app(
                 goal=body.goal,
                 budget=body.budget,
                 idempotency_key=body.idempotency_key,
+            )
+            app.state.ai_core.record_agent_event(
+                body.tenant_id, run.run_id, "create", "created"
             )
             return _run_summary(run)
         except AgentRuntimeError as exc:
@@ -373,6 +392,9 @@ def create_app(
                 principal.principal_id,
                 body.reason,
                 approval_id=body.approval_id,
+            )
+            app.state.ai_core.record_agent_event(
+                body.tenant_id, run_id, "approval", "approved"
             )
             return {"approval": approval.dict(), "status": "APPROVED"}
         except AgentRuntimeError as exc:
@@ -449,6 +471,12 @@ def create_app(
                 raise HTTPException(
                     status_code=422, detail="decision must be approve or deny"
                 )
+            app.state.ai_core.record_agent_event(
+                body.tenant_id,
+                approval.run_id,
+                "approval_decision",
+                "approved" if body.decision == "approve" else "denied",
+            )
             return {"approval": decision.dict(), **result}
         except AgentRuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

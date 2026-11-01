@@ -38,6 +38,9 @@ class AIObservability:
         with self._lock:
             records = list(self._records.get(tenant_id, ()))
         answers = [r for r in records if r["operation"] == "answer"]
+        agent_events = [
+            r for r in records if r["operation"].startswith("agent_run_")
+        ]
         ok = [r for r in answers if r["outcome"] == "succeeded"]
         latencies = sorted(r["latency_ms"] for r in ok)
         p95 = (
@@ -54,6 +57,8 @@ class AIObservability:
             else 0.0,
             "p95_latency_ms": p95,
             "total_cost_usd": sum(r["cost_usd"] for r in ok),
+            "agent_events": len(agent_events),
+            "agent_failures": sum(1 for r in agent_events if r["outcome"] == "failed"),
         }
 
     def recommendations(

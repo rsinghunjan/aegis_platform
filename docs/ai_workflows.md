@@ -122,11 +122,35 @@ the optional note, not the note text. Agent output verification and user ratings
 provide quality signals, but this implementation does not automatically change
 prompts, retrain models, or promote a model based on feedback.
 
+## Shared AI core and operator insights
+
+The `ai_core` package wraps the existing workflow and provides bounded,
+process-local memory, operation metrics, and advisory policy suggestions.
+Knowledge ingestion and answering use this core, and successful agent run
+creation, dispatch, feedback, and approval operations add hashed run metadata
+to the same tenant-scoped insights. It does not replace the durable agent
+runtime or its evidence chain. Run IDs and query text are not stored in this
+in-memory layer; query and run identifiers are represented by SHA-256 hashes.
+
+Retrieve the per-tenant summary with the `operator_read` authorization action:
+
+```bash
+curl 'http://127.0.0.1:8000/operator/ai/insights?tenant_id=team-a'
+```
+
+The response includes answer failure/citation/latency/cost metrics,
+recommendations, policy suggestions, and counts of agent lifecycle events.
+Suggestions are advisory only and are never applied automatically. Memory and
+insight counters currently reset on process restart and are not shared across
+workers; use durable, shared telemetry and memory storage before relying on
+them for production reporting or policy decisions.
+
 ## Operations and scope
 
 The answer endpoint reports per-request tokens, latency, cost, citations, and
 request ID. Durable AI usage/audit records are available in the operator usage
-endpoint. Agent runs remain a separate lifecycle; cross-service trace
+endpoint. Agent runs remain a separate durable lifecycle, with only summary
+events reflected in the process-local core; cross-service trace
 correlation, provider-specific price catalogs, budget enforcement for direct
 AI workflow calls, model evaluation pipelines, and automated feedback loops
 remain follow-on work.

@@ -55,6 +55,20 @@ class AICore:
         result["repeated_query"] = repeated
         return result
 
+    def record_agent_event(
+        self, tenant_id: str, run_id: str, action: str, outcome: str
+    ) -> None:
+        self.memory.remember(
+            tenant_id,
+            "agent_run",
+            {
+                "run_id_sha256": query_digest(run_id),
+                "action": action,
+                "outcome": outcome,
+            },
+        )
+        self.observability.record(tenant_id, f"agent_run_{action}", outcome)
+
     def insights(self, tenant_id: str) -> dict[str, Any]:
         return {
             "summary": self.observability.summary(tenant_id),

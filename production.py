@@ -205,6 +205,9 @@ def create_app(
         result = dispatch(message)
         if inspect.isawaitable(result):
             result = await result
+        app.state.ai_core.record_agent_event(
+            tenant_id, run_id, "resume" if resume else "execute", "queued"
+        )
         return {"status": "QUEUED", "run_id": run_id, "dispatch_id": result}
 
     @app.get("/healthz", tags=["health"])
@@ -298,6 +301,9 @@ def create_app(
                     else None,
                 },
             )
+            app.state.ai_core.record_agent_event(
+                body.tenant_id, run_id, "feedback", "recorded"
+            )
             return {"run_id": run_id, "evidence_id": evidence_id}
         except AgentRuntimeError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -315,6 +321,9 @@ def create_app(
                 budget=body.budget,
                 idempotency_key=body.idempotency_key,
             )
+            app.state.ai_core.record_agent_event(
+                body.tenant_id, run.run_id, "create", "created"
+            )
             return _run_summary(run)
         except AgentRuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -330,6 +339,9 @@ def create_app(
                 goal=body.goal,
                 budget=body.budget,
                 idempotency_key=body.idempotency_key,
+            )
+            app.state.ai_core.record_agent_event(
+                body.tenant_id, run.run_id, "create", "created"
             )
             return _run_summary(run)
         except AgentRuntimeError as exc:
@@ -380,6 +392,9 @@ def create_app(
                 principal.principal_id,
                 body.reason,
                 approval_id=body.approval_id,
+            )
+            app.state.ai_core.record_agent_event(
+                body.tenant_id, run_id, "approval", "approved"
             )
             return {"approval": approval.dict(), "status": "APPROVED"}
         except AgentRuntimeError as exc:
@@ -456,6 +471,12 @@ def create_app(
                 raise HTTPException(
                     status_code=422, detail="decision must be approve or deny"
                 )
+            app.state.ai_core.record_agent_event(
+                body.tenant_id,
+                approval.run_id,
+                "approval_decision",
+                "approved" if body.decision == "approve" else "denied",
+            )
             return {"approval": decision.dict(), **result}
         except AgentRuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

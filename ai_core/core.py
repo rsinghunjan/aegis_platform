@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from ai_core.limits import AIQuotaExceeded, AIQuotaGuard
 from ai_core.memory import AIMemory, query_digest
 from ai_core.observability import AIObservability
 from ai_core.policy import AIPolicyEngine
@@ -19,8 +20,10 @@ class AICore:
         memory: AIMemory | None = None,
         observability: AIObservability | None = None,
         policy: AIPolicyEngine | None = None,
+        quota: AIQuotaGuard | None = None,
     ):
         self.workflow = workflow
+        self.quota = quota
         self.memory = memory or AIMemory()
         self.observability = observability or AIObservability()
         self.policy = policy or AIPolicyEngine(self.observability)
@@ -35,13 +38,15 @@ class AICore:
         url = os.getenv("AEGIS_AI_CORE_DATABASE_URL") or getattr(
             getattr(workflow, "data_store", None), "database_url", None
         )
+        quota = AIQuotaGuard.from_env(workflow)
         if not url:
-            return cls(workflow)
+            return cls(workflow, quota=quota)
         store = AICoreStore(url)
         return cls(
             workflow,
             memory=AIMemory(store=store),
             observability=AIObservability(store=store),
+            quota=quota,
         )
 
     def ingest(self, tenant_id: str, document: str) -> dict[str, Any]:
@@ -50,6 +55,14 @@ class AICore:
         return result
 
     def answer(self, tenant_id: str, query: str, max_tokens: int = 512) -> dict[str, Any]:
+        if self.quota is not None and self.quota.enabled:
+            try:
+                self.quota.check(tenant_id, max_tokens)
+            except AIQuotaExceeded as exc:
+                self.observability.record(
+                    tenant_id, "answer_rejected", f"quota_{exc.kind}"
+                )
+                raise
         repeated = self.memory.seen_query(tenant_id, query)
         try:
             result = self.workflow.answer(tenant_id, query, max_tokens)

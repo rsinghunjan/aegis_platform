@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections import defaultdict, deque
 from typing import Any
 
+from ai_core.store import AICoreStore
+
+logger = logging.getLogger(__name__)
+
 
 class AIObservability:
-    def __init__(self, window: int = 500):
+    def __init__(self, window: int = 500, store: AICoreStore | None = None):
+        self.window = window
+        self.store = store
         self._records: dict[str, deque[dict[str, Any]]] = defaultdict(
             lambda: deque(maxlen=window)
         )
@@ -23,20 +30,41 @@ class AIObservability:
         cost_usd: float = 0.0,
         citations: int = 0,
     ) -> None:
+        record = {
+            "operation": operation,
+            "outcome": outcome,
+            "latency_ms": latency_ms,
+            "cost_usd": cost_usd,
+            "citations": citations,
+        }
         with self._lock:
-            self._records[tenant_id].append(
-                {
-                    "operation": operation,
-                    "outcome": outcome,
-                    "latency_ms": latency_ms,
-                    "cost_usd": cost_usd,
-                    "citations": citations,
-                }
-            )
+            self._records[tenant_id].append(record)
+        if self.store is not None:
+            try:
+                self.store.append(tenant_id, self._kind(operation), record)
+            except Exception as exc:
+                logger.warning("AI telemetry persistence failed: %s", type(exc).__name__)
+
+    @staticmethod
+    def _kind(operation: str) -> str:
+        return "obs:agent" if operation.startswith("agent_run_") else "obs:answer"
+
+    def _load(self, tenant_id: str) -> list[dict[str, Any]]:
+        if self.store is not None:
+            try:
+                return [
+                    {k: v for k, v in event.items() if k not in ("kind", "at")}
+                    for event in self.store.recent(
+                        tenant_id, ["obs:answer", "obs:agent"], self.window
+                    )
+                ]
+            except Exception as exc:
+                logger.warning("AI telemetry read failed: %s", type(exc).__name__)
+        with self._lock:
+            return list(self._records.get(tenant_id, ()))
 
     def summary(self, tenant_id: str) -> dict[str, Any]:
-        with self._lock:
-            records = list(self._records.get(tenant_id, ()))
+        records = self._load(tenant_id)
         answers = [r for r in records if r["operation"] == "answer"]
         agent_events = [
             r for r in records if r["operation"].startswith("agent_run_")

@@ -230,6 +230,21 @@ class AIDataStore:
                 )
             )
 
+    def usage_since(self, tenant_id: str, since: datetime) -> tuple[int, float]:
+        """Return (request count, USD spend) for a tenant since ``since``."""
+        self.initialize()
+        with self._sessions() as session:
+            count, cost = session.execute(
+                select(
+                    func.count(InferenceAuditRow.request_id),
+                    func.coalesce(func.sum(InferenceAuditRow.cost_usd), 0.0),
+                ).where(
+                    InferenceAuditRow.tenant_id == tenant_id,
+                    InferenceAuditRow.created_at >= since,
+                )
+            ).one()
+        return int(count), float(cost)
+
     def list_usage(self, tenant_id: str, limit: int = 100) -> list[dict[str, Any]]:
         self.initialize()
         with self._sessions() as session:

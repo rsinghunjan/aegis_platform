@@ -150,12 +150,45 @@ to per-process state so user requests do not fail; insights are then
 incomplete. Configure backups and retention for this table like the other AI
 tables. The metrics are still simple heuristics, not a full tracing system.
 
+## Usage limits and provider resilience
+
+`/ai/answer` can enforce per-tenant limits before any provider is called. Both
+are disabled unless set, and are read from the durable inference audit table so
+replicas on a shared database enforce them together:
+
+| Variable | Meaning |
+| --- | --- |
+| `AEGIS_AI_TENANT_DAILY_BUDGET_USD` | Max estimated spend per tenant per UTC day |
+| `AEGIS_AI_TENANT_REQUESTS_PER_MINUTE` | Max requests per tenant in a rolling 60 seconds |
+
+Over-limit requests return `429` with the fixed body
+`{"detail": "AI usage limit exceeded"}` and a `Retry-After` header; they write
+no audit row and appear as `quota_rejections` in `/operator/ai/insights`. The
+budget needs `AEGIS_LLM_INPUT_COST_PER_1K`/`AEGIS_LLM_OUTPUT_COST_PER_1K`
+(a warning is logged at startup if they are zero). The check also projects the
+request's `max_tokens` at the output rate but ignores retrieved context, so one
+call can slightly exceed the budget, and concurrent requests can briefly
+overshoot a limit. Treat these as cost guardrails, not exact billing. Limits are
+global per deployment; per-tenant overrides are not implemented. Invalid values
+fail startup.
+
+The inference router adds, per provider: OpenAI/Anthropic call timeouts
+(`AEGIS_INFERENCE_TIMEOUT_SECONDS`, default 30; SDK-internal retries are off),
+retries with exponential backoff (`AEGIS_INFERENCE_MAX_RETRIES`, default 1),
+and a circuit breaker that skips a provider after
+`AEGIS_INFERENCE_BREAKER_FAILURES` consecutive failed requests (default 5, `0`
+disables) until `AEGIS_INFERENCE_BREAKER_COOLDOWN_SECONDS` (default 30) passes,
+then allows one probe. Retries apply to any provider error, including
+non-transient ones, so keep the retry count small. Breaker state is per process.
+Ollama and vLLM keep their existing fixed HTTP timeouts. Routers constructed
+directly with `ModelRouter([...])` keep the old no-retry, no-breaker behavior.
+
 ## Operations and scope
 
 The answer endpoint reports per-request tokens, latency, cost, citations, and
 request ID. Durable AI usage/audit records are available in the operator usage
 endpoint. Agent runs remain a separate durable lifecycle, with only summary
 events reflected in the core; cross-service trace
-correlation, provider-specific price catalogs, budget enforcement for direct
-AI workflow calls, model evaluation pipelines, and automated feedback loops
+correlation, provider-specific price catalogs, exact (transactional) budget
+enforcement, model evaluation pipelines, and automated feedback loops
 remain follow-on work.

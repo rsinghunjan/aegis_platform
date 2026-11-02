@@ -58,3 +58,26 @@ Before calling a deployment production-ready, validate its threat model,
 tenant isolation, retention and deletion requirements, provider behavior,
 database failover/backup, worker recovery, capacity limits, alerting, evaluation
 quality, and rollback procedures in that deployment's environment.
+
+## Golden evaluation and feedback loop
+
+`data/golden_datasets/ai_workflow.json` is the versioned golden set for workflow
+answer quality. Run `python scripts/evaluate_ai_workflow.py` to evaluate the
+configured inference route. The report includes expected-fact recall,
+source-groundedness, citation coverage, regressions against dataset thresholds,
+and approval-gated tuning recommendations. It does not retain generated answers.
+Configure the same inference provider/model settings used by the deployment when
+running an evaluation intended to measure that deployment.
+
+Changes to prompts, retrieval, model routing, or the golden set run this
+evaluation tests as a pull-request gate. The provider-backed evaluation also
+runs when the `AEGIS_LLM_API_KEY` repository secret is configured; without it,
+CI skips the external-model call. Feedback submitted through
+`POST /agent/runs/{id}/feedback` remains in the tenant-scoped evidence chain and
+can be reviewed using `GET /operator/agent/runs/{id}/feedback-summary`. Pass
+reviewed ratings with `--feedback-rating <1-5>` to include them in an
+evaluation's feedback summary and tuning recommendations. A failing score or a
+low rating can suggest reviewing retrieval, prompts, or routing, but never
+changes those settings automatically. Tune only in a proposed change, rerun the
+golden evaluation, and require the existing human approval process before
+promotion.

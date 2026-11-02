@@ -355,7 +355,22 @@ def test_agent_feedback_is_authorized_and_added_to_evidence_chain(tmp_path):
                 "note": "Helpful",
             },
         )
+        low_rating = client.post(
+            f"/agent/runs/{run.run_id}/feedback",
+            json={"tenant_id": "tenant-a", "rating": 1},
+        )
+        summary = client.get(
+            f"/operator/agent/runs/{run.run_id}/feedback-summary",
+            params={"tenant_id": "tenant-a"},
+        )
     assert response.status_code == 200
+    assert low_rating.status_code == 200
+    assert summary.status_code == 200
+    assert summary.json()["rating_count"] == 2
+    assert summary.json()["average_rating"] == 3
+    assert summary.json()["tuning_recommendations"][0][
+        "requires_human_approval"
+    ] is True
     evidence = runtime.list_evidence(run.run_id, "tenant-a")
     feedback = next(item for item in evidence if item.kind == "user_feedback")
     assert feedback.metadata["rating"] == 5

@@ -9,6 +9,9 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import BaseModel, Field, StrictStr, ValidationError
+
+from safety_checker import SafetyChecker
 from services.ai_storage import AIDataStore
 from services.embeddings import (
     LocalHashEmbeddingProvider,
@@ -24,6 +27,10 @@ from services.inference import (
 from services.inference.gateway import build_inference_router
 
 logger = logging.getLogger(__name__)
+
+
+class _ModelAnswer(BaseModel):
+    answer: StrictStr = Field(min_length=1)
 
 
 @dataclass
@@ -58,6 +65,7 @@ class AIWorkflow:
         self.input_cost_per_1k = self._cost_rate("AEGIS_LLM_INPUT_COST_PER_1K")
         self.output_cost_per_1k = self._cost_rate("AEGIS_LLM_OUTPUT_COST_PER_1K")
         self._tenants: dict[str, _TenantKnowledge] = {}
+        self.safety_checker = SafetyChecker()
 
     @staticmethod
     def _cost_rate(setting: str) -> float:
@@ -129,6 +137,8 @@ class AIWorkflow:
             raise ValueError("query must not be empty")
         if len(query) > self.max_query_chars:
             raise ValueError("query exceeds the maximum length")
+        if self.safety_checker.is_unsafe(query):
+            raise ValueError("query rejected by safety policy")
         knowledge = self._knowledge(tenant_id)
         request_id = str(uuid.uuid4())
         request_sha256 = hashlib.sha256(query.encode("utf-8")).hexdigest()
@@ -155,6 +165,18 @@ class AIWorkflow:
             )
             raise AIWorkflowError("AI workflow retrieval is unavailable") from exc
 
+        if self.safety_checker.is_unsafe(context):
+            self._record_failed_request(
+                request_id=request_id,
+                tenant_id=tenant_id,
+                model=self.model,
+                request_sha256=request_sha256,
+                status="safety_blocked",
+                error_type="UnsafeRetrievedContext",
+                provider="not_invoked",
+            )
+            raise ValueError("retrieved context rejected by safety policy")
+
         try:
             result = self.inference_router.generate(
                 InferenceRequest(prompt=prompt, model=self.model, max_tokens=max_tokens)
@@ -172,13 +194,50 @@ class AIWorkflow:
                 error_type=type(exc).__name__,
             )
             raise AIWorkflowError("AI workflow provider is unavailable") from exc
+        provider = getattr(result, "provider", "unknown")
+        model = getattr(result, "model", self.model)
+        try:
+            answer = _ModelAnswer(answer=result.text).answer
+        except (ValidationError, AttributeError, TypeError) as exc:
+            self._record_failed_request(
+                request_id=request_id,
+                tenant_id=tenant_id,
+                provider=provider,
+                model=model,
+                request_sha256=request_sha256,
+                status="invalid_output",
+                error_type="InvalidModelOutput",
+            )
+            raise AIWorkflowError("AI workflow returned invalid model output") from exc
+        if not answer.strip():
+            self._record_failed_request(
+                request_id=request_id,
+                tenant_id=tenant_id,
+                provider=provider,
+                model=model,
+                request_sha256=request_sha256,
+                status="invalid_output",
+                error_type="InvalidModelOutput",
+            )
+            raise AIWorkflowError("AI workflow returned invalid model output")
+        if self.safety_checker.is_unsafe(answer):
+            self._record_failed_request(
+                request_id=request_id,
+                tenant_id=tenant_id,
+                provider=provider,
+                model=model,
+                request_sha256=request_sha256,
+                status="safety_blocked",
+                error_type="UnsafeModelAnswer",
+            )
+            raise ValueError("model answer rejected by safety policy")
         cost_usd = estimate_cost(
             result.input_tokens,
             result.output_tokens,
             self.input_cost_per_1k,
             self.output_cost_per_1k,
         )
-        response_sha256 = hashlib.sha256(result.text.encode("utf-8")).hexdigest()
+        response_sha256 = hashlib.sha256(answer.encode("utf-8")).hexdigest()
         try:
             self.data_store.record_inference(
                 request_id=request_id,
@@ -208,7 +267,7 @@ class AIWorkflow:
             raise AIWorkflowError("AI usage audit could not be persisted") from exc
         return {
             "request_id": request_id,
-            "answer": result.text,
+            "answer": answer,
             "model": result.model,
             "provider": result.provider,
             "input_tokens": result.input_tokens,

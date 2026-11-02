@@ -51,9 +51,18 @@ class AIWorkflow:
         embedding_provider: Any = None,
         data_store: AIDataStore | None = None,
     ):
+        self.embedding_provider = (
+            embedding_provider
+            if embedding_provider is not None
+            else self._default_embeddings()
+        )
+        if (
+            self._is_production()
+            and self.embedding_provider.name.lower() == "local-hash"
+        ):
+            raise RuntimeError("local-hash embeddings are not allowed in production")
         self.model = os.getenv("AEGIS_LLM_MODEL", "gpt-4o-mini")
         self.inference_router = inference_router or build_inference_router()
-        self.embedding_provider = embedding_provider or self._default_embeddings()
         self.data_store = data_store or AIDataStore()
         self.input_cost_per_1k = self._cost_rate("AEGIS_LLM_INPUT_COST_PER_1K")
         self.output_cost_per_1k = self._cost_rate("AEGIS_LLM_OUTPUT_COST_PER_1K")
@@ -70,14 +79,40 @@ class AIWorkflow:
         return rate
 
     @staticmethod
+    def _is_production() -> bool:
+        environment = (
+            os.getenv("AEGIS_ENV")
+            or os.getenv("ENVIRONMENT")
+            or os.getenv("ENV")
+            or ""
+        )
+        production_flag = os.getenv("AEGIS_PRODUCTION", "").lower()
+        return environment.strip().lower() in {"prod", "production"} or (
+            production_flag in {"1", "true", "yes"}
+        )
+
+    @staticmethod
     def _default_embeddings():
-        if os.getenv("AEGIS_EMBEDDING_PROVIDER", "local-hash").lower() == "openai":
+        production = AIWorkflow._is_production()
+        provider_name = os.getenv(
+            "AEGIS_EMBEDDING_PROVIDER",
+            "openai" if production else "local-hash",
+        ).strip().lower()
+        if provider_name == "local-hash":
+            if production:
+                raise RuntimeError(
+                    "local-hash embeddings are not allowed in production"
+                )
+            return LocalHashEmbeddingProvider()
+        if provider_name == "openai":
             provider = OpenAIEmbeddingProvider(
                 api_key=os.getenv("AEGIS_LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
             )
-            if provider.is_available():
-                return provider
-        return LocalHashEmbeddingProvider()
+        else:
+            raise ValueError(f"unsupported embedding provider: {provider_name}")
+        if not provider.is_available():
+            raise RuntimeError(f"{provider_name} embedding provider is unavailable")
+        return provider
 
     def _knowledge(self, tenant_id: str) -> _TenantKnowledge:
         if not tenant_id:

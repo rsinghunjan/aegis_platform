@@ -25,3 +25,24 @@ curl -s http://localhost:8181/v1/data/aegis/decision \
   -H 'content-type: application/json' \
   -d '{"input":{"request":{"request_id":"r1","ts":"2026-04-22T00:00:00Z","action":"deploy.request","actor":{"principal_id":"p1","principal_type":"user","org_id":"org1","roles":[],"claims":{}}},"resource":{"type":"deployment","id":"dep1","attributes":{"org_id":"org1","project_id":"proj1","environment_id":"env1","data_classification":"pci"}},"environment":{"id":"env1","risk_tier":"pci","cloud_targets":["kubernetes"],"region_constraints":["us-east-1"],"budget":{}},"policy":{"bundle_sha256":"x","pin_scope_used":"environment","mode":"central+sidecar","engine":"opa-central-http"}}}'
 ```
+
+## AI policy suggestions
+
+AI policy suggestions remain advisory until an authorized operator submits them
+with replay traffic to `POST /operator/ai/policy/proposals`. Configure a replay
+evaluator when creating the app; it receives the proposed policy and replay cases
+and must return `True` or `{"passed": true}` for the proposal to be created.
+Replay traffic itself is not persisted.
+
+Approval at
+`POST /operator/ai/policy/proposals/{proposal_id}/approve` explicitly writes the
+versioned policy to OPA's Data API at
+`/v1/data/aegis/ai_policies/{tenant_id}`. Set `AEGIS_OPA_POLICY_URL` to the OPA
+base URL, or inject a policy client. `GET /operator/ai/policy/versions` lists
+rollback targets, and `POST /operator/ai/policy/rollback` restores a selected
+version as a new version. These operator routes use the trusted principal and
+tenant authorization. The AI policy event history is stored separately from
+bounded telemetry retention.
+
+The `ai_generate` rules return OPA obligations for human approval or a maximum
+token limit. As with other Pattern-2 obligations, the caller must enforce them.

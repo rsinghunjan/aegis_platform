@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+import pytest
 
 from agentic.runtime import AgentRuntime, AgentStore
 from agentic.worker import AgentPrincipal
@@ -53,6 +54,110 @@ def test_recommendations_and_policy_suggestions_are_advisory():
     assert AIPolicyEngine(obs).suggest("quiet") == []
 
 
+def test_policy_proposal_requires_replay_and_explicit_approval():
+    class OpaClient:
+        def __init__(self):
+            self.applied = []
+
+        def apply(self, tenant_id, version, policy):
+            self.applied.append((tenant_id, version, policy))
+
+    opa = OpaClient()
+    engine = AIPolicyEngine(
+        AIObservability(),
+        replay_evaluator=lambda policy, traffic: {"passed": True},
+        opa_client=opa,
+    )
+    suggestion = {
+        "policy": "ai_generate",
+        "change": "require_approval",
+        "reason": "replay check",
+        "requires_human_approval": True,
+    }
+    proposal = engine.propose("tenant-a", suggestion, [{"outcome": "failed"}])
+    assert proposal["status"] == "pending"
+    assert opa.applied == []
+    pending = engine.list_proposals("tenant-a")[0]
+    assert pending["proposal_id"] == proposal["proposal_id"]
+
+    applied = engine.approve(
+        "tenant-a", proposal["proposal_id"], "reviewer", "approved"
+    )
+    assert applied["version"] == "ai-policy-v000001"
+    assert applied["policy_sha256"]
+    assert opa.applied[0][1] == applied["version"]
+    assert engine.list_proposals("tenant-a")[0]["status"] == "applied"
+    with pytest.raises(ValueError, match="not pending"):
+        engine.approve("tenant-a", proposal["proposal_id"], "reviewer")
+
+
+def test_policy_replay_failure_and_versioned_rollback(tmp_path):
+    class OpaClient:
+        def __init__(self):
+            self.applied = []
+
+        def apply(self, tenant_id, version, policy):
+            self.applied.append((tenant_id, version, policy))
+
+    store = AICoreStore(f"sqlite:///{tmp_path / 'policy.db'}")
+    opa = OpaClient()
+    engine = AIPolicyEngine(
+        AIObservability(),
+        replay_evaluator=lambda policy, traffic: policy["change"] == "require_approval",
+        opa_client=opa,
+        store=store,
+    )
+    suggestion = {
+        "policy": "ai_generate",
+        "change": "lower_max_tokens",
+        "requires_human_approval": True,
+    }
+    with pytest.raises(ValueError, match="did not pass replay"):
+        engine.propose("tenant-a", suggestion, [{"outcome": "succeeded"}])
+    assert engine.list_proposals("tenant-a") == []
+    assert opa.applied == []
+
+    first_suggestion = {**suggestion, "change": "require_approval"}
+    first = engine.propose("tenant-a", first_suggestion, [{"outcome": "failed"}])
+    first_applied = engine.approve("tenant-a", first["proposal_id"], "reviewer")
+
+    second_suggestion = {**suggestion, "change": "require_approval"}
+    second = engine.propose("tenant-a", second_suggestion, [{"outcome": "failed"}])
+    engine.approve("tenant-a", second["proposal_id"], "reviewer")
+
+    restarted = AIPolicyEngine(
+        AIObservability(),
+        replay_evaluator=lambda _policy, _traffic: True,
+        opa_client=opa,
+        store=AICoreStore(f"sqlite:///{tmp_path / 'policy.db'}"),
+    )
+    rolled_back = restarted.rollback(
+        "tenant-a", first_applied["version"], "reviewer", "restore prior policy"
+    )
+    assert rolled_back["event"] == "rolled_back"
+    assert rolled_back["version"] not in {
+        first_applied["version"],
+        opa.applied[1][1],
+    }
+    assert rolled_back["rollback_to"] == first_applied["version"]
+    assert rolled_back["policy"] == first_applied["policy"]
+    assert opa.applied[-1][1] == rolled_back["version"]
+
+
+def test_policy_event_history_is_not_subject_to_telemetry_retention(tmp_path):
+    store = AICoreStore(f"sqlite:///{tmp_path / 'policy-retention.db'}")
+    for index in range(510):
+        store.append_policy_event("tenant-a", {"event": "historical", "index": index})
+
+    version_event = store.append_policy_event(
+        "tenant-a", {"event": "approval"}, allocate_version=True
+    )
+    events = store.policy_events("tenant-a")
+    assert len(events) == 511
+    assert events[0]["index"] == 0
+    assert version_event["version"] == "ai-policy-v000511"
+
+
 def test_insights_route_is_authorized(tmp_path):
     def authorize(_request, tenant_id, action, _actor):
         return tenant_id == "tenant-a"
@@ -69,6 +174,66 @@ def test_insights_route_is_authorized(tmp_path):
         denied = client.get("/operator/ai/insights", params={"tenant_id": "tenant-b"})
     assert ok.status_code == 200 and ok.json()["summary"]["answers"] == 1
     assert denied.status_code in (401, 403)
+
+
+def test_policy_api_uses_trusted_approver_and_explicit_approval(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "AEGIS_AI_CORE_DATABASE_URL", f"sqlite:///{tmp_path / 'policy-api.db'}"
+    )
+
+    class OpaClient:
+        def __init__(self):
+            self.applied = []
+
+        def apply(self, tenant_id, version, policy):
+            self.applied.append((tenant_id, version, policy))
+
+    opa = OpaClient()
+    runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'runtime.db'}"))
+    with TestClient(
+        create_app(
+            runtime,
+            tenant_authorizer=lambda _request, tenant, _action, actor: (
+                tenant == "tenant-a" and actor == "reviewer"
+            ),
+            principal_resolver=lambda _request: AgentPrincipal(
+                principal_id="reviewer"
+            ),
+            ai_workflow=_workflow(tmp_path),
+            policy_replay_evaluator=lambda _policy, traffic: len(traffic) == 1,
+            policy_opa_client=opa,
+        )
+    ) as client:
+        proposal = client.post(
+            "/operator/ai/policy/proposals",
+            json={
+                "tenant_id": "tenant-a",
+                "suggestion": {
+                    "policy": "ai_generate",
+                    "change": "require_approval",
+                    "requires_human_approval": True,
+                },
+                "replay_traffic": [{"outcome": "failed"}],
+            },
+        )
+        pending = client.get(
+            "/operator/ai/policy/proposals", params={"tenant_id": "tenant-a"}
+        )
+        assert opa.applied == []
+        approved = client.post(
+            f"/operator/ai/policy/proposals/{proposal.json()['proposal_id']}/approve",
+            json={"tenant_id": "tenant-a", "actor": "spoofed"},
+        )
+        versions = client.get(
+            "/operator/ai/policy/versions", params={"tenant_id": "tenant-a"}
+        )
+
+    assert proposal.status_code == 200
+    assert pending.json()["proposals"][0]["status"] == "pending"
+    assert approved.status_code == 200
+    assert approved.json()["actor"] == "reviewer"
+    assert opa.applied[0][0] == "tenant-a"
+    assert versions.json()["versions"][0]["version"] == approved.json()["version"]
 
 
 def test_agent_routes_feed_tenant_scoped_ai_insights(tmp_path):

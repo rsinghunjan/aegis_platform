@@ -42,10 +42,12 @@ class AICore:
         if not url:
             return cls(workflow, quota=quota)
         store = AICoreStore(url)
+        observability = AIObservability(store=store)
         return cls(
             workflow,
             memory=AIMemory(store=store),
-            observability=AIObservability(store=store),
+            observability=observability,
+            policy=AIPolicyEngine(observability, store=store),
             quota=quota,
         )
 

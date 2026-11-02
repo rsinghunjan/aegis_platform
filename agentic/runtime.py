@@ -548,8 +548,10 @@ class AgentRuntime:
         capability_enforcement: Optional[bool] = None,
         approval_sla_seconds: Optional[int] = None,
         evidence_anchor_backend: Optional[EvidenceAnchorBackend] = None,
+        decision_core: Any = None,
     ):
         self.store = store or AgentStore()
+        self.decision_core = decision_core
         if planner is None:
             from agentic.planner import OpenAICompatiblePlanner
 
@@ -729,9 +731,19 @@ class AgentRuntime:
                         )
                         if count >= self.max_replans:
                             raise AgentRuntimeError("Maximum replanning attempts reached")
-                    plan = self.planner.plan(
-                        row.goal, set(self._tools), recovery=recovering
-                    )
+                    if self.decision_core is not None:
+                        plan = self.decision_core.plan_agent(
+                            row.tenant_id,
+                            row.run_id,
+                            row.goal,
+                            set(self._tools),
+                            self.planner,
+                            recovery=recovering,
+                        )
+                    else:
+                        plan = self.planner.plan(
+                            row.goal, set(self._tools), recovery=recovering
+                        )
                 except Exception as exc:
                     row.status = "FAILED"
                     row.error = str(exc)
@@ -1590,6 +1602,7 @@ class AgentRuntime:
                 step.status = "BLOCKED"
                 step.error = reason
                 session.commit()
+                self._record_ai_decision(tenant_id, run_id, action, decision.decision_id)
                 return {"status": "BLOCKED", "run_id": run_id, "reason": reason}
             if action == "review":
                 run.status = "WAITING_APPROVAL"
@@ -1627,6 +1640,7 @@ class AgentRuntime:
                     )
                     session.add(new_approval)
                 session.commit()
+                self._record_ai_decision(tenant_id, run_id, action, decision.decision_id)
                 if new_approval and self.approval_notifier:
                     try:
                         approval_payload = self._as_approval(new_approval)
@@ -1739,6 +1753,7 @@ class AgentRuntime:
                 },
             )
             session.commit()
+            self._record_ai_decision(tenant_id, run_id, action, decision.decision_id)
 
         try:
             if self._requires_os_sandbox(spec):
@@ -1839,6 +1854,18 @@ class AgentRuntime:
                     principal_id,
                 )
             return {"status": run.status, "run_id": run_id, "error": error}
+
+    def _record_ai_decision(
+        self, tenant_id: str, run_id: str, action: str, decision_id: str
+    ) -> None:
+        if self.decision_core is not None:
+            self.decision_core.record_agent_event(
+                tenant_id,
+                run_id,
+                "policy",
+                action,
+                metadata={"decision_id": decision_id},
+            )
 
     @staticmethod
     def _requires_os_sandbox(spec: ToolSpec) -> bool:

@@ -1,6 +1,15 @@
+import asyncio
+
 from fastapi.testclient import TestClient
 
-from agentic.runtime import AgentRuntime, AgentStore
+from agentic.runtime import (
+    AgentPolicyGate,
+    AgentRuntime,
+    AgentStore,
+    Plan,
+    PlanStep,
+    ToolSpec,
+)
 from agentic.worker import AgentPrincipal
 from ai_core import AICore, AICoreStore, AIMemory, AIObservability, AIPolicyEngine
 from production import create_app
@@ -179,3 +188,48 @@ def test_persisted_events_contain_no_raw_text(tmp_path):
     core.record_agent_event("t", "SECRET-RUN-ID", "create", "created")
     dump = str(store.recent("t"))
     assert "SECRET" not in dump
+
+
+def test_agent_planning_uses_shared_inference_and_runtime_policy(tmp_path):
+    class Planner:
+        def plan_with_inference(self, goal, registered_tools, generate, recovery=False):
+            assert goal.lower() in generate("plan for goal: " + goal).lower()
+            return Plan(
+                plan_id="plan-1",
+                steps=[
+                    PlanStep(
+                        step_id="step-1",
+                        ordinal=0,
+                        tool_name=next(iter(registered_tools)),
+                    )
+                ],
+            )
+
+    calls = []
+    workflow = _workflow(tmp_path)
+    core = AICore(workflow)
+    runtime = AgentRuntime(
+        store=AgentStore(f"sqlite:///{tmp_path / 'rt.db'}"),
+        planner=Planner(),
+        policy=AgentPolicyGate(autonomy_enabled=False),
+        decision_core=core,
+    )
+    runtime.register_tool(ToolSpec(name="echo"), lambda payload: calls.append(payload))
+    run = runtime.create_run("tenant-a", "Summarize platform status.")
+
+    result = asyncio.run(runtime.execute(run.run_id, "tenant-a"))
+
+    assert result["status"] == "BLOCKED"
+    assert calls == []
+    summary = core.insights("tenant-a")["summary"]
+    assert summary["inferences"] == 1
+    assert summary["agent_events"] == 2
+    assert summary["agent_failures"] == 0
+    events = core.memory.recall("tenant-a", "agent_run")
+    assert {event["action"]: event["outcome"] for event in events} == {
+        "plan": "succeeded",
+        "policy": "block",
+    }
+    assert "Summarize platform status." not in str(events)
+    usage = workflow.list_usage("tenant-a")
+    assert len(usage) == 1 and usage[0]["status"] == "succeeded"

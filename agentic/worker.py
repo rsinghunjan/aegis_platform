@@ -35,8 +35,10 @@ class ExecutionDispatcher(Protocol):
 class AgentWorker:
     """Worker-side executor, intended to run separately from the control-plane API."""
 
-    def __init__(self, runtime: AgentRuntime):
+    def __init__(self, runtime: AgentRuntime, decision_core: Any = None):
         self.runtime = runtime
+        if decision_core is not None:
+            self.runtime.decision_core = decision_core
 
     async def execute(self, message: AgentExecutionMessage) -> dict[str, Any]:
         method: Callable[..., Any] = self.runtime.resume if message.resume else self.runtime.execute

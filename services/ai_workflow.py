@@ -225,6 +225,78 @@ class AIWorkflow:
             ],
         }
 
+    def generate(
+        self, tenant_id: str, prompt: str, max_tokens: int = 512
+    ) -> dict[str, Any]:
+        if not tenant_id or not prompt:
+            raise ValueError("tenant_id and prompt are required")
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be positive")
+        request_id = str(uuid.uuid4())
+        request_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        try:
+            result = self.inference_router.generate(
+                InferenceRequest(prompt=prompt, model=self.model, max_tokens=max_tokens)
+            )
+        except Exception as exc:
+            attempts = getattr(exc, "attempts", ())
+            provider = attempts[-1].provider if attempts else "unavailable"
+            self._record_failed_request(
+                request_id=request_id,
+                tenant_id=tenant_id,
+                provider=provider,
+                model=self.model,
+                request_sha256=request_sha256,
+                status="failed",
+                error_type=type(exc).__name__,
+            )
+            raise AIWorkflowError("AI workflow provider is unavailable") from exc
+
+        cost_usd = estimate_cost(
+            result.input_tokens,
+            result.output_tokens,
+            self.input_cost_per_1k,
+            self.output_cost_per_1k,
+        )
+        response_sha256 = hashlib.sha256(result.text.encode("utf-8")).hexdigest()
+        try:
+            self.data_store.record_inference(
+                request_id=request_id,
+                tenant_id=tenant_id,
+                provider=result.provider,
+                model=result.model,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                latency_ms=result.latency_ms,
+                cost_usd=cost_usd,
+                status="succeeded",
+                request_sha256=request_sha256,
+                response_sha256=response_sha256,
+            )
+        except Exception as exc:
+            logger.critical(
+                "AI response audit persistence failed request_id=%s provider=%s model=%s "
+                "input_tokens=%s output_tokens=%s cost_usd=%s error_type=%s",
+                request_id,
+                result.provider,
+                result.model,
+                result.input_tokens,
+                result.output_tokens,
+                cost_usd,
+                type(exc).__name__,
+            )
+            raise AIWorkflowError("AI usage audit could not be persisted") from exc
+        return {
+            "request_id": request_id,
+            "text": result.text,
+            "model": result.model,
+            "provider": result.provider,
+            "input_tokens": result.input_tokens,
+            "output_tokens": result.output_tokens,
+            "latency_ms": result.latency_ms,
+            "cost_usd": cost_usd,
+        }
+
     def list_usage(self, tenant_id: str, limit: int = 100) -> list[dict[str, Any]]:
         if not tenant_id:
             raise ValueError("tenant_id is required")

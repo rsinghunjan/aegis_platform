@@ -83,6 +83,23 @@ def test_planner_falls_back_when_provider_unavailable(monkeypatch):
     assert plan.steps[0].tool_name == "echo"
 
 
+def test_planner_accepts_the_shared_inference_callback():
+    planner = OpenAICompatiblePlanner("https://planner.example/v1", "model-a")
+    prompts = []
+
+    def generate(prompt):
+        prompts.append(prompt)
+        return json.dumps(
+            {"steps": [{"tool": "echo", "input": {"message": "shared"}}]}
+        )
+
+    plan = planner.plan_with_inference("summarize", {"echo"}, generate)
+
+    assert plan.steps[0].input == {"message": "shared"}
+    assert len(prompts) == 1
+    assert "summarize" in prompts[0]
+
+
 def test_catalog_hash_version_persistence_and_tamper_enforcement(tmp_path):
     catalog = CapabilityCatalog()
     catalog.register(ToolSpec(name="echo", version="2.0.0"))

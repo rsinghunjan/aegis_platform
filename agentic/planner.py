@@ -75,6 +75,55 @@ class OpenAICompatiblePlanner(Planner):
         except Exception:
             return self.fallback.plan(goal, registered_tools, recovery)
 
+    def plan_with_inference(
+        self,
+        goal: str,
+        registered_tools: set[str],
+        generate: Any,
+        recovery: bool = False,
+    ) -> Plan:
+        schema = {
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tool": {"type": "string", "enum": sorted(registered_tools)},
+                            "input": {"type": "object"},
+                            "acceptance": {"type": "object"},
+                        },
+                        "required": ["tool", "input"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["steps"],
+            "additionalProperties": False,
+        }
+        prompt = (
+            "Return only JSON matching this schema. Never provide code, commands, "
+            f"or unregistered tools: {json.dumps(schema)}\n"
+            f"Recovery planning: {str(recovery).lower()}\n"
+            f"Goal: {goal}"
+        )
+        try:
+            content = generate(prompt)
+            if not isinstance(content, str) or len(content) > 256_000:
+                raise ValueError("invalid planner response")
+            return self._validate(
+                json.loads(
+                    content,
+                    parse_constant=lambda _value: (_ for _ in ()).throw(
+                        ValueError("non-finite JSON number")
+                    ),
+                ),
+                registered_tools,
+            )
+        except Exception:
+            return self.fallback.plan(goal, registered_tools, recovery)
+
     def _request_plan(self, goal: str, registered_tools: set[str]) -> Any:
         schema = {
             "type": "object",

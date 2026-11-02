@@ -14,6 +14,15 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional
 
 
+def request_timeout_seconds() -> float:
+    """Per-call timeout for SDK-backed providers (AEGIS_INFERENCE_TIMEOUT_SECONDS)."""
+    try:
+        value = float(os.getenv("AEGIS_INFERENCE_TIMEOUT_SECONDS", "30"))
+    except ValueError:
+        return 30.0
+    return value if value > 0 else 30.0
+
+
 @dataclass
 class InferenceRequest:
     prompt: str
@@ -122,7 +131,12 @@ class OpenAICompatibleProvider(InferenceProvider):
         import openai
 
         start = time.monotonic()
-        client = openai.OpenAI(api_key=self.api_key, base_url=self.base_url)
+        client = openai.OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=request_timeout_seconds(),
+            max_retries=0,
+        )
         response = client.chat.completions.create(
             model=request.model,
             messages=[{"role": "user", "content": request.prompt}],
@@ -168,7 +182,11 @@ class AnthropicProvider(InferenceProvider):
         import anthropic
 
         start = time.monotonic()
-        client = anthropic.Anthropic(api_key=self.api_key)
+        client = anthropic.Anthropic(
+            api_key=self.api_key,
+            timeout=request_timeout_seconds(),
+            max_retries=0,
+        )
         response = client.messages.create(
             model=request.model,
             max_tokens=request.max_tokens,

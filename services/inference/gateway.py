@@ -14,6 +14,23 @@ from .providers import (
 from .router import ModelRouter
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.getenv(name, str(default))))
+    except ValueError:
+        raise ValueError(f"{name} must be a non-negative integer") from None
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        raise ValueError(f"{name} must be a positive number") from None
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive number")
+    return value
+
+
 def _openai_provider() -> OpenAICompatibleProvider:
     return OpenAICompatibleProvider(
         api_key=os.getenv("AEGIS_LLM_API_KEY") or os.getenv("OPENAI_API_KEY"),
@@ -55,4 +72,9 @@ def build_inference_router() -> ModelRouter:
     Providers are attempted in that order; an explicit list does not silently
     add the echo provider.
     """
-    return ModelRouter(configured_providers())
+    return ModelRouter(
+        configured_providers(),
+        max_retries=_env_int("AEGIS_INFERENCE_MAX_RETRIES", 1),
+        failure_threshold=_env_int("AEGIS_INFERENCE_BREAKER_FAILURES", 5),
+        cooldown_seconds=_env_float("AEGIS_INFERENCE_BREAKER_COOLDOWN_SECONDS", 30.0),
+    )

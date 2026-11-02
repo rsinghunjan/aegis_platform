@@ -14,7 +14,7 @@ from typing import Any, Callable, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from ai_core import AICore
+from ai_core import AICore, AIQuotaExceeded
 from agentic.runtime import AgentRuntime, AgentRuntimeError, AgentStore
 from agentic.worker import AgentExecutionMessage, AgentPrincipal
 from services.ai_workflow import AIWorkflow, AIWorkflowError
@@ -258,6 +258,12 @@ def create_app(
             return app.state.ai_core.answer(
                 body.tenant_id, body.query, body.max_tokens
             )
+        except AIQuotaExceeded as exc:
+            raise HTTPException(
+                status_code=429,
+                detail="AI usage limit exceeded",
+                headers={"Retry-After": str(exc.retry_after_seconds)},
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except AIWorkflowError as exc:

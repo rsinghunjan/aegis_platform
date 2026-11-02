@@ -69,6 +69,7 @@ class AIObservability:
         agent_events = [
             r for r in records if r["operation"].startswith("agent_run_")
         ]
+        rejected = [r for r in records if r["operation"] == "answer_rejected"]
         ok = [r for r in answers if r["outcome"] == "succeeded"]
         latencies = sorted(r["latency_ms"] for r in ok)
         p95 = (
@@ -85,6 +86,7 @@ class AIObservability:
             else 0.0,
             "p95_latency_ms": p95,
             "total_cost_usd": sum(r["cost_usd"] for r in ok),
+            "quota_rejections": len(rejected),
             "agent_events": len(agent_events),
             "agent_failures": sum(1 for r in agent_events if r["outcome"] == "failed"),
         }

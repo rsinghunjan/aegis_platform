@@ -10,6 +10,9 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import BaseModel, Field, StrictStr, ValidationError
+
+from safety_checker import SafetyChecker
 from services.ai_storage import AIDataStore
 from services.embeddings import (
     LocalHashEmbeddingProvider,
@@ -27,6 +30,10 @@ from services.observability.ai_metrics import record_ai_request
 from services.observability.tracing import get_trace_id, start_span
 
 logger = logging.getLogger(__name__)
+
+
+class _ModelAnswer(BaseModel):
+    answer: StrictStr = Field(min_length=1)
 
 
 @dataclass
@@ -54,13 +61,23 @@ class AIWorkflow:
         embedding_provider: Any = None,
         data_store: AIDataStore | None = None,
     ):
+        self.embedding_provider = (
+            embedding_provider
+            if embedding_provider is not None
+            else self._default_embeddings()
+        )
+        if (
+            self._is_production()
+            and self.embedding_provider.name.lower() == "local-hash"
+        ):
+            raise RuntimeError("local-hash embeddings are not allowed in production")
         self.model = os.getenv("AEGIS_LLM_MODEL", "gpt-4o-mini")
         self.inference_router = inference_router or build_inference_router()
-        self.embedding_provider = embedding_provider or self._default_embeddings()
         self.data_store = data_store or AIDataStore()
         self.input_cost_per_1k = self._cost_rate("AEGIS_LLM_INPUT_COST_PER_1K")
         self.output_cost_per_1k = self._cost_rate("AEGIS_LLM_OUTPUT_COST_PER_1K")
         self._tenants: dict[str, _TenantKnowledge] = {}
+        self.safety_checker = SafetyChecker()
 
     @staticmethod
     def _cost_rate(setting: str) -> float:
@@ -73,14 +90,40 @@ class AIWorkflow:
         return rate
 
     @staticmethod
+    def _is_production() -> bool:
+        environment = (
+            os.getenv("AEGIS_ENV")
+            or os.getenv("ENVIRONMENT")
+            or os.getenv("ENV")
+            or ""
+        )
+        production_flag = os.getenv("AEGIS_PRODUCTION", "").lower()
+        return environment.strip().lower() in {"prod", "production"} or (
+            production_flag in {"1", "true", "yes"}
+        )
+
+    @staticmethod
     def _default_embeddings():
-        if os.getenv("AEGIS_EMBEDDING_PROVIDER", "local-hash").lower() == "openai":
+        production = AIWorkflow._is_production()
+        provider_name = os.getenv(
+            "AEGIS_EMBEDDING_PROVIDER",
+            "openai" if production else "local-hash",
+        ).strip().lower()
+        if provider_name == "local-hash":
+            if production:
+                raise RuntimeError(
+                    "local-hash embeddings are not allowed in production"
+                )
+            return LocalHashEmbeddingProvider()
+        if provider_name == "openai":
             provider = OpenAIEmbeddingProvider(
                 api_key=os.getenv("AEGIS_LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
             )
-            if provider.is_available():
-                return provider
-        return LocalHashEmbeddingProvider()
+        else:
+            raise ValueError(f"unsupported embedding provider: {provider_name}")
+        if not provider.is_available():
+            raise RuntimeError(f"{provider_name} embedding provider is unavailable")
+        return provider
 
     def _knowledge(self, tenant_id: str) -> _TenantKnowledge:
         if not tenant_id:
@@ -132,6 +175,8 @@ class AIWorkflow:
             raise ValueError("query must not be empty")
         if len(query) > self.max_query_chars:
             raise ValueError("query exceeds the maximum length")
+        if self.safety_checker.is_unsafe(query):
+            raise ValueError("query rejected by safety policy")
         knowledge = self._knowledge(tenant_id)
         request_id = str(uuid.uuid4())
         request_sha256 = hashlib.sha256(query.encode("utf-8")).hexdigest()
@@ -161,6 +206,18 @@ class AIWorkflow:
             record_ai_request("retrieval_failed", time.perf_counter() - started_at)
             raise AIWorkflowError("AI workflow retrieval is unavailable") from exc
 
+        if self.safety_checker.is_unsafe(context):
+            self._record_failed_request(
+                request_id=request_id,
+                tenant_id=tenant_id,
+                model=self.model,
+                request_sha256=request_sha256,
+                status="safety_blocked",
+                error_type="UnsafeRetrievedContext",
+                provider="not_invoked",
+            )
+            raise ValueError("retrieved context rejected by safety policy")
+
         try:
             with start_span(
                 "ai.provider",
@@ -186,13 +243,50 @@ class AIWorkflow:
             )
             record_ai_request("failed", time.perf_counter() - started_at)
             raise AIWorkflowError("AI workflow provider is unavailable") from exc
+        provider = getattr(result, "provider", "unknown")
+        model = getattr(result, "model", self.model)
+        try:
+            answer = _ModelAnswer(answer=result.text).answer
+        except (ValidationError, AttributeError, TypeError) as exc:
+            self._record_failed_request(
+                request_id=request_id,
+                tenant_id=tenant_id,
+                provider=provider,
+                model=model,
+                request_sha256=request_sha256,
+                status="invalid_output",
+                error_type="InvalidModelOutput",
+            )
+            raise AIWorkflowError("AI workflow returned invalid model output") from exc
+        if not answer.strip():
+            self._record_failed_request(
+                request_id=request_id,
+                tenant_id=tenant_id,
+                provider=provider,
+                model=model,
+                request_sha256=request_sha256,
+                status="invalid_output",
+                error_type="InvalidModelOutput",
+            )
+            raise AIWorkflowError("AI workflow returned invalid model output")
+        if self.safety_checker.is_unsafe(answer):
+            self._record_failed_request(
+                request_id=request_id,
+                tenant_id=tenant_id,
+                provider=provider,
+                model=model,
+                request_sha256=request_sha256,
+                status="safety_blocked",
+                error_type="UnsafeModelAnswer",
+            )
+            raise ValueError("model answer rejected by safety policy")
         cost_usd = estimate_cost(
             result.input_tokens,
             result.output_tokens,
             self.input_cost_per_1k,
             self.output_cost_per_1k,
         )
-        response_sha256 = hashlib.sha256(result.text.encode("utf-8")).hexdigest()
+        response_sha256 = hashlib.sha256(answer.encode("utf-8")).hexdigest()
         try:
             with start_span(
                 "ai.audit.persist",
@@ -236,7 +330,7 @@ class AIWorkflow:
         return {
             "request_id": request_id,
             "trace_id": get_trace_id(),
-            "answer": result.text,
+            "answer": answer,
             "model": result.model,
             "provider": result.provider,
             "input_tokens": result.input_tokens,

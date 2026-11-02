@@ -231,7 +231,7 @@ class OllamaProvider(InferenceProvider):
         resp = httpx.post(
             f"{self.base_url}/api/generate",
             json={"model": request.model, "prompt": request.prompt, "stream": False},
-            timeout=60.0,
+            timeout=request_timeout_seconds(),
         )
         resp.raise_for_status()
         data = resp.json()
@@ -277,7 +277,7 @@ class VLLMProvider(InferenceProvider):
                 "max_tokens": request.max_tokens,
                 "temperature": request.temperature,
             },
-            timeout=120.0,
+            timeout=request_timeout_seconds(),
         )
         resp.raise_for_status()
         data = resp.json()

@@ -1,4 +1,6 @@
+import sys
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -9,7 +11,13 @@ from production import create_app
 from services.ai_storage import AIDataStore
 from services.ai_workflow import AIWorkflow
 from services.embeddings import LocalHashEmbeddingProvider
-from services.inference import EchoProvider, InferenceRequest, ModelRouter
+from services.inference import (
+    EchoProvider,
+    InferenceRequest,
+    ModelRouter,
+    OllamaProvider,
+    VLLMProvider,
+)
 from services.inference.providers import InferenceProvider, ProviderError
 from services.inference.router import NoProviderAvailableError
 
@@ -70,6 +78,27 @@ def test_daily_budget_blocks_before_provider_call(tmp_path, monkeypatch):
     assert excinfo.value.kind == "budget"
     assert CountingProvider.calls == calls_after_first
     core.answer("other", "hello there", max_tokens=1)
+
+
+def test_daily_budget_returns_fixed_429_from_answer_api(tmp_path, monkeypatch):
+    class CountingProvider(EchoProvider):
+        calls = 0
+
+        def generate(self, request):
+            type(self).calls += 1
+            return super().generate(request)
+
+    monkeypatch.setenv("AEGIS_AI_TENANT_DAILY_BUDGET_USD", "0.001")
+    workflow = _workflow(tmp_path, [CountingProvider()])
+    with TestClient(_app(tmp_path, workflow)) as client:
+        response = client.post(
+            "/ai/answer",
+            json={"tenant_id": "a", "query": "q", "max_tokens": 2},
+        )
+    assert response.status_code == 429
+    assert response.json() == {"detail": "AI usage limit exceeded"}
+    assert int(response.headers["Retry-After"]) >= 1
+    assert CountingProvider.calls == 0
 
 
 def test_projected_cost_blocks_large_requests(tmp_path):
@@ -172,3 +201,26 @@ def test_provider_outage_degrades_to_fallback_via_api(tmp_path):
         response = client.post("/ai/answer", json={"tenant_id": "a", "query": "q"})
     assert response.status_code == 200
     assert response.json()["provider"] == "local-echo"
+
+
+@pytest.mark.parametrize("provider_type", [OllamaProvider, VLLMProvider])
+def test_http_providers_use_configured_timeout(monkeypatch, provider_type):
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            if provider_type is OllamaProvider:
+                return {"response": "ok"}
+            return {"choices": [{"text": "ok"}], "usage": {}}
+
+    def post(_url, *, json, timeout):
+        calls.append(timeout)
+        return Response()
+
+    monkeypatch.setitem(sys.modules, "httpx", SimpleNamespace(post=post))
+    monkeypatch.setenv("AEGIS_INFERENCE_TIMEOUT_SECONDS", "7")
+    provider_type().generate(InferenceRequest(prompt="hi"))
+    assert calls == [7.0]

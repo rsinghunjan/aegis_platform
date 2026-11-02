@@ -19,6 +19,7 @@ from sqlalchemy import (
     create_engine,
     delete,
     func,
+    inspect,
     select,
 )
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -74,6 +75,7 @@ class InferenceAuditRow(AIStorageBase):
     request_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     response_sha256: Mapped[str | None] = mapped_column(String(64))
     error_type: Mapped[str | None] = mapped_column(String(128))
+    trace_id: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
@@ -91,6 +93,15 @@ class AIDataStore:
     def initialize(self) -> None:
         if not self._initialized:
             AIStorageBase.metadata.create_all(self.engine)
+            columns = {
+                column["name"]
+                for column in inspect(self.engine).get_columns("ai_inference_audit")
+            }
+            if "trace_id" not in columns:
+                with self.engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        "ALTER TABLE ai_inference_audit ADD COLUMN trace_id VARCHAR(32)"
+                    )
             self._initialized = True
 
     def vector_store(self, tenant_id: str) -> TenantVectorStore:
@@ -209,6 +220,7 @@ class AIDataStore:
         request_sha256: str,
         response_sha256: str | None = None,
         error_type: str | None = None,
+        trace_id: str | None = None,
     ) -> None:
         self.initialize()
         with self._sessions.begin() as session:
@@ -226,6 +238,7 @@ class AIDataStore:
                     request_sha256=request_sha256,
                     response_sha256=response_sha256,
                     error_type=error_type,
+                    trace_id=trace_id,
                     created_at=datetime.now(timezone.utc),
                 )
             )
@@ -271,6 +284,7 @@ class AIDataStore:
                 "request_sha256": row.request_sha256,
                 "response_sha256": row.response_sha256,
                 "error_type": row.error_type,
+                "trace_id": row.trace_id,
                 "created_at": row.created_at.isoformat(),
             }
             for row in rows

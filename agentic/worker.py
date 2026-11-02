@@ -7,7 +7,12 @@ from typing import Any, Callable, Protocol
 
 from pydantic import BaseModel, Field
 
+from api.otel import init_otel
 from agentic.runtime import AgentRuntime
+from services.observability.tracing import (
+    extracted_trace_context,
+    start_span,
+)
 
 
 class AgentPrincipal(BaseModel):
@@ -26,6 +31,7 @@ class AgentExecutionMessage(BaseModel):
     tenant_id: str
     principal: AgentPrincipal
     resume: bool = False
+    traceparent: str | None = Field(default=None, max_length=55)
 
 
 class ExecutionDispatcher(Protocol):
@@ -39,16 +45,23 @@ class AgentWorker:
         self.runtime = runtime
 
     async def execute(self, message: AgentExecutionMessage) -> dict[str, Any]:
-        method: Callable[..., Any] = self.runtime.resume if message.resume else self.runtime.execute
-        result = method(
-            message.run_id,
-            message.tenant_id,
-            role=message.principal.role,
-            environment=message.principal.environment,
-            scopes=set(message.principal.scopes),
-            principal_id=message.principal.principal_id,
+        method: Callable[..., Any] = (
+            self.runtime.resume if message.resume else self.runtime.execute
         )
-        return await result if inspect.isawaitable(result) else result
+        with extracted_trace_context(message.traceparent):
+            with start_span(
+                "agent.worker.execute",
+                {"agent.run_id": message.run_id, "agent.resume": message.resume},
+            ):
+                result = method(
+                    message.run_id,
+                    message.tenant_id,
+                    role=message.principal.role,
+                    environment=message.principal.environment,
+                    scopes=set(message.principal.scopes),
+                    principal_id=message.principal.principal_id,
+                )
+                return await result if inspect.isawaitable(result) else result
 
 
 class CeleryExecutionDispatcher:
@@ -71,6 +84,7 @@ def register_celery_agent_worker(
     task_name: str = "aegis.execute_agent_run",
 ) -> Any:
     """Register the task in a worker process after its runtime/tools are configured."""
+    init_otel(celery_app=celery_app)
 
     @celery_app.task(name=task_name)
     def execute_agent_run(payload: dict[str, Any]) -> dict[str, Any]:

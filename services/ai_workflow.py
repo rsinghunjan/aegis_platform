@@ -5,6 +5,7 @@ import hashlib
 import logging
 import math
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -22,6 +23,8 @@ from services.inference import (
     estimate_cost,
 )
 from services.inference.gateway import build_inference_router
+from services.observability.ai_metrics import record_ai_request
+from services.observability.tracing import get_trace_id, start_span
 
 logger = logging.getLogger(__name__)
 
@@ -132,8 +135,10 @@ class AIWorkflow:
         knowledge = self._knowledge(tenant_id)
         request_id = str(uuid.uuid4())
         request_sha256 = hashlib.sha256(query.encode("utf-8")).hexdigest()
+        started_at = time.perf_counter()
         try:
-            retrieved = knowledge.pipeline.retrieve(query, top_k=5)
+            with start_span("ai.retrieval", {"ai.query.length": len(query)}):
+                retrieved = knowledge.pipeline.retrieve(query, top_k=5)
             context = "\n\n".join(
                 f"[{index + 1}] {chunk.text}" for index, chunk in enumerate(retrieved)
             )
@@ -153,12 +158,20 @@ class AIWorkflow:
                 error_type=type(exc).__name__,
                 provider="not_invoked",
             )
+            record_ai_request("retrieval_failed", time.perf_counter() - started_at)
             raise AIWorkflowError("AI workflow retrieval is unavailable") from exc
 
         try:
-            result = self.inference_router.generate(
-                InferenceRequest(prompt=prompt, model=self.model, max_tokens=max_tokens)
-            )
+            with start_span(
+                "ai.provider",
+                {"ai.provider": "router", "ai.model": self.model},
+            ) as span:
+                result = self.inference_router.generate(
+                    InferenceRequest(
+                        prompt=prompt, model=self.model, max_tokens=max_tokens
+                    )
+                )
+                span.set_attribute("ai.provider", result.provider)
         except Exception as exc:
             attempts = getattr(exc, "attempts", ())
             provider = attempts[-1].provider if attempts else "unavailable"
@@ -171,6 +184,7 @@ class AIWorkflow:
                 status="failed",
                 error_type=type(exc).__name__,
             )
+            record_ai_request("failed", time.perf_counter() - started_at)
             raise AIWorkflowError("AI workflow provider is unavailable") from exc
         cost_usd = estimate_cost(
             result.input_tokens,
@@ -180,19 +194,24 @@ class AIWorkflow:
         )
         response_sha256 = hashlib.sha256(result.text.encode("utf-8")).hexdigest()
         try:
-            self.data_store.record_inference(
-                request_id=request_id,
-                tenant_id=tenant_id,
-                provider=result.provider,
-                model=result.model,
-                input_tokens=result.input_tokens,
-                output_tokens=result.output_tokens,
-                latency_ms=result.latency_ms,
-                cost_usd=cost_usd,
-                status="succeeded",
-                request_sha256=request_sha256,
-                response_sha256=response_sha256,
-            )
+            with start_span(
+                "ai.audit.persist",
+                {"ai.request_id": request_id, "ai.audit.status": "succeeded"},
+            ):
+                self.data_store.record_inference(
+                    request_id=request_id,
+                    tenant_id=tenant_id,
+                    provider=result.provider,
+                    model=result.model,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                    latency_ms=result.latency_ms,
+                    cost_usd=cost_usd,
+                    status="succeeded",
+                    request_sha256=request_sha256,
+                    response_sha256=response_sha256,
+                    trace_id=get_trace_id(),
+                )
         except Exception as exc:
             logger.critical(
                 "AI response audit persistence failed request_id=%s provider=%s model=%s "
@@ -205,9 +224,18 @@ class AIWorkflow:
                 cost_usd,
                 type(exc).__name__,
             )
+            record_ai_request(
+                "audit_failed",
+                time.perf_counter() - started_at,
+                cost_usd=cost_usd,
+            )
             raise AIWorkflowError("AI usage audit could not be persisted") from exc
+        record_ai_request(
+            "succeeded", time.perf_counter() - started_at, cost_usd=cost_usd
+        )
         return {
             "request_id": request_id,
+            "trace_id": get_trace_id(),
             "answer": result.text,
             "model": result.model,
             "provider": result.provider,
@@ -249,19 +277,24 @@ class AIWorkflow:
         error_type: str,
     ) -> None:
         try:
-            self.data_store.record_inference(
-                request_id=request_id,
-                tenant_id=tenant_id,
-                provider=provider,
-                model=model,
-                input_tokens=0,
-                output_tokens=0,
-                latency_ms=0,
-                cost_usd=0,
-                status=status,
-                request_sha256=request_sha256,
-                error_type=error_type,
-            )
+            with start_span(
+                "ai.audit.persist",
+                {"ai.request_id": request_id, "ai.audit.status": status},
+            ):
+                self.data_store.record_inference(
+                    request_id=request_id,
+                    tenant_id=tenant_id,
+                    provider=provider,
+                    model=model,
+                    input_tokens=0,
+                    output_tokens=0,
+                    latency_ms=0,
+                    cost_usd=0,
+                    status=status,
+                    request_sha256=request_sha256,
+                    error_type=error_type,
+                    trace_id=get_trace_id(),
+                )
         except Exception as exc:
             logger.error(
                 "AI failure audit persistence failed request_id=%s status=%s error_type=%s",

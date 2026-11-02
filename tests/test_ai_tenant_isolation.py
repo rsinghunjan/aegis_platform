@@ -45,7 +45,6 @@ def test_knowledge_isolation_includes_document_deletion(tmp_path):
 
 def test_ai_and_agent_routes_do_not_expose_other_tenant_data(tmp_path):
     runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'tenant-agent.db'}"))
-    run = runtime.create_run("tenant-a", "Private tenant A goal")
     workflow = AIWorkflow(
         inference_router=ModelRouter([EchoProvider()]),
         embedding_provider=LocalHashEmbeddingProvider(dimensions=64),
@@ -55,6 +54,11 @@ def test_ai_and_agent_routes_do_not_expose_other_tenant_data(tmp_path):
     with TestClient(
         create_app(runtime, tenant_authorizer=lambda *_args: True, ai_workflow=workflow)
     ) as client:
+        created_run = client.post(
+            "/agent/runs",
+            json={"tenant_id": "tenant-a", "goal": "Private tenant A goal"},
+        )
+        run_id = created_run.json()["run_id"]
         indexed = client.post(
             "/ai/knowledge",
             json={"tenant_id": "tenant-a", "document": "Tenant A private material."},
@@ -68,14 +72,19 @@ def test_ai_and_agent_routes_do_not_expose_other_tenant_data(tmp_path):
             json={"tenant_id": "tenant-b", "query": "What material?"},
         )
         hidden_run = client.get(
-            f"/agent/runs/{run.run_id}", params={"tenant_id": "tenant-b"}
+            f"/agent/runs/{run_id}", params={"tenant_id": "tenant-b"}
+        )
+        insights_a = client.get(
+            "/operator/ai/insights", params={"tenant_id": "tenant-a"}
         )
         insights_b = client.get(
             "/operator/ai/insights", params={"tenant_id": "tenant-b"}
         )
 
+    assert created_run.status_code == 200
     assert indexed.status_code == 200
     assert answer_a.json()["citations"][0]["document_id"] == indexed.json()["document_id"]
     assert answer_b.json()["citations"] == []
     assert hidden_run.status_code == 404
+    assert insights_a.json()["summary"]["agent_events"] == 1
     assert insights_b.json()["summary"]["agent_events"] == 0

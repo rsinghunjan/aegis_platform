@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 import pytest
+from sqlalchemy import create_engine, inspect
 
 from agentic.runtime import AgentRuntime, AgentStore
 from production import create_app
@@ -10,8 +11,33 @@ from services.inference import EchoProvider, ModelRouter
 from services.inference.router import NoProviderAvailableError, RouteAttempt
 
 
+def test_ai_storage_adds_trace_column_to_existing_audit_table(tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'existing-ai.db'}"
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE ai_inference_audit ("
+            "request_id VARCHAR(36) PRIMARY KEY, tenant_id VARCHAR(128) NOT NULL, "
+            "provider VARCHAR(128) NOT NULL, model VARCHAR(256) NOT NULL, "
+            "input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, "
+            "latency_ms FLOAT NOT NULL, cost_usd FLOAT NOT NULL, "
+            "status VARCHAR(32) NOT NULL, request_sha256 VARCHAR(64) NOT NULL, "
+            "response_sha256 VARCHAR(64), error_type VARCHAR(128), "
+            "created_at DATETIME NOT NULL)"
+        )
+
+    store = AIDataStore(database_url)
+    store.initialize()
+
+    assert "trace_id" in {
+        column["name"]
+        for column in inspect(store.engine).get_columns("ai_inference_audit")
+    }
+
+
 def test_ai_workflow_routes_are_tenant_authorized_and_retrieve_tenant_docs(tmp_path):
     authorizations = []
+    traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 
     def authorize(_request, tenant_id, action, _actor):
         authorizations.append((tenant_id, action))
@@ -40,16 +66,20 @@ def test_ai_workflow_routes_are_tenant_authorized_and_retrieve_tenant_docs(tmp_p
         answered = client.post(
             "/ai/answer",
             json={"tenant_id": "tenant-a", "query": "What does Aegis combine?"},
+            headers={"traceparent": traceparent},
         )
 
     assert indexed.status_code == 200
     assert indexed.json()["chunks_indexed"] == 1
     assert denied.status_code == 403
     assert answered.status_code == 200
+    assert answered.headers["x-trace-id"] == "4bf92f3577b34da6a3ce929d0e0e4736"
+    assert answered.json()["trace_id"] == answered.headers["x-trace-id"]
     assert "Aegis combines retrieval" in answered.json()["answer"]
     assert answered.json()["citations"][0]["document_id"] == indexed.json()["document_id"]
     assert ("tenant-a", "ai_knowledge_write") in authorizations
     assert ("tenant-b", "ai_generate") in authorizations
+    assert workflow.list_usage("tenant-a")[0]["trace_id"] == answered.json()["trace_id"]
 
 
 def test_ai_workflow_rejects_oversized_document(tmp_path):

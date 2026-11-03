@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 import inspect
 from typing import Any, Callable, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from ai_core import AICore, AIQuotaExceeded
@@ -24,6 +24,15 @@ from agentic.worker import (
     CeleryExecutionDispatcher,
 )
 from services.ai_workflow import AIWorkflow, AIWorkflowError
+from services.observability.ai_metrics import CONTENT_TYPE_LATEST, render_metrics
+from services.observability.tracing import (
+    get_trace_id,
+    inject_trace_context,
+    start_span,
+    trace_id_context,
+    trace_id_from_traceparent,
+)
+from api.otel import init_otel
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +195,27 @@ def create_app(
     app.state.ai_core = AICore.durable(selected_ai_workflow)
     app.state.execution_dispatcher = selected_execution_dispatcher
 
+    @app.middleware("http")
+    async def trace_request(request: Request, call_next):
+        incoming_trace_id = trace_id_from_traceparent(
+            request.headers.get("traceparent")
+        )
+        with trace_id_context(incoming_trace_id):
+            with start_span(
+                "aegis.http.request",
+                {"http.method": request.method},
+            ):
+                response = await call_next(request)
+            response.headers["X-Trace-ID"] = get_trace_id() or incoming_trace_id or ""
+            return response
+
+    init_otel(
+        app=app,
+        sqlalchemy_engine=getattr(
+            getattr(selected_ai_workflow, "data_store", None), "engine", None
+        ),
+    )
+
     async def resolve_principal(request: Request) -> AgentPrincipal:
         if selected_principal_resolver is None:
             return AgentPrincipal()
@@ -225,7 +255,11 @@ def create_app(
                 status_code=503, detail="agent execution dispatcher is not configured"
             )
         message = AgentExecutionMessage(
-            run_id=run_id, tenant_id=tenant_id, principal=principal, resume=resume
+            run_id=run_id,
+            tenant_id=tenant_id,
+            principal=principal,
+            resume=resume,
+            traceparent=inject_trace_context(),
         )
         dispatch = getattr(
             selected_execution_dispatcher,
@@ -243,6 +277,15 @@ def create_app(
     @app.get("/healthz", tags=["health"])
     def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/metrics", include_in_schema=False)
+    def metrics() -> Response:
+        payload = render_metrics()
+        if payload is None:
+            raise HTTPException(
+                status_code=503, detail="Prometheus metrics dependency is unavailable"
+            )
+        return Response(content=payload, media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/readyz", tags=["health"])
     def readyz() -> dict[str, str]:

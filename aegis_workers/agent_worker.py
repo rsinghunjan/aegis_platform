@@ -6,4 +6,3 @@ from aegis_workers.worker import celery_app
 runtime = create_configured_agent_runtime()
 runtime.store.initialize()
 register_celery_agent_worker(celery_app, AgentWorker(runtime))
-

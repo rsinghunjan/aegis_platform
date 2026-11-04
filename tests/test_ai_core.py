@@ -76,6 +76,7 @@ def test_agent_routes_feed_tenant_scoped_ai_insights(tmp_path):
         return tenant_id == "tenant-a"
 
     runtime = AgentRuntime(store=AgentStore(f"sqlite:///{tmp_path / 'rt.db'}"))
+    dispatched = []
     with TestClient(
         create_app(
             runtime,
@@ -83,7 +84,9 @@ def test_agent_routes_feed_tenant_scoped_ai_insights(tmp_path):
             principal_resolver=lambda _request: AgentPrincipal(
                 principal_id="operator"
             ),
-            execution_dispatcher=lambda _message: "dispatch-1",
+            execution_dispatcher=lambda message: (
+                dispatched.append(message) or "dispatch-1"
+            ),
             ai_workflow=_workflow(tmp_path),
         )
     ) as client:
@@ -95,6 +98,11 @@ def test_agent_routes_feed_tenant_scoped_ai_insights(tmp_path):
         queued = client.post(
             f"/agent/runs/{run_id}/execute",
             json={"tenant_id": "tenant-a"},
+            headers={
+                "traceparent": (
+                    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                )
+            },
         )
         feedback = client.post(
             f"/agent/runs/{run_id}/feedback",
@@ -113,6 +121,9 @@ def test_agent_routes_feed_tenant_scoped_ai_insights(tmp_path):
     assert insights.json()["summary"]["agent_events"] == 3
     assert insights.json()["summary"]["agent_failures"] == 0
     assert other_tenant.status_code == 403
+    assert dispatched[0].traceparent.startswith(
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-"
+    )
 
 
 def _store(tmp_path, **kwargs):

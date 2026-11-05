@@ -11,9 +11,10 @@ RUN useradd --create-home --uid 10001 aegis \
     && mkdir -p /data \
     && chown aegis:aegis /data
 
-COPY requirements-control-plane.txt /app/requirements.txt
+COPY requirements-control-plane.txt requirements-observability.txt /app/
 RUN python -m pip install --upgrade pip \
-    && python -m pip install -r /app/requirements.txt
+    && python -m pip install -r /app/requirements-control-plane.txt \
+    && python -m pip install -r /app/requirements-observability.txt
 
 COPY --chown=aegis:aegis . /app
 USER aegis

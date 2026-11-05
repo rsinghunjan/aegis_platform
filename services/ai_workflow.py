@@ -13,6 +13,7 @@ from typing import Any
 from pydantic import BaseModel, Field, StrictStr, ValidationError
 
 from safety_checker import SafetyChecker
+from services.safety_classifier import build_llm_classifier
 from services.ai_storage import AIDataStore
 from services.embeddings import (
     LocalHashEmbeddingProvider,
@@ -88,7 +89,7 @@ class AIWorkflow:
         self.grounding_mode = os.getenv("AEGIS_GROUNDING_MODE", "warn").strip().lower()
         if self.grounding_mode not in {"off", "warn", "enforce"}:
             raise ValueError("AEGIS_GROUNDING_MODE must be off, warn, or enforce")
-        self.safety_checker = SafetyChecker()
+        self.safety_checker = self._build_safety_checker()
         self.prompts = PromptRegistry.from_environment()
 
     def _configure_capacity(self) -> None:
@@ -111,6 +112,24 @@ class AIWorkflow:
         self.max_documents_per_tenant = values["AEGIS_AI_MAX_DOCUMENTS_PER_TENANT"]
         self.max_indexed_chars_per_tenant = values["AEGIS_AI_MAX_INDEXED_CHARS_PER_TENANT"]
         self.max_chunks_per_tenant = values["AEGIS_AI_MAX_CHUNKS_PER_TENANT"]
+
+    def _build_safety_checker(self) -> SafetyChecker:
+        # Heuristics (PII, injection, keywords) always run first; the model adds semantic coverage.
+        default = "heuristic" if dev_providers_allowed() else "llm"
+        mode = os.getenv("AEGIS_SAFETY_CLASSIFIER", default).strip().lower()
+        if mode == "heuristic":
+            if not dev_providers_allowed():
+                logger.warning("Safety classifier is heuristic-only; set AEGIS_SAFETY_CLASSIFIER=llm")
+            return SafetyChecker()
+        if mode != "llm":
+            raise ValueError("AEGIS_SAFETY_CLASSIFIER must be llm or heuristic")
+
+        def generate(prompt: str) -> str:
+            return self.inference_router.generate(
+                InferenceRequest(prompt=prompt, model=self.model, max_tokens=32)
+            ).text
+
+        return SafetyChecker(model_callable=build_llm_classifier(generate), fail_closed=True)
 
     def _build_reranker(self):
         mode = os.getenv("AEGIS_RERANKER", "lexical").strip().lower()

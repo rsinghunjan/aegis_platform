@@ -11,13 +11,29 @@ from contextlib import asynccontextmanager
 import inspect
 from typing import Any, Callable, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from ai_core import AICore, AIQuotaExceeded
+from agentic.deployment import create_configured_agent_runtime
+from agentic.identity import OIDCTenantIdentity
 from agentic.runtime import AgentRuntime, AgentRuntimeError, AgentStore
-from agentic.worker import AgentExecutionMessage, AgentPrincipal
+from agentic.worker import (
+    AgentExecutionMessage,
+    AgentPrincipal,
+    CeleryExecutionDispatcher,
+)
+from services.ai_evaluation import tuning_recommendations
 from services.ai_workflow import AIWorkflow, AIWorkflowError
+from services.observability.ai_metrics import CONTENT_TYPE_LATEST, render_metrics
+from services.observability.tracing import (
+    get_trace_id,
+    inject_trace_context,
+    start_span,
+    trace_id_context,
+    trace_id_from_traceparent,
+)
+from api.otel import init_otel
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +133,26 @@ def create_app(
     policy_replay_evaluator: Callable[..., Any] | None = None,
     policy_opa_client: Any = None,
 ) -> FastAPI:
-    selected_runtime = runtime or AgentRuntime()
+    selected_runtime = runtime or create_configured_agent_runtime()
+    oidc_identity = OIDCTenantIdentity.from_environment()
+    selected_tenant_authorizer = tenant_authorizer or (
+        oidc_identity.authorize_tenant if oidc_identity is not None else None
+    )
+    selected_principal_resolver = principal_resolver or (
+        oidc_identity.resolve_principal if oidc_identity is not None else None
+    )
+    selected_execution_dispatcher = execution_dispatcher
+    broker_url = os.getenv("CELERY_BROKER_URL") or os.getenv("AEGIS_BROKER_URL")
+    if selected_execution_dispatcher is None and broker_url:
+        from celery import Celery
+
+        result_backend = os.getenv("CELERY_RESULT_BACKEND")
+        celery_app = Celery(
+            "aegis_agent_control_plane",
+            broker=broker_url,
+            backend=result_backend or broker_url,
+        )
+        selected_execution_dispatcher = CeleryExecutionDispatcher(celery_app)
     selected_ai_workflow = ai_workflow or AIWorkflow()
     if approval_notifier is not None:
         selected_runtime.approval_notifier = approval_notifier
@@ -181,11 +216,33 @@ def create_app(
     app.state.ai_core.policy.replay_evaluator = policy_replay_evaluator
     if policy_opa_client is not None:
         app.state.ai_core.policy.opa_client = policy_opa_client
+    app.state.execution_dispatcher = selected_execution_dispatcher
+
+    @app.middleware("http")
+    async def trace_request(request: Request, call_next):
+        incoming_trace_id = trace_id_from_traceparent(
+            request.headers.get("traceparent")
+        )
+        with trace_id_context(incoming_trace_id):
+            with start_span(
+                "aegis.http.request",
+                {"http.method": request.method},
+            ):
+                response = await call_next(request)
+            response.headers["X-Trace-ID"] = get_trace_id() or incoming_trace_id or ""
+            return response
+
+    init_otel(
+        app=app,
+        sqlalchemy_engine=getattr(
+            getattr(selected_ai_workflow, "data_store", None), "engine", None
+        ),
+    )
 
     async def resolve_principal(request: Request) -> AgentPrincipal:
-        if principal_resolver is None:
+        if selected_principal_resolver is None:
             return AgentPrincipal()
-        principal = principal_resolver(request)
+        principal = selected_principal_resolver(request)
         if inspect.isawaitable(principal):
             principal = await principal
         if isinstance(principal, AgentPrincipal):
@@ -197,13 +254,13 @@ def create_app(
     async def authorize(
         request: Request, tenant_id: str, action: str, actor: Optional[str] = None
     ) -> None:
-        if tenant_authorizer is None:
+        if selected_tenant_authorizer is None:
             raise HTTPException(
                 status_code=503,
                 detail="agent API authorization is not configured",
             )
         principal = await resolve_principal(request)
-        allowed = tenant_authorizer(
+        allowed = selected_tenant_authorizer(
             request, tenant_id, action, actor or principal.principal_id
         )
         if inspect.isawaitable(allowed):
@@ -216,14 +273,22 @@ def create_app(
     ) -> dict[str, Any]:
         principal = await resolve_principal(request)
         await authorize(request, tenant_id, "execute", principal.principal_id)
-        if execution_dispatcher is None:
+        if selected_execution_dispatcher is None:
             raise HTTPException(
                 status_code=503, detail="agent execution dispatcher is not configured"
             )
         message = AgentExecutionMessage(
-            run_id=run_id, tenant_id=tenant_id, principal=principal, resume=resume
+            run_id=run_id,
+            tenant_id=tenant_id,
+            principal=principal,
+            resume=resume,
+            traceparent=inject_trace_context(),
         )
-        dispatch = getattr(execution_dispatcher, "dispatch", execution_dispatcher)
+        dispatch = getattr(
+            selected_execution_dispatcher,
+            "dispatch",
+            selected_execution_dispatcher,
+        )
         result = dispatch(message)
         if inspect.isawaitable(result):
             result = await result
@@ -235,6 +300,15 @@ def create_app(
     @app.get("/healthz", tags=["health"])
     def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/metrics", include_in_schema=False)
+    def metrics() -> Response:
+        payload = render_metrics()
+        if payload is None:
+            raise HTTPException(
+                status_code=503, detail="Prometheus metrics dependency is unavailable"
+            )
+        return Response(content=payload, media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/readyz", tags=["health"])
     def readyz() -> dict[str, str]:
@@ -409,6 +483,31 @@ def create_app(
             return {"run_id": run_id, "evidence_id": evidence_id}
         except AgentRuntimeError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/operator/agent/runs/{run_id}/feedback-summary", tags=["operator"])
+    async def agent_feedback_summary(
+        request: Request, run_id: str, tenant_id: str
+    ) -> dict[str, Any]:
+        await authorize(request, tenant_id, "operator_read")
+        try:
+            feedback = [
+                item.metadata["rating"]
+                for item in app.state.agent_runtime.list_evidence(run_id, tenant_id)
+                if item.kind == "user_feedback"
+                and isinstance(item.metadata.get("rating"), int)
+                and not isinstance(item.metadata.get("rating"), bool)
+                and 1 <= item.metadata["rating"] <= 5
+            ]
+        except AgentRuntimeError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        average_rating = sum(feedback) / len(feedback) if feedback else None
+        return {
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "rating_count": len(feedback),
+            "average_rating": average_rating,
+            "tuning_recommendations": tuning_recommendations({}, feedback),
+        }
 
     @app.post("/agent/runs", tags=["agentic"])
     async def create_agent_run(
@@ -711,11 +810,11 @@ def create_app(
         return {
             "tenant_id": tenant_id,
             "identity": {
-                "tenant_authorizer_configured": tenant_authorizer is not None,
-                "principal_resolver_configured": principal_resolver is not None,
+                "tenant_authorizer_configured": selected_tenant_authorizer is not None,
+                "principal_resolver_configured": selected_principal_resolver is not None,
             },
             "execution": {
-                "execution_dispatcher_configured": execution_dispatcher is not None,
+                "execution_dispatcher_configured": selected_execution_dispatcher is not None,
                 "capability_enforcement": agent_runtime.capability_enforcement,
                 "approval_sla_seconds": agent_runtime.approval_sla_seconds,
             },

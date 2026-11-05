@@ -192,3 +192,28 @@ events reflected in the core; cross-service trace
 correlation, provider-specific price catalogs, exact (transactional) budget
 enforcement, model evaluation pipelines, and automated feedback loops
 remain follow-on work.
+
+## AI-native defaults and controls
+
+Real models are required: startup fails without a configured provider. The echo provider and
+`local-hash` embeddings are allowed only with `AEGIS_ALLOW_DEV_PROVIDERS=true` (tests/dev).
+
+| Setting | Values | Default |
+| --- | --- | --- |
+| `AEGIS_LLM_PLANNER_ENABLED` | `true`/`false` | `true` (schema-validated, deterministic fallback) |
+| `AEGIS_RERANKER` | `none`, `lexical`, `llm` | `lexical` |
+| `AEGIS_GROUNDING_MODE` | `off`, `warn`, `enforce` | `warn` |
+| `AEGIS_SAFETY_CLASSIFIER` | `llm`, `heuristic` | `llm` (`heuristic` in dev mode); fails closed |
+| `AEGIS_AI_MAX_DOCUMENTS_PER_TENANT` / `_MAX_INDEXED_CHARS_PER_TENANT` / `_MAX_CHUNKS_PER_TENANT` | integers | PostgreSQL (pgvector HNSW) 5000/50M/100000; SQLite 100/256000/512 |
+| `AEGIS_PROMPT_REGISTRY_PATH` | file path | in-memory |
+
+Operator endpoints: `GET /operator/ai/improvements`, `GET /operator/ai/improvements/retraining-manifest`,
+`GET|POST /operator/ai/prompts`, `POST /operator/ai/prompts/{version}/promote`,
+`POST /operator/ai/routing/apply`, `GET /operator/ai/regression-candidates`,
+`POST /operator/ai/policy/auto-propose` (replay-tested, human approval still required),
+`POST /operator/ai/anomalies/scan`.
+
+Feedback (`/agent/runs/{id}/feedback`) and verification results feed prompt, planner, routing and
+retraining candidates. Prompt promotion needs a passing evaluation and an approver. The retraining
+manifest is hash-only; model promotion continues through `promote_model_if_valid_signed.yml`.
+`ai-evaluation.yml` blocks merges via the "AI evaluation gate" check.

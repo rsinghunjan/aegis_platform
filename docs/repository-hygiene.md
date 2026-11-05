@@ -18,8 +18,7 @@ remain outside the repository root are not part of this cleanup.
 ## Canonical AI/control-plane paths
 
 - `README.md` — authoritative repository overview and control-plane quickstart.
-  `README2.md` and `README3.md` are retained historical subsystem drafts, not
-  alternate project or production entry points.
+  The superseded `README2.md`/`README3.md` drafts have been removed.
 - `production.py` — FastAPI application, tenant authorization, RAG endpoints,
   agent control-plane routes, and lifecycle-managed evidence anchoring.
 - `services/ai_workflow.py` and `services/embeddings/` — tenant-scoped reference
@@ -71,3 +70,18 @@ Removed numbered/duplicate workflows (`ci2`, `fully_ai_readiness_gate2`, `mlflow
 `sign_with_vault2`, `security_scan`), stray `.rtf`/`.patch3`/`.path` scaffolds, legacy
 `mmaisys_*` stubs, and duplicate pre-commit configs. The canonical entry point is
 `production.py` (`production:app`); the single pre-commit config is `.pre-commit-config.yaml`.
+
+## Retraining promotion path
+
+`GET /operator/ai/improvements/retraining-manifest` -> reviewer approves the manifest SHA-256 ->
+`promote_model_if_valid_signed.yml` (protected `model-promotion` environment) re-fetches and
+re-verifies the manifest, validates the candidate, signs it (`api/model_signing.py`, fail-closed),
+registers it with the manifest hash as provenance, and verifies the signature. The previous
+`mlflow-training*` example workflows were truncated and non-functional and were removed.
+
+## Known corruption
+
+Many files committed before this cleanup (about 117 `.py` and 30+ workflow files) begin with a
+block of bare line numbers (a pasted editor gutter); about 30 also lost their head and cannot be
+repaired mechanically. Repaired so far: `model_registry/signing.py`, `scripts/promote_mlflow_run.py`,
+`api/mlflow_registry.py`. Find the rest with `python -m compileall -q . ` and fix or delete them.

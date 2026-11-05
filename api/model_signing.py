@@ -21,9 +21,10 @@ def _load_pem(setting: str) -> bytes:
     value = os.getenv(setting, "").strip()
     if not value:
         raise SigningError(f"{setting} is not set")
-    path = Path(value)
+    if value.startswith("-----BEGIN"):
+        return value.encode()
     try:
-        return path.read_bytes() if path.is_file() else value.encode()
+        return Path(value).read_bytes()
     except OSError as exc:
         raise SigningError(f"cannot read {setting}") from exc
 

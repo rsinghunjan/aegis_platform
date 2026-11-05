@@ -82,3 +82,37 @@ decision = d {
     }
   }
 }
+
+decision = d {
+  input.request.action == "ai_generate"
+  tenant_id := input.request.actor.org_id
+  active := data.aegis.ai_policies[tenant_id].active
+  active.policy.change == "require_approval"
+
+  d := {
+    "allow": true,
+    "reason": "ai_policy_requires_human_approval",
+    "policy_id": "aegis-ai",
+    "policy_version": active.version,
+    "obligations": [{"type": "require_human_approval"}],
+    "labels": {"tenant_id": tenant_id}
+  }
+}
+
+decision = d {
+  input.request.action == "ai_generate"
+  tenant_id := input.request.actor.org_id
+  active := data.aegis.ai_policies[tenant_id].active
+  active.policy.change == "lower_max_tokens"
+
+  d := {
+    "allow": true,
+    "reason": "ai_policy_limits_max_tokens",
+    "policy_id": "aegis-ai",
+    "policy_version": active.version,
+    "obligations": [
+      {"type": "limit_max_tokens", "max_tokens": active.policy.value}
+    ],
+    "labels": {"tenant_id": tenant_id}
+  }
+}

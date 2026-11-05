@@ -18,6 +18,8 @@ from agentic.runtime import (
     ToolSpec,
 )
 from agentic.evidence_anchor import HttpTransparencyLogBackend
+from agentic.worker import AgentExecutionMessage, AgentPrincipal, AgentWorker
+from services.observability.tracing import get_trace_id
 
 
 def make_runtime(path, **kwargs):
@@ -28,6 +30,23 @@ def make_runtime(path, **kwargs):
 class LocalTestSandboxExecutor:
     async def execute(self, _spec, payload, handler):
         return handler(payload)
+
+
+def test_agent_worker_continues_propagated_trace_context():
+    class TraceRuntime:
+        async def execute(self, *_args, **_kwargs):
+            return {"trace_id": get_trace_id()}
+
+    message = AgentExecutionMessage(
+        run_id="run-1",
+        tenant_id="tenant-a",
+        principal=AgentPrincipal(),
+        traceparent="00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    )
+
+    result = asyncio.run(AgentWorker(TraceRuntime()).execute(message))
+
+    assert result["trace_id"] == "4bf92f3577b34da6a3ce929d0e0e4736"
 
 
 class FakeEvidenceAnchorBackend:

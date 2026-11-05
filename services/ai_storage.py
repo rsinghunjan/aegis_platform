@@ -19,7 +19,10 @@ from sqlalchemy import (
     create_engine,
     delete,
     func,
+    inspect,
+    literal,
     select,
+    text,
 )
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -27,9 +30,30 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from services.embeddings.vector_store import VectorRecord, VectorStore, _cosine_similarity
 
+try:
+    from pgvector.sqlalchemy import Vector
+except ImportError:
+    Vector = None
+
 
 class AIStorageBase(DeclarativeBase):
     pass
+
+
+def _embedding_dimensions() -> int:
+    try:
+        dimensions = int(os.getenv("AEGIS_EMBEDDING_DIM", "1536"))
+    except ValueError as exc:
+        raise ValueError("AEGIS_EMBEDDING_DIM must be a positive integer") from exc
+    if dimensions < 1:
+        raise ValueError("AEGIS_EMBEDDING_DIM must be a positive integer")
+    return dimensions
+
+
+def _embedding_type():
+    if Vector is None:
+        return JSON()
+    return JSON().with_variant(Vector(_embedding_dimensions()), "postgresql")
 
 
 class KnowledgeDocumentRow(AIStorageBase):
@@ -54,7 +78,7 @@ class KnowledgeChunkRow(AIStorageBase):
     tenant_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     document_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     text: Mapped[str] = mapped_column(Text, nullable=False)
-    embedding: Mapped[list[float]] = mapped_column(JSON, nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(_embedding_type(), nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
 
 
@@ -74,6 +98,7 @@ class InferenceAuditRow(AIStorageBase):
     request_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     response_sha256: Mapped[str | None] = mapped_column(String(64))
     error_type: Mapped[str | None] = mapped_column(String(128))
+    trace_id: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
@@ -90,7 +115,48 @@ class AIDataStore:
 
     def initialize(self) -> None:
         if not self._initialized:
+            is_postgresql = self.engine.dialect.name == "postgresql"
+            if is_postgresql:
+                if Vector is None:
+                    raise RuntimeError(
+                        "pgvector is required for PostgreSQL AI storage; "
+                        "install the vector extra"
+                    )
+                with self.engine.begin() as connection:
+                    connection.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS vector")
             AIStorageBase.metadata.create_all(self.engine)
+            columns = {
+                column["name"]
+                for column in inspect(self.engine).get_columns("ai_inference_audit")
+            }
+            if "trace_id" not in columns:
+                with self.engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        "ALTER TABLE ai_inference_audit ADD COLUMN trace_id VARCHAR(32)"
+                    )
+            if is_postgresql:
+                dimensions = _embedding_dimensions()
+                with self.engine.begin() as connection:
+                    embedding_type = connection.execute(
+                        text(
+                            "SELECT udt_name FROM information_schema.columns "
+                            "WHERE table_schema = current_schema() "
+                            "AND table_name = 'ai_knowledge_chunks' "
+                            "AND column_name = 'embedding'"
+                        )
+                    ).scalar_one_or_none()
+                    if embedding_type != "vector":
+                        connection.exec_driver_sql(
+                            "ALTER TABLE ai_knowledge_chunks "
+                            f"ALTER COLUMN embedding TYPE vector({dimensions}) "
+                            f"USING embedding::text::vector({dimensions})"
+                        )
+                    connection.exec_driver_sql(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "ix_ai_knowledge_chunks_embedding "
+                        "ON ai_knowledge_chunks USING hnsw "
+                        "(embedding vector_cosine_ops)"
+                    )
             self._initialized = True
 
     def vector_store(self, tenant_id: str) -> TenantVectorStore:
@@ -209,6 +275,7 @@ class AIDataStore:
         request_sha256: str,
         response_sha256: str | None = None,
         error_type: str | None = None,
+        trace_id: str | None = None,
     ) -> None:
         self.initialize()
         with self._sessions.begin() as session:
@@ -226,6 +293,7 @@ class AIDataStore:
                     request_sha256=request_sha256,
                     response_sha256=response_sha256,
                     error_type=error_type,
+                    trace_id=trace_id,
                     created_at=datetime.now(timezone.utc),
                 )
             )
@@ -271,6 +339,7 @@ class AIDataStore:
                 "request_sha256": row.request_sha256,
                 "response_sha256": row.response_sha256,
                 "error_type": row.error_type,
+                "trace_id": row.trace_id,
                 "created_at": row.created_at.isoformat(),
             }
             for row in rows
@@ -341,6 +410,28 @@ class TenantVectorStore(VectorStore):
             raise ValueError("top_k must be positive")
         self.store.initialize()
         with self.store._sessions() as session:
+            if session.bind.dialect.name == "postgresql":
+                distance = KnowledgeChunkRow.embedding.op("<=>")(
+                    literal(vector, type_=Vector(_embedding_dimensions()))
+                )
+                rows = session.execute(
+                    select(KnowledgeChunkRow, (1 - distance).label("score"))
+                    .where(KnowledgeChunkRow.tenant_id == self.tenant_id)
+                    .order_by(distance)
+                    .limit(top_k)
+                ).all()
+                return [
+                    (
+                        VectorRecord(
+                            id=row.id,
+                            vector=row.embedding,
+                            text=row.text,
+                            metadata=row.metadata_json,
+                        ),
+                        float(score),
+                    )
+                    for row, score in rows
+                ]
             rows = session.scalars(
                 select(KnowledgeChunkRow)
                 .where(KnowledgeChunkRow.tenant_id == self.tenant_id)

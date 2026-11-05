@@ -6,23 +6,27 @@ governance, or agent-runtime components.
 
 ## Components
 
-- `AICore` wraps `AIWorkflow` for knowledge ingestion and answering, records
-  tenant-scoped memory and observations, and produces operator insights.
+- `AICore` wraps `AIWorkflow` for knowledge ingestion, answering, and agent
+  planning inference, records tenant-scoped memory and observations, and
+  produces operator insights.
 - `AIMemory` keeps bounded interaction metadata, durable in SQL via `AICoreStore`. Query and run
   identifiers are hashed; raw prompts, goals, and answers are not retained.
-- `AIObservability` summarizes answer failures, citations, latency, cost, and
-  successful agent lifecycle events.
+- `AIObservability` summarizes answer and planning inference, latency, cost,
+  agent planning, policy decisions, and lifecycle events.
 - `AIPolicyEngine` creates heuristic policy suggestions. Suggestions require
   human approval and do not mutate enforcement policy.
 - `AgentRuntime` remains the durable system of record for agent runs, evidence,
-  approvals, and execution policy. The shared core only records a limited
-  summary of successful create, dispatch, feedback, and approval operations.
+  approvals, and execution policy. Planning inference and tool policy decisions
+  are observed by the shared core; the runtime's `AgentPolicyGate` remains the
+  enforcement authority for every selected tool.
 
 ## HTTP surface
 
-The existing `/ai/knowledge` and `/ai/answer` endpoints are routed through
-`AICore`. Agent run endpoints continue to use `AgentRuntime` and the configured
-execution dispatcher. `GET /operator/ai/insights?tenant_id=...` returns
+The existing `/ai/knowledge` and `/ai/answer` endpoints and agent planning
+inference are routed through `AICore`. Agent run endpoints continue to use
+`AgentRuntime` and the configured execution dispatcher. Worker processes should
+configure `AgentWorker` with the same durable `AICore` so planning and policy
+decisions are included in shared telemetry. `GET /operator/ai/insights?tenant_id=...` returns
 tenant-scoped persisted metrics, heuristic recommendations, and advisory
 policy suggestions. It requires the existing `operator_read` authorization.
 The existing authorization callbacks remain required; a tenant ID is not
@@ -43,8 +47,9 @@ deployment is production-ready. Important limitations include:
   here are observability hints, not the durable audit record.
 - Policy and operational recommendations are simple thresholds, not evaluated
   policy decisions. They must not be used as automatic enforcement.
-- The AI core currently wraps the knowledge workflow; it does not unify every
-  inference, training, governance, and agent decision path behind one planner.
+- The AI core unifies knowledge answers and agent planning, but does not unify
+  every inference, training, governance, or agent decision path behind one
+  planner. Tool execution policy remains a separate, enforced runtime gate.
 - The default local-hash embeddings and echo provider support offline
   development but are not semantic retrieval or useful generated answers.
 - Production deployment still depends on trusted tenant authorization, durable
@@ -52,7 +57,7 @@ deployment is production-ready. Important limitations include:
   controls, worker/dispatcher operations, monitoring, and security review.
 - Durable AI usage rows record model/token/latency/cost metadata and hashes,
   while the agent runtime maintains its own durable evidence. Cross-service
-  trace correlation and unified durable AI telemetry are not implemented here.
+  trace correlation is not implemented here.
 
 Before calling a deployment production-ready, validate its threat model,
 tenant isolation, retention and deletion requirements, provider behavior,

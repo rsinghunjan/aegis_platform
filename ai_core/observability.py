@@ -47,7 +47,9 @@ class AIObservability:
 
     @staticmethod
     def _kind(operation: str) -> str:
-        return "obs:agent" if operation.startswith("agent_run_") else "obs:answer"
+        if operation.startswith("agent_run_"):
+            return "obs:agent"
+        return "obs:inference" if operation.startswith("inference") else "obs:answer"
 
     def _load(self, tenant_id: str) -> list[dict[str, Any]]:
         if self.store is not None:
@@ -55,7 +57,9 @@ class AIObservability:
                 return [
                     {k: v for k, v in event.items() if k not in ("kind", "at")}
                     for event in self.store.recent(
-                        tenant_id, ["obs:answer", "obs:agent"], self.window
+                        tenant_id,
+                        ["obs:answer", "obs:agent", "obs:inference"],
+                        self.window,
                     )
                 ]
             except Exception as exc:
@@ -69,7 +73,12 @@ class AIObservability:
         agent_events = [
             r for r in records if r["operation"].startswith("agent_run_")
         ]
-        rejected = [r for r in records if r["operation"] == "answer_rejected"]
+        inferences = [r for r in records if r["operation"] == "inference"]
+        rejected = [
+            r
+            for r in records
+            if r["operation"] in {"answer_rejected", "inference_rejected"}
+        ]
         ok = [r for r in answers if r["outcome"] == "succeeded"]
         latencies = sorted(r["latency_ms"] for r in ok)
         p95 = (
@@ -87,6 +96,11 @@ class AIObservability:
             "p95_latency_ms": p95,
             "total_cost_usd": sum(r["cost_usd"] for r in ok),
             "quota_rejections": len(rejected),
+            "inferences": len(inferences),
+            "inference_failures": sum(1 for r in inferences if r["outcome"] == "failed"),
+            "inference_cost_usd": sum(
+                r["cost_usd"] for r in inferences if r["outcome"] == "succeeded"
+            ),
             "agent_events": len(agent_events),
             "agent_failures": sum(1 for r in agent_events if r["outcome"] == "failed"),
         }

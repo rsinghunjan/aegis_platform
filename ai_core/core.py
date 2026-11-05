@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import time
 from typing import Any
 
 from ai_core.limits import AIQuotaExceeded, AIQuotaGuard
@@ -91,19 +93,123 @@ class AICore:
         result["repeated_query"] = repeated
         return result
 
+    def plan_agent(
+        self,
+        tenant_id: str,
+        run_id: str,
+        goal: str,
+        registered_tools: set[str],
+        planner: Any,
+        recovery: bool = False,
+    ) -> Any:
+        started = time.monotonic()
+        try:
+            if hasattr(planner, "plan_with_inference"):
+                if self.quota is not None and self.quota.enabled:
+                    self.quota.check(tenant_id, 512)
+
+                def generate(prompt: str) -> str:
+                    try:
+                        result = self.workflow.generate(tenant_id, prompt)
+                    except AIWorkflowError:
+                        self.observability.record(tenant_id, "inference", "failed")
+                        self.memory.remember(
+                            tenant_id,
+                            "inference",
+                            {"prompt_sha256": query_digest(prompt), "outcome": "failed"},
+                        )
+                        raise
+                    self.observability.record(
+                        tenant_id,
+                        "inference",
+                        "succeeded",
+                        latency_ms=result["latency_ms"],
+                        cost_usd=result["cost_usd"],
+                    )
+                    self.memory.remember(
+                        tenant_id,
+                        "inference",
+                        {
+                            "prompt_sha256": query_digest(prompt),
+                            "request_id": result["request_id"],
+                            "outcome": "succeeded",
+                        },
+                    )
+                    return result["text"]
+
+                plan = planner.plan_with_inference(
+                    goal, registered_tools, generate, recovery
+                )
+            else:
+                plan = planner.plan(goal, registered_tools, recovery)
+        except AIQuotaExceeded as exc:
+            self.observability.record(
+                tenant_id, "inference_rejected", f"quota_{exc.kind}"
+            )
+            self.record_agent_event(
+                tenant_id,
+                run_id,
+                "plan",
+                "rejected",
+                latency_ms=(time.monotonic() - started) * 1000,
+            )
+            raise
+        except Exception:
+            self.record_agent_event(
+                tenant_id,
+                run_id,
+                "plan",
+                "failed",
+                latency_ms=(time.monotonic() - started) * 1000,
+                metadata={"goal_sha256": query_digest(goal)},
+            )
+            raise
+
+        self.record_agent_event(
+            tenant_id,
+            run_id,
+            "plan",
+            "succeeded",
+            latency_ms=(time.monotonic() - started) * 1000,
+            metadata={
+                "goal_sha256": query_digest(goal),
+                "plan_sha256": query_digest(
+                    json.dumps(plan.dict(), sort_keys=True, separators=(",", ":"))
+                ),
+                "step_count": len(plan.steps),
+            },
+        )
+        return plan
+
     def record_agent_event(
-        self, tenant_id: str, run_id: str, action: str, outcome: str
+        self,
+        tenant_id: str,
+        run_id: str,
+        action: str,
+        outcome: str,
+        latency_ms: float = 0.0,
+        cost_usd: float = 0.0,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
+        event = {
+            "run_id_sha256": query_digest(run_id),
+            "action": action,
+            "outcome": outcome,
+        }
+        if metadata:
+            event.update(metadata)
         self.memory.remember(
             tenant_id,
             "agent_run",
-            {
-                "run_id_sha256": query_digest(run_id),
-                "action": action,
-                "outcome": outcome,
-            },
+            event,
         )
-        self.observability.record(tenant_id, f"agent_run_{action}", outcome)
+        self.observability.record(
+            tenant_id,
+            f"agent_run_{action}",
+            outcome,
+            latency_ms=latency_ms,
+            cost_usd=cost_usd,
+        )
 
     def insights(self, tenant_id: str) -> dict[str, Any]:
         return {

@@ -213,6 +213,7 @@ def create_app(
     app.state.agent_runtime = selected_runtime
     app.state.ai_workflow = selected_ai_workflow
     app.state.ai_core = AICore.durable(selected_ai_workflow)
+    selected_runtime.decision_core = app.state.ai_core
     app.state.ai_core.policy.replay_evaluator = policy_replay_evaluator
     if policy_opa_client is not None:
         app.state.ai_core.policy.opa_client = policy_opa_client

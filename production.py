@@ -23,6 +23,7 @@ from agentic.worker import (
     AgentPrincipal,
     CeleryExecutionDispatcher,
 )
+from services.ai_evaluation import tuning_recommendations
 from services.ai_workflow import AIWorkflow, AIWorkflowError
 from services.observability.ai_metrics import CONTENT_TYPE_LATEST, render_metrics
 from services.observability.tracing import (
@@ -386,6 +387,31 @@ def create_app(
             return {"run_id": run_id, "evidence_id": evidence_id}
         except AgentRuntimeError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/operator/agent/runs/{run_id}/feedback-summary", tags=["operator"])
+    async def agent_feedback_summary(
+        request: Request, run_id: str, tenant_id: str
+    ) -> dict[str, Any]:
+        await authorize(request, tenant_id, "operator_read")
+        try:
+            feedback = [
+                item.metadata["rating"]
+                for item in app.state.agent_runtime.list_evidence(run_id, tenant_id)
+                if item.kind == "user_feedback"
+                and isinstance(item.metadata.get("rating"), int)
+                and not isinstance(item.metadata.get("rating"), bool)
+                and 1 <= item.metadata["rating"] <= 5
+            ]
+        except AgentRuntimeError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        average_rating = sum(feedback) / len(feedback) if feedback else None
+        return {
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "rating_count": len(feedback),
+            "average_rating": average_rating,
+            "tuning_recommendations": tuning_recommendations({}, feedback),
+        }
 
     @app.post("/agent/runs", tags=["agentic"])
     async def create_agent_run(

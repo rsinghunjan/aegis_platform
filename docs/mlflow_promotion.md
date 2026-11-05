@@ -98,3 +98,10 @@ Security & audit
 ```python name=tests/test_promote_mlflow_run.py
 """
 Unit tests for api.mlflow_registry.promote_run_to_registry.
+
+## Retraining-driven promotion (canonical)
+
+Use `.github/workflows/promote_model_if_valid_signed.yml`. Required repo configuration:
+environment `model-promotion` (required reviewers), variables `AEGIS_BASE_URL`, `MLFLOW_TRACKING_URI`,
+secrets `AEGIS_OPERATOR_TOKEN`, `AEGIS_MODEL_SIGN_PRIVATE_KEY`, `AEGIS_MODEL_SIGN_PUBLIC_KEY`
+(RSA PEM). The registry directory is `AEGIS_MODEL_REGISTRY_DIR`. Unsigned registration is refused.

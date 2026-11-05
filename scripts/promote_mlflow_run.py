@@ -1,52 +1,3 @@
-  1
-  2
-  3
-  4
-  5
-  6
-  7
-  8
-  9
- 10
- 11
- 12
- 13
- 14
- 15
- 16
- 17
- 18
- 19
- 20
- 21
- 22
- 23
- 24
- 25
- 26
- 27
- 28
- 29
- 30
- 31
- 32
- 33
- 34
- 35
- 36
- 37
- 38
- 39
- 40
- 41
- 42
- 43
- 44
- 45
- 46
- 47
- 48
- 49
 #!/usr/bin/env python
 """
 CLI to promote an MLflow run artifact into the Aegis ModelRegistry.
@@ -60,10 +11,12 @@ Notes:
  - Registry integration is best-effort; adapt imports if your registry API differs.
 """
 import os
+import sys
 import argparse
 import json
 import logging
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 logger = logging.getLogger("aegis.promote_mlflow")
 logging.basicConfig(level=logging.INFO)
 
@@ -74,6 +27,8 @@ def parse_args():
     p.add_argument("--model-name", required=True)
     p.add_argument("--version", default=None)
     p.add_argument("--sign-key", default=None)
+    p.add_argument("--manifest", default=None, help="approved retraining manifest JSON to record as provenance")
+    p.add_argument("--approved-manifest-sha256", default=None)
     return p.parse_args()
 
 def main():
@@ -84,6 +39,12 @@ def main():
         logger.exception("api.mlflow_registry helper not found; ensure this repo contains api/mlflow_registry.py")
         raise
 
+    manifest_sha = None
+    if args.manifest:
+        from services.feedback_loop import verify_retraining_manifest
+
+        with open(args.manifest, encoding="utf-8") as handle:
+            manifest_sha = verify_retraining_manifest(json.load(handle), args.approved_manifest_sha256 or "")
     res = promote_run_to_registry(
         run_id=args.run_id,
         artifact_path=args.artifact_path,
@@ -92,6 +53,15 @@ def main():
         sign_key=args.sign_key,
     )
 
+    if manifest_sha:
+        res["retraining_manifest_sha256"] = manifest_sha
+        try:
+            from mlflow.tracking import MlflowClient
+
+            MlflowClient().set_tag(args.run_id, "aegis.retraining.manifest_sha256", manifest_sha)
+        except Exception:
+            logger.exception("Could not tag MLflow run with manifest hash")
+            raise
     print(json.dumps(res, indent=2))
 
 if __name__ == "__main__":

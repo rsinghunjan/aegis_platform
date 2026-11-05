@@ -156,3 +156,17 @@ def export_retraining_manifest(signals: list[Mapping[str, Any]]) -> dict[str, An
         "manifest_sha256": hashlib.sha256(body.encode()).hexdigest(),
         "rows": rows,
     }
+
+
+def verify_retraining_manifest(manifest: Mapping[str, Any], approved_sha256: str) -> str:
+    """Recompute the manifest hash and require it to equal the human-approved value."""
+    if manifest.get("schema") != "aegis.feedback-manifest/v1":
+        raise ValueError("unsupported manifest schema")
+    rows = manifest.get("rows")
+    if not isinstance(rows, list) or manifest.get("count") != len(rows):
+        raise ValueError("manifest rows do not match count")
+    body = json.dumps(rows, sort_keys=True, separators=(",", ":"))
+    actual = hashlib.sha256(body.encode()).hexdigest()
+    if actual != manifest.get("manifest_sha256") or actual != (approved_sha256 or "").strip().lower():
+        raise ValueError("manifest hash does not match the approved value")
+    return actual

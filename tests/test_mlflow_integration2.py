@@ -48,9 +48,8 @@ def test_register_download_and_sign(monkeypatch, tmp_path):
     def fake_sign(p, key):
         sign_calls.append((p, key))
         return p + ".sig.json"
-    monkeypatch.setitem(sys.modules, 'api.model_signing', mock.MagicMock())
     import api.model_signing as ms
-    ms.sign_model_artifact = fake_sign
+    monkeypatch.setattr(ms, "sign_model_artifact", fake_sign)
 
     # monkeypatch registry
     fake_registry = mock.MagicMock()

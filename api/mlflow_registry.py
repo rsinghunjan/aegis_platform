@@ -1,138 +1,114 @@
-129
-130
-131
-132
-133
-134
-135
-136
-137
-138
-139
-140
-141
-142
-143
-144
-145
-146
-147
-148
-149
-150
-151
-152
-153
-154
-155
-156
-157
-158
-159
-160
-161
-162
-163
-164
-165
-166
-167
-168
-169
-170
-171
-172
-173
-174
-175
-176
-177
-178
-179
-180
-181
-182
-183
-184
-185
-186
-187
-188
-189
-190
-191
-192
-193
-194
-195
-196
+"""Promote an MLflow run artifact into the Aegis model registry directory.
+
+Layout: $AEGIS_MODEL_REGISTRY_DIR/<name>/<version>/{<artifact>, <artifact>.sig, model_signature.json}.
+Signing is mandatory when sign_key is given; any signing failure aborts before registration.
 """
+from __future__ import annotations
 
-    Returns a metadata dict:
-      {
-        "run_id": run_id,
-        "artifact_local_path": "/tmp/...",
-        "signed_paths": ["/tmp/....sig.json"],
-        "registered": True/False,
-        "model_name": model_name,
-        "version": version_str_or_generated
-      }
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, Optional
 
-    Raises Exception on unrecoverable failures (e.g., download failure).
-    """
+logger = logging.getLogger(__name__)
+
+_SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _download_mlflow_artifact(run_id: str, artifact_path: str, dst_dir: str) -> str:
+    from mlflow.tracking import MlflowClient
+
+    return MlflowClient().download_artifacts(run_id, artifact_path, dst_dir)
+
+
+def _find_artifact_file(downloaded: str, basename: str) -> Optional[str]:
+    path = Path(downloaded)
+    if path.is_file():
+        return str(path)
+    for candidate in path.rglob(basename):
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _register(model_name: str, version: str, artifact: str, signatures: list, extra: Dict[str, Any]) -> str:
+    if not _SAFE.match(model_name) or not _SAFE.match(version):
+        raise ValueError("model name and version must be simple identifiers")
+    root = Path(os.getenv("AEGIS_MODEL_REGISTRY_DIR", "model_registry/models")).resolve()
+    target = (root / model_name / version).resolve()
+    if root not in target.parents:
+        raise ValueError("invalid registry target")
+    if target.exists():
+        raise FileExistsError(f"{model_name}:{version} is already registered")
+    target.mkdir(parents=True)
+    shutil.copy2(artifact, target / Path(artifact).name)
+    for sig in signatures:
+        shutil.copy2(sig, target / Path(sig).name)
+    metadata = {
+        "sha256": _sha256(artifact),
+        "artifact": Path(artifact).name,
+        "signatures": [Path(s).name for s in signatures],
+        **extra,
+    }
+    (target / "model_signature.json").write_text(json.dumps(metadata, sort_keys=True), encoding="utf-8")
+    return str(target)
+
+
+def promote_run_to_registry(
+    run_id: str,
+    artifact_path: str,
+    model_name: str,
+    version: Optional[str] = None,
+    sign_key: Optional[str] = None,
+    registry_module: Any = None,
+) -> Dict[str, Any]:
+    """Returns {run_id, artifact_local_path, signed_paths, registered, registry_path, model_name, version}."""
     tmpdir = tempfile.mkdtemp(prefix="aegis_mlflow_promote_")
-    signed_paths = []
-    registered = False
+    signed_paths: list = []
+    downloaded = _download_mlflow_artifact(run_id, artifact_path, tmpdir)
+    candidate = _find_artifact_file(downloaded, os.path.basename(artifact_path))
+    if not candidate:
+        raise FileNotFoundError(f"Could not locate artifact file in downloaded path: {downloaded}")
+    if sign_key:
+        from api.model_signing import sign_model_artifact
+
+        signed_paths.append(sign_model_artifact(candidate, sign_key))
+    ver = version or f"mlflow-{run_id}"
+    registry_path = _register(model_name, ver, candidate, signed_paths, {"run_id": run_id})
     try:
-        downloaded = _download_mlflow_artifact(run_id, artifact_path, tmpdir)
-        basename = os.path.basename(artifact_path)
-        candidate = _find_artifact_file(downloaded, basename)
-        if not candidate:
-            raise FileNotFoundError(f"Could not locate artifact file in downloaded path: {downloaded}")
+        from mlflow.tracking import MlflowClient
 
-        # optionally sign the artifact file
-        if sign_key:
-            try:
-                from api.model_signing import sign_model_artifact
-                sig = sign_model_artifact(candidate, sign_key)
-                signed_paths.append(sig)
-                logger.info("Signed artifact: %s -> %s", candidate, sig)
-            except Exception:
-                logger.exception("Signing failed; continuing without signature (call may still register if allowed)")
-
-        # determine version string if not provided
-        ver = version or f"mlflow-{run_id}"
-
-        # attempt registry registration
-        registered = _register_with_registry(model_name, ver, candidate, registry_module)
-
-        # annotate the MLflow run with registry data (best-effort)
-        try:
-            from mlflow.tracking import MlflowClient
-            client = MlflowClient()
-            tags = {
-                "aegis.registry.registered": str(bool(registered)),
-                "aegis.registry.model_name": model_name,
-                "aegis.registry.model_version": ver,
-            }
-            if signed_paths:
-                tags["aegis.artifact.signed"] = ",".join(signed_paths)
-            for k, v in tags.items():
-                client.set_tag(run_id, k, v)
-            logger.info("Annotated MLflow run %s with registry tags", run_id)
-        except Exception:
-            logger.exception("Failed to annotate MLflow run with registry tags (non-fatal)")
-
-        return {
-            "run_id": run_id,
-            "artifact_local_path": candidate,
-            "signed_paths": signed_paths,
-            "registered": registered,
-            "model_name": model_name,
-            "version": ver,
+        client = MlflowClient()
+        tags = {
+            "aegis.registry.registered": "True",
+            "aegis.registry.model_name": model_name,
+            "aegis.registry.model_version": ver,
         }
-    finally:
-        # Keep the tmpdir for debugging on CI by default. If you prefer to clean up, uncomment the next line.
-        # shutil.rmtree(tmpdir, ignore_errors=True)
-        pass
-api/mlflow_registry.py
+        if signed_paths:
+            tags["aegis.artifact.signed"] = ",".join(Path(p).name for p in signed_paths)
+        for key, value in tags.items():
+            client.set_tag(run_id, key, value)
+    except Exception:
+        logger.exception("Failed to annotate MLflow run with registry tags (non-fatal)")
+    return {
+        "run_id": run_id,
+        "artifact_local_path": candidate,
+        "signed_paths": signed_paths,
+        "registered": True,
+        "registry_path": registry_path,
+        "model_name": model_name,
+        "version": ver,
+    }

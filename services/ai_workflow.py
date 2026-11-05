@@ -25,7 +25,7 @@ from services.inference import (
     ModelRouter,
     estimate_cost,
 )
-from services.inference.gateway import build_inference_router
+from services.inference.gateway import build_inference_router, dev_providers_allowed
 from services.observability.ai_metrics import record_ai_request
 from services.observability.tracing import get_trace_id, start_span
 
@@ -67,10 +67,13 @@ class AIWorkflow:
             else self._default_embeddings()
         )
         if (
-            self._is_production()
+            not dev_providers_allowed()
             and self.embedding_provider.name.lower() == "local-hash"
         ):
-            raise RuntimeError("local-hash embeddings are not allowed in production")
+            raise RuntimeError(
+                "local-hash embeddings are only allowed when "
+                "AEGIS_ALLOW_DEV_PROVIDERS=true"
+            )
         self.model = os.getenv("AEGIS_LLM_MODEL", "gpt-4o-mini")
         self.inference_router = inference_router or build_inference_router()
         self.data_store = data_store or AIDataStore()
@@ -104,15 +107,16 @@ class AIWorkflow:
 
     @staticmethod
     def _default_embeddings():
-        production = AIWorkflow._is_production()
+        dev = dev_providers_allowed()
         provider_name = os.getenv(
             "AEGIS_EMBEDDING_PROVIDER",
-            "openai" if production else "local-hash",
+            "local-hash" if dev else "openai",
         ).strip().lower()
         if provider_name == "local-hash":
-            if production:
+            if not dev:
                 raise RuntimeError(
-                    "local-hash embeddings are not allowed in production"
+                    "local-hash embeddings are only allowed when "
+                    "AEGIS_ALLOW_DEV_PROVIDERS=true"
                 )
             return LocalHashEmbeddingProvider()
         if provider_name == "openai":

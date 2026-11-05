@@ -10,6 +10,8 @@ from fastapi.testclient import TestClient
 # Ensure we run tests using a dedicated SQLite file DB for determinism
 TEST_DB_FILE = Path("./test_aegis.db")
 os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DB_FILE.resolve()}"
+# Tests use the offline echo provider and local-hash embeddings
+os.environ.setdefault("AEGIS_ALLOW_DEV_PROVIDERS", "true")
 # Use a stable secret for tests
 os.environ["AEGIS_SECRET_KEY"] = "test-secret-key"
 

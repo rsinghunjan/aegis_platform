@@ -43,16 +43,38 @@ class OpenAICompatiblePlanner(Planner):
         self.max_steps = max_steps
         self.fallback = fallback or DeterministicJSONPlanner()
         self.provider_name = "openai-compatible-chat-completions"
+        # "llm" when the last plan came from the model, "fallback" otherwise.
+        self.last_source = "llm"
 
     @classmethod
     def from_environment(cls) -> Planner:
-        if os.getenv("AEGIS_LLM_PLANNER_ENABLED", "").lower() not in {"1", "true", "yes"}:
+        """LLM planning is the default; set AEGIS_LLM_PLANNER_ENABLED=false to opt out.
+
+        Outside dev/test (AEGIS_ALLOW_DEV_PROVIDERS), a missing API key is a
+        startup error rather than a silent downgrade to deterministic planning.
+        """
+        flag = os.getenv("AEGIS_LLM_PLANNER_ENABLED", "").strip().lower()
+        if flag in {"0", "false", "no"}:
             return DeterministicJSONPlanner()
-        endpoint = os.getenv("AEGIS_LLM_BASE_URL", "")
+        dev = os.getenv("AEGIS_ALLOW_DEV_PROVIDERS", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        endpoint = (
+            os.getenv("AEGIS_LLM_BASE_URL")
+            or os.getenv("OPENAI_BASE_URL")
+            or "https://api.openai.com/v1"
+        )
         key = os.getenv("AEGIS_LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
-        model = os.getenv("AEGIS_LLM_MODEL", "")
-        if not endpoint or not key or not model:
-            return DeterministicJSONPlanner()
+        model = os.getenv("AEGIS_LLM_MODEL", "gpt-4o-mini")
+        if not key:
+            if dev:
+                return DeterministicJSONPlanner()
+            raise RuntimeError(
+                "LLM planner requires AEGIS_LLM_API_KEY; set "
+                "AEGIS_LLM_PLANNER_ENABLED=false to use deterministic planning"
+            )
         try:
             return cls(
                 endpoint=endpoint,
@@ -61,18 +83,24 @@ class OpenAICompatiblePlanner(Planner):
                 timeout=float(os.getenv("AEGIS_LLM_TIMEOUT_SECONDS", "10")),
                 max_steps=int(os.getenv("AEGIS_LLM_MAX_STEPS", "16")),
             )
-        except (TypeError, ValueError):
-            return DeterministicJSONPlanner()
+        except (TypeError, ValueError) as exc:
+            if dev:
+                return DeterministicJSONPlanner()
+            raise RuntimeError(f"invalid LLM planner configuration: {exc}") from exc
 
     def plan(
         self, goal: str, registered_tools: set[str], recovery: bool = False
     ) -> Plan:
         if not self.api_key:
+            self.last_source = "fallback"
             return self.fallback.plan(goal, registered_tools, recovery)
         try:
             candidate = self._request_plan(goal, registered_tools)
-            return self._validate(candidate, registered_tools)
+            plan = self._validate(candidate, registered_tools)
+            self.last_source = "llm"
+            return plan
         except Exception:
+            self.last_source = "fallback"
             return self.fallback.plan(goal, registered_tools, recovery)
 
     def plan_with_inference(
@@ -112,7 +140,7 @@ class OpenAICompatiblePlanner(Planner):
             content = generate(prompt)
             if not isinstance(content, str) or len(content) > 256_000:
                 raise ValueError("invalid planner response")
-            return self._validate(
+            plan = self._validate(
                 json.loads(
                     content,
                     parse_constant=lambda _value: (_ for _ in ()).throw(
@@ -121,7 +149,10 @@ class OpenAICompatiblePlanner(Planner):
                 ),
                 registered_tools,
             )
+            self.last_source = "llm"
+            return plan
         except Exception:
+            self.last_source = "fallback"
             return self.fallback.plan(goal, registered_tools, recovery)
 
     def _request_plan(self, goal: str, registered_tools: set[str]) -> Any:

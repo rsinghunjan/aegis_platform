@@ -48,7 +48,9 @@ class SafetyChecker:
         blocked_keywords: Optional[Iterable[str]] = None,
         pii_regexes: Optional[List[re.Pattern]] = None,
         model_callable: Optional[Callable[[str], float]] = None,
+        fail_closed: bool = False,
     ):
+        self.fail_closed = fail_closed
         self.blocked_keywords = [
             k.lower() for k in (blocked_keywords or DEFAULT_BLOCKED_KEYWORDS)
         ]
@@ -98,6 +100,8 @@ class SafetyChecker:
                     return True
             except Exception as e:
                 logger.exception("Safety model callable raised an exception: %s", e)
+                if self.fail_closed:
+                    return True
 
         logger.debug("Text considered safe by heuristics")
         return False  

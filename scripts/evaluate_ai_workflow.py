@@ -40,7 +40,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--dataset",
         type=Path,
-        default=ROOT / "data/golden_datasets/ai_workflow.json",
+        action="append",
+        help="Golden dataset; repeatable. Defaults to the golden set plus the "
+        "regression set when present.",
     )
     parser.add_argument("--emit-json", type=Path)
     parser.add_argument(
@@ -50,7 +52,21 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        dataset = load_dataset(args.dataset)
+        paths = args.dataset or [
+            ROOT / "data/golden_datasets/ai_workflow.json",
+            ROOT / "data/golden_datasets/regression.json",
+        ]
+        datasets = [load_dataset(path) for path in paths if path.exists()]
+        if not datasets:
+            raise ValueError("no golden dataset found")
+        # Merge cases; the strictest threshold per metric wins.
+        dataset = {
+            "cases": [case for item in datasets for case in item["cases"]],
+            "thresholds": {
+                name: max(item["thresholds"][name] for item in datasets)
+                for name in datasets[0]["thresholds"]
+            },
+        }
         with tempfile.TemporaryDirectory(prefix="aegis-evaluation-") as directory:
             workflow = AIWorkflow(
                 data_store=AIDataStore(f"sqlite:///{Path(directory) / 'evaluation.db'}")

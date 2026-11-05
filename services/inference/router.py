@@ -121,6 +121,22 @@ class ModelRouter:
         }
         self.last_attempts: List[RouteAttempt] = []
 
+    def provider_order(self) -> List[str]:
+        return [provider.name for provider in self.providers]
+
+    def reorder(self, names: List[str]) -> None:
+        """Reorder the fallback chain; ``names`` must be a permutation of it."""
+        if sorted(names) != sorted(self.provider_order()):
+            raise ValueError("order must contain exactly the configured providers")
+        by_name = {provider.name: provider for provider in self.providers}
+        self.providers = [by_name[name] for name in names]
+        self.breakers = {
+            self._key(index, provider): next(
+                b for key, b in self.breakers.items() if key.split(":", 1)[1] == provider.name
+            )
+            for index, provider in enumerate(self.providers)
+        }
+
     @staticmethod
     def _key(index: int, provider: InferenceProvider) -> str:
         return f"{index}:{provider.name}"

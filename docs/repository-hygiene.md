@@ -64,3 +64,10 @@ feature store, evaluation, and promotion components are not a unified runtime
 pipeline. These are explicit follow-ups; do not infer they are implemented from
 the former patch backlog. Legacy service variants should not be imported as the
 canonical application.
+
+## Canonical paths (AI-native hardening)
+
+Removed numbered/duplicate workflows (`ci2`, `fully_ai_readiness_gate2`, `mlflow-training2`,
+`sign_with_vault2`, `security_scan`), stray `.rtf`/`.patch3`/`.path` scaffolds, legacy
+`mmaisys_*` stubs, and duplicate pre-commit configs. The canonical entry point is
+`production.py` (`production:app`); the single pre-commit config is `.pre-commit-config.yaml`.

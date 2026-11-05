@@ -23,7 +23,9 @@ from agentic.worker import (
     AgentPrincipal,
     CeleryExecutionDispatcher,
 )
+from services import feedback_loop
 from services.ai_evaluation import tuning_recommendations
+from services.prompt_eval import build_prompt_evaluator
 from services.ai_workflow import AIWorkflow, AIWorkflowError
 from services.observability.ai_metrics import CONTENT_TYPE_LATEST, render_metrics
 from services.observability.tracing import (
@@ -101,6 +103,21 @@ class AgentFeedbackRequest(BaseModel):
     tenant_id: str = Field(min_length=1, max_length=128)
     rating: int = Field(ge=1, le=5)
     note: str = Field(default="", max_length=2000)
+
+
+class PromptProposalRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=128)
+    template: str = Field(min_length=1, max_length=4000)
+    reason: str = Field(default="", max_length=500)
+
+
+class PromptPromoteRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=128)
+
+
+class RoutingApplyRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=128)
+    order: list[str] = Field(min_items=1, max_items=16)
 
 
 def _run_summary(run: Any) -> dict[str, Any]:
@@ -460,6 +477,93 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.get("/operator/ai/improvements", tags=["ai-workflows"])
+    async def ai_improvements(request: Request, tenant_id: str) -> dict[str, Any]:
+        await authorize(request, tenant_id, "operator_read")
+        workflow = app.state.ai_workflow
+        signals = await asyncio.to_thread(
+            feedback_loop.collect_run_signals, app.state.agent_runtime, tenant_id
+        )
+        usage = await asyncio.to_thread(workflow.list_usage, tenant_id, 500)
+        candidates = feedback_loop.build_candidates(
+            signals, usage, workflow.inference_router.provider_order()
+        )
+        manifest = feedback_loop.export_retraining_manifest(signals)
+        return {
+            "tenant_id": tenant_id,
+            "candidates": candidates,
+            "retraining_manifest_sha256": manifest["manifest_sha256"],
+            "retraining_rows": manifest["count"],
+        }
+
+    @app.get("/operator/ai/improvements/retraining-manifest", tags=["ai-workflows"])
+    async def retraining_manifest(request: Request, tenant_id: str) -> dict[str, Any]:
+        await authorize(request, tenant_id, "operator_read")
+        signals = await asyncio.to_thread(
+            feedback_loop.collect_run_signals, app.state.agent_runtime, tenant_id
+        )
+        return feedback_loop.export_retraining_manifest(signals)
+
+    @app.get("/operator/ai/prompts", tags=["ai-workflows"])
+    async def list_prompts(request: Request, tenant_id: str) -> dict[str, Any]:
+        await authorize(request, tenant_id, "operator_read")
+        return {"prompts": app.state.ai_workflow.prompts.list()}
+
+    @app.post("/operator/ai/prompts", tags=["ai-workflows"])
+    async def propose_prompt(
+        request: Request, body: PromptProposalRequest
+    ) -> dict[str, Any]:
+        principal = await resolve_principal(request)
+        await authorize(
+            request, body.tenant_id, "ai_policy_propose", principal.principal_id
+        )
+        try:
+            return app.state.ai_workflow.prompts.propose(body.template, body.reason)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/operator/ai/prompts/{version}/promote", tags=["ai-workflows"])
+    async def promote_prompt(
+        request: Request, version: int, body: PromptPromoteRequest
+    ) -> dict[str, Any]:
+        principal = await resolve_principal(request)
+        await authorize(request, body.tenant_id, "approve", principal.principal_id)
+        workflow = app.state.ai_workflow
+        try:
+            return await asyncio.to_thread(
+                workflow.prompts.promote,
+                version,
+                principal.principal_id,
+                build_prompt_evaluator(workflow),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.warning("Prompt evaluation failed: %s", type(exc).__name__)
+            raise HTTPException(status_code=503, detail="prompt evaluation failed") from exc
+
+    @app.post("/operator/ai/routing/apply", tags=["ai-workflows"])
+    async def apply_routing(
+        request: Request, body: RoutingApplyRequest
+    ) -> dict[str, Any]:
+        principal = await resolve_principal(request)
+        await authorize(request, body.tenant_id, "approve", principal.principal_id)
+        router = app.state.ai_workflow.inference_router
+        try:
+            router.reorder(body.order)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        app.state.ai_core.record_agent_event(
+            body.tenant_id,
+            "routing",
+            "routing_applied",
+            "applied",
+            metadata={"actor_sha256": hashlib.sha256(principal.principal_id.encode()).hexdigest()},
+        )
+        return {"order": router.provider_order(), "applied_by": principal.principal_id}
 
     @app.post("/agent/runs/{run_id}/feedback", tags=["agentic"])
     async def record_agent_feedback(

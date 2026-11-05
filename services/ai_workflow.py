@@ -26,6 +26,7 @@ from services.inference import (
     estimate_cost,
 )
 from services.inference.gateway import build_inference_router, dev_providers_allowed
+from services.prompt_registry import PromptRegistry, render
 from services.observability.ai_metrics import record_ai_request
 from services.observability.tracing import get_trace_id, start_span
 
@@ -81,6 +82,7 @@ class AIWorkflow:
         self.output_cost_per_1k = self._cost_rate("AEGIS_LLM_OUTPUT_COST_PER_1K")
         self._tenants: dict[str, _TenantKnowledge] = {}
         self.safety_checker = SafetyChecker()
+        self.prompts = PromptRegistry.from_environment()
 
     @staticmethod
     def _cost_rate(setting: str) -> float:
@@ -174,7 +176,13 @@ class AIWorkflow:
             "embedding_provider": self.embedding_provider.name,
         }
 
-    def answer(self, tenant_id: str, query: str, max_tokens: int = 512) -> dict[str, Any]:
+    def answer(
+        self,
+        tenant_id: str,
+        query: str,
+        max_tokens: int = 512,
+        prompt_template: str | None = None,
+    ) -> dict[str, Any]:
         if not query or not query.strip():
             raise ValueError("query must not be empty")
         if len(query) > self.max_query_chars:
@@ -191,10 +199,8 @@ class AIWorkflow:
             context = "\n\n".join(
                 f"[{index + 1}] {chunk.text}" for index, chunk in enumerate(retrieved)
             )
-            prompt = (
-                "Answer the question using only the supplied context. If it is "
-                "insufficient, say you do not know.\n\n"
-                f"Context:\n{context}\n\nQuestion: {query}\nAnswer:"
+            prompt = render(
+                prompt_template or self.prompts.active()["template"], context, query
             )
             request_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         except Exception as exc:

@@ -80,6 +80,23 @@ class AskAIRequest(BaseModel):
     max_tokens: int = Field(default=512, ge=1, le=4096)
 
 
+class PolicyProposalRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=128)
+    suggestion: dict[str, Any]
+    replay_traffic: list[dict[str, Any]] = Field(min_items=1, max_items=500)
+
+
+class PolicyApprovalRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=128)
+    reason: str = Field(default="", max_length=500)
+
+
+class PolicyRollbackRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=128)
+    version: str = Field(min_length=1, max_length=64)
+    reason: str = Field(default="", max_length=500)
+
+
 class AgentFeedbackRequest(BaseModel):
     tenant_id: str = Field(min_length=1, max_length=128)
     rating: int = Field(ge=1, le=5)
@@ -113,6 +130,8 @@ def create_app(
     principal_resolver: Optional[Callable[[Request], Any]] = None,
     execution_dispatcher: Any = None,
     ai_workflow: AIWorkflow | None = None,
+    policy_replay_evaluator: Callable[..., Any] | None = None,
+    policy_opa_client: Any = None,
 ) -> FastAPI:
     selected_runtime = runtime or create_configured_agent_runtime()
     oidc_identity = OIDCTenantIdentity.from_environment()
@@ -194,6 +213,9 @@ def create_app(
     app.state.agent_runtime = selected_runtime
     app.state.ai_workflow = selected_ai_workflow
     app.state.ai_core = AICore.durable(selected_ai_workflow)
+    app.state.ai_core.policy.replay_evaluator = policy_replay_evaluator
+    if policy_opa_client is not None:
+        app.state.ai_core.policy.opa_client = policy_opa_client
     app.state.execution_dispatcher = selected_execution_dispatcher
 
     @app.middleware("http")
@@ -363,6 +385,80 @@ def create_app(
     async def ai_insights(request: Request, tenant_id: str) -> dict[str, Any]:
         await authorize(request, tenant_id, "operator_read")
         return app.state.ai_core.insights(tenant_id)
+
+    @app.get("/operator/ai/policy/proposals", tags=["ai-workflows"])
+    async def list_ai_policy_proposals(
+        request: Request, tenant_id: str
+    ) -> dict[str, Any]:
+        await authorize(request, tenant_id, "operator_read")
+        return {
+            "tenant_id": tenant_id,
+            "proposals": app.state.ai_core.policy.list_proposals(tenant_id),
+        }
+
+    @app.get("/operator/ai/policy/versions", tags=["ai-workflows"])
+    async def list_ai_policy_versions(
+        request: Request, tenant_id: str
+    ) -> dict[str, Any]:
+        await authorize(request, tenant_id, "operator_read")
+        return {
+            "tenant_id": tenant_id,
+            "versions": app.state.ai_core.policy.history(tenant_id),
+        }
+
+    @app.post("/operator/ai/policy/proposals", tags=["ai-workflows"])
+    async def propose_ai_policy(
+        request: Request, body: PolicyProposalRequest
+    ) -> dict[str, Any]:
+        principal = await resolve_principal(request)
+        await authorize(
+            request, body.tenant_id, "ai_policy_propose", principal.principal_id
+        )
+        try:
+            return app.state.ai_core.policy.propose(
+                body.tenant_id, body.suggestion, body.replay_traffic
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.post(
+        "/operator/ai/policy/proposals/{proposal_id}/approve",
+        tags=["ai-workflows"],
+    )
+    async def approve_ai_policy(
+        request: Request, proposal_id: str, body: PolicyApprovalRequest
+    ) -> dict[str, Any]:
+        principal = await resolve_principal(request)
+        await authorize(request, body.tenant_id, "approve", principal.principal_id)
+        try:
+            return app.state.ai_core.policy.approve(
+                body.tenant_id, proposal_id, principal.principal_id, body.reason
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.post("/operator/ai/policy/rollback", tags=["ai-workflows"])
+    async def rollback_ai_policy(
+        request: Request, body: PolicyRollbackRequest
+    ) -> dict[str, Any]:
+        principal = await resolve_principal(request)
+        await authorize(request, body.tenant_id, "approve", principal.principal_id)
+        try:
+            return app.state.ai_core.policy.rollback(
+                body.tenant_id, body.version, principal.principal_id, body.reason
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @app.post("/agent/runs/{run_id}/feedback", tags=["agentic"])
     async def record_agent_feedback(

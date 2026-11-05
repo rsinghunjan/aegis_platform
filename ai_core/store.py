@@ -34,6 +34,18 @@ class AICoreEventRow(AICoreBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class AIPolicyEventRow(AICoreBase):
+    __tablename__ = "ai_policy_events"
+    __table_args__ = (
+        Index("ix_ai_policy_tenant_id", "tenant_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class AICoreStore:
     """Append-only event log with per-tenant, per-kind retention.
 
@@ -105,6 +117,42 @@ class AICoreStore:
             {"kind": row.kind, "at": row.created_at.timestamp(), **row.payload}
             for row in reversed(rows)
         ]
+
+    def append_policy_event(
+        self,
+        tenant_id: str,
+        payload: dict[str, Any],
+        allocate_version: bool = False,
+    ) -> dict[str, Any]:
+        """Append durable policy evidence and allocate its version from the DB ID."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        self.initialize()
+        with self._sessions.begin() as session:
+            row = AIPolicyEventRow(
+                tenant_id=tenant_id,
+                payload={},
+                created_at=datetime.now(timezone.utc),
+            )
+            session.add(row)
+            session.flush()
+            event = dict(payload)
+            if allocate_version:
+                event["version"] = f"ai-policy-v{row.id:06d}"
+            row.payload = event
+        return event
+
+    def policy_events(self, tenant_id: str) -> list[dict[str, Any]]:
+        """Return the complete, non-retained policy audit history for a tenant."""
+        self.initialize()
+        query = (
+            select(AIPolicyEventRow)
+            .where(AIPolicyEventRow.tenant_id == tenant_id)
+            .order_by(AIPolicyEventRow.id)
+        )
+        with self._sessions() as session:
+            rows = session.scalars(query).all()
+        return [dict(row.payload) for row in rows]
 
     def forget(self, tenant_id: str) -> None:
         self.initialize()

@@ -211,6 +211,21 @@ class AICore:
             cost_usd=cost_usd,
         )
 
+    def propose_from_suggestions(
+        self, tenant_id: str, replay_traffic: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Turn advisory suggestions into replay-validated pending proposals.
+
+        Never approves or applies: approval stays a separate human action.
+        """
+        proposals, rejected = [], []
+        for suggestion in self.policy.suggest(tenant_id):
+            try:
+                proposals.append(self.policy.propose(tenant_id, suggestion, replay_traffic))
+            except (ValueError, RuntimeError) as exc:
+                rejected.append({"suggestion": suggestion, "reason": str(exc)})
+        return {"proposals": proposals, "rejected": rejected}
+
     def insights(self, tenant_id: str) -> dict[str, Any]:
         return {
             "summary": self.observability.summary(tenant_id),

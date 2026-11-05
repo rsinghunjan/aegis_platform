@@ -14,7 +14,9 @@ from typing import Any, Callable, Optional
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
-from ai_core import AICore, AIQuotaExceeded
+from datetime import datetime, timezone
+
+from ai_core import AICore, AIQuotaExceeded, anomaly
 from agentic.deployment import create_configured_agent_runtime
 from agentic.identity import OIDCTenantIdentity
 from agentic.runtime import AgentRuntime, AgentRuntimeError, AgentStore
@@ -105,6 +107,17 @@ class AgentFeedbackRequest(BaseModel):
     note: str = Field(default="", max_length=2000)
 
 
+class AutoProposeRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=128)
+    replay_traffic: list[dict[str, Any]] = Field(min_items=1, max_items=500)
+
+
+class AnomalyScanRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=128)
+    model_name: str = Field(default="default", min_length=1, max_length=128)
+    remediate: bool = False
+
+
 class PromptProposalRequest(BaseModel):
     tenant_id: str = Field(min_length=1, max_length=128)
     template: str = Field(min_length=1, max_length=4000)
@@ -149,6 +162,7 @@ def create_app(
     ai_workflow: AIWorkflow | None = None,
     policy_replay_evaluator: Callable[..., Any] | None = None,
     policy_opa_client: Any = None,
+    drift_remediation: Any = None,
 ) -> FastAPI:
     selected_runtime = runtime or create_configured_agent_runtime()
     oidc_identity = OIDCTenantIdentity.from_environment()
@@ -504,6 +518,57 @@ def create_app(
             feedback_loop.collect_run_signals, app.state.agent_runtime, tenant_id
         )
         return feedback_loop.export_retraining_manifest(signals)
+
+    @app.post("/operator/ai/policy/auto-propose", tags=["ai-workflows"])
+    async def auto_propose_policies(
+        request: Request, body: AutoProposeRequest
+    ) -> dict[str, Any]:
+        principal = await resolve_principal(request)
+        await authorize(
+            request, body.tenant_id, "ai_policy_propose", principal.principal_id
+        )
+        try:
+            return app.state.ai_core.propose_from_suggestions(
+                body.tenant_id, body.replay_traffic
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/operator/ai/anomalies/scan", tags=["ai-workflows"])
+    async def scan_anomalies(
+        request: Request, body: AnomalyScanRequest
+    ) -> dict[str, Any]:
+        principal = await resolve_principal(request)
+        await authorize(
+            request, body.tenant_id, "ai_policy_propose", principal.principal_id
+        )
+        workflow = app.state.ai_workflow
+        usage = await asyncio.to_thread(workflow.list_usage, body.tenant_id, 500)
+        anomalies = anomaly.detect_anomalies(usage)
+
+        def generate(prompt: str) -> str:
+            return workflow.generate(body.tenant_id, prompt, 64)["text"]
+
+        triaged = await asyncio.to_thread(anomaly.triage, anomalies, generate)
+        remediation = []
+        if body.remediate and triaged:
+            if drift_remediation is None:
+                raise HTTPException(
+                    status_code=503, detail="drift remediation is not configured"
+                )
+            for finding in anomaly.to_drift_findings(
+                body.tenant_id,
+                body.model_name,
+                triaged,
+                datetime.now(timezone.utc).isoformat(),
+            ):
+                # High-risk actions still stop at the runtime approval gate.
+                remediation.append(await drift_remediation.consume(finding))
+        return {
+            "tenant_id": body.tenant_id,
+            "anomalies": triaged,
+            "remediation": remediation,
+        }
 
     @app.get("/operator/ai/regression-candidates", tags=["ai-workflows"])
     async def regression_candidates(request: Request, tenant_id: str) -> dict[str, Any]:

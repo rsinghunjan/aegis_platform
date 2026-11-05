@@ -23,7 +23,7 @@ from agentic.worker import (
     AgentPrincipal,
     CeleryExecutionDispatcher,
 )
-from services import feedback_loop
+from services import feedback_loop, regression_sets
 from services.ai_evaluation import tuning_recommendations
 from services.prompt_eval import build_prompt_evaluator
 from services.ai_workflow import AIWorkflow, AIWorkflowError
@@ -504,6 +504,17 @@ def create_app(
             feedback_loop.collect_run_signals, app.state.agent_runtime, tenant_id
         )
         return feedback_loop.export_retraining_manifest(signals)
+
+    @app.get("/operator/ai/regression-candidates", tags=["ai-workflows"])
+    async def regression_candidates(request: Request, tenant_id: str) -> dict[str, Any]:
+        await authorize(request, tenant_id, "operator_read")
+        usage = await asyncio.to_thread(
+            app.state.ai_workflow.list_usage, tenant_id, 500
+        )
+        return {
+            "tenant_id": tenant_id,
+            "failures": regression_sets.failure_candidates(usage),
+        }
 
     @app.get("/operator/ai/prompts", tags=["ai-workflows"])
     async def list_prompts(request: Request, tenant_id: str) -> dict[str, Any]:

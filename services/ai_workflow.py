@@ -26,6 +26,8 @@ from services.inference import (
     estimate_cost,
 )
 from services.inference.gateway import build_inference_router, dev_providers_allowed
+from services.embeddings.rerank import LLMReranker, LexicalReranker
+from services.grounding import check_grounding
 from services.prompt_registry import PromptRegistry, render
 from services.observability.ai_metrics import record_ai_request
 from services.observability.tracing import get_trace_id, start_span
@@ -81,8 +83,49 @@ class AIWorkflow:
         self.input_cost_per_1k = self._cost_rate("AEGIS_LLM_INPUT_COST_PER_1K")
         self.output_cost_per_1k = self._cost_rate("AEGIS_LLM_OUTPUT_COST_PER_1K")
         self._tenants: dict[str, _TenantKnowledge] = {}
+        self._configure_capacity()
+        self.reranker = self._build_reranker()
+        self.grounding_mode = os.getenv("AEGIS_GROUNDING_MODE", "warn").strip().lower()
+        if self.grounding_mode not in {"off", "warn", "enforce"}:
+            raise ValueError("AEGIS_GROUNDING_MODE must be off, warn, or enforce")
         self.safety_checker = SafetyChecker()
         self.prompts = PromptRegistry.from_environment()
+
+    def _configure_capacity(self) -> None:
+        """PostgreSQL uses an HNSW (pgvector) index, so it can hold far larger corpora
+        than the bounded SQLite/dev scan. Each limit is overridable by environment."""
+        indexed = self.data_store.engine.dialect.name == "postgresql"
+        defaults = {
+            "AEGIS_AI_MAX_DOCUMENTS_PER_TENANT": (100, 5_000),
+            "AEGIS_AI_MAX_INDEXED_CHARS_PER_TENANT": (256_000, 50_000_000),
+            "AEGIS_AI_MAX_CHUNKS_PER_TENANT": (512, 100_000),
+        }
+        values = {}
+        for name, (dev, prod) in defaults.items():
+            try:
+                values[name] = int(os.getenv(name, str(prod if indexed else dev)))
+            except ValueError as exc:
+                raise ValueError(f"{name} must be a positive integer") from exc
+            if values[name] < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        self.max_documents_per_tenant = values["AEGIS_AI_MAX_DOCUMENTS_PER_TENANT"]
+        self.max_indexed_chars_per_tenant = values["AEGIS_AI_MAX_INDEXED_CHARS_PER_TENANT"]
+        self.max_chunks_per_tenant = values["AEGIS_AI_MAX_CHUNKS_PER_TENANT"]
+
+    def _build_reranker(self):
+        mode = os.getenv("AEGIS_RERANKER", "lexical").strip().lower()
+        if mode == "none":
+            return None
+        if mode == "lexical":
+            return LexicalReranker()
+        if mode == "llm":
+            def generate(prompt: str) -> str:
+                return self.inference_router.generate(
+                    InferenceRequest(prompt=prompt, model=self.model, max_tokens=256)
+                ).text
+
+            return LLMReranker(generate)
+        raise ValueError("AEGIS_RERANKER must be none, lexical, or llm")
 
     @staticmethod
     def _cost_rate(setting: str) -> float:
@@ -195,7 +238,11 @@ class AIWorkflow:
         started_at = time.perf_counter()
         try:
             with start_span("ai.retrieval", {"ai.query.length": len(query)}):
-                retrieved = knowledge.pipeline.retrieve(query, top_k=5)
+                retrieved = knowledge.pipeline.retrieve(
+                    query, top_k=20 if self.reranker else 5
+                )
+                if self.reranker:
+                    retrieved = self.reranker.rerank(query, retrieved, 5)
             context = "\n\n".join(
                 f"[{index + 1}] {chunk.text}" for index, chunk in enumerate(retrieved)
             )
@@ -290,6 +337,20 @@ class AIWorkflow:
                 error_type="UnsafeModelAnswer",
             )
             raise ValueError("model answer rejected by safety policy")
+        grounding = (
+            check_grounding(answer, context) if self.grounding_mode != "off" else None
+        )
+        if grounding and not grounding["grounded"] and self.grounding_mode == "enforce":
+            self._record_failed_request(
+                request_id=request_id,
+                tenant_id=tenant_id,
+                provider=provider,
+                model=model,
+                request_sha256=request_sha256,
+                status="ungrounded",
+                error_type="UngroundedModelAnswer",
+            )
+            raise AIWorkflowError("AI workflow answer is not grounded in the context")
         cost_usd = estimate_cost(
             result.input_tokens,
             result.output_tokens,
@@ -347,6 +408,7 @@ class AIWorkflow:
             "output_tokens": result.output_tokens,
             "latency_ms": result.latency_ms,
             "cost_usd": cost_usd,
+            "grounding": grounding,
             "citations": [
                 {
                     "document_id": chunk.metadata["document_id"],

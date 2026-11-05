@@ -76,8 +76,9 @@ running an evaluation intended to measure that deployment.
 
 Changes to prompts, retrieval, model routing, or the golden set run this
 evaluation tests as a pull-request gate. The provider-backed evaluation also
-runs when the `AEGIS_LLM_API_KEY` repository secret is configured; without it,
-CI skips the external-model call. Feedback submitted through
+runs when the `AEGIS_LLM_API_KEY` or `OPENAI_API_KEY` repository secret is
+configured; without either key, CI skips the external-model call. Feedback
+submitted through
 `POST /agent/runs/{id}/feedback` remains in the tenant-scoped evidence chain and
 can be reviewed using `GET /operator/agent/runs/{id}/feedback-summary`. Pass
 reviewed ratings with `--feedback-rating <1-5>` to include them in an

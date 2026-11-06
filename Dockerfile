@@ -3,6 +3,7 @@ FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     AEGIS_AGENT_DATABASE_URL=sqlite:////data/aegis_agent.db \
+    AEGIS_AI_DATABASE_URL=sqlite:////data/aegis_ai.db \
     AEGIS_MEMORY_DATABASE_URL=sqlite:////data/aegis_agent.db
 
 WORKDIR /app

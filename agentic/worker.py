@@ -69,13 +69,20 @@ class AgentWorker:
 class CeleryExecutionDispatcher:
     """Queue worker execution through an application-configured Celery instance."""
 
-    def __init__(self, celery_app: Any, task_name: str = "aegis.execute_agent_run"):
+    def __init__(
+        self,
+        celery_app: Any,
+        task_name: str = "aegis.execute_agent_run",
+        queue: str | None = None,
+    ):
         self.celery_app = celery_app
         self.task_name = task_name
+        self.queue = queue
 
     def dispatch(self, message: AgentExecutionMessage) -> str:
+        options = {"queue": self.queue} if self.queue else {}
         result = self.celery_app.send_task(
-            self.task_name, args=[message.dict()]
+            self.task_name, args=[message.dict()], **options
         )
         return str(result.id)
 

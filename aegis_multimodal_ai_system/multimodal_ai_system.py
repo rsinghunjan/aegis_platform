@@ -14,6 +14,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
 class MultimodalAISystem:
     DEFAULT_MODEL_IDS = {
         "core_llm": "gpt2",

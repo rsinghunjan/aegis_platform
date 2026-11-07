@@ -42,49 +42,6 @@ from api.otel import init_otel
 logger = logging.getLogger(__name__)
 
 
-def _validate_production_integrations(
-    tenant_authorizer: Any,
-    principal_resolver: Any,
-    execution_dispatcher: Any,
-) -> None:
-    environment = (
-        os.getenv("AEGIS_ENV")
-        or os.getenv("ENVIRONMENT")
-        or os.getenv("ENV")
-        or ""
-    ).strip().lower()
-    if environment not in {"prod", "production"} and os.getenv(
-        "AEGIS_PRODUCTION", ""
-    ).strip().lower() not in {"1", "true", "yes"}:
-        return
-
-    if os.getenv("AEGIS_ALLOW_DEV_PROVIDERS", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-    }:
-        raise RuntimeError("development AI providers are not allowed in production")
-    if tenant_authorizer is None or principal_resolver is None:
-        raise RuntimeError(
-            "production requires trusted tenant authorization and principal resolution"
-        )
-    if execution_dispatcher is None:
-        raise RuntimeError("production requires a configured agent execution dispatcher")
-
-    database_urls = {
-        "AEGIS_AGENT_DATABASE_URL": os.getenv("AEGIS_AGENT_DATABASE_URL")
-        or os.getenv("DATABASE_URL", ""),
-        "AEGIS_AI_DATABASE_URL": os.getenv("AEGIS_AI_DATABASE_URL", ""),
-    }
-    for setting, database_url in database_urls.items():
-        if not database_url.strip().lower().startswith(
-            ("postgresql://", "postgresql+", "postgres://")
-        ):
-            raise RuntimeError(
-                f"production requires {setting} to use a shared PostgreSQL database"
-            )
-
-
 class CreateAgentRunRequest(BaseModel):
     tenant_id: str
     goal: str
@@ -207,6 +164,7 @@ def create_app(
     policy_opa_client: Any = None,
     drift_remediation: Any = None,
 ) -> FastAPI:
+    selected_runtime = runtime or create_configured_agent_runtime()
     oidc_identity = OIDCTenantIdentity.from_environment()
     selected_tenant_authorizer = tenant_authorizer or (
         oidc_identity.authorize_tenant if oidc_identity is not None else None
@@ -225,15 +183,7 @@ def create_app(
             broker=broker_url,
             backend=result_backend or broker_url,
         )
-        selected_execution_dispatcher = CeleryExecutionDispatcher(
-            celery_app, queue=os.getenv("AEGIS_AGENT_QUEUE")
-        )
-    _validate_production_integrations(
-        selected_tenant_authorizer,
-        selected_principal_resolver,
-        selected_execution_dispatcher,
-    )
-    selected_runtime = runtime or create_configured_agent_runtime()
+        selected_execution_dispatcher = CeleryExecutionDispatcher(celery_app)
     selected_ai_workflow = ai_workflow or AIWorkflow()
     if approval_notifier is not None:
         selected_runtime.approval_notifier = approval_notifier
@@ -242,14 +192,11 @@ def create_app(
     async def lifespan(_app: FastAPI):
         try:
             selected_runtime.store.initialize()
-            ai_data_store = getattr(selected_ai_workflow, "data_store", None)
-            if ai_data_store is not None:
-                ai_data_store.initialize()
         except Exception as exc:
             logger.exception("Aegis runtime database initialization failed")
             raise RuntimeError(
-                "Aegis database initialization failed; configure the agent and AI "
-                "database URLs, install their drivers, and enable pgvector for PostgreSQL"
+                "Aegis database is unavailable; configure AEGIS_AGENT_DATABASE_URL "
+                "or DATABASE_URL and install the matching SQLAlchemy database driver"
             ) from exc
         anchor_task = None
         if selected_runtime.evidence_anchor_backend is not None:
@@ -398,20 +345,11 @@ def create_app(
     @app.get("/readyz", tags=["health"])
     def readyz() -> dict[str, str]:
         try:
-            stores = [
-                app.state.agent_runtime.store,
-                getattr(app.state.ai_workflow, "data_store", None),
-            ]
-            for store in stores:
-                engine = getattr(store, "engine", None)
-                if engine is not None:
-                    with engine.connect() as connection:
-                        connection.exec_driver_sql("SELECT 1")
+            with app.state.agent_runtime.store.engine.connect() as connection:
+                connection.exec_driver_sql("SELECT 1")
         except Exception as exc:
-            logger.warning("Aegis database readiness check failed: %s", type(exc).__name__)
-            raise HTTPException(
-                status_code=503, detail="application database unavailable"
-            ) from exc
+            logger.warning("Aegis readiness check failed: %s", type(exc).__name__)
+            raise HTTPException(status_code=503, detail="database unavailable") from exc
         return {"status": "ready"}
 
     @app.post("/ai/knowledge", tags=["ai-workflows"])

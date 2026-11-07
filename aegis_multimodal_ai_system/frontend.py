@@ -1,9 +1,7 @@
 import gradio as gr
 
-
 def dummy_chat(message, history=None):
     return "Hello! This is a demo response.", ""
-
 
 with gr.Blocks(title="Multimodal AI Chat") as demo:
     gr.Markdown("# 🛡️ Aegis Multimodal AI Demo")

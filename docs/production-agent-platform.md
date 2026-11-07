@@ -6,6 +6,41 @@ dispatch is not configured. When `AEGIS_ENV=production` (or
 tenant authorization, an execution dispatcher, development-provider fallbacks
 disabled, and PostgreSQL URLs for both the agent store and AI/vector store.
 
+## Single-server Docker Compose
+
+`docker-compose.production.yml` runs the canonical API and its separate agent
+worker from the same release image. It uses external PostgreSQL, Redis, OIDC,
+and model services; it does not provision them or provide high availability.
+Do not use the older `docker-compose.platform.yml` for this runtime.
+
+1. Build and publish the root `Dockerfile` image, including a trusted
+   `AEGIS_AGENT_TOOL_MODULE` if agent runs need tools. Register the same tools
+   for both API and worker; without them queued plans cannot execute tools.
+2. Provision PostgreSQL with the `vector` extension, an authenticated broker
+   and result backend, an OIDC issuer, and a model provider. Configure their
+   network access, TLS trust, backups, retention, and credentials separately.
+3. Copy `docker/production.env.example` to `.env.production` at the repository
+   root, restrict file permissions (for example `chmod 600 .env.production`),
+   and replace every placeholder. Pin `AEGIS_IMAGE` to an immutable digest.
+   The environment file is ignored by Git but remains readable to the host and
+   Docker administrators; use your host's secret management controls.
+   Set database and broker TLS options and CA certificates for your services.
+4. Start and inspect the services:
+
+   ```bash
+   docker compose --env-file .env.production -f docker-compose.production.yml up -d
+   docker compose --env-file .env.production -f docker-compose.production.yml ps
+   docker compose --env-file .env.production -f docker-compose.production.yml logs agent-worker
+   curl --fail http://127.0.0.1:8000/readyz
+   ```
+
+The API listens only on the host's loopback interface. For remote access, put a
+properly configured TLS-terminating reverse proxy in front of it and restrict
+access according to your security requirements. The worker does not expose an
+HTTP health endpoint; monitor the worker and queue separately. The API's
+readiness endpoint alone does not prove that the worker, identity provider, or
+model provider can process requests. Follow the verification steps below.
+
 ## Kubernetes and Helm
 
 Start from `helm/aegis-api/values.production.example.yaml`. It demonstrates a

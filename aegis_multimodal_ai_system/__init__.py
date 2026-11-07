@@ -1,1 +1,1 @@
-"""Aegis multimodal AI package."""
+# This file marks the directory as a Python package.

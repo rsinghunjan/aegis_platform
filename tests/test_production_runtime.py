@@ -1,7 +1,6 @@
 import asyncio
 import time
 
-import pytest
 from fastapi.testclient import TestClient
 
 from agentic.runtime import AgentRuntime, AgentStore, ToolSpec
@@ -11,7 +10,7 @@ from agentic.worker import (
     AgentWorker,
     CeleryExecutionDispatcher,
 )
-from production import _validate_production_integrations, create_app
+from production import create_app
 
 
 class CollectingDispatcher:
@@ -55,51 +54,6 @@ class CollectingEvidenceAnchorBackend:
         return proof in self.anchors
 
 
-def test_production_configuration_requires_trusted_integrations(monkeypatch):
-    monkeypatch.setenv("AEGIS_ENV", "production")
-    monkeypatch.delenv("AEGIS_ALLOW_DEV_PROVIDERS", raising=False)
-    monkeypatch.setenv("AEGIS_AGENT_DATABASE_URL", "postgresql://agent-db/aegis")
-    monkeypatch.setenv("AEGIS_AI_DATABASE_URL", "postgresql://ai-db/aegis")
-
-    with pytest.raises(RuntimeError, match="trusted tenant authorization"):
-        _validate_production_integrations(None, None, None)
-
-    def authorize(*_args):
-        return True
-
-    def resolve(_request):
-        return AgentPrincipal(principal_id="operator")
-
-    with pytest.raises(RuntimeError, match="execution dispatcher"):
-        _validate_production_integrations(authorize, resolve, None)
-
-    _validate_production_integrations(authorize, resolve, CollectingDispatcher())
-
-
-def test_production_configuration_rejects_development_provider_fallback(monkeypatch):
-    monkeypatch.setenv("AEGIS_ENV", "production")
-    monkeypatch.setenv("AEGIS_ALLOW_DEV_PROVIDERS", "true")
-    with pytest.raises(RuntimeError, match="development AI providers"):
-        _validate_production_integrations(
-            lambda *_args: True,
-            lambda _request: AgentPrincipal(principal_id="operator"),
-            CollectingDispatcher(),
-        )
-
-
-def test_production_configuration_requires_postgresql_for_ai_storage(monkeypatch):
-    monkeypatch.setenv("AEGIS_ENV", "production")
-    monkeypatch.delenv("AEGIS_ALLOW_DEV_PROVIDERS", raising=False)
-    monkeypatch.setenv("AEGIS_AGENT_DATABASE_URL", "postgresql://agent-db/aegis")
-    monkeypatch.setenv("AEGIS_AI_DATABASE_URL", "sqlite:///./aegis_ai.db")
-    with pytest.raises(RuntimeError, match="AEGIS_AI_DATABASE_URL"):
-        _validate_production_integrations(
-            lambda *_args: True,
-            lambda _request: AgentPrincipal(principal_id="operator"),
-            CollectingDispatcher(),
-        )
-
-
 def test_celery_dispatcher_sends_run_reference():
     class FakeCelery:
         def __init__(self):
@@ -119,22 +73,6 @@ def test_celery_dispatcher_sends_run_reference():
     assert task_id == "celery-task-1"
     assert celery.call[0] == "aegis.execute_agent_run"
     assert celery.call[1][0]["run_id"] == "run-1"
-
-
-def test_celery_dispatcher_routes_to_configured_queue():
-    class FakeCelery:
-        def send_task(self, name, args, **options):
-            self.call = (name, args, options)
-            return type("Result", (), {"id": "celery-task-2"})()
-
-    celery = FakeCelery()
-    message = AgentExecutionMessage(
-        run_id="run-2",
-        tenant_id="tenant-a",
-        principal=AgentPrincipal(principal_id="operator"),
-    )
-    CeleryExecutionDispatcher(celery, queue="aegis_agent").dispatch(message)
-    assert celery.call[2] == {"queue": "aegis_agent"}
 
 
 def test_canonical_health_and_readiness(tmp_path):

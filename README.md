@@ -95,6 +95,10 @@ docker build -t aegis-platform .
 docker run --rm -p 8000:8000 -v aegis-data:/data aegis-platform
 ```
 
+For an API and agent worker using external production services, see the
+[production deployment guide](docs/production-agent-platform.md). The single
+container above is a reference setup, not a production deployment.
+
 ## Canonical runtime and safety
 
 - `production.py` is the FastAPI application entry point.
